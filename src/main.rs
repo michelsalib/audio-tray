@@ -4,13 +4,15 @@
 
 //! Windows audio output tray app.
 //!
-//! Mode dispatch (plan §6): default = tray. Per-device icons are assigned from the
-//! tray's native right-click menu ("Icon" submenu), not a separate window.
+//! Mode dispatch (plan §6): default = tray. Left-click opens the acrylic control panel
+//! (volume, mute, output/input switching, per-device icons); right-click opens the quick
+//! menu (Sound settings + Quit).
 //! Dev utilities retained from the early slices:
 //!   audio-tray            run the tray (default)
 //!   audio-tray --list     print current default + active output devices
 //!   audio-tray --set <q>  switch default output to the device whose friendly name
 //!                         contains <q> (case-insensitive), or whose id equals <q>
+//!   audio-tray --flyout [menu]  preview the control panel (or the right-click menu)
 //!   audio-tray --update   check GitHub releases and self-update now (see update.rs)
 
 use anyhow::{bail, Context, Result};
@@ -28,7 +30,7 @@ mod tray;
 mod update;
 
 use audio::wasapi::WasapiBackend;
-use audio::{AudioBackend, Device, DeviceId};
+use audio::{AudioBackend, Device, DeviceId, Flow};
 use config::Config;
 use icons::IconId;
 
@@ -53,16 +55,20 @@ fn main() -> Result<()> {
     }
     match args.first().map(String::as_str) {
         Some("--flyout") => {
-            // Dev: show the acrylic flyout once and print the chosen action.
-            let devices = backend.enumerate()?;
-            let current = backend.current_default().ok();
-            let config = Config::load();
-            match flyout::show(&devices, current.as_ref(), &config, None) {
-                Some(flyout::FlyoutAction::Quit) => println!("flyout: Quit"),
-                Some(flyout::FlyoutAction::Switch(id)) => println!("flyout: Switch {}", id.0),
-                Some(flyout::FlyoutAction::SetIcon(d, i)) => println!("flyout: SetIcon {d} -> {i:?}"),
-                None => println!("flyout: dismissed"),
+            // Dev: show the flyout once. `--flyout menu` previews the right-click menu.
+            let trigger = match args.get(1).map(String::as_str) {
+                Some("menu") => flyout::Trigger::RightClick,
+                _ => flyout::Trigger::LeftClick,
+            };
+            let mut config = Config::load();
+            let outcome = flyout::show(&backend, &mut config, None, trigger);
+            if outcome.config_changed {
+                config.save()?;
             }
+            println!(
+                "flyout: closed (config_changed={}, quit={})",
+                outcome.config_changed, outcome.quit
+            );
         }
         Some("--list") => list(&backend)?,
         Some("--set") => {
@@ -134,12 +140,19 @@ fn list(backend: &WasapiBackend) -> Result<()> {
         }
     }
 
-    let current = backend.current_default().ok();
-    println!("\nActive output devices:");
-    for d in &devices {
-        let marker = if Some(&d.id) == current.as_ref() { "*" } else { " " };
-        println!("  {marker} [{:?}] {}", d.form_factor, d.friendly_name);
-        println!("      id: {}", d.id.0);
+    for (flow, title) in [(Flow::Output, "output"), (Flow::Input, "input")] {
+        let default = backend.default_of(flow).ok().flatten();
+        println!("\nActive {title} devices:");
+        for d in backend.enumerate_flow(flow)?.iter() {
+            let marker = if Some(&d.id) == default.as_ref() { "*" } else { " " };
+            let level = match backend.volume_of(&d.id) {
+                Ok(v) => format!("{:>3.0}%", v * 100.0),
+                Err(_) => "  ? ".to_string(),
+            };
+            let mute = if backend.is_muted(&d.id).unwrap_or(false) { " muted" } else { "" };
+            println!("  {marker} [{:?}] {level}{mute}  {}", d.form_factor, d.friendly_name);
+            println!("      id: {}", d.id.0);
+        }
     }
     Ok(())
 }

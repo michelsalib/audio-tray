@@ -2,18 +2,93 @@
 //! render endpoints, read the current default, and read per-device properties
 //! (friendly name, form factor). Switching lives in [`super::switch`] (plan §6).
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
 use anyhow::{Context, Result};
-use windows::core::PWSTR;
+use windows::core::{implement, PCWSTR, PWSTR};
+use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
-use windows::Win32::Media::Audio::Endpoints::IAudioEndpointVolume;
+use windows::Win32::Media::Audio::Endpoints::{
+    IAudioEndpointVolume, IAudioEndpointVolumeCallback, IAudioEndpointVolumeCallback_Impl,
+};
 use windows::Win32::Media::Audio::{
-    eCommunications, eConsole, eMultimedia, eRender, ERole, IMMDevice, IMMDeviceEnumerator,
-    MMDeviceEnumerator, PKEY_AudioEndpoint_FormFactor, DEVICE_STATE_ACTIVE,
+    eCapture, eCommunications, eConsole, eMultimedia, eRender, EDataFlow, ERole, IMMDevice,
+    IMMDeviceEnumerator, MMDeviceEnumerator, AUDIO_VOLUME_NOTIFICATION_DATA,
+    PKEY_AudioEndpoint_FormFactor, DEVICE_STATE_ACTIVE,
 };
 use windows::Win32::System::Com::StructuredStorage::{PropVariantToStringAlloc, PropVariantToUInt32};
 use windows::Win32::System::Com::{CoCreateInstance, CoTaskMemFree, CLSCTX_ALL, STGM_READ};
+use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 
-use super::{AudioBackend, Device, DeviceId, FormFactor};
+use super::{AudioBackend, Device, DeviceId, Flow, FormFactor};
+
+/// Posts `msg` to `hwnd` whenever an endpoint's volume or mute changes. The callback fires
+/// on a WASAPI-owned thread, so it does nothing but post — the UI thread re-reads and
+/// repaints. `hwnd` is stored as an `isize` to keep the COM object thread-agnostic.
+///
+/// `pending` coalesces: at most one message is queued at a time. Posted messages outrank
+/// input in `GetMessage`, so an unthrottled storm (e.g. a microphone's automatic gain
+/// control, which fires constantly) would starve the flyout of clicks and it could never
+/// be dismissed. The UI clears the flag when it handles the message.
+#[implement(IAudioEndpointVolumeCallback)]
+struct VolCallback {
+    hwnd: isize,
+    msg: u32,
+    pending: Arc<AtomicBool>,
+}
+
+#[allow(non_snake_case)]
+impl IAudioEndpointVolumeCallback_Impl for VolCallback_Impl {
+    fn OnNotify(&self, _data: *mut AUDIO_VOLUME_NOTIFICATION_DATA) -> windows::core::Result<()> {
+        if !self.pending.swap(true, Ordering::SeqCst) {
+            unsafe {
+                let _ = PostMessageW(
+                    Some(HWND(self.hwnd as *mut core::ffi::c_void)),
+                    self.msg,
+                    WPARAM(0),
+                    LPARAM(0),
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A live volume/mute-change subscription for one endpoint; unregisters on drop. Holds the
+/// endpoint interface so the UI can re-read from it without re-activating COM.
+pub struct VolumeWatch {
+    endpoint: IAudioEndpointVolume,
+    callback: IAudioEndpointVolumeCallback,
+}
+
+impl VolumeWatch {
+    /// Current (volume 0.0..=1.0, muted) of the watched endpoint.
+    pub fn read(&self) -> Option<(f32, bool)> {
+        unsafe {
+            let v = self.endpoint.GetMasterVolumeLevelScalar().ok()?;
+            let m = self.endpoint.GetMute().ok()?.as_bool();
+            Some((v, m))
+        }
+    }
+}
+
+impl Drop for VolumeWatch {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = self.endpoint.UnregisterControlChangeNotify(&self.callback);
+        }
+    }
+}
+
+impl Flow {
+    fn data_flow(self) -> EDataFlow {
+        match self {
+            Flow::Output => eRender,
+            Flow::Input => eCapture,
+        }
+    }
+}
 
 /// Reads the WASAPI render-endpoint state. COM must already be initialized on the
 /// calling thread (see `main`).
@@ -75,6 +150,91 @@ impl WasapiBackend {
         }
     }
 
+    /// Active endpoints for a direction (output = render, input = capture).
+    pub fn enumerate_flow(&self, flow: Flow) -> Result<Vec<Device>> {
+        unsafe {
+            let collection = self
+                .enumerator
+                .EnumAudioEndpoints(flow.data_flow(), DEVICE_STATE_ACTIVE)
+                .context("EnumAudioEndpoints")?;
+            let count = collection.GetCount().context("GetCount")?;
+            let mut devices = Vec::with_capacity(count as usize);
+            for i in 0..count {
+                let device = collection.Item(i).with_context(|| format!("Item({i})"))?;
+                devices.push(self.describe(&device)?);
+            }
+            Ok(devices)
+        }
+    }
+
+    /// Current default endpoint (eConsole role) for a direction, if one is set.
+    pub fn default_of(&self, flow: Flow) -> Result<Option<DeviceId>> {
+        unsafe {
+            match self.enumerator.GetDefaultAudioEndpoint(flow.data_flow(), eConsole) {
+                Ok(device) => Ok(Some(DeviceId(take_pwstr(device.GetId().context("GetId")?)?))),
+                Err(_) => Ok(None),
+            }
+        }
+    }
+
+    /// Make an endpoint (any direction) the default across all three roles. The id itself
+    /// encodes the direction, so `IPolicyConfig` handles capture devices the same way.
+    pub fn set_default_of(&self, id: &DeviceId) -> Result<()> {
+        super::switch::set_default(id)
+    }
+
+    /// Resolve an endpoint by its id string.
+    fn device_by_id(&self, id: &DeviceId) -> Result<IMMDevice> {
+        let wide: Vec<u16> = id.0.encode_utf16().chain(std::iter::once(0)).collect();
+        unsafe { self.enumerator.GetDevice(PCWSTR(wide.as_ptr())) }
+            .with_context(|| format!("GetDevice({})", id.0))
+    }
+
+    /// Activate the volume/mute control for a specific endpoint.
+    fn endpoint_volume(&self, id: &DeviceId) -> Result<IAudioEndpointVolume> {
+        let device = self.device_by_id(id)?;
+        unsafe { device.Activate(CLSCTX_ALL, None) }.context("activate IAudioEndpointVolume")
+    }
+
+    /// Master volume of a specific endpoint, 0.0..=1.0.
+    pub fn volume_of(&self, id: &DeviceId) -> Result<f32> {
+        unsafe { self.endpoint_volume(id)?.GetMasterVolumeLevelScalar() }.context("get volume")
+    }
+
+    /// Set the master volume of a specific endpoint (clamped to 0.0..=1.0).
+    pub fn set_volume_of(&self, id: &DeviceId, level: f32) -> Result<()> {
+        let level = level.clamp(0.0, 1.0);
+        unsafe { self.endpoint_volume(id)?.SetMasterVolumeLevelScalar(level, std::ptr::null()) }
+            .context("set volume")
+    }
+
+    /// Whether a specific endpoint is muted.
+    pub fn is_muted(&self, id: &DeviceId) -> Result<bool> {
+        Ok(unsafe { self.endpoint_volume(id)?.GetMute() }.context("get mute")?.as_bool())
+    }
+
+    /// Mute or unmute a specific endpoint.
+    pub fn set_muted(&self, id: &DeviceId, muted: bool) -> Result<()> {
+        unsafe { self.endpoint_volume(id)?.SetMute(muted, std::ptr::null()) }.context("set mute")
+    }
+
+    /// Subscribe to volume/mute changes on `id` from any source (media keys, other apps,
+    /// us). `msg` is posted to `hwnd` on each change; the returned [`VolumeWatch`] keeps the
+    /// subscription alive and unregisters when dropped.
+    pub fn watch_volume(
+        &self,
+        id: &DeviceId,
+        hwnd: isize,
+        msg: u32,
+        pending: Arc<AtomicBool>,
+    ) -> Result<VolumeWatch> {
+        let endpoint = self.endpoint_volume(id)?;
+        let callback: IAudioEndpointVolumeCallback = VolCallback { hwnd, msg, pending }.into();
+        unsafe { endpoint.RegisterControlChangeNotify(&callback) }
+            .context("RegisterControlChangeNotify")?;
+        Ok(VolumeWatch { endpoint, callback })
+    }
+
     /// The default for each of the three roles Windows tracks independently.
     pub fn defaults_by_role(&self) -> [(&'static str, Result<Option<DeviceId>>); 3] {
         [
@@ -104,26 +264,35 @@ impl WasapiBackend {
 
             let form_factor = read_form_factor(&store);
 
-            Ok(Device { id, friendly_name, form_factor })
+            // ContainerId groups all functions of the physical device; used to find its
+            // Bluetooth battery node. Stored as a CLSID property → `{GUID}` string.
+            let container_id = {
+                use windows::Win32::Foundation::PROPERTYKEY;
+                let key = PROPERTYKEY {
+                    fmtid: windows::core::GUID::from_u128(0x8C7E_D206_3F8A_4827_B3AB_AE9E_1FAE_FC6C),
+                    pid: 2,
+                };
+                store
+                    .GetValue(&key)
+                    .ok()
+                    .and_then(|pv| {
+                        PropVariantToStringAlloc(&pv).ok().and_then(|p| {
+                            let out = p.to_string().ok();
+                            CoTaskMemFree(Some(p.0 as *const _));
+                            out
+                        })
+                    })
+                    .filter(|s| !s.is_empty())
+            };
+
+            Ok(Device { id, friendly_name, form_factor, container_id })
         }
     }
 }
 
 impl AudioBackend for WasapiBackend {
     fn enumerate(&self) -> Result<Vec<Device>> {
-        unsafe {
-            let collection = self
-                .enumerator
-                .EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE)
-                .context("EnumAudioEndpoints")?;
-            let count = collection.GetCount().context("GetCount")?;
-            let mut devices = Vec::with_capacity(count as usize);
-            for i in 0..count {
-                let device = collection.Item(i).with_context(|| format!("Item({i})"))?;
-                devices.push(self.describe(&device)?);
-            }
-            Ok(devices)
-        }
+        self.enumerate_flow(Flow::Output)
     }
 
     fn current_default(&self) -> Result<DeviceId> {
@@ -147,6 +316,7 @@ fn read_form_factor(store: &windows::Win32::UI::Shell::PropertiesSystem::IProper
             // Values from the Win32 `EndpointFormFactor` enum (stable ABI).
             Ok(1) => FormFactor::Speakers,
             Ok(3) => FormFactor::Headphones,
+            Ok(4) => FormFactor::Microphone,
             Ok(5) => FormFactor::Headset,
             Ok(8) => FormFactor::Spdif,
             Ok(9) => FormFactor::DigitalDisplay,

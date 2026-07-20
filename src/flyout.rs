@@ -1,16 +1,21 @@
-//! A custom Windows-11-style flyout, modelled on the system sound-output flyout: an
+//! A custom Windows-11-style flyout, modelled on the system sound flyout: an
 //! acrylic-blurred, rounded, dark surface with an accent "pill" on the selected row.
 //!
-//! A classic Win32 `TrackPopupMenu` can't look like this — that flyout is a WinUI/XAML
-//! surface. So we build our own: a per-pixel-alpha *layered* window whose contents we
-//! paint into an ARGB buffer (`UpdateLayeredWindow`), with the acrylic blur supplied by
-//! the compositor (`SetWindowCompositionAttribute`) and rounded corners by DWM. Rows are
-//! laid out and hit-tested by hand; the flyout is modal via mouse capture, like a menu.
+//! Unlike a classic `TrackPopupMenu`, this is a live control surface: volume sliders,
+//! mute toggles, output + input device switching, and an inline per-device icon picker,
+//! all painted by hand into a per-pixel-alpha *layered* window (`UpdateLayeredWindow`),
+//! with acrylic blur from the compositor (`SetWindowCompositionAttribute`) and rounded
+//! corners from DWM. Rows and controls are laid out and hit-tested by hand; the flyout is
+//! modal via mouse capture, like a menu, but stays open while you operate it.
+//!
+//! Left-click opens the full [`Trigger::LeftClick`] panel; right-click opens the tiny
+//! [`Trigger::RightClick`] menu (Sound settings + Quit).
 
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use ab_glyph::{Font, FontVec, PxScale, ScaleFont};
-use windows::core::{s, w};
+use windows::core::{s, w, PCWSTR};
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
 use windows::Win32::Graphics::Dwm::{
     DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE,
@@ -22,25 +27,39 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 use windows::Win32::UI::HiDpi::GetDpiForSystem;
-use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
+use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, VK_ESCAPE};
+use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW,
-    LoadCursorW, RegisterClassW, SetCursor, SetForegroundWindow, ShowWindow, SystemParametersInfoW,
-    TranslateMessage, UpdateLayeredWindow, IDC_ARROW, MSG, SPI_GETWORKAREA, SW_SHOWNA,
-    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, ULW_ALPHA, WM_CAPTURECHANGED, WM_LBUTTONDOWN,
-    WM_LBUTTONUP, WM_MOUSEMOVE, WM_RBUTTONDOWN, WNDCLASSW, WS_EX_LAYERED, WS_EX_TOOLWINDOW,
-    WS_EX_TOPMOST, WS_POPUP,
+    LoadCursorW, PostMessageW, RegisterClassW, SetCursor, SetForegroundWindow, ShowWindow,
+    SystemParametersInfoW, TranslateMessage, UpdateLayeredWindow, IDC_ARROW, MSG, SPI_GETWORKAREA,
+    SW_SHOWNA, SW_SHOWNORMAL, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, ULW_ALPHA, WM_APP,
+    WM_CAPTURECHANGED, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_RBUTTONDOWN,
+    WNDCLASSW, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
-use crate::audio::{Device, DeviceId};
+use crate::audio::wasapi::{VolumeWatch, WasapiBackend};
+use crate::audio::{DeviceId, Flow};
 use crate::config::Config;
 use crate::icons::{self, IconId};
 
-/// What the user chose in the flyout.
-pub enum FlyoutAction {
-    Switch(DeviceId),
-    SetIcon(String, IconId),
-    Quit,
+/// Which entry point opened the flyout.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Trigger {
+    /// The full audio control panel.
+    LeftClick,
+    /// The tiny quick menu (Sound settings + Quit).
+    RightClick,
+}
+
+/// What the caller must do after the flyout closes.
+pub struct Outcome {
+    pub quit: bool,
+    pub config_changed: bool,
+    /// The default *output* device was switched while the flyout was open. The
+    /// endpoint-change notifications that would refresh the tray icon are consumed by our
+    /// own modal message loop, so the caller must refresh explicitly.
+    pub output_changed: bool,
 }
 
 /// Where to open the flyout: horizontally centred on the tray icon (`cx`), sitting just
@@ -52,105 +71,215 @@ pub struct Anchor {
 }
 
 // Layout, in DIPs (scaled by the monitor DPI at show time). Tuned to the native Win11
-// "Sortie son" (sound-output) flyout: roomy 40-DIP rows, semibold section headers, an
-// accent selection pill, and generous side padding.
+// sound flyout: roomy rows, a semibold section header, an accent selection pill.
 const CORNER: f32 = 8.0;
 const PAD_V: f32 = 6.0; // top/bottom padding inside the panel
-const ITEM_H: f32 = 44.0; // clickable row height (native list-item pitch ≈ 44 DIP)
-const HEADER_H: f32 = 40.0; // section-header block (top gap + label)
-const SEP_H: f32 = 9.0;
+const HEADER_FIRST_H: f32 = 30.0; // first section header (modest top gap)
+const HEADER_H: f32 = 36.0; // later section headers (larger top gap → group separation)
+const SLIDER_H: f32 = 48.0; // volume-slider row
+const ITEM_H: f32 = 44.0; // device / action row
+const CHIPS_H: f32 = 56.0; // inline icon-picker row
+const SEP_H: f32 = 11.0;
 const ICON_X: f32 = 14.0; // left inset of a row's leading icon
 const ICON_PX: f32 = 20.0; // leading icon glyph size
 const TEXT_X: f32 = 48.0; // left inset of a row's label
 const HEADER_X: f32 = 15.0; // left inset of a section-header label
-const RIGHT_PAD: f32 = 20.0;
-const MIN_W: f32 = 340.0;
+const RIGHT_PAD: f32 = 16.0;
+const MIN_W: f32 = 340.0; // panel minimum width
+const MENU_MIN_W: f32 = 200.0; // right-click menu minimum width
 const MAX_W: f32 = 460.0;
 const ROW_MARGIN: f32 = 4.0; // side margin of the row highlight/pill
 const ROW_RADIUS: f32 = 4.0; // corner radius of the row highlight
 const PILL_W: f32 = 3.0; // accent selection-indicator pill width
 const PILL_H: f32 = 16.0; // accent selection-indicator pill height
+const PENCIL_W: f32 = 42.0; // right-hand space reserved for the edit affordance (label stops here)
+const PENCIL_BTN: f32 = 30.0; // the pencil's round hover-button diameter
+const PENCIL_RIGHT: f32 = 9.0; // gap from the panel's right edge to the button
+const BATTERY_W: f32 = 96.0; // right-hand space reserved on battery rows (fits battery + hover pencil)
+// slider geometry
+const TRACK_X0: f32 = 52.0; // track left edge
+const VALUE_W: f32 = 46.0; // reserved right area for the percentage
+const TRACK_H: f32 = 4.0;
+const THUMB_R: f32 = 7.0;
+// icon-picker chips
+const CHIP: f32 = 34.0;
+const CHIP_GAP: f32 = 7.0;
+const CHIPS_X: f32 = 48.0;
+
+// Posted (by the WASAPI volume callback) when a watched endpoint's volume/mute changes,
+// so external changes (media keys, other apps) are reflected live while we're open.
+const WM_VOL_CHANGED: u32 = WM_APP + 10;
+// Posted by the window proc when we lose mouse capture (another window/app took focus,
+// e.g. the Start menu). WM_CAPTURECHANGED is *sent* to the proc, not queued, so we bounce
+// it back as a posted message the modal loop can act on to dismiss.
+const WM_FLYOUT_CLOSE: u32 = WM_APP + 11;
+
+// Fluent glyphs painted directly (not from the built-in IconId set).
+const GLYPH_VOLUME: char = '\u{E767}';
+const GLYPH_MUTE: char = '\u{E74F}';
+const GLYPH_MIC: char = '\u{E720}';
+const GLYPH_MIC_OFF: char = '\u{EC54}';
+const GLYPH_EDIT: char = '\u{E70F}';
+const GLYPH_SETTINGS: char = '\u{E713}';
+const GLYPH_CANCEL: char = '\u{E711}';
 
 // Colours (RGB); alpha applied at blend time.
 const TINT: [u8; 3] = [0x2C, 0x2C, 0x2C]; // panel base (semi-transparent, acrylic shows through)
 const TINT_A: f32 = 0.82;
-const TEXT: [u8; 3] = [0xFF, 0xFF, 0xFF]; // primary text (body + section headers, differ by weight)
+const TEXT: [u8; 3] = [0xFF, 0xFF, 0xFF]; // primary text + glyphs
+const DARK_GLYPH: [u8; 3] = [0x12, 0x16, 0x1C]; // icon colour on a solid accent chip
 const HOVER_A: f32 = 0.06; // white overlay for hover
 const SEL_A: f32 = 0.09; // white overlay for the selected row
 
-#[derive(Clone)]
-enum RowKind {
-    Item { icon: Option<IconId>, glyph: Option<char>, label: String, selected: bool },
-    Header(String),
-    Separator,
+#[derive(Clone, Copy)]
+enum ActionKind {
+    SoundSettings,
+    Quit,
 }
 
-struct Row {
-    kind: RowKind,
+impl ActionKind {
+    fn label(self) -> &'static str {
+        match self {
+            ActionKind::SoundSettings => "Sound settings",
+            ActionKind::Quit => "Quit Audio Tray",
+        }
+    }
+    fn glyph(self) -> char {
+        match self {
+            ActionKind::SoundSettings => GLYPH_SETTINGS,
+            ActionKind::Quit => GLYPH_CANCEL,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Elem {
+    Header(&'static str),
+    Slider { group: usize },
+    Device { group: usize, dev: usize },
+    IconChips { group: usize, dev: usize },
+    Separator,
+    Action(ActionKind),
+}
+
+struct LaidElem {
+    elem: Elem,
     top: i32,
     height: i32,
-    action: Option<FlyoutAction>,
 }
 
-struct Flyout {
+struct DeviceRow {
+    id: DeviceId,
+    label: String,
+    icon: IconId,
+    selected: bool,
+    battery: Option<u8>, // Bluetooth battery 0..=100, if the device reports one
+}
+
+struct Group {
+    flow: Flow,
+    title: &'static str,
+    default_id: Option<DeviceId>,
+    level: f32, // 0.0..=1.0 of the default endpoint
+    muted: bool,
+    devices: Vec<DeviceRow>,
+}
+
+struct Flyout<'a> {
+    backend: &'a WasapiBackend,
+    config: &'a mut Config,
+    trigger: Trigger,
     scale: f32,
+    accent: [u8; 3],
     width: i32,
     height: i32,
-    accent: [u8; 3],
-    rows: Vec<Row>,
-    /// index into `rows` of the currently hovered actionable row
+    groups: Vec<Group>,
+    expanded: Option<(usize, usize)>, // (group, dev) whose icon picker is open
+    elems: Vec<LaidElem>,
     hover: Option<usize>,
-    base: Vec<u8>, // static content (panel + text + icons + selection), rendered once
-    buf: Vec<u8>,  // base + hover overlay, straight-alpha RGBA, presented each frame
+    hover_pencil: bool,          // the cursor is over the hovered device row's edit pencil
+    hover_chip: Option<usize>,   // chip index the cursor is over, within a hovered icon picker
+    drag: Option<usize>,    // index into elems of the slider being dragged
+    pending: Option<usize>, // index pressed on button-down, acted on button-up
+    watches: Vec<Option<VolumeWatch>>, // per-group volume/mute change subscriptions
+    vol_dirty: Arc<AtomicBool>,        // shared coalescing flag for the volume callbacks
+    config_changed: bool,
+    output_changed: bool,
+    quit: bool,
+    base: Vec<u8>, // static content, re-rendered on model changes
+    buf: Vec<u8>,  // base + dynamic overlays (sliders, hover), presented each frame
+    hwnd: HWND,
+    x: i32,
+    y: i32,
+    base_cx: i32,     // horizontal anchor (icon centre / cursor)
+    base_bottom: i32, // bottom edge to sit above
+    wa: RECT,         // work area
+    margin: i32,
 }
 
-/// Show the flyout near the tray and block until the user picks an item or dismisses it.
+/// Show the flyout near the tray and operate it until the user dismisses it.
 pub fn show(
-    devices: &[Device],
-    current: Option<&DeviceId>,
-    config: &Config,
+    backend: &WasapiBackend,
+    config: &mut Config,
     anchor: Option<Anchor>,
-) -> Option<FlyoutAction> {
-    unsafe { show_inner(devices, current, config, anchor) }
+    trigger: Trigger,
+) -> Outcome {
+    unsafe { show_inner(backend, config, anchor, trigger) }
 }
 
 unsafe fn show_inner(
-    devices: &[Device],
-    current: Option<&DeviceId>,
-    config: &Config,
+    backend: &WasapiBackend,
+    config: &mut Config,
     anchor: Option<Anchor>,
-) -> Option<FlyoutAction> {
+    trigger: Trigger,
+) -> Outcome {
     let scale = (GetDpiForSystem() as f32 / 96.0).max(1.0);
     let accent = accent_rgb();
 
-    // The device whose icon the "Icon" section edits: the current default (else the first).
-    let target = current
-        .and_then(|c| devices.iter().find(|d| &d.id == c))
-        .or_else(|| devices.first());
+    let groups = match trigger {
+        Trigger::LeftClick => build_groups(backend, config),
+        Trigger::RightClick => Vec::new(),
+    };
 
     let mut fly = Flyout {
+        backend,
+        config,
+        trigger,
         scale,
+        accent,
         width: 0,
         height: 0,
-        accent,
-        rows: Vec::new(),
+        groups,
+        expanded: None,
+        elems: Vec::new(),
         hover: None,
+        hover_pencil: false,
+        hover_chip: None,
+        drag: None,
+        pending: None,
+        watches: Vec::new(),
+        vol_dirty: Arc::new(AtomicBool::new(false)),
+        config_changed: false,
+        output_changed: false,
+        quit: false,
         base: Vec::new(),
         buf: Vec::new(),
+        hwnd: HWND(std::ptr::null_mut()),
+        x: 0,
+        y: 0,
+        base_cx: 0,
+        base_bottom: 0,
+        wa: RECT::default(),
+        margin: (8.0 * scale) as i32,
     };
-    fly.build_rows(devices, current, target, config);
-    fly.layout();
 
-    // Position: bottom-right anchored to the tray icon (so the flyout opens above it),
-    // clamped to the work area. Falls back to the cursor when there's no anchor.
-    let mut wa = RECT::default();
+    // Resolve the anchor: bottom-right above the tray icon, else the cursor.
     let _ = SystemParametersInfoW(
         SPI_GETWORKAREA,
         0,
-        Some(&mut wa as *mut _ as *mut std::ffi::c_void),
+        Some(&mut fly.wa as *mut _ as *mut std::ffi::c_void),
         SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
     );
-    let margin = (8.0 * scale) as i32;
     let gap = (8.0 * scale) as i32;
     let (cx, bottom) = match anchor {
         Some(a) => (a.cx, a.bottom - gap),
@@ -160,70 +289,101 @@ unsafe fn show_inner(
             (cur.x, cur.y)
         }
     };
-    let bottom = bottom.min(wa.bottom - margin);
-    // Centre horizontally on the icon, clamped to the work area.
-    let x = (cx - fly.width / 2)
-        .min(wa.right - margin - fly.width)
-        .max(wa.left + margin);
-    let y = (bottom - fly.height).max(wa.top + margin);
+    fly.base_cx = cx;
+    fly.base_bottom = bottom.min(fly.wa.bottom - fly.margin);
 
-    let hwnd = match fly.create_window(x, y) {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!("flyout: create_window failed: {e:?}");
-            return None;
-        }
-    };
+    fly.rebuild_layout();
+    fly.reposition();
 
-    // Paint the static layer once (expensive: text + icons); hover only re-composites.
+    if let Err(e) = fly.create_window() {
+        eprintln!("flyout: create_window failed: {e:?}");
+        return Outcome { quit: false, config_changed: false, output_changed: false };
+    }
+
     fly.render_base();
     fly.compose();
-    let _ = ShowWindow(hwnd, SW_SHOWNA);
-    fly.animate_in(hwnd, x, y);
-    // Foreground + capture so the flyout behaves like a menu: it receives every mouse
-    // move/click (for hover + selection) and an outside click reliably dismisses it.
-    let _ = SetForegroundWindow(hwnd);
-    SetCapture(hwnd);
-    // While the mouse is captured Windows stops sending WM_SETCURSOR, so the class cursor
-    // isn't consulted — force the arrow explicitly (kills the leftover "busy" spinner).
+    let _ = ShowWindow(fly.hwnd, SW_SHOWNA);
+    fly.animate_in();
+    // Foreground + capture so the flyout behaves like a menu: it sees every mouse
+    // move/click, and an outside click reliably dismisses it.
+    let _ = SetForegroundWindow(fly.hwnd);
+    SetCapture(fly.hwnd);
+    // While the mouse is captured Windows stops sending WM_SETCURSOR, so force the arrow.
     let _ = SetCursor(LoadCursorW(None, IDC_ARROW).ok());
+    // Subscribe to external volume/mute changes (media keys, other apps) while we're open.
+    fly.setup_watches();
 
-    // Modal loop: mouse is captured to us, so we see every move/click (coords relative to
-    // our client). A click inside a row selects it; a click outside dismisses.
-    let mut result: Option<FlyoutAction> = None;
     let mut msg = MSG::default();
     'pump: while GetMessageW(&mut msg, None, 0, 0).0 > 0 {
         match msg.message {
             WM_MOUSEMOVE => {
                 let (mx, my) = mouse_xy(msg.lParam);
-                let inside = (0..fly.width).contains(&mx) && (0..fly.height).contains(&my);
-                let hover = if inside { fly.row_at(my) } else { None };
-                if hover != fly.hover {
-                    fly.hover = hover;
-                    fly.compose();
-                    fly.present(hwnd, x, y, 255);
+                if let Some(si) = fly.drag {
+                    if let Elem::Slider { group } = fly.elems[si].elem {
+                        let level = fly.level_from_x(mx);
+                        fly.set_group_level(group, level);
+                        fly.compose();
+                        fly.present(fly.x, fly.y, 255);
+                    }
+                } else {
+                    let inside = fly.inside(mx, my);
+                    let hover = if inside { fly.elem_at(my) } else { None };
+                    let kind = hover.map(|i| fly.elems[i].elem);
+                    let on_pencil =
+                        matches!(kind, Some(Elem::Device { .. })) && fly.over_pencil(mx);
+                    let on_chip = match kind {
+                        Some(Elem::IconChips { .. }) => fly.chip_at(mx),
+                        _ => None,
+                    };
+                    if hover != fly.hover
+                        || on_pencil != fly.hover_pencil
+                        || on_chip != fly.hover_chip
+                    {
+                        fly.hover = hover;
+                        fly.hover_pencil = on_pencil;
+                        fly.hover_chip = on_chip;
+                        fly.compose();
+                        fly.present(fly.x, fly.y, 255);
+                    }
+                }
+            }
+            WM_LBUTTONDOWN => {
+                let (mx, my) = mouse_xy(msg.lParam);
+                if !fly.inside(mx, my) {
+                    break 'pump; // click outside → dismiss
+                }
+                fly.pending = None;
+                if let Some(i) = fly.elem_at(my) {
+                    if let Elem::Slider { group } = fly.elems[i].elem {
+                        fly.press_slider(i, group, mx);
+                    } else {
+                        fly.pending = Some(i);
+                    }
                 }
             }
             WM_LBUTTONUP => {
-                let (mx, my) = mouse_xy(msg.lParam);
-                let inside = (0..fly.width).contains(&mx) && (0..fly.height).contains(&my);
-                if inside {
-                    if let Some(i) = fly.row_at(my) {
-                        result = fly.rows[i].action.take();
-                        break 'pump;
-                    }
-                } else {
-                    break 'pump; // click outside → dismiss
+                if fly.drag.take().is_some() {
+                    continue; // finished a volume drag; stay open
                 }
-            }
-            WM_LBUTTONDOWN | WM_RBUTTONDOWN => {
                 let (mx, my) = mouse_xy(msg.lParam);
-                let inside = (0..fly.width).contains(&mx) && (0..fly.height).contains(&my);
-                if !inside {
+                if fly.inside(mx, my) {
+                    if let Some(i) = fly.elem_at(my) {
+                        if fly.pending == Some(i) && fly.activate(i, mx) {
+                            break 'pump;
+                        }
+                    }
+                }
+                fly.pending = None;
+            }
+            WM_RBUTTONDOWN => {
+                let (mx, my) = mouse_xy(msg.lParam);
+                if !fly.inside(mx, my) {
                     break 'pump;
                 }
             }
-            WM_CAPTURECHANGED => break 'pump, // lost capture (e.g. clicked another app)
+            WM_VOL_CHANGED => fly.refresh_volumes(),
+            WM_KEYDOWN if msg.wParam.0 as u16 == VK_ESCAPE.0 => break 'pump,
+            WM_FLYOUT_CLOSE => break 'pump, // lost capture (Start menu, Alt-Tab, …)
             _ => {
                 let _ = TranslateMessage(&msg);
                 DispatchMessageW(&msg);
@@ -231,156 +391,397 @@ unsafe fn show_inner(
         }
     }
 
+    fly.watches.clear(); // unregister the volume callbacks before the window goes away
     let _ = ReleaseCapture();
-    let _ = DestroyWindow(hwnd);
-    result
+    let _ = DestroyWindow(fly.hwnd);
+    Outcome {
+        quit: fly.quit,
+        config_changed: fly.config_changed,
+        output_changed: fly.output_changed,
+    }
 }
 
-impl Flyout {
-    fn build_rows(
-        &mut self,
-        devices: &[Device],
-        current: Option<&DeviceId>,
-        target: Option<&Device>,
-        config: &Config,
-    ) {
-        // Devices (click to switch; current is selected), under a section header like the
-        // native flyout's "Périphérique de sortie".
-        self.rows.push(Row {
-            kind: RowKind::Header("Output device".to_string()),
-            top: 0,
-            height: 0,
-            action: None,
-        });
-        for dev in devices {
-            let icon = config
-                .icon_for(&dev.id.0)
-                .unwrap_or_else(|| icons::default_icon(dev.form_factor, &dev.friendly_name));
-            let selected = current == Some(&dev.id);
-            self.rows.push(Row {
-                kind: RowKind::Item {
-                    icon: Some(icon),
-                    glyph: None,
-                    label: dev.friendly_name.clone(),
-                    selected,
-                },
-                top: 0,
-                height: 0,
-                action: Some(FlyoutAction::Switch(dev.id.clone())),
-            });
-        }
+/// Read the current output + input state into display groups. Groups with no devices are
+/// omitted (e.g. a machine with no microphone shows no Input section).
+fn build_groups(backend: &WasapiBackend, config: &Config) -> Vec<Group> {
+    // Bluetooth battery levels keyed by ContainerId — enumerated once for all devices.
+    let batteries = crate::audio::battery::levels();
+    let battery_of = |container: &Option<String>| -> Option<u8> {
+        let c = container.as_ref()?;
+        batteries
+            .iter()
+            .find(|(id, _)| id.eq_ignore_ascii_case(c))
+            .map(|(_, pct)| *pct)
+    };
 
-        // Icon picker for the current default device (its own section header separates it
-        // from the device list — no rule, matching the native flyout).
-        if let Some(dev) = target {
-            self.rows.push(Row {
-                kind: RowKind::Header("Icon".to_string()),
-                top: 0,
-                height: 0,
-                action: None,
-            });
-            let sel = config
-                .icon_for(&dev.id.0)
-                .unwrap_or_else(|| icons::default_icon(dev.form_factor, &dev.friendly_name));
-            for icon in IconId::ALL {
-                self.rows.push(Row {
-                    kind: RowKind::Item {
-                        icon: Some(icon),
-                        glyph: None,
-                        label: icon.label().to_string(),
-                        selected: icon == sel,
-                    },
-                    top: 0,
-                    height: 0,
-                    action: Some(FlyoutAction::SetIcon(dev.id.0.clone(), icon)),
-                });
-            }
+    let mut groups = Vec::new();
+    for (flow, title) in [(Flow::Output, "Output"), (Flow::Input, "Input")] {
+        let devices = backend.enumerate_flow(flow).unwrap_or_default();
+        if devices.is_empty() {
+            continue;
         }
+        let default_id = backend.default_of(flow).ok().flatten();
+        let (level, muted) = match &default_id {
+            Some(id) => (
+                backend.volume_of(id).unwrap_or(0.0),
+                backend.is_muted(id).unwrap_or(false),
+            ),
+            None => (0.0, false),
+        };
+        let rows = devices
+            .into_iter()
+            .map(|d| {
+                let icon = config
+                    .icon_for(&d.id.0)
+                    .unwrap_or_else(|| icons::default_icon(d.form_factor, &d.friendly_name));
+                let selected = default_id.as_ref() == Some(&d.id);
+                let battery = battery_of(&d.container_id);
+                DeviceRow { id: d.id, label: d.friendly_name, icon, selected, battery }
+            })
+            .collect();
+        groups.push(Group { flow, title, default_id, level, muted, devices: rows });
+    }
+    groups
+}
 
-        // Quit.
-        self.rows.push(Row { kind: RowKind::Separator, top: 0, height: 0, action: None });
-        self.rows.push(Row {
-            kind: RowKind::Item {
-                icon: None,
-                glyph: Some('\u{E711}'), // Cancel
-                label: "Quit".to_string(),
-                selected: false,
-            },
-            top: 0,
-            height: 0,
-            action: Some(FlyoutAction::Quit),
-        });
+impl Flyout<'_> {
+    /// Rebuild the element list from the current model, then lay it out (sizes the panel
+    /// and allocates buffers). Invalidates transient hit state.
+    fn rebuild_layout(&mut self) {
+        self.hover = None;
+        self.hover_pencil = false;
+        self.hover_chip = None;
+        self.drag = None;
+        self.pending = None;
+        self.build_elems();
+        self.layout();
     }
 
-    /// Assign each row a vertical slot and compute the panel size.
+    fn build_elems(&mut self) {
+        let mut elems = Vec::new();
+        match self.trigger {
+            Trigger::RightClick => {
+                elems.push(Elem::Action(ActionKind::SoundSettings));
+                elems.push(Elem::Action(ActionKind::Quit));
+            }
+            Trigger::LeftClick => {
+                for (gi, g) in self.groups.iter().enumerate() {
+                    elems.push(Elem::Header(g.title));
+                    if g.default_id.is_some() {
+                        elems.push(Elem::Slider { group: gi });
+                    }
+                    for di in 0..g.devices.len() {
+                        elems.push(Elem::Device { group: gi, dev: di });
+                        if self.expanded == Some((gi, di)) {
+                            elems.push(Elem::IconChips { group: gi, dev: di });
+                        }
+                    }
+                }
+                elems.push(Elem::Separator);
+                elems.push(Elem::Action(ActionKind::SoundSettings));
+            }
+        }
+        self.elems = elems
+            .into_iter()
+            .map(|elem| LaidElem { elem, top: 0, height: 0 })
+            .collect();
+    }
+
     fn layout(&mut self) {
         let scale = self.scale;
         let d = |v: f32| (v * scale).round() as i32;
-
-        // Width from the widest content: row labels (indented past the icon) and section
-        // headers (indented to HEADER_X), whichever needs more room.
         let font = ui_font();
-        let font_sb = ui_font_semibold();
+        let font_sb = ui_font_semibold().or(font);
         let text_px = 14.0 * scale;
         let hdr_px = 14.0 * scale;
+        let mw = |f: Option<&FontVec>, px: f32, s: &str| f.map(|f| measure(f, px, s)).unwrap_or(0.0);
+
+        let chips_w = CHIPS_X * scale
+            + IconId::ALL.len() as f32 * CHIP * scale
+            + (IconId::ALL.len() as f32 - 1.0) * CHIP_GAP * scale
+            + RIGHT_PAD * scale;
+
         let mut max_w = 0.0f32;
-        for r in &self.rows {
-            match &r.kind {
-                RowKind::Item { label, .. } => {
-                    if let Some(f) = font {
-                        max_w = max_w.max(d(TEXT_X) as f32 + measure(f, text_px, label));
-                    }
+        for le in &self.elems {
+            let w = match le.elem {
+                Elem::Header(t) => HEADER_X * scale + mw(font_sb, hdr_px, t) + RIGHT_PAD * scale,
+                Elem::Slider { .. } => (TRACK_X0 + 130.0 + VALUE_W) * scale,
+                Elem::Device { group, dev } => {
+                    let row = &self.groups[group].devices[dev];
+                    let reserve = if row.battery.is_some() { BATTERY_W } else { PENCIL_W };
+                    TEXT_X * scale + mw(font, text_px, &row.label) + reserve * scale
                 }
-                RowKind::Header(h) => {
-                    if let Some(f) = font_sb.or(font) {
-                        max_w = max_w.max(d(HEADER_X) as f32 + measure(f, hdr_px, h));
-                    }
-                }
-                RowKind::Separator => {}
-            }
+                Elem::IconChips { .. } => chips_w,
+                Elem::Separator => 0.0,
+                Elem::Action(k) => TEXT_X * scale + mw(font, text_px, k.label()) + RIGHT_PAD * scale,
+            };
+            max_w = max_w.max(w);
         }
-        let want = max_w + d(RIGHT_PAD) as f32;
-        self.width = want.clamp(d(MIN_W) as f32, d(MAX_W) as f32).round() as i32;
+        let min_w = match self.trigger {
+            Trigger::LeftClick => MIN_W,
+            Trigger::RightClick => MENU_MIN_W,
+        };
+        self.width = max_w.clamp(min_w * scale, MAX_W * scale).round() as i32;
 
         let mut y = d(PAD_V);
-        for r in &mut self.rows {
-            let h = match &r.kind {
-                RowKind::Item { .. } => d(ITEM_H),
-                RowKind::Header(_) => d(HEADER_H),
-                RowKind::Separator => d(SEP_H),
+        for (i, le) in self.elems.iter_mut().enumerate() {
+            let h = match le.elem {
+                // The first header sits at the very top, so it only needs a small gap; a
+                // later header separates one group from the one above it.
+                Elem::Header(_) => if i == 0 { HEADER_FIRST_H } else { HEADER_H },
+                Elem::Slider { .. } => SLIDER_H,
+                Elem::Device { .. } => ITEM_H,
+                Elem::IconChips { .. } => CHIPS_H,
+                Elem::Separator => SEP_H,
+                Elem::Action(_) => ITEM_H,
             };
-            r.top = y;
-            r.height = h;
-            y += h;
+            le.top = y;
+            le.height = d(h);
+            y += le.height;
         }
         self.height = y + d(PAD_V);
+
         let bytes = (self.width * self.height * 4) as usize;
         self.base = vec![0u8; bytes];
         self.buf = vec![0u8; bytes];
     }
 
-    fn row_at(&self, y: i32) -> Option<usize> {
-        self.rows
-            .iter()
-            .position(|r| r.action.is_some() && y >= r.top && y < r.top + r.height)
+    /// Position the panel: centred on the anchor, sitting above it, clamped to the work
+    /// area. Recomputed whenever the size changes so it keeps its bottom edge.
+    fn reposition(&mut self) {
+        self.x = (self.base_cx - self.width / 2)
+            .min(self.wa.right - self.margin - self.width)
+            .max(self.wa.left + self.margin);
+        self.y = (self.base_bottom - self.height).max(self.wa.top + self.margin);
     }
 
-    /// Render the static layer (panel + separators + text + icons + selection pill) into
-    /// `base`. Expensive (glyph rasterization) — done once; hover updates only `compose`.
+    fn inside(&self, mx: i32, my: i32) -> bool {
+        (0..self.width).contains(&mx) && (0..self.height).contains(&my)
+    }
+
+    /// Index of the actionable element at vertical position `y`.
+    fn elem_at(&self, y: i32) -> Option<usize> {
+        self.elems.iter().position(|le| {
+            let actionable = matches!(
+                le.elem,
+                Elem::Slider { .. } | Elem::Device { .. } | Elem::IconChips { .. } | Elem::Action(_)
+            );
+            actionable && y >= le.top && y < le.top + le.height
+        })
+    }
+
+    fn level_from_x(&self, mx: i32) -> f32 {
+        let scale = self.scale;
+        let x0 = TRACK_X0 * scale;
+        let x1 = self.width as f32 - VALUE_W * scale;
+        (((mx as f32) - x0) / (x1 - x0)).clamp(0.0, 1.0)
+    }
+
+    /// Whether `mx` is over the edit pencil's round button (its hover/click target).
+    fn over_pencil(&self, mx: i32) -> bool {
+        let cx = pencil_center_x(self.width, self.scale);
+        ((mx as f32) - cx).abs() <= PENCIL_BTN * self.scale / 2.0
+    }
+
+    /// Which icon-picker chip (if any) is at horizontal position `mx`.
+    fn chip_at(&self, mx: i32) -> Option<usize> {
+        let scale = self.scale;
+        let x0 = (CHIPS_X * scale).round() as i32;
+        let step = ((CHIP + CHIP_GAP) * scale).round() as i32;
+        let chip = (CHIP * scale).round() as i32;
+        if mx < x0 || step <= 0 {
+            return None;
+        }
+        let i = ((mx - x0) / step) as usize;
+        let within = (mx - x0) - (i as i32) * step;
+        (i < IconId::ALL.len() && within <= chip).then_some(i)
+    }
+
+    fn set_group_level(&mut self, group: usize, level: f32) {
+        self.groups[group].level = level;
+        if let Some(id) = self.groups[group].default_id.clone() {
+            let _ = self.backend.set_volume_of(&id, level);
+        }
+    }
+
+    /// Subscribe to volume/mute changes on each group's default endpoint.
+    fn setup_watches(&mut self) {
+        self.watches = (0..self.groups.len()).map(|_| None).collect();
+        for group in 0..self.groups.len() {
+            self.rewatch(group);
+        }
+    }
+
+    /// (Re)subscribe a group to its current default endpoint — called at open and whenever
+    /// the default is switched from within the flyout (the old endpoint's watch is dropped,
+    /// which unregisters it).
+    fn rewatch(&mut self, group: usize) {
+        if group >= self.watches.len() {
+            return;
+        }
+        let hwnd = self.hwnd.0 as isize;
+        let backend = self.backend;
+        let pending = Arc::clone(&self.vol_dirty);
+        self.watches[group] = self.groups[group]
+            .default_id
+            .as_ref()
+            .and_then(|id| backend.watch_volume(id, hwnd, WM_VOL_CHANGED, pending).ok());
+    }
+
+    /// Re-read each default endpoint's volume/mute (from the cached watch interface, no COM
+    /// re-activation) so external changes show up live. Skipped mid-drag so it never fights
+    /// the user's own slider.
+    fn refresh_volumes(&mut self) {
+        // Clear the coalescing flag *before* reading, so a change that lands during the
+        // read re-arms and posts again (we never miss the final state).
+        self.vol_dirty.store(false, Ordering::SeqCst);
+        if self.drag.is_some() {
+            return;
+        }
+        let backend = self.backend;
+        let mut vol_changed = false;
+        let mut mute_changed = false;
+        for group in 0..self.groups.len() {
+            let reading = match self.watches.get(group).and_then(|w| w.as_ref()) {
+                Some(w) => w.read(),
+                None => self.groups[group].default_id.as_ref().and_then(|id| {
+                    Some((backend.volume_of(id).ok()?, backend.is_muted(id).ok()?))
+                }),
+            };
+            if let Some((v, m)) = reading {
+                let g = &mut self.groups[group];
+                if (v - g.level).abs() > 0.001 {
+                    g.level = v;
+                    vol_changed = true;
+                }
+                if m != g.muted {
+                    g.muted = m;
+                    mute_changed = true;
+                }
+            }
+        }
+        // A mute flip swaps the slider's leading glyph (which lives in `base`); a plain
+        // volume change only moves the fill/thumb/number, all drawn in the cheap `compose`
+        // overlay — so avoid re-rasterizing every glyph for a mere volume tick (a mic's
+        // auto-gain can fire these constantly).
+        if mute_changed {
+            self.render_base();
+        }
+        if mute_changed || vol_changed {
+            self.compose();
+            self.present(self.x, self.y, 255);
+        }
+    }
+
+    /// A press on a slider row: the leading icon area toggles mute, the rest starts a drag.
+    fn press_slider(&mut self, elem: usize, group: usize, mx: i32) {
+        let scale = self.scale;
+        if (mx as f32) < (TRACK_X0 - 6.0) * scale {
+            if let Some(id) = self.groups[group].default_id.clone() {
+                let muted = !self.groups[group].muted;
+                if let Err(e) = self.backend.set_muted(&id, muted) {
+                    eprintln!("mute failed: {e:#}");
+                }
+                self.groups[group].muted = muted;
+                self.render_base();
+                self.compose();
+                self.present(self.x, self.y, 255);
+            }
+        } else {
+            self.drag = Some(elem);
+            let level = self.level_from_x(mx);
+            self.set_group_level(group, level);
+            self.compose();
+            self.present(self.x, self.y, 255);
+        }
+    }
+
+    /// Act on a click at button-up. Returns true if the flyout should close.
+    fn activate(&mut self, i: usize, mx: i32) -> bool {
+        match self.elems[i].elem {
+            Elem::Device { group, dev } => {
+                if self.over_pencil(mx) {
+                    // Toggle the inline icon picker for this device.
+                    self.expanded = if self.expanded == Some((group, dev)) {
+                        None
+                    } else {
+                        Some((group, dev))
+                    };
+                    self.rebuild_layout();
+                    self.reposition();
+                    self.render_base();
+                    self.compose();
+                    self.present(self.x, self.y, 255);
+                } else {
+                    let id = self.groups[group].devices[dev].id.clone();
+                    if self.groups[group].default_id.as_ref() != Some(&id) {
+                        if let Err(e) = self.backend.set_default_of(&id) {
+                            eprintln!("switch failed: {e:#}");
+                        }
+                        if self.groups[group].flow == Flow::Output {
+                            self.output_changed = true;
+                        }
+                        for row in &mut self.groups[group].devices {
+                            row.selected = row.id == id;
+                        }
+                        self.groups[group].level =
+                            self.backend.volume_of(&id).unwrap_or(self.groups[group].level);
+                        self.groups[group].muted = self.backend.is_muted(&id).unwrap_or(false);
+                        self.groups[group].default_id = Some(id);
+                        self.rewatch(group); // follow volume/mute of the new default
+                        self.render_base();
+                        self.compose();
+                        self.present(self.x, self.y, 255);
+                    }
+                }
+                false
+            }
+            Elem::IconChips { group, dev } => {
+                if let Some(ci) = self.chip_at(mx) {
+                    let icon = IconId::ALL[ci];
+                    let id = self.groups[group].devices[dev].id.0.clone();
+                    self.groups[group].devices[dev].icon = icon;
+                    self.config.set_icon(id, icon);
+                    self.config_changed = true;
+                    // Persist immediately and close the picker — choosing an icon commits it.
+                    if let Err(e) = self.config.save() {
+                        eprintln!("save config failed: {e:#}");
+                    }
+                    self.expanded = None;
+                    self.rebuild_layout();
+                    self.reposition();
+                    self.render_base();
+                    self.compose();
+                    self.present(self.x, self.y, 255);
+                }
+                false
+            }
+            Elem::Action(ActionKind::SoundSettings) => {
+                open_sound_settings();
+                true
+            }
+            Elem::Action(ActionKind::Quit) => {
+                self.quit = true;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Render the static layer (panel + headers + rows + icons + selection + slider tracks
+    /// + chips) into `base`. Slider fill/thumb/value and hover live in `compose`.
     fn render_base(&mut self) {
         let scale = self.scale;
         let accent = self.accent;
         let w = self.width;
         let h = self.height;
         let d = |v: f32| (v * scale).round() as i32;
-        // Disjoint field borrows: rows shared, base mutable.
-        let rows = &self.rows;
+        let groups = &self.groups;
         let buf = self.base.as_mut_slice();
 
         for p in buf.iter_mut() {
             *p = 0;
         }
-        // Panel base: rounded, semi-transparent (acrylic shows through the rest).
         fill_round_rect(buf, w, h, 0.0, 0.0, w as f32, h as f32, d(CORNER) as f32, TINT, TINT_A);
 
         let font = ui_font();
@@ -390,80 +791,215 @@ impl Flyout {
         let icon_px = (ICON_PX * scale).round() as u32;
         let mx = d(ROW_MARGIN) as f32;
 
-        for r in rows.iter() {
-            match &r.kind {
-                RowKind::Separator => {
-                    let sy = r.top as f32 + r.height as f32 / 2.0;
-                    fill_rect(buf, w, h, mx + d(6.0) as f32, sy, w as f32 - mx - d(6.0) as f32, sy + 1.0, [0xFF, 0xFF, 0xFF], 0.07);
+        for le in &self.elems {
+            match le.elem {
+                Elem::Separator => {
+                    let sy = le.top as f32 + le.height as f32 / 2.0;
+                    fill_rect(buf, w, h, mx + d(6.0) as f32, sy, w as f32 - mx - d(6.0) as f32, sy + 1.0, TEXT, 0.07);
                 }
-                RowKind::Header(text) => {
-                    // Semibold, full white — matches the native flyout's section captions
-                    // (body text below is the same colour but regular weight).
+                Elem::Header(text) => {
                     if let Some(f) = font_sb {
-                        let base = r.top as f32 + r.height as f32 - hdr_px * 0.62;
+                        let base = le.top as f32 + le.height as f32 - hdr_px * 0.55;
                         draw_text(buf, w, h, f, hdr_px, d(HEADER_X) as f32, base, TEXT, 1.0, text);
                     }
                 }
-                RowKind::Item { icon, glyph, label, selected } => {
-                    let ry0 = r.top as f32 + 1.0;
-                    let ry1 = (r.top + r.height) as f32 - 1.0;
-                    if *selected {
-                        fill_round_rect(buf, w, h, mx, ry0, w as f32 - mx, ry1, d(ROW_RADIUS) as f32, [0xFF, 0xFF, 0xFF], SEL_A);
-                        // Accent selection-indicator pill on the selected row (3×16 DIP, like
-                        // the native flyout / WinUI NavigationView).
+                Elem::Slider { group } => {
+                    let g = &groups[group];
+                    let cy_i = le.top + le.height / 2;
+                    let cy = cy_i as f32;
+                    let (glyph, col) = match (g.flow, g.muted) {
+                        (Flow::Output, false) => (GLYPH_VOLUME, TEXT),
+                        (Flow::Output, true) => (GLYPH_MUTE, accent),
+                        (Flow::Input, false) => (GLYPH_MIC, TEXT),
+                        (Flow::Input, true) => (GLYPH_MIC_OFF, accent),
+                    };
+                    if let Ok((rgba, gw, gh)) = icons::render_glyph(glyph, icon_px, col) {
+                        blit(buf, w, h, d(ICON_X), cy_i - gh as i32 / 2, &rgba, gw, gh);
+                    }
+                    // Track background; the accent fill + thumb + value are drawn in compose.
+                    let x0 = TRACK_X0 * scale;
+                    let x1 = w as f32 - VALUE_W * scale;
+                    let th = TRACK_H * scale;
+                    fill_round_rect(buf, w, h, x0, cy - th / 2.0, x1, cy + th / 2.0, th / 2.0, TEXT, 0.28);
+                }
+                Elem::Device { group, dev } => {
+                    let row = &groups[group].devices[dev];
+                    let ry0 = le.top as f32 + 1.0;
+                    let ry1 = (le.top + le.height) as f32 - 1.0;
+                    if row.selected {
+                        fill_round_rect(buf, w, h, mx, ry0, w as f32 - mx, ry1, d(ROW_RADIUS) as f32, TEXT, SEL_A);
                         let ph = d(PILL_H) as f32;
                         let pw = d(PILL_W) as f32;
                         let py0 = (ry0 + ry1) / 2.0 - ph / 2.0;
                         let px0 = mx + d(2.0) as f32;
                         fill_round_rect(buf, w, h, px0, py0, px0 + pw, py0 + ph, pw / 2.0, accent, 1.0);
                     }
-
-                    let cy = r.top + r.height / 2;
-                    // Leading glyph: neutral white (only the accent pill carries the accent,
-                    // as in the native flyout).
-                    if let Some(id) = icon {
-                        if let Ok((rgba, gw, gh)) = id.render(icon_px, TEXT) {
-                            blit(buf, w, h, d(ICON_X), cy - gh as i32 / 2, &rgba, gw, gh);
-                        }
-                    } else if let Some(ch) = glyph {
-                        if let Some(ff) = icons::fluent_font() {
-                            let gpx = ICON_PX * scale;
-                            draw_text(buf, w, h, ff, gpx, d(ICON_X) as f32, cy as f32 + gpx * 0.36, TEXT, 1.0, &ch.to_string());
-                        }
+                    let cy = le.top + le.height / 2;
+                    if let Ok((rgba, gw, gh)) = row.icon.render(icon_px, TEXT) {
+                        blit(buf, w, h, d(ICON_X), cy - gh as i32 / 2, &rgba, gw, gh);
                     }
-                    // Label.
                     if let Some(f) = font {
                         let base = cy as f32 + text_px * 0.34;
-                        draw_text(buf, w, h, f, text_px, d(TEXT_X) as f32, base, TEXT, 1.0, label);
+                        // Leave the trailing zone free — truncate a long name so it never
+                        // runs under the battery readout (or the hover pencil).
+                        let reserve = if row.battery.is_some() { BATTERY_W } else { PENCIL_W };
+                        let max_w = w as f32 - d(TEXT_X) as f32 - reserve * scale;
+                        let label = fit_label(f, text_px, &row.label, max_w);
+                        draw_text(buf, w, h, f, text_px, d(TEXT_X) as f32, base, TEXT, 1.0, &label);
+                    }
+                    // The battery readout and the edit pencil both live on the right and are
+                    // mutually exclusive (pencil on hover, battery otherwise) — drawn in
+                    // `compose`, which knows the hover state.
+                }
+                Elem::IconChips { group, dev } => {
+                    let sel_icon = groups[group].devices[dev].icon;
+                    let cy = le.top + le.height / 2;
+                    let chip = d(CHIP) as f32;
+                    let step = ((CHIP + CHIP_GAP) * scale).round() as i32;
+                    let inner = (CHIP * scale * 0.58).round() as u32;
+                    let r = d(6.0) as f32;
+                    for (idx, icon) in IconId::ALL.iter().enumerate() {
+                        let cx0 = d(CHIPS_X) + idx as i32 * step;
+                        let cy0 = cy - (chip / 2.0) as i32;
+                        let selected = *icon == sel_icon;
+                        if selected {
+                            fill_round_rect(buf, w, h, cx0 as f32, cy0 as f32, cx0 as f32 + chip, cy0 as f32 + chip, r, accent, 1.0);
+                        } else {
+                            fill_round_rect(buf, w, h, cx0 as f32, cy0 as f32, cx0 as f32 + chip, cy0 as f32 + chip, r, TEXT, 0.06);
+                        }
+                        let col = if selected { DARK_GLYPH } else { TEXT };
+                        if let Ok((rgba, gw, gh)) = icon.render(inner, col) {
+                            let ox = cx0 + ((chip - gw as f32) / 2.0) as i32;
+                            let oy = cy0 + ((chip - gh as f32) / 2.0) as i32;
+                            blit(buf, w, h, ox, oy, &rgba, gw, gh);
+                        }
+                    }
+                }
+                Elem::Action(k) => {
+                    let cy = le.top + le.height / 2;
+                    if let Ok((rgba, gw, gh)) = icons::render_glyph(k.glyph(), icon_px, TEXT) {
+                        blit(buf, w, h, d(ICON_X), cy - gh as i32 / 2, &rgba, gw, gh);
+                    }
+                    if let Some(f) = font {
+                        let base = cy as f32 + text_px * 0.34;
+                        draw_text(buf, w, h, f, text_px, d(TEXT_X) as f32, base, TEXT, 1.0, k.label());
                     }
                 }
             }
         }
     }
 
-    /// Cheap per-frame composite: copy the static base, then draw the hover highlight over
-    /// the hovered row. Keeps hover updates snappy (no glyph rasterization).
+    /// Copy the static base, then draw the dynamic overlays: slider fill/thumb/value, the
+    /// hover highlight, and the edit affordance on the hovered device row.
     fn compose(&mut self) {
         self.buf.copy_from_slice(&self.base);
-        let Some(i) = self.hover else { return };
         let scale = self.scale;
+        let accent = self.accent;
         let (w, h) = (self.width, self.height);
+        let panel_w = self.width;
         let d = |v: f32| (v * scale).round() as i32;
-        let (top, height) = (self.rows[i].top, self.rows[i].height);
+        let groups = &self.groups;
+        let elems = &self.elems;
+        let hover = self.hover;
+        let hover_pencil = self.hover_pencil;
+        let hover_chip = self.hover_chip;
+        let font = ui_font();
+        let buf = self.buf.as_mut_slice();
         let mx = d(ROW_MARGIN) as f32;
-        let ry0 = top as f32 + 1.0;
-        let ry1 = (top + height) as f32 - 1.0;
-        fill_round_rect(self.buf.as_mut_slice(), w, h, mx, ry0, w as f32 - mx, ry1, d(ROW_RADIUS) as f32, [0xFF, 0xFF, 0xFF], HOVER_A);
+
+        for le in elems {
+            if let Elem::Slider { group } = le.elem {
+                let g = &groups[group];
+                let cy = le.top as f32 + le.height as f32 / 2.0;
+                let x0 = TRACK_X0 * scale;
+                let x1 = w as f32 - VALUE_W * scale;
+                let level = g.level.clamp(0.0, 1.0);
+                let fx = x0 + (x1 - x0) * level;
+                let th = TRACK_H * scale;
+                let (fill_col, fill_a, thumb_a, val_a) =
+                    if g.muted { (TEXT, 0.34, 0.5, 0.5) } else { (accent, 1.0, 1.0, 1.0) };
+                if fx > x0 {
+                    fill_round_rect(buf, w, h, x0, cy - th / 2.0, fx, cy + th / 2.0, th / 2.0, fill_col, fill_a);
+                }
+                let tr = THUMB_R * scale;
+                fill_round_rect(buf, w, h, fx - tr, cy - tr, fx + tr, cy + tr, tr, fill_col, thumb_a);
+                if let Some(f) = font {
+                    let vpx = 13.0 * scale;
+                    let s = (level * 100.0).round().to_string();
+                    let tw = measure(f, vpx, &s);
+                    let vx = w as f32 - RIGHT_PAD * scale - tw;
+                    draw_text(buf, w, h, f, vpx, vx, cy + vpx * 0.34, TEXT, val_a, &s);
+                }
+            }
+        }
+
+        // Right-hand affordances + hover highlights. On a device row the battery readout
+        // and the edit pencil are mutually exclusive: pencil on the hovered row, battery
+        // otherwise (so the current device still shows its battery when not hovered).
+        for (idx, le) in elems.iter().enumerate() {
+            let hovered = hover == Some(idx);
+            match le.elem {
+                Elem::Device { group, dev } => {
+                    let dev_row = &groups[group].devices[dev];
+                    let cy = (le.top + le.height / 2) as f32;
+                    if hovered {
+                        // Whole-row highlight (selected row already carries one in base).
+                        if !dev_row.selected {
+                            let ry0 = le.top as f32 + 1.0;
+                            let ry1 = (le.top + le.height) as f32 - 1.0;
+                            fill_round_rect(buf, w, h, mx, ry0, w as f32 - mx, ry1, d(ROW_RADIUS) as f32, TEXT, HOVER_A);
+                        }
+                        // The battery stays visible but shifts left so the pencil can sit to
+                        // its right (rather than replacing it).
+                        if let Some(pct) = dev_row.battery {
+                            let pencil_left = pencil_center_x(panel_w, scale) - PENCIL_BTN * scale / 2.0;
+                            draw_battery(buf, w, h, scale, pencil_left - 6.0 * scale, cy, pct, font);
+                        }
+                        // Round button behind the pencil, only when the pencil is hovered.
+                        if hover_pencil {
+                            let r = PENCIL_BTN * scale / 2.0;
+                            let cxp = pencil_center_x(panel_w, scale);
+                            fill_round_rect(buf, w, h, cxp - r, cy - r, cxp + r, cy + r, r, TEXT, 0.10);
+                        }
+                        let a = if hover_pencil { 1.0 } else { 0.85 };
+                        draw_pencil(buf, w, h, scale, panel_w, cy, a);
+                    } else if let Some(pct) = dev_row.battery {
+                        draw_battery(buf, w, h, scale, panel_w as f32 - RIGHT_PAD * scale, cy, pct, font);
+                    }
+                }
+                Elem::IconChips { group, dev } => {
+                    if hovered {
+                        if let Some(ci) = hover_chip {
+                            let cy = le.top + le.height / 2;
+                            let chip = d(CHIP) as f32;
+                            let step = ((CHIP + CHIP_GAP) * scale).round() as i32;
+                            let cx0 = d(CHIPS_X) + ci as i32 * step;
+                            let cy0 = cy - (chip / 2.0) as i32;
+                            let r = d(6.0) as f32;
+                            // Brighten the hovered chip (accent chips lighten a touch too).
+                            let selected = IconId::ALL[ci] == groups[group].devices[dev].icon;
+                            let a = if selected { 0.14 } else { 0.10 };
+                            fill_round_rect(buf, w, h, cx0 as f32, cy0 as f32, cx0 as f32 + chip, cy0 as f32 + chip, r, TEXT, a);
+                        }
+                    }
+                }
+                Elem::Action(_) => {
+                    if hovered {
+                        let ry0 = le.top as f32 + 1.0;
+                        let ry1 = (le.top + le.height) as f32 - 1.0;
+                        fill_round_rect(buf, w, h, mx, ry0, w as f32 - mx, ry1, d(ROW_RADIUS) as f32, TEXT, HOVER_A);
+                    }
+                }
+                _ => {}
+            }
+        }
     }
 
-    unsafe fn create_window(&self, x: i32, y: i32) -> windows::core::Result<HWND> {
+    fn create_window(&mut self) -> windows::core::Result<()> {
         static REGISTERED: OnceLock<()> = OnceLock::new();
-        let hinstance = HINSTANCE(GetModuleHandleW(None)?.0);
+        let hinstance = HINSTANCE(unsafe { GetModuleHandleW(None) }?.0);
         REGISTERED.get_or_init(|| {
-            // A class cursor is required, or the window inherits whatever the cursor last
-            // was — often the "app starting" spinner left over while we rasterize/animate
-            // before pumping messages — and never resets it to a plain arrow.
-            let cursor = LoadCursorW(None, IDC_ARROW).unwrap_or_default();
+            let cursor = unsafe { LoadCursorW(None, IDC_ARROW) }.unwrap_or_default();
             let wc = WNDCLASSW {
                 lpfnWndProc: Some(wndproc),
                 hInstance: hinstance,
@@ -471,128 +1007,134 @@ impl Flyout {
                 lpszClassName: w!("AudioTrayFlyout"),
                 ..Default::default()
             };
-            RegisterClassW(&wc);
+            unsafe { RegisterClassW(&wc) };
         });
 
-        let hwnd = CreateWindowExW(
-            WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
-            w!("AudioTrayFlyout"),
-            w!("Audio output"),
-            WS_POPUP,
-            x,
-            y,
-            self.width,
-            self.height,
-            None,
-            None,
-            Some(hinstance),
-            None,
-        )?;
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
+                w!("AudioTrayFlyout"),
+                w!("Audio"),
+                WS_POPUP,
+                self.x,
+                self.y,
+                self.width,
+                self.height,
+                None,
+                None,
+                Some(hinstance),
+                None,
+            )
+        }?;
+        self.hwnd = hwnd;
 
-        // Win11 dark + rounded corners for the frame around our acrylic content.
         let dark: i32 = 1;
-        let _ = DwmSetWindowAttribute(
-            hwnd,
-            DWMWA_USE_IMMERSIVE_DARK_MODE,
-            &dark as *const _ as *const std::ffi::c_void,
-            4,
-        );
+        let _ = unsafe {
+            DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark as *const _ as *const std::ffi::c_void, 4)
+        };
         let round: i32 = 2; // DWMWCP_ROUND
-        let _ = DwmSetWindowAttribute(
-            hwnd,
-            DWMWA_WINDOW_CORNER_PREFERENCE,
-            &round as *const _ as *const std::ffi::c_void,
-            4,
-        );
-        enable_acrylic(hwnd);
-        Ok(hwnd)
+        let _ = unsafe {
+            DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &round as *const _ as *const std::ffi::c_void, 4)
+        };
+        unsafe { enable_acrylic(hwnd) };
+        Ok(())
     }
 
     /// Slide up + fade in, like the native tray flyouts. Runs before the modal loop.
-    unsafe fn animate_in(&self, hwnd: HWND, x: i32, y: i32) {
+    fn animate_in(&self) {
         let slide = (14.0 * self.scale) as i32;
         let frames = 9;
         for i in 1..=frames {
             let t = i as f32 / frames as f32;
             let ease = 1.0 - (1.0 - t) * (1.0 - t); // ease-out quad
-            let yy = y + (slide as f32 * (1.0 - ease)) as i32;
-            self.present(hwnd, x, yy, (255.0 * ease) as u8);
+            let yy = self.y + (slide as f32 * (1.0 - ease)) as i32;
+            self.present(self.x, yy, (255.0 * ease) as u8);
             std::thread::sleep(std::time::Duration::from_millis(9));
         }
-        self.present(hwnd, x, y, 255);
+        self.present(self.x, self.y, 255);
     }
 
     /// Push the rendered ARGB buffer to the layered window (premultiplied BGRA), scaled by
-    /// a global `alpha` (for fade animations).
-    unsafe fn present(&self, hwnd: HWND, x: i32, y: i32, alpha: u8) {
+    /// a global `alpha` (for fade animations). `UpdateLayeredWindow` also moves + resizes
+    /// the window to `(x, y)` and the buffer's dimensions.
+    fn present(&self, x: i32, y: i32, alpha: u8) {
         let (w, h) = (self.width, self.height);
-        let screen = GetDC(None);
-        let mem = CreateCompatibleDC(Some(screen));
+        unsafe {
+            let screen = GetDC(None);
+            let mem = CreateCompatibleDC(Some(screen));
 
-        let bmi = BITMAPINFO {
-            bmiHeader: BITMAPINFOHEADER {
-                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-                biWidth: w,
-                biHeight: -h, // top-down
-                biPlanes: 1,
-                biBitCount: 32,
-                biCompression: BI_RGB.0,
+            let bmi = BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER {
+                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: w,
+                    biHeight: -h, // top-down
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: BI_RGB.0,
+                    ..Default::default()
+                },
                 ..Default::default()
-            },
-            ..Default::default()
-        };
-        let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
-        let hbm = CreateDIBSection(Some(mem), &bmi, DIB_RGB_COLORS, &mut bits, None, 0);
-        let Ok(hbm) = hbm else {
+            };
+            let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
+            let hbm = CreateDIBSection(Some(mem), &bmi, DIB_RGB_COLORS, &mut bits, None, 0);
+            let Ok(hbm) = hbm else {
+                let _ = DeleteDC(mem);
+                ReleaseDC(None, screen);
+                return;
+            };
+
+            // straight-alpha RGBA -> premultiplied BGRA
+            let px = (w * h) as usize;
+            let dst = std::slice::from_raw_parts_mut(bits as *mut u8, px * 4);
+            for i in 0..px {
+                let r = self.buf[i * 4] as u32;
+                let g = self.buf[i * 4 + 1] as u32;
+                let b = self.buf[i * 4 + 2] as u32;
+                let a = self.buf[i * 4 + 3] as u32;
+                dst[i * 4] = ((b * a) / 255) as u8;
+                dst[i * 4 + 1] = ((g * a) / 255) as u8;
+                dst[i * 4 + 2] = ((r * a) / 255) as u8;
+                dst[i * 4 + 3] = a as u8;
+            }
+
+            let old = SelectObject(mem, HGDIOBJ(hbm.0));
+            let mut src = POINT { x: 0, y: 0 };
+            let mut dpos = POINT { x, y };
+            let mut size = SIZE { cx: w, cy: h };
+            let blend = BLENDFUNCTION {
+                BlendOp: AC_SRC_OVER as u8,
+                BlendFlags: 0,
+                SourceConstantAlpha: alpha,
+                AlphaFormat: AC_SRC_ALPHA as u8,
+            };
+            let _ = UpdateLayeredWindow(
+                self.hwnd,
+                Some(screen),
+                Some(&mut dpos),
+                Some(&mut size),
+                Some(mem),
+                Some(&mut src),
+                COLORREF(0),
+                Some(&blend),
+                ULW_ALPHA,
+            );
+
+            SelectObject(mem, old);
+            let _ = DeleteObject(HGDIOBJ(hbm.0));
             let _ = DeleteDC(mem);
             ReleaseDC(None, screen);
-            return;
-        };
-
-        // straight-alpha RGBA -> premultiplied BGRA
-        let px = (w * h) as usize;
-        let dst = std::slice::from_raw_parts_mut(bits as *mut u8, px * 4);
-        for i in 0..px {
-            let r = self.buf[i * 4] as u32;
-            let g = self.buf[i * 4 + 1] as u32;
-            let b = self.buf[i * 4 + 2] as u32;
-            let a = self.buf[i * 4 + 3] as u32;
-            dst[i * 4] = ((b * a) / 255) as u8;
-            dst[i * 4 + 1] = ((g * a) / 255) as u8;
-            dst[i * 4 + 2] = ((r * a) / 255) as u8;
-            dst[i * 4 + 3] = a as u8;
         }
-
-        let old = SelectObject(mem, HGDIOBJ(hbm.0));
-        let mut src = POINT { x: 0, y: 0 };
-        let mut dpos = POINT { x, y };
-        let mut size = SIZE { cx: w, cy: h };
-        let blend = BLENDFUNCTION {
-            BlendOp: AC_SRC_OVER as u8,
-            BlendFlags: 0,
-            SourceConstantAlpha: alpha,
-            AlphaFormat: AC_SRC_ALPHA as u8,
-        };
-        let _ = UpdateLayeredWindow(
-            hwnd,
-            Some(screen),
-            Some(&mut dpos),
-            Some(&mut size),
-            Some(mem),
-            Some(&mut src),
-            COLORREF(0),
-            Some(&blend),
-            ULW_ALPHA,
-        );
-
-        SelectObject(mem, old);
-        let _ = DeleteObject(HGDIOBJ(hbm.0));
-        let _ = DeleteDC(mem);
-        ReleaseDC(None, screen);
     }
 }
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    // WM_CAPTURECHANGED is *sent* straight to the proc (it never reaches the modal loop's
+    // GetMessage), so losing capture — Start menu, Alt-Tab, another app grabbing focus —
+    // would otherwise orphan the flyout. Re-post it as a queued message the loop dismisses
+    // on. (Our own ReleaseCapture at teardown also lands here, harmlessly.)
+    if msg == WM_CAPTURECHANGED {
+        let _ = PostMessageW(Some(hwnd), WM_FLYOUT_CLOSE, WPARAM(0), LPARAM(0));
+    }
     DefWindowProcW(hwnd, msg, wp, lp)
 }
 
@@ -600,6 +1142,59 @@ fn mouse_xy(lp: LPARAM) -> (i32, i32) {
     let x = (lp.0 & 0xFFFF) as u16 as i16 as i32;
     let y = ((lp.0 >> 16) & 0xFFFF) as u16 as i16 as i32;
     (x, y)
+}
+
+/// Open Settings ▸ System ▸ Sound (the native page the flyout offers as an escape hatch).
+fn open_sound_settings() {
+    unsafe {
+        ShellExecuteW(
+            None,
+            w!("open"),
+            w!("ms-settings:sound"),
+            PCWSTR::null(),
+            PCWSTR::null(),
+            SW_SHOWNORMAL,
+        );
+    }
+}
+
+/// Horizontal centre (in px) of the edit pencil's button — shared by hit-testing, the
+/// hover highlight, and the glyph so they always coincide.
+fn pencil_center_x(panel_w: i32, scale: f32) -> f32 {
+    panel_w as f32 - (PENCIL_RIGHT + PENCIL_BTN / 2.0) * scale
+}
+
+/// Draw the trailing "edit icon" pencil on a device row, centred on its button.
+fn draw_pencil(buf: &mut [u8], w: i32, h: i32, scale: f32, panel_w: i32, cy: f32, alpha: f32) {
+    let size = (16.0 * scale).round() as u32;
+    if let Ok((rgba, gw, gh)) = icons::render_glyph(GLYPH_EDIT, size, TEXT) {
+        let cx = pencil_center_x(panel_w, scale);
+        let x = (cx - gw as f32 / 2.0).round() as i32;
+        let y = (cy - gh as f32 / 2.0).round() as i32;
+        blit_a(buf, w, h, x, y, &rgba, gw, gh, alpha);
+    }
+}
+
+/// Draw the battery readout (a level glyph + "NN%") ending at right edge `right` (px).
+fn draw_battery(buf: &mut [u8], w: i32, h: i32, scale: f32, right: f32, cy: f32, pct: u8, font: Option<&FontVec>) {
+    const DIM: f32 = 0.9;
+    let pct = pct.min(100);
+    let text = format!("{pct}%");
+    let px = 12.5 * scale;
+    let tw = font.map(|f| measure(f, px, &text)).unwrap_or(0.0);
+    if let Some(f) = font {
+        draw_text(buf, w, h, f, px, right - tw, cy + px * 0.34, TEXT, DIM, &text);
+    }
+    // Segoe Fluent battery levels: Battery0 (E850, empty) … Battery10 (E85A, full).
+    let level = ((pct as f32 / 10.0).round() as u32).min(10);
+    let glyph = char::from_u32(0xE850 + level).unwrap_or('\u{E850}');
+    let size = (20.0 * scale).round() as u32;
+    let gap = 5.0 * scale;
+    if let Ok((rgba, gw, gh)) = icons::render_glyph(glyph, size, TEXT) {
+        let x = (right - tw - gap - gw as f32).round() as i32;
+        let y = (cy - gh as f32 / 2.0).round() as i32;
+        blit_a(buf, w, h, x, y, &rgba, gw, gh, DIM);
+    }
 }
 
 // --- acrylic + accent -------------------------------------------------------
@@ -636,7 +1231,6 @@ unsafe fn enable_acrylic(hwnd: HWND) {
     let mut policy = AccentPolicy {
         accent_state: ACCENT_ENABLE_ACRYLICBLURBEHIND,
         accent_flags: 0,
-        // AABBGGRR — a light dark tint; our own buffer supplies most of the tint.
         gradient_color: 0x0020_2020,
         animation_id: 0,
     };
@@ -649,7 +1243,37 @@ unsafe fn enable_acrylic(hwnd: HWND) {
 }
 
 /// The user's Windows accent colour (registry `DWM\AccentColor`, stored `AABBGGRR`).
+/// The accent colour to paint (selection pill, slider fill/thumb). On our dark surface
+/// Windows uses the *Light2* shade of the accent palette rather than the base accent —
+/// matching that keeps us in step with the native flyout. Falls back to the DWM base
+/// accent, then the Win11 default.
 fn accent_rgb() -> [u8; 3] {
+    accent_palette_light2().unwrap_or_else(dwm_accent_rgb)
+}
+
+/// The "Light2" accent shade from `Explorer\Accent\AccentPalette` — an 8-entry RGBA blob
+/// ordered lightest→darkest `[Light3, Light2, Light1, Accent, Dark1, Dark2, Dark3, …]`.
+fn accent_palette_light2() -> Option<[u8; 3]> {
+    use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_BINARY};
+    let mut buf = [0u8; 32];
+    let mut size = buf.len() as u32;
+    let ok = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            w!(r"Software\Microsoft\Windows\CurrentVersion\Explorer\Accent"),
+            w!("AccentPalette"),
+            RRF_RT_REG_BINARY,
+            None,
+            Some(buf.as_mut_ptr() as *mut core::ffi::c_void),
+            Some(&mut size),
+        )
+    };
+    // Light2 is the second entry (bytes 4..7 = R,G,B).
+    (ok.0 == 0 && size >= 8).then(|| [buf[4], buf[5], buf[6]])
+}
+
+/// The user's Windows accent colour from the DWM registry key (stored `AABBGGRR`).
+fn dwm_accent_rgb() -> [u8; 3] {
     use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
     let mut v: u32 = 0;
     let mut size = 4u32;
@@ -694,10 +1318,8 @@ fn ui_font_semibold() -> Option<&'static FontVec> {
 }
 
 /// Convert a desired **em size** (in px) into the ab_glyph `PxScale` that actually yields
-/// it. ab_glyph scales a font by its *height* (ascent − descent + line-gap), so a plain
-/// `PxScale::from(px)` renders an em of only ~0.75·px for Segoe UI — leaving text ~25%
-/// smaller than the same nominal size in Windows' own em-based layout (the native flyout).
-/// Sizing by em keeps our text matched to Windows' point sizes.
+/// it. ab_glyph scales a font by its *height*, so a plain `PxScale::from(px)` renders an
+/// em of only ~0.75·px for Segoe UI. Sizing by em keeps our text matched to Windows.
 fn em_scale(font: &FontVec, em_px: f32) -> PxScale {
     match font.units_per_em() {
         Some(upem) => PxScale::from(em_px * font.height_unscaled() / upem),
@@ -708,6 +1330,29 @@ fn em_scale(font: &FontVec, em_px: f32) -> PxScale {
 fn measure(font: &FontVec, px: f32, text: &str) -> f32 {
     let sf = font.as_scaled(em_scale(font, px));
     text.chars().map(|c| sf.h_advance(font.glyph_id(c))).sum()
+}
+
+/// Truncate `text` with a trailing ellipsis so it fits within `max_w` px. Returned as-is
+/// when it already fits.
+fn fit_label(font: &FontVec, px: f32, text: &str, max_w: f32) -> String {
+    let sf = font.as_scaled(em_scale(font, px));
+    let advance = |c: char| sf.h_advance(font.glyph_id(c));
+    if text.chars().map(advance).sum::<f32>() <= max_w {
+        return text.to_string();
+    }
+    let budget = max_w - advance('…');
+    let mut out = String::new();
+    let mut acc = 0.0;
+    for ch in text.chars() {
+        let cw = advance(ch);
+        if acc + cw > budget {
+            break;
+        }
+        acc += cw;
+        out.push(ch);
+    }
+    out.push('…');
+    out
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -731,10 +1376,16 @@ fn draw_text(buf: &mut [u8], w: i32, h: i32, font: &FontVec, px: f32, mut pen: f
 
 /// Blit a straight-alpha RGBA sprite (its own colour) onto the buffer.
 fn blit(buf: &mut [u8], w: i32, h: i32, x0: i32, y0: i32, rgba: &[u8], sw: u32, sh: u32) {
+    blit_a(buf, w, h, x0, y0, rgba, sw, sh, 1.0);
+}
+
+/// Blit a straight-alpha RGBA sprite, scaling its alpha by `alpha` (for dimmed glyphs).
+#[allow(clippy::too_many_arguments)]
+fn blit_a(buf: &mut [u8], w: i32, h: i32, x0: i32, y0: i32, rgba: &[u8], sw: u32, sh: u32, alpha: f32) {
     for sy in 0..sh as i32 {
         for sx in 0..sw as i32 {
             let i = ((sy as u32 * sw + sx as u32) * 4) as usize;
-            let a = rgba[i + 3] as f32 / 255.0;
+            let a = rgba[i + 3] as f32 / 255.0 * alpha;
             if a <= 0.0 {
                 continue;
             }

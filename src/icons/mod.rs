@@ -18,6 +18,7 @@ pub enum IconId {
     WirelessEarbuds,
     Headphones,
     HeadsetMic,
+    Microphone,
     Speakers,
     LaptopSpeakers,
     Hdmi,
@@ -25,11 +26,12 @@ pub enum IconId {
 }
 
 impl IconId {
-    /// Every icon, in the order shown in Settings.
-    pub const ALL: [IconId; 7] = [
+    /// Every icon, in the order shown in the picker.
+    pub const ALL: [IconId; 8] = [
         IconId::WirelessEarbuds,
         IconId::Headphones,
         IconId::HeadsetMic,
+        IconId::Microphone,
         IconId::Speakers,
         IconId::LaptopSpeakers,
         IconId::Hdmi,
@@ -43,23 +45,11 @@ impl IconId {
             IconId::WirelessEarbuds => '\u{E7F6}', // Headphone (no earbuds glyph exists)
             IconId::Headphones => '\u{E7F6}',      // Headphone
             IconId::HeadsetMic => '\u{E95B}',      // Headset (with mic)
+            IconId::Microphone => '\u{E720}',      // Microphone
             IconId::Speakers => '\u{E767}',        // Volume (speaker + waves)
             IconId::LaptopSpeakers => '\u{E7F8}',  // DeviceLaptopNoPic
             IconId::Hdmi => '\u{E7F4}',            // TVMonitor
             IconId::Unknown => '\u{E9CE}',         // Unknown (? in a circle)
-        }
-    }
-
-    /// Human-readable label for Settings.
-    pub fn label(self) -> &'static str {
-        match self {
-            IconId::WirelessEarbuds => "Wireless earbuds",
-            IconId::Headphones => "Headphones",
-            IconId::HeadsetMic => "Headset + mic",
-            IconId::Speakers => "Speakers",
-            IconId::LaptopSpeakers => "Laptop speakers",
-            IconId::Hdmi => "HDMI / display",
-            IconId::Unknown => "Unknown",
         }
     }
 
@@ -73,31 +63,38 @@ impl IconId {
     /// Rasterize this icon's glyph into a `size`×`size` RGBA buffer, in colour `rgb`
     /// (with anti-aliased alpha). Rendering at the target size keeps it crisp.
     pub fn render(self, size: u32, rgb: [u8; 3]) -> Result<(Vec<u8>, u32, u32)> {
-        let font = fluent_font().context("Segoe Fluent Icons font not found")?;
-        let mut buf = vec![0u8; (size * size * 4) as usize];
-
-        // Leave a little padding so the glyph doesn't touch the edges.
-        let px = size as f32 * 0.84;
-        let glyph = font.glyph_id(self.glyph()).with_scale(px);
-
-        if let Some(outline) = font.outline_glyph(glyph) {
-            let b = outline.px_bounds();
-            let ox = ((size as f32 - b.width()) / 2.0).round() as i32;
-            let oy = ((size as f32 - b.height()) / 2.0).round() as i32;
-            outline.draw(|gx, gy, coverage| {
-                let x = gx as i32 + ox;
-                let y = gy as i32 + oy;
-                if x >= 0 && y >= 0 && (x as u32) < size && (y as u32) < size {
-                    let i = ((y as u32 * size + x as u32) * 4) as usize;
-                    buf[i] = rgb[0];
-                    buf[i + 1] = rgb[1];
-                    buf[i + 2] = rgb[2];
-                    buf[i + 3] = (coverage * 255.0).round().clamp(0.0, 255.0) as u8;
-                }
-            });
-        }
-        Ok((buf, size, size))
+        render_glyph(self.glyph(), size, rgb)
     }
+}
+
+/// Rasterize an arbitrary Segoe Fluent glyph into a `size`×`size` RGBA buffer, colour
+/// `rgb`, its bounding box centred in the box. Used for the built-in [`IconId`] set and
+/// for the flyout's control glyphs (speaker, mic, gear…) so they all align identically.
+pub fn render_glyph(glyph: char, size: u32, rgb: [u8; 3]) -> Result<(Vec<u8>, u32, u32)> {
+    let font = fluent_font().context("Segoe Fluent Icons font not found")?;
+    let mut buf = vec![0u8; (size * size * 4) as usize];
+
+    // Leave a little padding so the glyph doesn't touch the edges.
+    let px = size as f32 * 0.84;
+    let g = font.glyph_id(glyph).with_scale(px);
+
+    if let Some(outline) = font.outline_glyph(g) {
+        let b = outline.px_bounds();
+        let ox = ((size as f32 - b.width()) / 2.0).round() as i32;
+        let oy = ((size as f32 - b.height()) / 2.0).round() as i32;
+        outline.draw(|gx, gy, coverage| {
+            let x = gx as i32 + ox;
+            let y = gy as i32 + oy;
+            if x >= 0 && y >= 0 && (x as u32) < size && (y as u32) < size {
+                let i = ((y as u32 * size + x as u32) * 4) as usize;
+                buf[i] = rgb[0];
+                buf[i + 1] = rgb[1];
+                buf[i + 2] = rgb[2];
+                buf[i + 3] = (coverage * 255.0).round().clamp(0.0, 255.0) as u8;
+            }
+        });
+    }
+    Ok((buf, size, size))
 }
 
 /// Load & cache the Segoe Fluent Icons font (present on Windows 10 1903+/11).
@@ -119,6 +116,7 @@ pub fn default_icon(form_factor: FormFactor, name_hint: &str) -> IconId {
         FormFactor::Speakers => IconId::Speakers,
         FormFactor::Headphones => IconId::Headphones,
         FormFactor::Headset => IconId::HeadsetMic,
+        FormFactor::Microphone => IconId::Microphone,
         FormFactor::DigitalDisplay => IconId::Hdmi,
         FormFactor::Spdif => IconId::Speakers, // digital passthrough, usually to speakers
         FormFactor::Unknown => IconId::Unknown,

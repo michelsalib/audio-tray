@@ -3,6 +3,7 @@
 //! `Device` identity is the WASAPI endpoint ID string (`IMMDevice::GetId`), never the
 //! friendly name — names collide, localize, and change; the ID is stable (plan §2.5).
 
+pub mod battery;
 pub mod notify;
 pub mod switch;
 pub mod wasapi;
@@ -10,6 +11,14 @@ pub mod wasapi;
 /// Stable endpoint identity from `IMMDevice::GetId`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct DeviceId(pub String);
+
+/// Endpoint direction — playback (`eRender`) vs recording (`eCapture`). The flyout shows
+/// both; the tray icon still reflects the default *output* only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Flow {
+    Output,
+    Input,
+}
 
 /// Endpoint form factor. This is a *hint only* — Windows cannot distinguish wireless
 /// earbuds from headphones, so the per-device icon mapping in Settings is authoritative
@@ -19,6 +28,7 @@ pub enum FormFactor {
     Speakers,
     Headphones,
     Headset,
+    Microphone,
     Spdif,
     DigitalDisplay,
     Unknown,
@@ -31,6 +41,9 @@ pub struct Device {
     pub friendly_name: String,
     /// Hint only — see [`FormFactor`].
     pub form_factor: FormFactor,
+    /// `PKEY_Device_ContainerId` as an upper-case `{GUID}` string — groups all functions of
+    /// one physical device, used to find its Bluetooth battery node (see [`battery`]).
+    pub container_id: Option<String>,
 }
 
 pub trait AudioBackend {

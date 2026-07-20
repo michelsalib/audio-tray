@@ -1,6 +1,6 @@
 [package]
 name = "audio-tray"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Windows system-tray app for viewing and switching the default audio output device"
 license = "MIT"
@@ -43,6 +43,9 @@ features = [
     "Win32_Media_Audio",
     "Win32_Media_Audio_Endpoints",
     "Win32_Devices_FunctionDiscovery",
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_Devices_Properties",
+    "Win32_UI_Shell",
     "Win32_UI_Shell_PropertiesSystem",
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Input_KeyboardAndMouse",

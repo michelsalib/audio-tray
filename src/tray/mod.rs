@@ -2,19 +2,17 @@
 //!
 //! The tray owns no window of its own — `tray-icon` provides the icon and posts click
 //! events through a global channel that we drain after each dispatched message. Left-click
-//! opens the native Windows sound flyout; right-click opens our own acrylic flyout (see
-//! [`crate::flyout`]) for switching output and assigning the per-device tray glyph.
+//! opens our acrylic control flyout (volume, mute, output/input switching, per-device
+//! icons — see [`crate::flyout`]); right-click opens the tiny quick menu (Sound settings +
+//! Quit).
 
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::System::Threading::GetCurrentThreadId;
-use windows::Win32::UI::Input::KeyboardAndMouse::{
-    SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP,
-    VIRTUAL_KEY, VK_CONTROL, VK_LWIN,
-};
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, DispatchMessageW, GetAncestor, GetClassNameW, GetMessageW, PeekMessageW,
     PostQuitMessage, PostThreadMessageW, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx,
@@ -25,7 +23,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use crate::audio::wasapi::WasapiBackend;
 use crate::audio::{notify, AudioBackend};
 use crate::config::Config;
-use crate::flyout::{self, FlyoutAction};
+use crate::flyout::{self, Trigger};
 use crate::icons::{self, IconId};
 
 /// Posted (from the mouse hook) when the user scrolls over the taskbar/tray; wParam is
@@ -40,8 +38,8 @@ pub fn run(backend: WasapiBackend) -> Result<()> {
     let mut config = Config::load();
 
     let (_, initial_icon) = resolve_current(&backend, &config);
-    // Left-click opens the native Windows sound flyout; right-click opens our own acrylic
-    // flyout (handled via TrayIconEvent — we deliberately don't hand a menu to tray-icon).
+    // Left-click opens our acrylic control flyout; right-click opens the quick menu
+    // (handled via TrayIconEvent — we deliberately don't hand a menu to tray-icon).
     let tray = TrayIconBuilder::new()
         .with_tooltip("Audio output")
         .with_icon(icon_image(initial_icon)?)
@@ -57,9 +55,14 @@ pub fn run(backend: WasapiBackend) -> Result<()> {
     let _volume_hook = ScrollVolumeHook::install(thread_id);
 
     let devices = backend.enumerate().map(|d| d.len()).unwrap_or(0);
-    println!("tray: created ({devices} output device(s)); left = flyout, right = menu.");
+    println!("tray: created ({devices} output device(s)); left = panel, right = menu.");
 
     let tray_rx = TrayIconEvent::receiver();
+    // The click that dismisses an open flyout (it has mouse capture) is also reported by
+    // the shell as a fresh tray click. This guard ignores tray clicks for a brief window
+    // after a flyout closes, so a second click on the icon reads as "close", not "close
+    // then immediately reopen".
+    let mut reopen_guard = Instant::now();
     let mut msg = MSG::default();
     unsafe {
         // GetMessageW returns >0 for a normal message, 0 for WM_QUIT, -1 on error.
@@ -90,23 +93,28 @@ pub fn run(backend: WasapiBackend) -> Result<()> {
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
 
-            // Tray icon clicks: left → native Windows sound flyout; right → our flyout.
+            // Tray icon clicks: left → control panel; right → quick menu. Both centre on
+            // the icon, opening just above it.
             while let Ok(ev) = tray_rx.try_recv() {
                 if let TrayIconEvent::Click {
                     button, button_state: MouseButtonState::Up, rect, ..
                 } = ev
                 {
-                    match button {
-                        MouseButton::Left => open_sound_flyout(),
-                        MouseButton::Right => {
-                            // Centre the flyout on the icon, opening just above it.
-                            let anchor = flyout::Anchor {
-                                cx: (rect.position.x + rect.size.width as f64 / 2.0) as i32,
-                                bottom: rect.position.y as i32,
-                            };
-                            handle_flyout(&backend, &mut config, &tray, Some(anchor))?;
-                        }
-                        _ => {}
+                    if Instant::now() < reopen_guard {
+                        continue; // this is the click that just closed the flyout
+                    }
+                    let trigger = match button {
+                        MouseButton::Left => Some(Trigger::LeftClick),
+                        MouseButton::Right => Some(Trigger::RightClick),
+                        _ => None,
+                    };
+                    if let Some(trigger) = trigger {
+                        let anchor = flyout::Anchor {
+                            cx: (rect.position.x + rect.size.width as f64 / 2.0) as i32,
+                            bottom: rect.position.y as i32,
+                        };
+                        handle_flyout(&backend, &mut config, &tray, Some(anchor), trigger)?;
+                        reopen_guard = Instant::now() + Duration::from_millis(350);
                     }
                 }
             }
@@ -115,33 +123,30 @@ pub fn run(backend: WasapiBackend) -> Result<()> {
     Ok(())
 }
 
-/// Show the acrylic flyout and apply the user's choice.
+/// Show the flyout (control panel or quick menu) and apply its outcome. Device switching
+/// and volume/mute happen live inside the flyout; here we only persist icon changes and
+/// honour a Quit. The tray icon is refreshed whenever the config changed (a per-device
+/// icon may be the current default's).
 fn handle_flyout(
     backend: &WasapiBackend,
     config: &mut Config,
     tray: &TrayIcon,
     anchor: Option<flyout::Anchor>,
+    trigger: Trigger,
 ) -> Result<()> {
-    let devices = backend.enumerate().unwrap_or_default();
-    let current = backend.current_default().ok();
-    let Some(action) = flyout::show(&devices, current.as_ref(), config, anchor) else {
-        return Ok(());
-    };
-    match action {
-        FlyoutAction::Quit => unsafe { PostQuitMessage(0) },
-        FlyoutAction::Switch(id) => {
-            // The resulting change notification refreshes the icon, so the UI never lies.
-            if let Err(e) = backend.set_default(&id) {
-                eprintln!("switch failed: {e:#}");
-            }
+    let outcome = flyout::show(backend, config, anchor, trigger);
+    if outcome.config_changed {
+        if let Err(e) = config.save() {
+            eprintln!("save config failed: {e:#}");
         }
-        FlyoutAction::SetIcon(dev, icon) => {
-            config.set_icon(dev, icon);
-            if let Err(e) = config.save() {
-                eprintln!("save config failed: {e:#}");
-            }
-            refresh(backend, tray, config)?;
-        }
+    }
+    // The tray icon tracks the default output; switching it inside the flyout consumes the
+    // endpoint-change notifications, so refresh here when the config or the default changed.
+    if outcome.config_changed || outcome.output_changed {
+        refresh(backend, tray, config)?;
+    }
+    if outcome.quit {
+        unsafe { PostQuitMessage(0) };
     }
     Ok(())
 }
@@ -187,38 +192,6 @@ fn small_icon_size() -> u32 {
     use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSMICON};
     let px = unsafe { GetSystemMetrics(SM_CXSMICON) };
     if px <= 0 { 16 } else { px as u32 }
-}
-
-/// Invoke the native Windows sound-output flyout by synthesizing its shortcut,
-/// Win+Ctrl+V (the "Sortie son" / audio output switcher).
-fn open_sound_flyout() {
-    const VK_V: VIRTUAL_KEY = VIRTUAL_KEY(0x56);
-    let seq = [
-        key_input(VK_CONTROL, false),
-        key_input(VK_LWIN, false),
-        key_input(VK_V, false),
-        key_input(VK_V, true),
-        key_input(VK_LWIN, true),
-        key_input(VK_CONTROL, true),
-    ];
-    unsafe {
-        SendInput(&seq, std::mem::size_of::<INPUT>() as i32);
-    }
-}
-
-fn key_input(vk: VIRTUAL_KEY, up: bool) -> INPUT {
-    INPUT {
-        r#type: INPUT_KEYBOARD,
-        Anonymous: INPUT_0 {
-            ki: KEYBDINPUT {
-                wVk: vk,
-                wScan: 0,
-                dwFlags: if up { KEYEVENTF_KEYUP } else { KEYBD_EVENT_FLAGS(0) },
-                time: 0,
-                dwExtraInfo: 0,
-            },
-        },
-    }
 }
 
 /// A low-level mouse hook that turns wheel-over-taskbar into a volume step. The hook

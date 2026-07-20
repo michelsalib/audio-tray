@@ -4,7 +4,7 @@
 [![Release](https://github.com/michelsalib/audio-tray/actions/workflows/release.yml/badge.svg)](https://github.com/michelsalib/audio-tray/releases/latest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-A tiny Windows system-tray app for **viewing and switching your default audio output device** — without digging through Settings.
+A tiny Windows system-tray app for **controlling your audio without digging through Settings** — switch the default output/input device, set volume, and mute, all from one native-feeling flyout.
 
 <p align="center">
   <img src="assets/app.ico" width="96" alt="Audio Tray icon">
@@ -13,9 +13,9 @@ A tiny Windows system-tray app for **viewing and switching your default audio ou
 ## Features
 
 - **Lives in the system tray** with an icon that reflects the current output device (speakers, headphones, headset, HDMI…), rendered from Segoe Fluent Icons and themed to your taskbar.
-- **Left-click** → opens Windows' own audio-output flyout (the native "select output" picker).
-- **Right-click** → a compact acrylic flyout to switch the default output device, choose a per-device icon, or quit.
-- **Scroll** the mouse wheel over the tray icon to change the system volume.
+- **Left-click** → a compact acrylic flyout that replaces the native sound flyout: set output **and** input volume, mute/unmute, switch the default output and input device, pick a per-device icon, and see the battery level of Bluetooth devices that report one.
+- **Right-click** → a small quick menu: open Windows' Sound settings, or quit.
+- **Scroll** the mouse wheel over the tray icon to change the current output volume.
 - **Starts at sign-in** (optional, chosen at install time).
 - **Auto-updates** itself from GitHub Releases.
 
@@ -42,9 +42,9 @@ Once running, Audio Tray sits in the notification area:
 
 | Action | Result |
 |--------|--------|
-| Left-click | Open the native Windows output-device flyout |
-| Right-click | Open the Audio Tray flyout (switch device / pick icon / quit) |
-| Scroll wheel | Adjust system volume |
+| Left-click | Open the Audio Tray control flyout (volume, mute, switch output/input, pick icon, Sound settings) |
+| Right-click | Quick menu — Sound settings / Quit |
+| Scroll wheel | Adjust the current output volume |
 
 ### Command-line (dev/diagnostics)
 

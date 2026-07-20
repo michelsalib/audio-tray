@@ -3,6 +3,11 @@ name = "audio-tray"
 version = "0.1.0"
 edition = "2021"
 description = "Windows system-tray app for viewing and switching the default audio output device"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/michelsalib/audio-tray"
+homepage = "https://github.com/michelsalib/audio-tray"
+authors = ["Michel Salib"]
 
 [dependencies]
 ab_glyph = "0.2.32"
@@ -47,3 +52,6 @@ features = [
     "Win32_System_Console",
     "Win32_UI_HiDpi",
 ]
+
+[build-dependencies]
+winresource = "0.1.31"

@@ -42,6 +42,8 @@ ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 OutputDir=dist
 OutputBaseFilename=AudioTray-{#AppVersion}-Setup
+; Icon for the Setup.exe itself (the installed exe already embeds it via build.rs).
+SetupIconFile=..\assets\app.ico
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern

@@ -8,25 +8,8 @@ This repo ships three automated pieces:
 | Auto-update | In-app updater checks GitHub Releases on launch | [`src/update.rs`](src/update.rs) |
 | winget | winget-releaser opens a manifest PR on each release (opt-in) | [`.github/workflows/winget.yml`](.github/workflows/winget.yml), [`packaging/winget/`](packaging/winget/) |
 
-CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs fmt/clippy/build/test on every push and PR.
-
----
-
-## 0. One-time: create the public GitHub repo
-
-`git init` and the first commit are already done locally. Create the remote and push
-(no `gh` CLI installed, so do it in the browser + git):
-
-1. Create an **empty public** repo at <https://github.com/new> named `audio-tray`
-   (owner `michelsalib`). Do **not** add a README/license/`.gitignore` — the repo already has them.
-2. Push:
-   ```sh
-   git remote add origin https://github.com/michelsalib/audio-tray.git
-   git branch -M main
-   git push -u origin main
-   ```
-
-The repo **must be public** for the self-updater and winget to download release assets anonymously.
+CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs clippy/build/test on every push and PR.
+The repo must stay **public** so the self-updater and winget can download release assets anonymously.
 
 ---
 

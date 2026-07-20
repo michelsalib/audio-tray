@@ -1,0 +1,25 @@
+name: Publish to winget
+
+# Auto-submits a manifest-update PR to microsoft/winget-pkgs on each stable
+# release, so `winget upgrade` users get the new version. Uses winget-releaser
+# (Komac under the hood).
+#
+# DORMANT until you opt in. To enable (see RELEASING.md):
+#   1. Do the ONE-TIME initial submission of MichelSalib.AudioTray to winget-pkgs.
+#   2. Add secret WINGET_TOKEN = a classic PAT with `public_repo` scope.
+#   3. Add repo variable PUBLISH_WINGET = true.
+on:
+  release:
+    types: [released] # published, non-prerelease releases only
+
+jobs:
+  publish:
+    if: ${{ vars.PUBLISH_WINGET == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: vedantmgoyal9/winget-releaser@v2
+        with:
+          identifier: MichelSalib.AudioTray
+          # Match the Inno installer asset only (not the self-update .zip).
+          installers-regex: 'Setup\.exe$'
+          token: ${{ secrets.WINGET_TOKEN }}

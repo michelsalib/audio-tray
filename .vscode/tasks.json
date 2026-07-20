@@ -1,0 +1,27 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "cargo build (debug)",
+      "type": "shell",
+      "command": "cargo",
+      "args": ["build"],
+      "options": {
+        "env": {
+          // Ensure cargo is found even if this VS Code window started before rustup
+          // added ~/.cargo/bin to PATH.
+          "PATH": "${env:USERPROFILE}\\.cargo\\bin;${env:PATH}"
+        }
+      },
+      "problemMatcher": ["$rustc"],
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "presentation": {
+        "clear": true,
+        "reveal": "silent"
+      }
+    }
+  ]
+}

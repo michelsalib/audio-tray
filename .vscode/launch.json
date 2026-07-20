@@ -1,0 +1,27 @@
+{
+  // Requires the "C/C++" extension (ms-vscode.cpptools). cppvsdbg reads MSVC PDB debug
+  // info natively — the right debugger for the x86_64-pc-windows-msvc toolchain.
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Debug tray (default)",
+      "type": "cppvsdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/target/debug/audio-tray.exe",
+      "args": [],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "preLaunchTask": "cargo build (debug)"
+    },
+    {
+      "name": "Debug --list",
+      "type": "cppvsdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/target/debug/audio-tray.exe",
+      "args": ["--list"],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "preLaunchTask": "cargo build (debug)"
+    }
+  ]
+}

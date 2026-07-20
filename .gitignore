@@ -1,0 +1,14 @@
+# Rust build output
+/target
+
+# Backup / editor files
+*.bak
+*~
+
+# Packaging build output (installer + zipped binary produced by CI or local runs)
+/packaging/dist
+/dist
+
+# OS junk
+Thumbs.db
+Desktop.ini

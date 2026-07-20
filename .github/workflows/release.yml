@@ -1,0 +1,71 @@
+name: Release
+
+# Push a semver tag to cut a release, e.g.:
+#   git tag v0.1.1 && git push origin v0.1.1
+# The tag version MUST match `version` in Cargo.toml (enforced below).
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write # needed to create the GitHub Release
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Resolve + verify version
+        id: ver
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          CARGO_VERSION="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')"
+          echo "tag=$TAG_VERSION  cargo=$CARGO_VERSION"
+          if [ "$TAG_VERSION" != "$CARGO_VERSION" ]; then
+            echo "::error::Tag v$TAG_VERSION does not match Cargo.toml version $CARGO_VERSION. Bump Cargo.toml and re-tag."
+            exit 1
+          fi
+          echo "version=$TAG_VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Build release
+        run: cargo build --release --locked
+
+      - name: Package self-update asset (zipped exe)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force packaging/dist | Out-Null
+          Copy-Item target/release/audio-tray.exe packaging/dist/audio-tray.exe -Force
+          Compress-Archive -Path packaging/dist/audio-tray.exe `
+            -DestinationPath packaging/dist/audio-tray-x86_64-pc-windows-msvc.zip -Force
+
+      - name: Build Inno Setup installer
+        shell: pwsh
+        run: |
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup -y --no-progress
+          }
+          $exe = (Resolve-Path target/release/audio-tray.exe).Path
+          & $iscc "/DAppVersion=${{ steps.ver.outputs.version }}" "/DSourceExe=$exe" packaging/audio-tray.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit code $LASTEXITCODE" }
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          # Both assets attach to the release for tag ${{ github.ref_name }}:
+          #  - Setup.exe  → humans + winget
+          #  - .zip       → the in-app self-updater (src/update.rs)
+          files: |
+            packaging/dist/AudioTray-${{ steps.ver.outputs.version }}-Setup.exe
+            packaging/dist/audio-tray-x86_64-pc-windows-msvc.zip
+          generate_release_notes: true
+          fail_on_unmatched_files: true

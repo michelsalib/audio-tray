@@ -1,0 +1,22 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.9.0.schema.json
+PackageIdentifier: MichelSalib.AudioTray
+PackageVersion: 0.1.0
+PackageLocale: en-US
+Publisher: MichelSalib
+PublisherUrl: https://github.com/michelsalib
+PackageName: Audio Tray
+PackageUrl: https://github.com/michelsalib/audio-tray
+# TODO: winget requires a license. Add a LICENSE file to the repo and set this
+# accordingly (e.g. MIT). "Proprietary" is a valid placeholder if unlicensed.
+License: MIT
+LicenseUrl: https://github.com/michelsalib/audio-tray/blob/main/LICENSE
+ShortDescription: Windows system-tray app for viewing and switching the default audio output device.
+Moniker: audio-tray
+Tags:
+  - audio
+  - sound
+  - tray
+  - output-device
+  - windows
+ManifestType: defaultLocale
+ManifestVersion: 1.9.0

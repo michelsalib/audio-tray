@@ -13,6 +13,7 @@
 # and changes nothing. Publishing to crates.io is off (see `publish = false`
 # in Cargo.toml) — this is an app, not a library.
 
+publish = false                                 # not a crates.io crate — skip `cargo publish`
 tag-name = "v{{version}}"                       # matches release.yml + the existing v0.4.x tags
 pre-release-commit-message = "Release v{{version}}"
 push = true                                     # push the release commit + tag to origin

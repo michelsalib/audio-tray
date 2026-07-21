@@ -18,6 +18,24 @@ The repo must stay **public** so the self-updater and winget can download releas
 The tag is the source of truth for the version. It **must** match `version` in
 `Cargo.toml` (the release workflow fails otherwise).
 
+### Recommended: `cargo release`
+
+[`release.toml`](release.toml) drives [`cargo release`](https://github.com/crate-ci/cargo-release)
+(`cargo install cargo-release`). One command bumps the version, refreshes
+`Cargo.lock`, commits `Release v<version>`, tags `v<version>`, and pushes the
+commit + tag — which triggers `release.yml`. The tag can't drift from the
+Cargo.toml version because both come from the same bump.
+
+```sh
+cargo release patch            # dry-run preview (0.4.1 -> 0.4.2); also: minor / major
+cargo release patch --execute  # actually do it
+```
+
+Publishing to crates.io is disabled (`publish = false` in both `Cargo.toml` and
+`release.toml`) — this is an app, not a library.
+
+### Manual (equivalent)
+
 ```sh
 # 1. Bump the version in Cargo.toml, e.g. 0.1.0 -> 0.1.1
 # 2. Update Cargo.lock + commit

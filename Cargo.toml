@@ -1,6 +1,6 @@
 [package]
 name = "audio-tray"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2021"
 description = "Windows system-tray app for viewing and switching the default audio output device"
 license = "MIT"

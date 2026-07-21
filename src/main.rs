@@ -13,6 +13,7 @@
 //!   audio-tray --set <q>  switch default output to the device whose friendly name
 //!                         contains <q> (case-insensitive), or whose id equals <q>
 //!   audio-tray --flyout [menu]  preview the control panel (or the right-click menu)
+//!   audio-tray --meter    sample the default output+input peak meters for 4s (diagnostic)
 //!   audio-tray --update   check GitHub releases and self-update now (see update.rs)
 
 use anyhow::{bail, Context, Result};
@@ -108,6 +109,21 @@ fn main() -> Result<()> {
             }
             let after = backend.master_volume()?;
             println!("volume: {:.0}% -> {:.0}%", before * 100.0, after * 100.0);
+        }
+        Some("--meter") => {
+            // Dev: sample the default output + input peak meters (IAudioMeterInformation)
+            // for a few seconds, to confirm they report live activity.
+            let out = backend.default_of(Flow::Output).ok().flatten();
+            let inp = backend.default_of(Flow::Input).ok().flatten();
+            let om = out.as_ref().and_then(|id| backend.meter_for(id, Flow::Output).ok());
+            let im = inp.as_ref().and_then(|id| backend.meter_for(id, Flow::Input).ok());
+            println!("sampling meters for 4s (out_meter={}, in_meter={})...", om.is_some(), im.is_some());
+            for _ in 0..80 {
+                let o = om.as_ref().map(|m| m.peak()).unwrap_or(-1.0);
+                let i = im.as_ref().map(|m| m.peak()).unwrap_or(-1.0);
+                println!("out={o:.3}  in={i:.3}");
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
         }
         Some("--update") => update::run_manual()?,
         _ => {

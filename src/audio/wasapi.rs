@@ -11,11 +11,12 @@ use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
 use windows::Win32::Media::Audio::Endpoints::{
     IAudioEndpointVolume, IAudioEndpointVolumeCallback, IAudioEndpointVolumeCallback_Impl,
+    IAudioMeterInformation,
 };
 use windows::Win32::Media::Audio::{
-    eCapture, eCommunications, eConsole, eMultimedia, eRender, EDataFlow, ERole, IMMDevice,
-    IMMDeviceEnumerator, MMDeviceEnumerator, AUDIO_VOLUME_NOTIFICATION_DATA,
-    PKEY_AudioEndpoint_FormFactor, DEVICE_STATE_ACTIVE,
+    eCapture, eCommunications, eConsole, eMultimedia, eRender, EDataFlow, ERole, IAudioCaptureClient,
+    IAudioClient, IMMDevice, IMMDeviceEnumerator, MMDeviceEnumerator, AUDCLNT_SHAREMODE_SHARED,
+    AUDIO_VOLUME_NOTIFICATION_DATA, PKEY_AudioEndpoint_FormFactor, DEVICE_STATE_ACTIVE,
 };
 use windows::Win32::System::Com::StructuredStorage::{PropVariantToStringAlloc, PropVariantToUInt32};
 use windows::Win32::System::Com::{CoCreateInstance, CoTaskMemFree, CLSCTX_ALL, STGM_READ};
@@ -77,6 +78,98 @@ impl Drop for VolumeWatch {
     fn drop(&mut self) {
         unsafe {
             let _ = self.endpoint.UnregisterControlChangeNotify(&self.callback);
+        }
+    }
+}
+
+/// A live peak-level meter for one endpoint, polled on a timer to drive the slider's
+/// activity glow. Render and capture need different plumbing: a render endpoint's meter is
+/// always live, but a capture endpoint's meter only reports while *something* is capturing,
+/// so we hold a silent capture stream open for the duration (see [`CaptureMeter`]).
+pub enum Meter {
+    Render(RenderMeter),
+    Capture(CaptureMeter),
+}
+
+impl Meter {
+    /// Current peak sample value, 0.0..=1.0 (0 when silent).
+    pub fn peak(&self) -> f32 {
+        match self {
+            Meter::Render(m) => m.peak(),
+            Meter::Capture(m) => m.peak(),
+        }
+    }
+}
+
+/// Peak meter for a render endpoint (activated `IAudioMeterInformation`). The endpoint
+/// meter aggregates every stream on the device, so it reflects whatever is playing without
+/// us opening a stream of our own.
+pub struct RenderMeter {
+    meter: IAudioMeterInformation,
+}
+
+impl RenderMeter {
+    fn peak(&self) -> f32 {
+        unsafe { self.meter.GetPeakValue() }.unwrap_or(0.0).clamp(0.0, 1.0)
+    }
+}
+
+/// Peak meter for a capture endpoint. A capture endpoint's `IAudioMeterInformation` is
+/// dormant unless a capture stream is running (the same reason Windows' own mic level bar
+/// only moves while the Sound page is open), so we open a silent shared-mode capture stream
+/// and keep it running. Each poll drains and discards the queued frames (so the buffer
+/// keeps flowing) and reads the endpoint peak. The stream stops on drop; while it lives,
+/// Windows shows its "microphone in use" indicator, exactly as the Settings meter does.
+pub struct CaptureMeter {
+    client: IAudioClient,
+    capture: IAudioCaptureClient,
+    meter: IAudioMeterInformation,
+}
+
+impl CaptureMeter {
+    fn new(device: &IMMDevice) -> Result<Self> {
+        unsafe {
+            let client: IAudioClient =
+                device.Activate(CLSCTX_ALL, None).context("activate IAudioClient")?;
+            let fmt = client.GetMixFormat().context("GetMixFormat")?;
+            // 200 ms shared-mode buffer; we drain it ~30x/s so it never overflows.
+            let init = client.Initialize(AUDCLNT_SHAREMODE_SHARED, 0, 2_000_000, 0, fmt, None);
+            CoTaskMemFree(Some(fmt as *const _));
+            init.context("IAudioClient::Initialize (capture)")?;
+            let capture: IAudioCaptureClient =
+                client.GetService().context("GetService IAudioCaptureClient")?;
+            let meter: IAudioMeterInformation =
+                device.Activate(CLSCTX_ALL, None).context("activate IAudioMeterInformation")?;
+            client.Start().context("IAudioClient::Start")?;
+            Ok(CaptureMeter { client, capture, meter })
+        }
+    }
+
+    fn peak(&self) -> f32 {
+        unsafe {
+            // Drain and discard queued packets so the capture buffer keeps flowing and the
+            // meter stays current.
+            while let Ok(frames) = self.capture.GetNextPacketSize() {
+                if frames == 0 {
+                    break;
+                }
+                let mut data = std::ptr::null_mut();
+                let mut n = 0u32;
+                let mut flags = 0u32;
+                if self.capture.GetBuffer(&mut data, &mut n, &mut flags, None, None).is_err() {
+                    break;
+                }
+                let _ = self.capture.ReleaseBuffer(n);
+            }
+            self.meter.GetPeakValue().unwrap_or(0.0).clamp(0.0, 1.0)
+        }
+    }
+}
+
+impl Drop for CaptureMeter {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = self.client.Stop();
         }
     }
 }
@@ -216,6 +309,21 @@ impl WasapiBackend {
     /// Mute or unmute a specific endpoint.
     pub fn set_muted(&self, id: &DeviceId, muted: bool) -> Result<()> {
         unsafe { self.endpoint_volume(id)?.SetMute(muted, std::ptr::null()) }.context("set mute")
+    }
+
+    /// Open a live peak-level meter for a specific endpoint (for the activity glow). Output
+    /// uses the always-live endpoint meter; input opens a silent capture stream so its
+    /// otherwise-dormant meter reports — see [`Meter`].
+    pub fn meter_for(&self, id: &DeviceId, flow: Flow) -> Result<Meter> {
+        let device = self.device_by_id(id)?;
+        match flow {
+            Flow::Output => {
+                let meter: IAudioMeterInformation = unsafe { device.Activate(CLSCTX_ALL, None) }
+                    .context("activate IAudioMeterInformation")?;
+                Ok(Meter::Render(RenderMeter { meter }))
+            }
+            Flow::Input => Ok(Meter::Capture(CaptureMeter::new(&device)?)),
+        }
     }
 
     /// Subscribe to volume/mute changes on `id` from any source (media keys, other apps,

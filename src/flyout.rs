@@ -31,14 +31,14 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, VK
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW,
-    LoadCursorW, PostMessageW, RegisterClassW, SetCursor, SetForegroundWindow, ShowWindow,
-    SystemParametersInfoW, TranslateMessage, UpdateLayeredWindow, IDC_ARROW, MSG, SPI_GETWORKAREA,
-    SW_SHOWNA, SW_SHOWNORMAL, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, ULW_ALPHA, WM_APP,
-    WM_CAPTURECHANGED, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_RBUTTONDOWN,
-    WNDCLASSW, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    KillTimer, LoadCursorW, PostMessageW, RegisterClassW, SetCursor, SetForegroundWindow, SetTimer,
+    ShowWindow, SystemParametersInfoW, TranslateMessage, UpdateLayeredWindow, IDC_ARROW, MSG,
+    SPI_GETWORKAREA, SW_SHOWNA, SW_SHOWNORMAL, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, ULW_ALPHA,
+    WM_APP, WM_CAPTURECHANGED, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
+    WM_RBUTTONDOWN, WM_TIMER, WNDCLASSW, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
-use crate::audio::wasapi::{VolumeWatch, WasapiBackend};
+use crate::audio::wasapi::{Meter, VolumeWatch, WasapiBackend};
 use crate::audio::{DeviceId, Flow};
 use crate::config::Config;
 use crate::icons::{self, IconId};
@@ -79,7 +79,6 @@ const HEADER_H: f32 = 36.0; // later section headers (larger top gap → group s
 const SLIDER_H: f32 = 48.0; // volume-slider row
 const ITEM_H: f32 = 44.0; // device / action row
 const CHIPS_H: f32 = 56.0; // inline icon-picker row
-const SEP_H: f32 = 11.0;
 const ICON_X: f32 = 14.0; // left inset of a row's leading icon
 const ICON_PX: f32 = 20.0; // leading icon glyph size
 const TEXT_X: f32 = 48.0; // left inset of a row's label
@@ -87,7 +86,7 @@ const HEADER_X: f32 = 15.0; // left inset of a section-header label
 const RIGHT_PAD: f32 = 16.0;
 const MIN_W: f32 = 340.0; // panel minimum width
 const MENU_MIN_W: f32 = 200.0; // right-click menu minimum width
-const MAX_W: f32 = 460.0;
+const MAX_W: f32 = 480.0; // wide enough for the full 10-icon picker row (~467 px)
 const ROW_MARGIN: f32 = 4.0; // side margin of the row highlight/pill
 const ROW_RADIUS: f32 = 4.0; // corner radius of the row highlight
 const PILL_W: f32 = 3.0; // accent selection-indicator pill width
@@ -113,6 +112,13 @@ const WM_VOL_CHANGED: u32 = WM_APP + 10;
 // e.g. the Start menu). WM_CAPTURECHANGED is *sent* to the proc, not queued, so we bounce
 // it back as a posted message the modal loop can act on to dismiss.
 const WM_FLYOUT_CLOSE: u32 = WM_APP + 11;
+
+// A Win32 timer drives ~30 fps sampling of each default endpoint's live peak level
+// (IAudioMeterInformation) so the slider fill reacts to real audio while we're open.
+const METER_TIMER_ID: usize = 1;
+const METER_INTERVAL_MS: u32 = 33;
+// Per-tick fall-off of the displayed peak: instant attack, gentle release (a VU-meter feel).
+const METER_DECAY: f32 = 0.82;
 
 // Fluent glyphs painted directly (not from the built-in IconId set).
 const GLYPH_VOLUME: char = '\u{E767}';
@@ -158,7 +164,6 @@ enum Elem {
     Slider { group: usize },
     Device { group: usize, dev: usize },
     IconChips { group: usize, dev: usize },
-    Separator,
     Action(ActionKind),
 }
 
@@ -182,6 +187,7 @@ struct Group {
     default_id: Option<DeviceId>,
     level: f32, // 0.0..=1.0 of the default endpoint
     muted: bool,
+    peak: f32, // smoothed live peak level 0.0..=1.0 of the default endpoint (activity glow)
     devices: Vec<DeviceRow>,
 }
 
@@ -202,6 +208,7 @@ struct Flyout<'a> {
     drag: Option<usize>,    // index into elems of the slider being dragged
     pending: Option<usize>, // index pressed on button-down, acted on button-up
     watches: Vec<Option<VolumeWatch>>, // per-group volume/mute change subscriptions
+    meters: Vec<Option<Meter>>,        // per-group live peak meters (polled on a timer)
     vol_dirty: Arc<AtomicBool>,        // shared coalescing flag for the volume callbacks
     config_changed: bool,
     output_changed: bool,
@@ -258,6 +265,7 @@ unsafe fn show_inner(
         drag: None,
         pending: None,
         watches: Vec::new(),
+        meters: Vec::new(),
         vol_dirty: Arc::new(AtomicBool::new(false)),
         config_changed: false,
         output_changed: false,
@@ -312,6 +320,8 @@ unsafe fn show_inner(
     let _ = SetCursor(LoadCursorW(None, IDC_ARROW).ok());
     // Subscribe to external volume/mute changes (media keys, other apps) while we're open.
     fly.setup_watches();
+    // Poll each endpoint's live peak meter ~30 fps so the slider fill reacts to audio.
+    let _ = SetTimer(Some(fly.hwnd), METER_TIMER_ID, METER_INTERVAL_MS, None);
 
     let mut msg = MSG::default();
     'pump: while GetMessageW(&mut msg, None, 0, 0).0 > 0 {
@@ -362,8 +372,15 @@ unsafe fn show_inner(
                 }
             }
             WM_LBUTTONUP => {
-                if fly.drag.take().is_some() {
-                    continue; // finished a volume drag; stay open
+                if let Some(si) = fly.drag.take() {
+                    // Only an *output* volume change plays the "ding"; changing the input
+                    // (mic) level shouldn't trigger a notification sound.
+                    if let Elem::Slider { group } = fly.elems[si].elem {
+                        if fly.groups[group].flow == Flow::Output {
+                            beep_volume();
+                        }
+                    }
+                    continue; // stay open
                 }
                 let (mx, my) = mouse_xy(msg.lParam);
                 if fly.inside(mx, my) {
@@ -382,6 +399,7 @@ unsafe fn show_inner(
                 }
             }
             WM_VOL_CHANGED => fly.refresh_volumes(),
+            WM_TIMER => fly.tick_meters(),
             WM_KEYDOWN if msg.wParam.0 as u16 == VK_ESCAPE.0 => break 'pump,
             WM_FLYOUT_CLOSE => break 'pump, // lost capture (Start menu, Alt-Tab, …)
             _ => {
@@ -391,7 +409,9 @@ unsafe fn show_inner(
         }
     }
 
+    let _ = KillTimer(Some(fly.hwnd), METER_TIMER_ID);
     fly.watches.clear(); // unregister the volume callbacks before the window goes away
+    fly.meters.clear(); // release the peak-meter interfaces too
     let _ = ReleaseCapture();
     let _ = DestroyWindow(fly.hwnd);
     Outcome {
@@ -439,7 +459,7 @@ fn build_groups(backend: &WasapiBackend, config: &Config) -> Vec<Group> {
                 DeviceRow { id: d.id, label: d.friendly_name, icon, selected, battery }
             })
             .collect();
-        groups.push(Group { flow, title, default_id, level, muted, devices: rows });
+        groups.push(Group { flow, title, default_id, level, muted, peak: 0.0, devices: rows });
     }
     groups
 }
@@ -477,8 +497,6 @@ impl Flyout<'_> {
                         }
                     }
                 }
-                elems.push(Elem::Separator);
-                elems.push(Elem::Action(ActionKind::SoundSettings));
             }
         }
         self.elems = elems
@@ -512,7 +530,6 @@ impl Flyout<'_> {
                     TEXT_X * scale + mw(font, text_px, &row.label) + reserve * scale
                 }
                 Elem::IconChips { .. } => chips_w,
-                Elem::Separator => 0.0,
                 Elem::Action(k) => TEXT_X * scale + mw(font, text_px, k.label()) + RIGHT_PAD * scale,
             };
             max_w = max_w.max(w);
@@ -532,7 +549,6 @@ impl Flyout<'_> {
                 Elem::Slider { .. } => SLIDER_H,
                 Elem::Device { .. } => ITEM_H,
                 Elem::IconChips { .. } => CHIPS_H,
-                Elem::Separator => SEP_H,
                 Elem::Action(_) => ITEM_H,
             };
             le.top = y;
@@ -604,9 +620,10 @@ impl Flyout<'_> {
         }
     }
 
-    /// Subscribe to volume/mute changes on each group's default endpoint.
+    /// Subscribe to volume/mute changes and the peak meter on each group's default endpoint.
     fn setup_watches(&mut self) {
         self.watches = (0..self.groups.len()).map(|_| None).collect();
+        self.meters = (0..self.groups.len()).map(|_| None).collect();
         for group in 0..self.groups.len() {
             self.rewatch(group);
         }
@@ -614,7 +631,7 @@ impl Flyout<'_> {
 
     /// (Re)subscribe a group to its current default endpoint — called at open and whenever
     /// the default is switched from within the flyout (the old endpoint's watch is dropped,
-    /// which unregisters it).
+    /// which unregisters it). Also re-activates the peak meter that feeds the activity glow.
     fn rewatch(&mut self, group: usize) {
         if group >= self.watches.len() {
             return;
@@ -622,10 +639,43 @@ impl Flyout<'_> {
         let hwnd = self.hwnd.0 as isize;
         let backend = self.backend;
         let pending = Arc::clone(&self.vol_dirty);
-        self.watches[group] = self.groups[group]
-            .default_id
+        let flow = self.groups[group].flow;
+        let id = self.groups[group].default_id.clone();
+        self.watches[group] = id
             .as_ref()
             .and_then(|id| backend.watch_volume(id, hwnd, WM_VOL_CHANGED, pending).ok());
+        // The activity glow is output-only: metering an input endpoint needs a running
+        // capture stream, which would keep Windows' "microphone in use" indicator lit the
+        // whole time the flyout is open. So we only meter output; the input slider stays a
+        // plain slider (its peak holds at 0, which the additive glow renders as no glow).
+        self.meters[group] = match flow {
+            Flow::Output => id.as_ref().and_then(|id| backend.meter_for(id, flow).ok()),
+            Flow::Input => None,
+        };
+    }
+
+    /// Sample each default endpoint's live peak level and fold it into the smoothed `peak`
+    /// (fast attack, gentle release), then repaint if anything moved. Driven by the ~30 fps
+    /// timer. A muted endpoint reads as silent so its fill settles back to the resting glow.
+    fn tick_meters(&mut self) {
+        let mut changed = false;
+        for group in 0..self.groups.len() {
+            let raw = if self.groups[group].muted {
+                0.0
+            } else {
+                self.meters.get(group).and_then(|m| m.as_ref()).map_or(0.0, |m| m.peak())
+            };
+            let g = &mut self.groups[group];
+            let shown = if raw >= g.peak { raw } else { (g.peak * METER_DECAY).max(raw) };
+            if (shown - g.peak).abs() > 0.004 {
+                changed = true;
+            }
+            g.peak = shown;
+        }
+        if changed {
+            self.compose();
+            self.present(self.x, self.y, 255);
+        }
     }
 
     /// Re-read each default endpoint's volume/mute (from the cached watch interface, no COM
@@ -793,10 +843,6 @@ impl Flyout<'_> {
 
         for le in &self.elems {
             match le.elem {
-                Elem::Separator => {
-                    let sy = le.top as f32 + le.height as f32 / 2.0;
-                    fill_rect(buf, w, h, mx + d(6.0) as f32, sy, w as f32 - mx - d(6.0) as f32, sy + 1.0, TEXT, 0.07);
-                }
                 Elem::Header(text) => {
                     if let Some(f) = font_sb {
                         let base = le.top as f32 + le.height as f32 - hdr_px * 0.55;
@@ -916,18 +962,47 @@ impl Flyout<'_> {
                 let level = g.level.clamp(0.0, 1.0);
                 let fx = x0 + (x1 - x0) * level;
                 let th = TRACK_H * scale;
-                let (fill_col, fill_a, thumb_a, val_a) =
-                    if g.muted { (TEXT, 0.34, 0.5, 0.5) } else { (accent, 1.0, 1.0, 1.0) };
-                if fx > x0 {
-                    fill_round_rect(buf, w, h, x0, cy - th / 2.0, fx, cy + th / 2.0, th / 2.0, fill_col, fill_a);
-                }
                 let tr = THUMB_R * scale;
-                fill_round_rect(buf, w, h, fx - tr, cy - tr, fx + tr, cy + tr, tr, fill_col, thumb_a);
+                if g.muted {
+                    // Muted: a flat, dim fill with no activity glow.
+                    if fx > x0 {
+                        fill_round_rect(buf, w, h, x0, cy - th / 2.0, fx, cy + th / 2.0, th / 2.0, TEXT, 0.34);
+                    }
+                    fill_round_rect(buf, w, h, fx - tr, cy - tr, fx + tr, cy + tr, tr, TEXT, 0.5);
+                } else {
+                    // The fill glows with the endpoint's live peak. The glow is purely
+                    // *additive*: at rest (p≈0) it's a normal full-accent slider — matching a
+                    // non-metered slider — and as audio rises it lightens toward white and
+                    // grows a soft bloom halo, with a pulsing halo around the thumb. `powf`
+                    // lifts low/mid levels (speech/music rarely peaks near 1.0) so it reads.
+                    let p = g.peak.clamp(0.0, 1.0).powf(0.55);
+                    // Outer bloom — the main "glow": a soft lightened-accent halo that grows
+                    // tall and more opaque with the level (drawn under the fill so it reads
+                    // as a halo above/below the track).
+                    if p > 0.01 && fx > x0 {
+                        let bloom = lerp3(accent, TEXT, 0.35);
+                        let bh = th * (1.5 + 5.0 * p);
+                        fill_round_rect(buf, w, h, x0, cy - bh / 2.0, fx, cy + bh / 2.0, bh / 2.0, bloom, 0.30 * p);
+                    }
+                    // Base fill: full accent, lightening toward white as it glows.
+                    let fill_col = lerp3(accent, TEXT, 0.5 * p);
+                    if fx > x0 {
+                        fill_round_rect(buf, w, h, x0, cy - th / 2.0, fx, cy + th / 2.0, th / 2.0, fill_col, 1.0);
+                    }
+                    // Thumb: matching glow plus a soft pulsing halo.
+                    if p > 0.01 {
+                        let halo = lerp3(accent, TEXT, 0.4);
+                        let hr = tr * (1.4 + 1.3 * p);
+                        fill_round_rect(buf, w, h, fx - hr, cy - hr, fx + hr, cy + hr, hr, halo, 0.32 * p);
+                    }
+                    fill_round_rect(buf, w, h, fx - tr, cy - tr, fx + tr, cy + tr, tr, fill_col, 1.0);
+                }
                 if let Some(f) = font {
                     let vpx = 13.0 * scale;
                     let s = (level * 100.0).round().to_string();
                     let tw = measure(f, vpx, &s);
                     let vx = w as f32 - RIGHT_PAD * scale - tw;
+                    let val_a = if g.muted { 0.5 } else { 1.0 };
                     draw_text(buf, w, h, f, vpx, vx, cy + vpx * 0.34, TEXT, val_a, &s);
                 }
             }
@@ -1144,7 +1219,18 @@ fn mouse_xy(lp: LPARAM) -> (i32, i32) {
     (x, y)
 }
 
-/// Open Settings ▸ System ▸ Sound (the native page the flyout offers as an escape hatch).
+/// Play the Windows "Default Beep" — the same ding Windows itself plays on a volume
+/// change (the `SystemDefault` sound). Async + best-effort; it honours the user's sound
+/// scheme and plays at the current level, so it doubles as audible volume feedback.
+fn beep_volume() {
+    use windows::Win32::System::Diagnostics::Debug::MessageBeep;
+    use windows::Win32::UI::WindowsAndMessaging::MB_OK;
+    unsafe {
+        let _ = MessageBeep(MB_OK);
+    }
+}
+
+/// Open Settings ▸ System ▸ Sound (the native page the right-click menu offers).
 fn open_sound_settings() {
     unsafe {
         ShellExecuteW(
@@ -1394,13 +1480,6 @@ fn blit_a(buf: &mut [u8], w: i32, h: i32, x0: i32, y0: i32, rgba: &[u8], sw: u32
     }
 }
 
-fn fill_rect(buf: &mut [u8], w: i32, h: i32, x0: f32, y0: f32, x1: f32, y1: f32, col: [u8; 3], alpha: f32) {
-    for y in y0.floor() as i32..y1.ceil() as i32 {
-        for x in x0.floor() as i32..x1.ceil() as i32 {
-            blend(buf, w, h, x, y, col, alpha);
-        }
-    }
-}
 
 #[allow(clippy::too_many_arguments)]
 fn fill_round_rect(buf: &mut [u8], w: i32, h: i32, x0: f32, y0: f32, x1: f32, y1: f32, r: f32, col: [u8; 3], alpha: f32) {
@@ -1424,6 +1503,14 @@ fn fill_round_rect(buf: &mut [u8], w: i32, h: i32, x0: f32, y0: f32, x1: f32, y1
             }
         }
     }
+}
+
+/// Linear interpolation between two RGB colours (`t` clamped to 0..=1). Used to lighten
+/// the slider fill toward white as live audio activity rises.
+fn lerp3(a: [u8; 3], b: [u8; 3], t: f32) -> [u8; 3] {
+    let t = t.clamp(0.0, 1.0);
+    let l = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
+    [l(a[0], b[0]), l(a[1], b[1]), l(a[2], b[2])]
 }
 
 /// Source-over blend of a straight-alpha colour into the straight-alpha RGBA buffer.

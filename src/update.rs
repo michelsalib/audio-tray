@@ -15,6 +15,8 @@
 //! The version compared is `CARGO_PKG_VERSION`, so Cargo.toml's `version` must
 //! match the release tag (CI enforces this — see .github/workflows/release.yml).
 
+use std::sync::Mutex;
+
 use anyhow::{Context, Result};
 
 const REPO_OWNER: &str = "michelsalib";
@@ -23,6 +25,24 @@ const BIN_NAME: &str = "audio-tray";
 /// Must match the asset name suffix produced by the release workflow.
 const TARGET: &str = "x86_64-pc-windows-msvc";
 
+/// Set to the new version string once a background update has been downloaded and applied
+/// to the on-disk exe. The flyout reads this to offer a "restart to update" entry; the new
+/// binary only takes effect once the process restarts.
+static PENDING: Mutex<Option<String>> = Mutex::new(None);
+
+/// The version an applied-but-not-yet-running update will upgrade to, if any.
+pub fn pending_version() -> Option<String> {
+    PENDING.lock().ok().and_then(|g| g.clone())
+}
+
+/// Record that version `v` has been staged on disk (called by the background check on a
+/// successful update, and by the `--flyout update` dev preview to fake one).
+pub fn set_pending_version(v: impl Into<String>) {
+    if let Ok(mut g) = PENDING.lock() {
+        *g = Some(v.into());
+    }
+}
+
 /// Spawn the background update check. Non-blocking; every error is swallowed
 /// (logged to the attached console, if any) so a flaky network or GitHub outage
 /// never affects the tray. No-op in debug builds.
@@ -30,10 +50,10 @@ pub fn spawn_background_check() {
     if cfg!(debug_assertions) {
         return;
     }
-    std::thread::spawn(|| {
-        if let Err(e) = check_and_apply(false) {
-            eprintln!("audio-tray: background update check failed: {e:#}");
-        }
+    std::thread::spawn(|| match check_and_apply(false) {
+        Ok(self_update::Status::Updated(v)) => set_pending_version(v),
+        Ok(self_update::Status::UpToDate(_)) => {}
+        Err(e) => eprintln!("audio-tray: background update check failed: {e:#}"),
     });
 }
 

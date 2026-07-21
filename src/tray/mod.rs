@@ -145,10 +145,26 @@ fn handle_flyout(
     if outcome.config_changed || outcome.output_changed {
         refresh(backend, tray, config)?;
     }
+    if outcome.restart {
+        restart_app();
+    }
     if outcome.quit {
         unsafe { PostQuitMessage(0) };
     }
     Ok(())
+}
+
+/// Relaunch the (already self-updated on disk) exe as a fresh process, then quit this one so
+/// the newer build takes over. Best-effort: if the relaunch fails we stay running rather
+/// than leaving the user with no tray.
+fn restart_app() {
+    match std::env::current_exe() {
+        Ok(exe) => match std::process::Command::new(exe).spawn() {
+            Ok(_) => unsafe { PostQuitMessage(0) },
+            Err(e) => eprintln!("restart: failed to relaunch: {e:#}"),
+        },
+        Err(e) => eprintln!("restart: current_exe() failed: {e:#}"),
+    }
 }
 
 /// Update the tray icon + tooltip to reflect the current default device.

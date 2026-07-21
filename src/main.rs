@@ -12,7 +12,9 @@
 //!   audio-tray --list     print current default + active output devices
 //!   audio-tray --set <q>  switch default output to the device whose friendly name
 //!                         contains <q> (case-insensitive), or whose id equals <q>
-//!   audio-tray --flyout [menu]  preview the control panel (or the right-click menu)
+//!   audio-tray --flyout [menu|icons|update]  preview the panel (menu = right-click;
+//!                         icons = the first device's icon-picker screen; update = fake a
+//!                         staged update so the restart banner shows)
 //!   audio-tray --meter    sample the default output+input peak meters for 4s (diagnostic)
 //!   audio-tray --update   check GitHub releases and self-update now (see update.rs)
 
@@ -56,19 +58,25 @@ fn main() -> Result<()> {
     }
     match args.first().map(String::as_str) {
         Some("--flyout") => {
-            // Dev: show the flyout once. `--flyout menu` previews the right-click menu.
-            let trigger = match args.get(1).map(String::as_str) {
-                Some("menu") => flyout::Trigger::RightClick,
-                _ => flyout::Trigger::LeftClick,
-            };
+            // Dev: show the flyout once. `--flyout menu` previews the right-click menu;
+            // `--flyout icons` jumps straight to the first device's icon-picker screen;
+            // `--flyout update` fakes a staged update so the restart banner shows.
             let mut config = Config::load();
-            let outcome = flyout::show(&backend, &mut config, None, trigger);
+            let outcome = match args.get(1).map(String::as_str) {
+                Some("menu") => flyout::show(&backend, &mut config, None, flyout::Trigger::RightClick),
+                Some("icons") => flyout::show_icons_preview(&backend, &mut config, None),
+                Some("update") => {
+                    update::set_pending_version("9.9.9");
+                    flyout::show(&backend, &mut config, None, flyout::Trigger::LeftClick)
+                }
+                _ => flyout::show(&backend, &mut config, None, flyout::Trigger::LeftClick),
+            };
             if outcome.config_changed {
                 config.save()?;
             }
             println!(
-                "flyout: closed (config_changed={}, quit={})",
-                outcome.config_changed, outcome.quit
+                "flyout: closed (config_changed={}, quit={}, restart={})",
+                outcome.config_changed, outcome.quit, outcome.restart
             );
         }
         Some("--list") => list(&backend)?,

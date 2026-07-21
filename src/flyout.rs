@@ -60,6 +60,9 @@ pub struct Outcome {
     /// endpoint-change notifications that would refresh the tray icon are consumed by our
     /// own modal message loop, so the caller must refresh explicitly.
     pub output_changed: bool,
+    /// The user clicked the "restart to update" entry — the caller should relaunch the
+    /// (already-updated on disk) exe and exit.
+    pub restart: bool,
 }
 
 /// Where to open the flyout: horizontally centred on the tray icon (`cx`), sitting just
@@ -78,7 +81,6 @@ const HEADER_FIRST_H: f32 = 30.0; // first section header (modest top gap)
 const HEADER_H: f32 = 36.0; // later section headers (larger top gap → group separation)
 const SLIDER_H: f32 = 48.0; // volume-slider row
 const ITEM_H: f32 = 44.0; // device / action row
-const CHIPS_H: f32 = 56.0; // inline icon-picker row
 const ICON_X: f32 = 14.0; // left inset of a row's leading icon
 const ICON_PX: f32 = 20.0; // leading icon glyph size
 const TEXT_X: f32 = 48.0; // left inset of a row's label
@@ -86,7 +88,7 @@ const HEADER_X: f32 = 15.0; // left inset of a section-header label
 const RIGHT_PAD: f32 = 16.0;
 const MIN_W: f32 = 340.0; // panel minimum width
 const MENU_MIN_W: f32 = 200.0; // right-click menu minimum width
-const MAX_W: f32 = 480.0; // wide enough for the full 10-icon picker row (~467 px)
+const MAX_W: f32 = 420.0; // cap on the panel width (driven by device-name length)
 const ROW_MARGIN: f32 = 4.0; // side margin of the row highlight/pill
 const ROW_RADIUS: f32 = 4.0; // corner radius of the row highlight
 const PILL_W: f32 = 3.0; // accent selection-indicator pill width
@@ -100,10 +102,19 @@ const TRACK_X0: f32 = 52.0; // track left edge
 const VALUE_W: f32 = 46.0; // reserved right area for the percentage
 const TRACK_H: f32 = 4.0;
 const THUMB_R: f32 = 7.0;
-// icon-picker chips
-const CHIP: f32 = 34.0;
-const CHIP_GAP: f32 = 7.0;
-const CHIPS_X: f32 = 48.0;
+// icon-picker page (a dedicated screen you slide to from a device's edit pencil)
+const PICKER_HEADER_H: f32 = 46.0; // back-arrow + device-name title row
+const BACK_LEFT: f32 = 7.0; // left inset of the back button
+const BACK_BTN: f32 = 32.0; // back button's round hover target diameter
+const BACK_GLYPH_PX: f32 = 16.0; // back chevron glyph size
+const TITLE_PX: f32 = 15.0; // picker title (device name) em size
+// wrapping icon grid
+const GRID_CHIP: f32 = 44.0; // one icon cell (square)
+const GRID_GAP: f32 = 8.0; // gap between cells (both axes)
+const GRID_X: f32 = 14.0; // grid side inset (used to size columns)
+const GRID_TOP_PAD: f32 = 4.0; // gap above the first grid row
+const GRID_BOTTOM_PAD: f32 = 10.0; // gap below the last grid row
+const GRID_ICON_RATIO: f32 = 0.55; // glyph size inside a cell
 
 // Posted (by the WASAPI volume callback) when a watched endpoint's volume/mute changes,
 // so external changes (media keys, other apps) are reflected live while we're open.
@@ -128,6 +139,8 @@ const GLYPH_MIC_OFF: char = '\u{EC54}';
 const GLYPH_EDIT: char = '\u{E70F}';
 const GLYPH_SETTINGS: char = '\u{E713}';
 const GLYPH_CANCEL: char = '\u{E711}';
+const GLYPH_BACK: char = '\u{E72B}'; // Back (leftward arrow) — the picker's cancel affordance
+const GLYPH_UPDATE: char = '\u{E72C}'; // Refresh (circular arrow) — restart-to-update banner
 
 // Colours (RGB); alpha applied at blend time.
 const TINT: [u8; 3] = [0x2C, 0x2C, 0x2C]; // panel base (semi-transparent, acrylic shows through)
@@ -158,12 +171,29 @@ impl ActionKind {
     }
 }
 
+/// Which screen the flyout is showing. The icon picker is a *dedicated* sub-screen you
+/// slide to from a device row's edit pencil (rather than an inline row), so it can lay its
+/// icons out in a wrapping grid without ever changing the flyout's width.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum View {
+    /// The main audio panel (sliders + device lists).
+    Main,
+    /// The per-device icon chooser: a back arrow, the device name as title, and a grid.
+    IconPicker { group: usize, dev: usize },
+}
+
 #[derive(Clone, Copy)]
 enum Elem {
     Header(&'static str),
     Slider { group: usize },
     Device { group: usize, dev: usize },
-    IconChips { group: usize, dev: usize },
+    /// The icon-picker screen's header: a back arrow + the device name as the title.
+    PickerHeader { group: usize, dev: usize },
+    /// The icon-picker screen's wrapping grid of selectable icons.
+    IconGrid { group: usize, dev: usize },
+    /// A "restart to update to v…" call-to-action at the bottom of the main panel, shown
+    /// only when a background update has been staged on disk.
+    UpdateBanner,
     Action(ActionKind),
 }
 
@@ -200,11 +230,12 @@ struct Flyout<'a> {
     width: i32,
     height: i32,
     groups: Vec<Group>,
-    expanded: Option<(usize, usize)>, // (group, dev) whose icon picker is open
+    view: View,               // which screen is shown (main panel / an icon picker)
     elems: Vec<LaidElem>,
     hover: Option<usize>,
     hover_pencil: bool,          // the cursor is over the hovered device row's edit pencil
-    hover_chip: Option<usize>,   // chip index the cursor is over, within a hovered icon picker
+    hover_back: bool,            // the cursor is over the picker's back button
+    hover_chip: Option<usize>,   // chip index the cursor is over, within the icon grid
     drag: Option<usize>,    // index into elems of the slider being dragged
     pending: Option<usize>, // index pressed on button-down, acted on button-up
     watches: Vec<Option<VolumeWatch>>, // per-group volume/mute change subscriptions
@@ -213,6 +244,8 @@ struct Flyout<'a> {
     config_changed: bool,
     output_changed: bool,
     quit: bool,
+    restart: bool,
+    update: Option<String>, // staged update's version, if any → bottom "restart to update" row
     base: Vec<u8>, // static content, re-rendered on model changes
     buf: Vec<u8>,  // base + dynamic overlays (sliders, hover), presented each frame
     hwnd: HWND,
@@ -231,7 +264,17 @@ pub fn show(
     anchor: Option<Anchor>,
     trigger: Trigger,
 ) -> Outcome {
-    unsafe { show_inner(backend, config, anchor, trigger) }
+    unsafe { show_inner(backend, config, anchor, trigger, false) }
+}
+
+/// Dev preview: open straight onto the first output device's icon-picker screen (so the
+/// picker can be iterated on without first hovering + clicking a device's edit pencil).
+pub fn show_icons_preview(
+    backend: &WasapiBackend,
+    config: &mut Config,
+    anchor: Option<Anchor>,
+) -> Outcome {
+    unsafe { show_inner(backend, config, anchor, Trigger::LeftClick, true) }
 }
 
 unsafe fn show_inner(
@@ -239,6 +282,7 @@ unsafe fn show_inner(
     config: &mut Config,
     anchor: Option<Anchor>,
     trigger: Trigger,
+    start_icons: bool,
 ) -> Outcome {
     let scale = (GetDpiForSystem() as f32 / 96.0).max(1.0);
     let accent = accent_rgb();
@@ -257,10 +301,11 @@ unsafe fn show_inner(
         width: 0,
         height: 0,
         groups,
-        expanded: None,
+        view: View::Main,
         elems: Vec::new(),
         hover: None,
         hover_pencil: false,
+        hover_back: false,
         hover_chip: None,
         drag: None,
         pending: None,
@@ -270,6 +315,12 @@ unsafe fn show_inner(
         config_changed: false,
         output_changed: false,
         quit: false,
+        restart: false,
+        // Only the full left-click panel offers the restart-to-update entry.
+        update: match trigger {
+            Trigger::LeftClick => crate::update::pending_version(),
+            Trigger::RightClick => None,
+        },
         base: Vec::new(),
         buf: Vec::new(),
         hwnd: HWND(std::ptr::null_mut()),
@@ -300,12 +351,17 @@ unsafe fn show_inner(
     fly.base_cx = cx;
     fly.base_bottom = bottom.min(fly.wa.bottom - fly.margin);
 
+    // Dev preview: jump straight to the first output device's icon picker.
+    if start_icons && fly.groups.first().is_some_and(|g| !g.devices.is_empty()) {
+        fly.view = View::IconPicker { group: 0, dev: 0 };
+    }
+
     fly.rebuild_layout();
     fly.reposition();
 
     if let Err(e) = fly.create_window() {
         eprintln!("flyout: create_window failed: {e:?}");
-        return Outcome { quit: false, config_changed: false, output_changed: false };
+        return Outcome { quit: false, config_changed: false, output_changed: false, restart: false };
     }
 
     fly.render_base();
@@ -341,16 +397,22 @@ unsafe fn show_inner(
                     let kind = hover.map(|i| fly.elems[i].elem);
                     let on_pencil =
                         matches!(kind, Some(Elem::Device { .. })) && fly.over_pencil(mx);
-                    let on_chip = match kind {
-                        Some(Elem::IconChips { .. }) => fly.chip_at(mx),
+                    let on_back =
+                        matches!(kind, Some(Elem::PickerHeader { .. })) && fly.over_back(mx);
+                    let on_chip = match (kind, hover) {
+                        (Some(Elem::IconGrid { .. }), Some(i)) => {
+                            fly.grid_chip_at(mx, my, fly.elems[i].top)
+                        }
                         _ => None,
                     };
                     if hover != fly.hover
                         || on_pencil != fly.hover_pencil
+                        || on_back != fly.hover_back
                         || on_chip != fly.hover_chip
                     {
                         fly.hover = hover;
                         fly.hover_pencil = on_pencil;
+                        fly.hover_back = on_back;
                         fly.hover_chip = on_chip;
                         fly.compose();
                         fly.present(fly.x, fly.y, 255);
@@ -385,7 +447,7 @@ unsafe fn show_inner(
                 let (mx, my) = mouse_xy(msg.lParam);
                 if fly.inside(mx, my) {
                     if let Some(i) = fly.elem_at(my) {
-                        if fly.pending == Some(i) && fly.activate(i, mx) {
+                        if fly.pending == Some(i) && fly.activate(i, mx, my) {
                             break 'pump;
                         }
                     }
@@ -418,6 +480,7 @@ unsafe fn show_inner(
         quit: fly.quit,
         config_changed: fly.config_changed,
         output_changed: fly.output_changed,
+        restart: fly.restart,
     }
 }
 
@@ -465,101 +528,178 @@ fn build_groups(backend: &WasapiBackend, config: &Config) -> Vec<Group> {
 }
 
 impl Flyout<'_> {
-    /// Rebuild the element list from the current model, then lay it out (sizes the panel
-    /// and allocates buffers). Invalidates transient hit state.
-    fn rebuild_layout(&mut self) {
+    fn reset_hover(&mut self) {
         self.hover = None;
         self.hover_pencil = false;
+        self.hover_back = false;
         self.hover_chip = None;
         self.drag = None;
         self.pending = None;
-        self.build_elems();
-        self.layout();
     }
 
-    fn build_elems(&mut self) {
-        let mut elems = Vec::new();
-        match self.trigger {
-            Trigger::RightClick => {
-                elems.push(Elem::Action(ActionKind::SoundSettings));
-                elems.push(Elem::Action(ActionKind::Quit));
-            }
-            Trigger::LeftClick => {
-                for (gi, g) in self.groups.iter().enumerate() {
-                    elems.push(Elem::Header(g.title));
-                    if g.default_id.is_some() {
-                        elems.push(Elem::Slider { group: gi });
-                    }
-                    for di in 0..g.devices.len() {
-                        elems.push(Elem::Device { group: gi, dev: di });
-                        if self.expanded == Some((gi, di)) {
-                            elems.push(Elem::IconChips { group: gi, dev: di });
-                        }
-                    }
-                }
-            }
-        }
-        self.elems = elems
-            .into_iter()
-            .map(|elem| LaidElem { elem, top: 0, height: 0 })
-            .collect();
+    /// Size the panel and lay out the current view, allocating buffers. Invalidates
+    /// transient hit state. Both the width and the height are fixed for the flyout's whole
+    /// life — the width from the main list, the height from the tallest screen — so
+    /// navigating between the main panel and an icon picker never resizes the window.
+    fn rebuild_layout(&mut self) {
+        self.reset_hover();
+        self.width = self.main_content_width();
+        self.height = self.panel_height();
+        let (elems, _) = self.build_view(self.view, self.height);
+        self.elems = elems;
+        let bytes = (self.width * self.height * 4) as usize;
+        self.base = vec![0u8; bytes];
+        self.buf = vec![0u8; bytes];
     }
 
-    fn layout(&mut self) {
+    /// The fixed panel height shared by every screen: the taller of the main panel and the
+    /// icon picker (in practice the main panel, which has the sliders + device lists).
+    fn panel_height(&self) -> i32 {
+        let main_h = self.build_view(View::Main, 0).1;
+        let picker_h = if matches!(self.trigger, Trigger::LeftClick)
+            && self.groups.iter().any(|g| !g.devices.is_empty())
+        {
+            self.build_view(View::IconPicker { group: 0, dev: 0 }, 0).1
+        } else {
+            0
+        };
+        main_h.max(picker_h)
+    }
+
+    /// The label for the restart-to-update banner, if an update is staged.
+    fn update_label(&self) -> Option<String> {
+        self.update.as_ref().map(|v| format!("Restart to update to v{v}"))
+    }
+
+    /// The panel width, measured from the *main* view's content only. Constant for the life
+    /// of the flyout (the device set and labels don't change while open), so it anchors the
+    /// width for every screen — the icon picker wraps its grid into this width rather than
+    /// forcing the panel wider.
+    fn main_content_width(&self) -> i32 {
         let scale = self.scale;
-        let d = |v: f32| (v * scale).round() as i32;
         let font = ui_font();
         let font_sb = ui_font_semibold().or(font);
         let text_px = 14.0 * scale;
         let hdr_px = 14.0 * scale;
         let mw = |f: Option<&FontVec>, px: f32, s: &str| f.map(|f| measure(f, px, s)).unwrap_or(0.0);
 
-        let chips_w = CHIPS_X * scale
-            + IconId::ALL.len() as f32 * CHIP * scale
-            + (IconId::ALL.len() as f32 - 1.0) * CHIP_GAP * scale
-            + RIGHT_PAD * scale;
-
         let mut max_w = 0.0f32;
-        for le in &self.elems {
-            let w = match le.elem {
-                Elem::Header(t) => HEADER_X * scale + mw(font_sb, hdr_px, t) + RIGHT_PAD * scale,
-                Elem::Slider { .. } => (TRACK_X0 + 130.0 + VALUE_W) * scale,
-                Elem::Device { group, dev } => {
-                    let row = &self.groups[group].devices[dev];
-                    let reserve = if row.battery.is_some() { BATTERY_W } else { PENCIL_W };
-                    TEXT_X * scale + mw(font, text_px, &row.label) + reserve * scale
+        match self.trigger {
+            Trigger::RightClick => {
+                for k in [ActionKind::SoundSettings, ActionKind::Quit] {
+                    max_w = max_w.max(TEXT_X * scale + mw(font, text_px, k.label()) + RIGHT_PAD * scale);
                 }
-                Elem::IconChips { .. } => chips_w,
-                Elem::Action(k) => TEXT_X * scale + mw(font, text_px, k.label()) + RIGHT_PAD * scale,
-            };
-            max_w = max_w.max(w);
+            }
+            Trigger::LeftClick => {
+                for g in &self.groups {
+                    max_w = max_w.max(HEADER_X * scale + mw(font_sb, hdr_px, g.title) + RIGHT_PAD * scale);
+                    if g.default_id.is_some() {
+                        max_w = max_w.max((TRACK_X0 + 130.0 + VALUE_W) * scale);
+                    }
+                    for row in &g.devices {
+                        let reserve = if row.battery.is_some() { BATTERY_W } else { PENCIL_W };
+                        max_w = max_w.max(TEXT_X * scale + mw(font, text_px, &row.label) + reserve * scale);
+                    }
+                }
+                if let Some(label) = self.update_label() {
+                    max_w = max_w.max(TEXT_X * scale + mw(font, text_px, &label) + RIGHT_PAD * scale);
+                }
+            }
         }
         let min_w = match self.trigger {
             Trigger::LeftClick => MIN_W,
             Trigger::RightClick => MENU_MIN_W,
         };
-        self.width = max_w.clamp(min_w * scale, MAX_W * scale).round() as i32;
+        max_w.clamp(min_w * scale, MAX_W * scale).round() as i32
+    }
 
-        let mut y = d(PAD_V);
-        for (i, le) in self.elems.iter_mut().enumerate() {
-            let h = match le.elem {
-                // The first header sits at the very top, so it only needs a small gap; a
-                // later header separates one group from the one above it.
-                Elem::Header(_) => if i == 0 { HEADER_FIRST_H } else { HEADER_H },
-                Elem::Slider { .. } => SLIDER_H,
-                Elem::Device { .. } => ITEM_H,
-                Elem::IconChips { .. } => CHIPS_H,
-                Elem::Action(_) => ITEM_H,
-            };
-            le.top = y;
-            le.height = d(h);
-            y += le.height;
+    /// Build (and vertically lay out) the elements for `view`, returning them plus the total
+    /// panel height. Pure over `self` — used both to render the current screen and to render
+    /// the two screens involved in a slide transition. Uses the fixed `self.width`.
+    ///
+    /// `fill_h` is the fixed panel height every screen shares (so navigating never resizes
+    /// the window): the layout is grown to at least `fill_h`, and on the icon-picker screen
+    /// the grid is centred in the slack below the header. Pass `0` to lay out naturally
+    /// (used once, to measure each screen's intrinsic height).
+    fn build_view(&self, view: View, fill_h: i32) -> (Vec<LaidElem>, i32) {
+        let scale = self.scale;
+        let d = |v: f32| (v * scale).round() as i32;
+        let mut kinds: Vec<Elem> = Vec::new();
+        match (self.trigger, view) {
+            (Trigger::RightClick, _) => {
+                kinds.push(Elem::Action(ActionKind::SoundSettings));
+                kinds.push(Elem::Action(ActionKind::Quit));
+            }
+            (Trigger::LeftClick, View::Main) => {
+                for (gi, g) in self.groups.iter().enumerate() {
+                    kinds.push(Elem::Header(g.title));
+                    if g.default_id.is_some() {
+                        kinds.push(Elem::Slider { group: gi });
+                    }
+                    for di in 0..g.devices.len() {
+                        kinds.push(Elem::Device { group: gi, dev: di });
+                    }
+                }
+                // A staged update gets a restart call-to-action pinned to the very bottom.
+                if self.update.is_some() {
+                    kinds.push(Elem::UpdateBanner);
+                }
+            }
+            (Trigger::LeftClick, View::IconPicker { group, dev }) => {
+                kinds.push(Elem::PickerHeader { group, dev });
+                kinds.push(Elem::IconGrid { group, dev });
+            }
         }
-        self.height = y + d(PAD_V);
 
-        let bytes = (self.width * self.height * 4) as usize;
-        self.base = vec![0u8; bytes];
-        self.buf = vec![0u8; bytes];
+        let mut elems = Vec::with_capacity(kinds.len());
+        let mut y = d(PAD_V);
+        for (i, elem) in kinds.into_iter().enumerate() {
+            let height = match elem {
+                // The first header sits at the very top (small gap); a later header separates
+                // one group from the one above it.
+                Elem::Header(_) => d(if i == 0 { HEADER_FIRST_H } else { HEADER_H }),
+                Elem::Slider { .. } => d(SLIDER_H),
+                Elem::Device { .. } => d(ITEM_H),
+                Elem::PickerHeader { .. } => d(PICKER_HEADER_H),
+                Elem::IconGrid { .. } => self.grid_px_height(),
+                Elem::UpdateBanner => d(ITEM_H),
+                Elem::Action(_) => d(ITEM_H),
+            };
+            elems.push(LaidElem { elem, top: y, height });
+            y += height;
+        }
+        let natural = y + d(PAD_V);
+        let total = natural.max(fill_h);
+
+        // Centre the icon grid in any extra vertical space, so the picker fills the shared
+        // panel height without a big empty band at the bottom (the header stays pinned top).
+        let slack = total - natural;
+        if slack > 0 {
+            for le in &mut elems {
+                if matches!(le.elem, Elem::IconGrid { .. }) {
+                    le.top += slack / 2;
+                }
+            }
+        }
+        (elems, total)
+    }
+
+    /// Icon-grid geometry for the current width — see the free [`grid_metrics`].
+    fn grid_metrics(&self) -> (i32, i32, i32, i32) {
+        grid_metrics(self.width, self.scale)
+    }
+
+    /// Total pixel height of the wrapping icon grid (top pad + rows + bottom pad).
+    fn grid_px_height(&self) -> i32 {
+        let scale = self.scale;
+        let (cols, _left, chip, step) = self.grid_metrics();
+        let gap = step - chip;
+        let n = IconId::ALL.len() as i32;
+        let rows = (n + cols - 1) / cols;
+        (GRID_TOP_PAD * scale).round() as i32
+            + rows * chip
+            + (rows - 1).max(0) * gap
+            + (GRID_BOTTOM_PAD * scale).round() as i32
     }
 
     /// Position the panel: centred on the anchor, sitting above it, clamped to the work
@@ -580,7 +720,12 @@ impl Flyout<'_> {
         self.elems.iter().position(|le| {
             let actionable = matches!(
                 le.elem,
-                Elem::Slider { .. } | Elem::Device { .. } | Elem::IconChips { .. } | Elem::Action(_)
+                Elem::Slider { .. }
+                    | Elem::Device { .. }
+                    | Elem::PickerHeader { .. }
+                    | Elem::IconGrid { .. }
+                    | Elem::UpdateBanner
+                    | Elem::Action(_)
             );
             actionable && y >= le.top && y < le.top + le.height
         })
@@ -599,18 +744,31 @@ impl Flyout<'_> {
         ((mx as f32) - cx).abs() <= PENCIL_BTN * self.scale / 2.0
     }
 
-    /// Which icon-picker chip (if any) is at horizontal position `mx`.
-    fn chip_at(&self, mx: i32) -> Option<usize> {
+    /// Whether `mx` is over the picker's back button (its hover/click target).
+    fn over_back(&self, mx: i32) -> bool {
         let scale = self.scale;
-        let x0 = (CHIPS_X * scale).round() as i32;
-        let step = ((CHIP + CHIP_GAP) * scale).round() as i32;
-        let chip = (CHIP * scale).round() as i32;
-        if mx < x0 || step <= 0 {
+        let x0 = BACK_LEFT * scale;
+        let x1 = (BACK_LEFT + BACK_BTN) * scale;
+        (mx as f32) >= x0 && (mx as f32) <= x1
+    }
+
+    /// Which icon-grid cell (if any) is at `(mx, my)`, given the grid element's top `gy`.
+    fn grid_chip_at(&self, mx: i32, my: i32, gy: i32) -> Option<usize> {
+        let scale = self.scale;
+        let (cols, left, chip, step) = self.grid_metrics();
+        let gy0 = gy + (GRID_TOP_PAD * scale).round() as i32;
+        if mx < left || my < gy0 {
             return None;
         }
-        let i = ((mx - x0) / step) as usize;
-        let within = (mx - x0) - (i as i32) * step;
-        (i < IconId::ALL.len() && within <= chip).then_some(i)
+        let col = (mx - left) / step;
+        let row = (my - gy0) / step;
+        let within_x = (mx - left) - col * step;
+        let within_y = (my - gy0) - row * step;
+        if col >= cols || within_x > chip || within_y > chip {
+            return None;
+        }
+        let k = (row * cols + col) as usize;
+        (k < IconId::ALL.len()).then_some(k)
     }
 
     fn set_group_level(&mut self, group: usize, level: f32) {
@@ -747,21 +905,12 @@ impl Flyout<'_> {
     }
 
     /// Act on a click at button-up. Returns true if the flyout should close.
-    fn activate(&mut self, i: usize, mx: i32) -> bool {
+    fn activate(&mut self, i: usize, mx: i32, my: i32) -> bool {
         match self.elems[i].elem {
             Elem::Device { group, dev } => {
                 if self.over_pencil(mx) {
-                    // Toggle the inline icon picker for this device.
-                    self.expanded = if self.expanded == Some((group, dev)) {
-                        None
-                    } else {
-                        Some((group, dev))
-                    };
-                    self.rebuild_layout();
-                    self.reposition();
-                    self.render_base();
-                    self.compose();
-                    self.present(self.x, self.y, 255);
+                    // Slide to the device's dedicated icon-picker screen.
+                    self.navigate(View::IconPicker { group, dev }, true);
                 } else {
                     let id = self.groups[group].devices[dev].id.clone();
                     if self.groups[group].default_id.as_ref() != Some(&id) {
@@ -786,25 +935,32 @@ impl Flyout<'_> {
                 }
                 false
             }
-            Elem::IconChips { group, dev } => {
-                if let Some(ci) = self.chip_at(mx) {
+            Elem::PickerHeader { .. } => {
+                // The back arrow cancels the picker and slides back to the main panel.
+                if self.over_back(mx) {
+                    self.navigate(View::Main, false);
+                }
+                false
+            }
+            Elem::IconGrid { group, dev } => {
+                // Clicking an icon validates the choice: persist it, then slide back.
+                if let Some(ci) = self.grid_chip_at(mx, my, self.elems[i].top) {
                     let icon = IconId::ALL[ci];
                     let id = self.groups[group].devices[dev].id.0.clone();
                     self.groups[group].devices[dev].icon = icon;
                     self.config.set_icon(id, icon);
                     self.config_changed = true;
-                    // Persist immediately and close the picker — choosing an icon commits it.
                     if let Err(e) = self.config.save() {
                         eprintln!("save config failed: {e:#}");
                     }
-                    self.expanded = None;
-                    self.rebuild_layout();
-                    self.reposition();
-                    self.render_base();
-                    self.compose();
-                    self.present(self.x, self.y, 255);
+                    self.navigate(View::Main, false);
                 }
                 false
+            }
+            Elem::UpdateBanner => {
+                // The update is already on disk; the caller relaunches the exe and exits.
+                self.restart = true;
+                true
             }
             Elem::Action(ActionKind::SoundSettings) => {
                 open_sound_settings();
@@ -818,16 +974,67 @@ impl Flyout<'_> {
         }
     }
 
-    /// Render the static layer (panel + headers + rows + icons + selection + slider tracks
-    /// + chips) into `base`. Slider fill/thumb/value and hover live in `compose`.
+    /// Slide-transition from the current screen to `to`, then commit it. `forward` slides
+    /// the new screen in from the right (drilling into the picker); otherwise it comes from
+    /// the left (backing out). The window keeps a constant size — the width and height are
+    /// both fixed — so this is a pure horizontal slide with no resize.
+    fn navigate(&mut self, to: View, forward: bool) {
+        let (w, h) = (self.width, self.height);
+        let n = (w * h * 4) as usize;
+        // Outgoing screen: reuse the current composed frame (keeps its slider fills etc.).
+        let src = self.buf.clone();
+        let (dst_elems, _) = self.build_view(to, h);
+        let mut dst = vec![0u8; n];
+        self.render_page(&dst_elems, &mut dst, h);
+        let mut frame = vec![0u8; n];
+
+        let frames = 9;
+        for i in 1..=frames {
+            let t = i as f32 / frames as f32;
+            let ease = 1.0 - (1.0 - t) * (1.0 - t); // ease-out quad
+            let off = (ease * w as f32).round() as i32;
+            // Forward: old slides left out, new enters from the right; back is the mirror.
+            let (dx_src, dx_dst) = if forward { (-off, w - off) } else { (off, off - w) };
+            for p in frame.iter_mut() {
+                *p = 0;
+            }
+            blit_shift(&mut frame, w, h, &src, dx_src);
+            blit_shift(&mut frame, w, h, &dst, dx_dst);
+            self.present_buf(&frame, w, h, self.x, self.y, 255);
+            std::thread::sleep(std::time::Duration::from_millis(9));
+        }
+
+        // Commit the destination screen.
+        self.view = to;
+        self.elems = dst_elems;
+        self.reset_hover();
+        self.base = vec![0u8; n];
+        self.buf = vec![0u8; n];
+        self.render_base();
+        self.compose();
+        self.present(self.x, self.y, 255);
+    }
+
+    /// Render the current view's static layer into `self.base`. Slider fill/thumb/value and
+    /// hover live in `compose`.
     fn render_base(&mut self) {
+        let mut base = vec![0u8; (self.width * self.height * 4) as usize];
+        self.render_page(&self.elems, &mut base, self.height);
+        self.base = base;
+    }
+
+    /// Render an arbitrary element list into `out` (a `self.width` × `out_h` RGBA buffer):
+    /// the panel background, then every element's static content. Pure over `self` so it can
+    /// paint any screen at any height — used both for the live `base` and for the two frames
+    /// composited during a slide transition. `out_h` also clips drawing to the buffer.
+    fn render_page(&self, elems: &[LaidElem], out: &mut [u8], out_h: i32) {
         let scale = self.scale;
         let accent = self.accent;
         let w = self.width;
-        let h = self.height;
+        let h = out_h;
         let d = |v: f32| (v * scale).round() as i32;
         let groups = &self.groups;
-        let buf = self.base.as_mut_slice();
+        let buf = out;
 
         for p in buf.iter_mut() {
             *p = 0;
@@ -841,7 +1048,7 @@ impl Flyout<'_> {
         let icon_px = (ICON_PX * scale).round() as u32;
         let mx = d(ROW_MARGIN) as f32;
 
-        for le in &self.elems {
+        for le in elems {
             match le.elem {
                 Elem::Header(text) => {
                     if let Some(f) = font_sb {
@@ -897,26 +1104,39 @@ impl Flyout<'_> {
                     // mutually exclusive (pencil on hover, battery otherwise) — drawn in
                     // `compose`, which knows the hover state.
                 }
-                Elem::IconChips { group, dev } => {
+                Elem::PickerHeader { group, dev } => {
+                    let cy_i = le.top + le.height / 2;
+                    // The back chevron, centred in its button on the left.
+                    let bpx = (BACK_GLYPH_PX * scale).round() as u32;
+                    if let Ok((rgba, gw, gh)) = icons::render_glyph(GLYPH_BACK, bpx, TEXT) {
+                        let bx = ((BACK_LEFT + BACK_BTN / 2.0) * scale).round() as i32 - gw as i32 / 2;
+                        blit(buf, w, h, bx, cy_i - gh as i32 / 2, &rgba, gw, gh);
+                    }
+                    // The device name as the screen title.
+                    if let Some(f) = font_sb {
+                        let title_px = TITLE_PX * scale;
+                        let base = cy_i as f32 + title_px * 0.34;
+                        let max_w = w as f32 - d(TEXT_X) as f32 - RIGHT_PAD * scale;
+                        let title = fit_label(f, title_px, &groups[group].devices[dev].label, max_w);
+                        draw_text(buf, w, h, f, title_px, d(TEXT_X) as f32, base, TEXT, 1.0, &title);
+                    }
+                }
+                Elem::IconGrid { group, dev } => {
                     let sel_icon = groups[group].devices[dev].icon;
-                    let cy = le.top + le.height / 2;
-                    let chip = d(CHIP) as f32;
-                    let step = ((CHIP + CHIP_GAP) * scale).round() as i32;
-                    let inner = (CHIP * scale * 0.58).round() as u32;
-                    let r = d(6.0) as f32;
+                    let (cols, left, chip, step) = self.grid_metrics();
+                    let gy0 = le.top + (GRID_TOP_PAD * scale).round() as i32;
+                    let inner = (chip as f32 * GRID_ICON_RATIO).round() as u32;
+                    let r = d(8.0) as f32;
                     for (idx, icon) in IconId::ALL.iter().enumerate() {
-                        let cx0 = d(CHIPS_X) + idx as i32 * step;
-                        let cy0 = cy - (chip / 2.0) as i32;
+                        let cx0 = left + (idx as i32 % cols) * step;
+                        let cy0 = gy0 + (idx as i32 / cols) * step;
                         let selected = *icon == sel_icon;
-                        if selected {
-                            fill_round_rect(buf, w, h, cx0 as f32, cy0 as f32, cx0 as f32 + chip, cy0 as f32 + chip, r, accent, 1.0);
-                        } else {
-                            fill_round_rect(buf, w, h, cx0 as f32, cy0 as f32, cx0 as f32 + chip, cy0 as f32 + chip, r, TEXT, 0.06);
-                        }
-                        let col = if selected { DARK_GLYPH } else { TEXT };
-                        if let Ok((rgba, gw, gh)) = icon.render(inner, col) {
-                            let ox = cx0 + ((chip - gw as f32) / 2.0) as i32;
-                            let oy = cy0 + ((chip - gh as f32) / 2.0) as i32;
+                        let (bg, a) = if selected { (accent, 1.0) } else { (TEXT, 0.06) };
+                        fill_round_rect(buf, w, h, cx0 as f32, cy0 as f32, (cx0 + chip) as f32, (cy0 + chip) as f32, r, bg, a);
+                        let gcol = if selected { DARK_GLYPH } else { TEXT };
+                        if let Ok((rgba, gw, gh)) = icon.render(inner, gcol) {
+                            let ox = cx0 + (chip - gw as i32) / 2;
+                            let oy = cy0 + (chip - gh as i32) / 2;
                             blit(buf, w, h, ox, oy, &rgba, gw, gh);
                         }
                     }
@@ -929,6 +1149,22 @@ impl Flyout<'_> {
                     if let Some(f) = font {
                         let base = cy as f32 + text_px * 0.34;
                         draw_text(buf, w, h, f, text_px, d(TEXT_X) as f32, base, TEXT, 1.0, k.label());
+                    }
+                }
+                Elem::UpdateBanner => {
+                    let cy = le.top + le.height / 2;
+                    // A subtle accent band marks it as a call-to-action.
+                    let ry0 = le.top as f32 + 1.0;
+                    let ry1 = (le.top + le.height) as f32 - 1.0;
+                    fill_round_rect(buf, w, h, mx, ry0, w as f32 - mx, ry1, d(ROW_RADIUS) as f32, accent, 0.16);
+                    if let Ok((rgba, gw, gh)) = icons::render_glyph(GLYPH_UPDATE, icon_px, accent) {
+                        blit(buf, w, h, d(ICON_X), cy - gh as i32 / 2, &rgba, gw, gh);
+                    }
+                    if let (Some(f), Some(label)) = (font, self.update_label()) {
+                        let base = cy as f32 + text_px * 0.34;
+                        let maxw = w as f32 - d(TEXT_X) as f32 - RIGHT_PAD * scale;
+                        let label = fit_label(f, text_px, &label, maxw);
+                        draw_text(buf, w, h, f, text_px, d(TEXT_X) as f32, base, TEXT, 1.0, &label);
                     }
                 }
             }
@@ -948,6 +1184,7 @@ impl Flyout<'_> {
         let elems = &self.elems;
         let hover = self.hover;
         let hover_pencil = self.hover_pencil;
+        let hover_back = self.hover_back;
         let hover_chip = self.hover_chip;
         let font = ui_font();
         let buf = self.buf.as_mut_slice();
@@ -1042,19 +1279,27 @@ impl Flyout<'_> {
                         draw_battery(buf, w, h, scale, panel_w as f32 - RIGHT_PAD * scale, cy, pct, font);
                     }
                 }
-                Elem::IconChips { group, dev } => {
+                Elem::PickerHeader { .. } => {
+                    // Round hover button behind the back arrow.
+                    if hovered && hover_back {
+                        let cy = (le.top + le.height / 2) as f32;
+                        let cxb = (BACK_LEFT + BACK_BTN / 2.0) * scale;
+                        let r = BACK_BTN * scale / 2.0;
+                        fill_round_rect(buf, w, h, cxb - r, cy - r, cxb + r, cy + r, r, TEXT, 0.10);
+                    }
+                }
+                Elem::IconGrid { group, dev } => {
                     if hovered {
                         if let Some(ci) = hover_chip {
-                            let cy = le.top + le.height / 2;
-                            let chip = d(CHIP) as f32;
-                            let step = ((CHIP + CHIP_GAP) * scale).round() as i32;
-                            let cx0 = d(CHIPS_X) + ci as i32 * step;
-                            let cy0 = cy - (chip / 2.0) as i32;
-                            let r = d(6.0) as f32;
+                            let (cols, left, chip, step) = grid_metrics(w, scale);
+                            let gy0 = le.top + (GRID_TOP_PAD * scale).round() as i32;
+                            let cx0 = left + (ci as i32 % cols) * step;
+                            let cy0 = gy0 + (ci as i32 / cols) * step;
+                            let r = d(8.0) as f32;
                             // Brighten the hovered chip (accent chips lighten a touch too).
                             let selected = IconId::ALL[ci] == groups[group].devices[dev].icon;
                             let a = if selected { 0.14 } else { 0.10 };
-                            fill_round_rect(buf, w, h, cx0 as f32, cy0 as f32, cx0 as f32 + chip, cy0 as f32 + chip, r, TEXT, a);
+                            fill_round_rect(buf, w, h, cx0 as f32, cy0 as f32, (cx0 + chip) as f32, (cy0 + chip) as f32, r, TEXT, a);
                         }
                     }
                 }
@@ -1063,6 +1308,14 @@ impl Flyout<'_> {
                         let ry0 = le.top as f32 + 1.0;
                         let ry1 = (le.top + le.height) as f32 - 1.0;
                         fill_round_rect(buf, w, h, mx, ry0, w as f32 - mx, ry1, d(ROW_RADIUS) as f32, TEXT, HOVER_A);
+                    }
+                }
+                Elem::UpdateBanner => {
+                    if hovered {
+                        // Deepen the accent band on hover.
+                        let ry0 = le.top as f32 + 1.0;
+                        let ry1 = (le.top + le.height) as f32 - 1.0;
+                        fill_round_rect(buf, w, h, mx, ry0, w as f32 - mx, ry1, d(ROW_RADIUS) as f32, accent, 0.14);
                     }
                 }
                 _ => {}
@@ -1129,11 +1382,16 @@ impl Flyout<'_> {
         self.present(self.x, self.y, 255);
     }
 
-    /// Push the rendered ARGB buffer to the layered window (premultiplied BGRA), scaled by
-    /// a global `alpha` (for fade animations). `UpdateLayeredWindow` also moves + resizes
-    /// the window to `(x, y)` and the buffer's dimensions.
+    /// Push `self.buf` (the current screen) to the layered window. Thin wrapper over
+    /// [`present_buf`](Self::present_buf).
     fn present(&self, x: i32, y: i32, alpha: u8) {
-        let (w, h) = (self.width, self.height);
+        self.present_buf(&self.buf, self.width, self.height, x, y, alpha);
+    }
+
+    /// Push a rendered ARGB buffer (`w`×`h`) to the layered window (premultiplied BGRA),
+    /// scaled by a global `alpha` (for fade animations). `UpdateLayeredWindow` also moves +
+    /// resizes the window to `(x, y)` and `(w, h)`.
+    fn present_buf(&self, src_buf: &[u8], w: i32, h: i32, x: i32, y: i32, alpha: u8) {
         unsafe {
             let screen = GetDC(None);
             let mem = CreateCompatibleDC(Some(screen));
@@ -1162,10 +1420,10 @@ impl Flyout<'_> {
             let px = (w * h) as usize;
             let dst = std::slice::from_raw_parts_mut(bits as *mut u8, px * 4);
             for i in 0..px {
-                let r = self.buf[i * 4] as u32;
-                let g = self.buf[i * 4 + 1] as u32;
-                let b = self.buf[i * 4 + 2] as u32;
-                let a = self.buf[i * 4 + 3] as u32;
+                let r = src_buf[i * 4] as u32;
+                let g = src_buf[i * 4 + 1] as u32;
+                let b = src_buf[i * 4 + 2] as u32;
+                let a = src_buf[i * 4 + 3] as u32;
                 dst[i * 4] = ((b * a) / 255) as u8;
                 dst[i * 4 + 1] = ((g * a) / 255) as u8;
                 dst[i * 4 + 2] = ((r * a) / 255) as u8;
@@ -1211,6 +1469,21 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         let _ = PostMessageW(Some(hwnd), WM_FLYOUT_CLOSE, WPARAM(0), LPARAM(0));
     }
     DefWindowProcW(hwnd, msg, wp, lp)
+}
+
+/// Icon-grid geometry for a given panel `width`: `(cols, left_px, chip_px, step_px)`. The
+/// grid wraps to as many equal columns as fit the width and is centred within the panel, so
+/// the icons wrap onto multiple rows without ever widening the flyout.
+fn grid_metrics(width: i32, scale: f32) -> (i32, i32, i32, i32) {
+    let chip = (GRID_CHIP * scale).round() as i32;
+    let gap = (GRID_GAP * scale).round() as i32;
+    let step = chip + gap;
+    let n = IconId::ALL.len() as i32;
+    let avail = width - ((GRID_X + RIGHT_PAD) * scale).round() as i32;
+    let cols = (((avail + gap) / step).max(1)).min(n);
+    let grid_w = cols * chip + (cols - 1) * gap;
+    let left = (width - grid_w) / 2;
+    (cols, left, chip, step)
 }
 
 fn mouse_xy(lp: LPARAM) -> (i32, i32) {
@@ -1457,6 +1730,25 @@ fn draw_text(buf: &mut [u8], w: i32, h: i32, font: &FontVec, px: f32, mut pen: f
             });
         }
         pen += sf.h_advance(gid);
+    }
+}
+
+/// Copy a `w`×`h` page buffer into `frame` (also `w`×`h`) shifted horizontally by `dx`
+/// (opaque copy, no blending), clipping to the frame. Used to slide two pre-rendered
+/// screens across each other during a navigation transition.
+fn blit_shift(frame: &mut [u8], w: i32, h: i32, page: &[u8], dx: i32) {
+    let x_lo = dx.max(0);
+    let x_hi = (w + dx).min(w);
+    if x_lo >= x_hi {
+        return;
+    }
+    for y in 0..h {
+        let row = (y * w) as usize * 4;
+        for x in x_lo..x_hi {
+            let di = row + x as usize * 4;
+            let si = row + (x - dx) as usize * 4;
+            frame[di..di + 4].copy_from_slice(&page[si..si + 4]);
+        }
     }
 }
 

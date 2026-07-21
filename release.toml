@@ -1,0 +1,19 @@
+# Configuration for `cargo release` (https://github.com/crate-ci/cargo-release).
+#
+# Cut a release with:
+#
+#     cargo release patch --execute     # 0.4.1 -> 0.4.2  (also: minor / major)
+#
+# It bumps `version` in Cargo.toml, refreshes Cargo.lock, makes a "Release
+# v<version>" commit, tags it `v<version>`, and pushes the commit + tag to
+# origin — which triggers .github/workflows/release.yml (the tag is the source
+# of truth for the version, and cargo-release guarantees the two always match).
+#
+# Without `--execute` the command is a dry run: it prints what it *would* do
+# and changes nothing. Publishing to crates.io is off (see `publish = false`
+# in Cargo.toml) — this is an app, not a library.
+
+tag-name = "v{{version}}"                       # matches release.yml + the existing v0.4.x tags
+pre-release-commit-message = "Release v{{version}}"
+push = true                                     # push the release commit + tag to origin
+allow-branch = ["main"]                         # only ever release from the default branch

@@ -5,13 +5,26 @@
 //! Users pick one icon per device in Settings; `default_icon` only chooses the starting
 //! glyph until then.
 
+use std::cell::OnceCell;
+use std::mem::ManuallyDrop;
 use std::sync::OnceLock;
 
 use ab_glyph::{Font, FontVec};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use windows::core::PCWSTR;
+use windows::Win32::Graphics::DirectWrite::{
+    DWriteCreateFactory, IDWriteFactory2, IDWriteFontFace, DWRITE_FACTORY_TYPE_SHARED,
+    DWRITE_FONT_FACE_TYPE_TRUETYPE, DWRITE_FONT_SIMULATIONS_NONE, DWRITE_GLYPH_OFFSET,
+    DWRITE_GLYPH_RUN, DWRITE_GRID_FIT_MODE_ENABLED, DWRITE_MEASURING_MODE_GDI_NATURAL,
+    DWRITE_RENDERING_MODE_GDI_NATURAL, DWRITE_TEXTURE_ALIASED_1x1,
+    DWRITE_TEXT_ANTIALIAS_MODE_GRAYSCALE,
+};
 
 use crate::audio::FormFactor;
+
+/// Segoe Fluent Icons, the font Windows renders its own shell/tray glyphs from.
+const FONT_PATH: &str = r"C:\Windows\Fonts\SegoeIcons.ttf";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum IconId {
@@ -192,7 +205,117 @@ fn dist_to_segment(px: f32, py: f32, ax: f32, ay: f32, bx: f32, by: f32) -> f32 
 /// Rasterize an arbitrary Segoe Fluent glyph into a `size`×`size` RGBA buffer, colour
 /// `rgb`, its bounding box centred in the box. Used for the built-in [`IconId`] set and
 /// for the flyout's control glyphs (speaker, mic, gear…) so they all align identically.
+///
+/// Rendered through DirectWrite — the same engine the Windows shell uses for its own tray
+/// glyphs — with grid-fitting (hinting) so strokes snap to whole pixels and stay crisp at
+/// the 16–24 px tray size, instead of the soft, unhinted grey edges a plain glyph
+/// rasteriser produces. Falls back to [`render_glyph_ab`] only if DirectWrite is somehow
+/// unavailable.
 pub fn render_glyph(glyph: char, size: u32, rgb: [u8; 3]) -> Result<(Vec<u8>, u32, u32)> {
+    DWRITE.with(|cell| match cell.get_or_init(Dwrite::new) {
+        Some(dw) => dw.render(glyph, size, rgb),
+        None => render_glyph_ab(glyph, size, rgb),
+    })
+}
+
+/// A DirectWrite factory + Segoe Fluent font face, cached per thread (all rendering runs on
+/// the tray/flyout thread). DirectWrite objects are cheap to keep alive and avoid rebuilding
+/// the face on every icon refresh / flyout repaint.
+struct Dwrite {
+    factory: IDWriteFactory2,
+    face: IDWriteFontFace,
+}
+
+thread_local! {
+    static DWRITE: OnceCell<Option<Dwrite>> = const { OnceCell::new() };
+}
+
+impl Dwrite {
+    fn new() -> Option<Dwrite> {
+        unsafe {
+            let factory: IDWriteFactory2 = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED).ok()?;
+            let path: Vec<u16> = FONT_PATH.encode_utf16().chain(std::iter::once(0)).collect();
+            let file = factory.CreateFontFileReference(PCWSTR(path.as_ptr()), None).ok()?;
+            let files = [Some(file)];
+            let face = factory
+                .CreateFontFace(DWRITE_FONT_FACE_TYPE_TRUETYPE, &files, 0, DWRITE_FONT_SIMULATIONS_NONE)
+                .ok()?;
+            Some(Dwrite { factory, face })
+        }
+    }
+
+    fn render(&self, glyph: char, size: u32, rgb: [u8; 3]) -> Result<(Vec<u8>, u32, u32)> {
+        // Em fraction of the box; leaves a little padding, matching the previous look.
+        const FILL: f32 = 0.84;
+        let mut buf = vec![0u8; (size * size * 4) as usize];
+        unsafe {
+            let cp = glyph as u32;
+            let mut gi: u16 = 0;
+            self.face.GetGlyphIndices(&cp, 1, &mut gi)?;
+
+            let advance = 0.0f32;
+            let offset = DWRITE_GLYPH_OFFSET { advanceOffset: 0.0, ascenderOffset: 0.0 };
+            let run = DWRITE_GLYPH_RUN {
+                // Borrow the cached face without touching its refcount: transmute_copy
+                // duplicates the pointer and `ManuallyDrop` never releases it, so the one
+                // reference stays owned by `self.face` (which outlives this call).
+                fontFace: ManuallyDrop::new(Some(std::mem::transmute_copy(&self.face))),
+                fontEmSize: size as f32 * FILL,
+                glyphCount: 1,
+                glyphIndices: &gi,
+                glyphAdvances: &advance,
+                glyphOffsets: &offset,
+                isSideways: false.into(),
+                bidiLevel: 0,
+            };
+
+            // GDI-natural + grid-fit + greyscale = the hinted, pixel-snapped rendering the
+            // shell uses; greyscale (not ClearType) keeps the alpha texture 1 byte/pixel.
+            let analysis = self.factory.CreateGlyphRunAnalysis(
+                &run,
+                None,
+                DWRITE_RENDERING_MODE_GDI_NATURAL,
+                DWRITE_MEASURING_MODE_GDI_NATURAL,
+                DWRITE_GRID_FIT_MODE_ENABLED,
+                DWRITE_TEXT_ANTIALIAS_MODE_GRAYSCALE,
+                0.0,
+                size as f32 / 2.0,
+            )?;
+            let bounds = analysis.GetAlphaTextureBounds(DWRITE_TEXTURE_ALIASED_1x1)?;
+            let bw = (bounds.right - bounds.left).max(0) as u32;
+            let bh = (bounds.bottom - bounds.top).max(0) as u32;
+            if bw > 0 && bh > 0 {
+                let mut cov = vec![0u8; (bw * bh) as usize];
+                analysis.CreateAlphaTexture(DWRITE_TEXTURE_ALIASED_1x1, &bounds, &mut cov)?;
+                // Centre the coverage box in the icon; an integer offset keeps the grid-fit
+                // alignment (and therefore the crispness) intact.
+                let dx = ((size as i32 - bw as i32) / 2).max(0) as u32;
+                let dy = ((size as i32 - bh as i32) / 2).max(0) as u32;
+                for y in 0..bh {
+                    for x in 0..bw {
+                        let a = cov[(y * bw + x) as usize];
+                        if a == 0 {
+                            continue;
+                        }
+                        let (px, py) = (dx + x, dy + y);
+                        if px < size && py < size {
+                            let i = ((py * size + px) * 4) as usize;
+                            buf[i] = rgb[0];
+                            buf[i + 1] = rgb[1];
+                            buf[i + 2] = rgb[2];
+                            buf[i + 3] = a;
+                        }
+                    }
+                }
+            }
+        }
+        Ok((buf, size, size))
+    }
+}
+
+/// Fallback glyph rasteriser (unhinted, via `ab_glyph`) used only if DirectWrite can't be
+/// initialised. Kept because the earbud icons and flyout text still rely on `ab_glyph`.
+fn render_glyph_ab(glyph: char, size: u32, rgb: [u8; 3]) -> Result<(Vec<u8>, u32, u32)> {
     let font = fluent_font().context("Segoe Fluent Icons font not found")?;
     let mut buf = vec![0u8; (size * size * 4) as usize];
 
@@ -223,7 +346,7 @@ pub fn render_glyph(glyph: char, size: u32, rgb: [u8; 3]) -> Result<(Vec<u8>, u3
 pub(crate) fn fluent_font() -> Option<&'static FontVec> {
     static FONT: OnceLock<Option<FontVec>> = OnceLock::new();
     FONT.get_or_init(|| {
-        let bytes = std::fs::read(r"C:\Windows\Fonts\SegoeIcons.ttf").ok()?;
+        let bytes = std::fs::read(FONT_PATH).ok()?;
         FontVec::try_from_vec(bytes).ok()
     })
     .as_ref()

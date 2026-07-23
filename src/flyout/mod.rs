@@ -33,8 +33,9 @@ use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
     DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW, KillTimer, LoadCursorW, SetCursor,
     SetForegroundWindow, SetTimer, ShowWindow, SystemParametersInfoW, TranslateMessage, IDC_ARROW,
-    MSG, SPI_GETWORKAREA, SW_SHOWNA, SW_SHOWNORMAL, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WM_APP,
-    WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_RBUTTONDOWN, WM_TIMER,
+    MSG, SPI_GETWORKAREA, SW_SHOWNA, SW_SHOWNORMAL, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WHEEL_DELTA,
+    WM_APP, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN,
+    WM_TIMER,
 };
 
 use crate::audio::wasapi::{Meter, VolumeWatch, WasapiBackend};
@@ -92,6 +93,10 @@ const METER_TIMER_ID: usize = 1;
 const METER_INTERVAL_MS: u32 = 33;
 // Per-tick fall-off of the displayed peak: instant attack, gentle release (a VU-meter feel).
 const METER_DECAY: f32 = 0.82;
+// Volume change per wheel notch (`WHEEL_DELTA`) when scrolling over the flyout — 2%, matching
+// the native tray flyout. Applied proportionally to the delta, so precision-touchpad scroll
+// (which arrives in sub-notch steps) nudges the volume smoothly instead of in big jumps.
+const SCROLL_STEP: f32 = 0.02;
 
 /// Transient pointer-interaction state: what the cursor is over, and any in-flight
 /// press/drag. Cleared on every relayout and screen change (see [`Flyout::reset_hover`]).
@@ -304,6 +309,13 @@ unsafe fn show_inner(
                     break 'pump;
                 }
             }
+            WM_MOUSEWHEEL => {
+                // WM_MOUSEWHEEL reports the pointer in *screen* coordinates (unlike the other
+                // mouse messages) and the wheel delta in the high word of wParam.
+                let delta = (msg.wParam.0 >> 16) as u16 as i16;
+                let (_, sy) = mouse_xy(msg.lParam);
+                fly.scroll_volume(sy - fly.surface.y, delta);
+            }
             WM_VOL_CHANGED => fly.refresh_volumes(),
             WM_TIMER => fly.tick_meters(),
             WM_KEYDOWN if msg.wParam.0 as u16 == VK_ESCAPE.0 => break 'pump,
@@ -353,6 +365,35 @@ impl Flyout<'_> {
         if let Some(id) = self.model.groups[group].default_id.clone() {
             let _ = self.backend.set_volume_of(&id, level);
         }
+    }
+
+    /// Adjust volume in response to a wheel notch at client-y `cy`. Scrolls the slider under
+    /// the cursor, or the primary output slider otherwise, so scrolling anywhere on the panel
+    /// nudges the output volume like the native tray flyout.
+    fn scroll_volume(&mut self, cy: i32, delta: i16) {
+        let Some(group) = self.scroll_target_group(cy) else {
+            return;
+        };
+        let notches = delta as f32 / WHEEL_DELTA as f32;
+        let level = (self.model.groups[group].level + notches * SCROLL_STEP).clamp(0.0, 1.0);
+        self.set_group_level(group, level);
+        self.compose();
+        self.surface.flush();
+    }
+
+    /// Which group a wheel event should adjust: the slider row under the cursor, else the
+    /// first output slider (the panel's primary volume). `None` when there's no slider (the
+    /// right-click quick menu), so scrolling there is a no-op.
+    fn scroll_target_group(&self, cy: i32) -> Option<usize> {
+        if let Some(i) = layout::elem_at(&self.surface.elems, cy) {
+            if let Elem::Slider { group } = self.surface.elems[i].elem {
+                return Some(group);
+            }
+        }
+        self.surface.elems.iter().find_map(|le| match le.elem {
+            Elem::Slider { group } if self.model.groups[group].flow == Flow::Output => Some(group),
+            _ => None,
+        })
     }
 
     /// Subscribe to volume/mute changes and the peak meter on each group's default endpoint.

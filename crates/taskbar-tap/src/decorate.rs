@@ -205,6 +205,150 @@ impl StripState {
     }
 }
 
+/// Markers audio-tray sends for the two icons Segoe Fluent has no glyph for.
+///
+/// Plane 15 private use rather than the BMP private-use area, because Segoe Fluent
+/// occupies much of the latter itself (roughly U+E700..U+F8B3) and a BMP codepoint
+/// could collide with a real glyph. Must match `GLYPH_WIRELESS_EARBUDS` /
+/// `GLYPH_ROUND_EARBUDS` on the audio-tray side.
+const EARBUDS_WIRELESS: char = '\u{F0001}';
+const EARBUDS_ROUND: char = '\u{F0002}';
+
+/// Stroke width of the hand-drawn icons, as a fraction of the icon box.
+///
+/// `2 × OUTLINE_HW` from `audio_tray::icons`, which strokes ±0.030 either side of
+/// each shape's outline. Keep the two in step or the earbuds will not match the
+/// weight of the tray icon they mirror.
+const VECTOR_STROKE: f64 = 0.060;
+
+/// One shape of a hand-drawn icon, in the same normalised (0..1, y down) space the
+/// tray's rasteriser uses — see `audio_tray::icons::Shape`.
+enum Vector {
+    /// Stroked outline of a circle.
+    Circle { cx: f64, cy: f64, r: f64 },
+    /// Stroked outline of a near-vertical capsule: a bud's stem.
+    ///
+    /// The raster version tilts these a few degrees (0.03 of the box over 0.48);
+    /// this draws them upright, which is indistinguishable at 16 epx and avoids a
+    /// rotated `Path` for no visible gain.
+    Stem { cx: f64, top: f64, bottom: f64, r: f64 },
+}
+
+/// The shapes for a marker codepoint, or `None` if it is an ordinary font glyph.
+///
+/// Transcribed from `audio_tray::icons::render_earbuds` /
+/// `render_round_earbuds`. Duplicated rather than shared because the two renderers
+/// have nothing in common — one is a signed-distance rasteriser in the app, the
+/// other is XAML shapes inside Explorer — but the coordinates must stay in step.
+fn vector_icon(glyph: char) -> Option<&'static [Vector]> {
+    // AirPods-style: a round bud on a slim stem.
+    const WIRELESS: &[Vector] = &[
+        Vector::Circle { cx: 0.31, cy: 0.27, r: 0.135 },
+        Vector::Stem { cx: 0.295, top: 0.30, bottom: 0.78, r: 0.055 },
+        Vector::Circle { cx: 0.69, cy: 0.27, r: 0.135 },
+        Vector::Stem { cx: 0.705, top: 0.30, bottom: 0.78, r: 0.055 },
+    ];
+    // Sony WF / Galaxy Buds silhouette: a round body with a smaller ear-tip fused
+    // at its inner-lower edge, mirrored so the tips face each other.
+    const ROUND: &[Vector] = &[
+        Vector::Circle { cx: 0.28, cy: 0.475, r: 0.155 },
+        Vector::Circle { cx: 0.37, cy: 0.595, r: 0.085 },
+        Vector::Circle { cx: 0.72, cy: 0.475, r: 0.155 },
+        Vector::Circle { cx: 0.63, cy: 0.595, r: 0.085 },
+    ];
+    match glyph {
+        EARBUDS_WIRELESS => Some(WIRELESS),
+        EARBUDS_ROUND => Some(ROUND),
+        _ => None,
+    }
+}
+
+/// The icon inside a segment: a `FontIcon` normally, or hand-drawn shapes for the
+/// two icons Segoe Fluent does not provide.
+///
+/// Shapes cannot inherit `Foreground` the way a `FontIcon` can, so they need an
+/// explicit `Stroke`. With a pill there is always a colour to use (`on_accent`
+/// picks black or white for the accent); without one — the bare-glyph dev mode —
+/// this falls back to white rather than guessing at the taskbar's brush.
+fn icon_markup(glyph: char, size: u32, colour: Option<&str>) -> String {
+    let Some(shapes) = vector_icon(glyph) else {
+        let fg = colour.map_or(String::new(), |c| format!(r#" Foreground="{c}""#));
+        return format!(
+            r##"      <FontIcon FontFamily="Segoe Fluent Icons" Glyph="&#x{:04X};" FontSize="{size}"
+                VerticalAlignment="Center" HorizontalAlignment="Center"{fg}/>"##,
+            glyph as u32
+        );
+    };
+
+    let box_px = f64::from(size);
+    let stroke = colour.unwrap_or("#FFFFFFFF");
+    let width = VECTOR_STROKE * box_px;
+
+    // Fit the ink to the box. The coordinates come from the tray's rasteriser, where
+    // they only span about 0.70 of the box — fine there, where an icon is never seen
+    // beside another, but in the strip these sit next to a Segoe Fluent glyph whose
+    // ink fills the full 16 epx. Measured before fitting: 11.3 epx tall against the
+    // microphone's 16.0, which reads as a smaller, weaker icon.
+    //
+    // Uniform scale about the centre, so nothing is distorted, and the stroke is
+    // *not* scaled — it is a weight, and it should stay matched to the font's.
+    let half = VECTOR_STROKE / 2.0;
+    let (mut x0, mut y0, mut x1, mut y1) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+    let mut include = |ax: f64, ay: f64, bx: f64, by: f64| {
+        x0 = x0.min(ax);
+        y0 = y0.min(ay);
+        x1 = x1.max(bx);
+        y1 = y1.max(by);
+    };
+    for shape in shapes {
+        match *shape {
+            Vector::Circle { cx, cy, r } => {
+                include(cx - r - half, cy - r - half, cx + r + half, cy + r + half)
+            }
+            Vector::Stem { cx, top, bottom, r } => {
+                include(cx - r - half, top - r - half, cx + r + half, bottom + r + half)
+            }
+        }
+    }
+    let (span_x, span_y) = (x1 - x0, y1 - y0);
+    let fit = 1.0 / span_x.max(span_y);
+    let (pad_x, pad_y) = ((1.0 - span_x * fit) / 2.0, (1.0 - span_y * fit) / 2.0);
+    let at = |x: f64, y: f64| (((x - x0) * fit + pad_x) * box_px, ((y - y0) * fit + pad_y) * box_px);
+    let of = |v: f64| v * fit * box_px;
+
+    let mut drawn = String::new();
+    for shape in shapes {
+        // `Canvas` because these are absolute positions in a fixed box; every other
+        // panel would fight the coordinates.
+        let element = match *shape {
+            Vector::Circle { cx, cy, r } => {
+                let (left, top) = at(cx - r, cy - r);
+                format!(
+                    r#"        <Ellipse Canvas.Left="{left:.3}" Canvas.Top="{top:.3}" Width="{0:.3}" Height="{0:.3}"
+                 Stroke="{stroke}" StrokeThickness="{width:.3}"/>"#,
+                    of(2.0 * r)
+                )
+            }
+            Vector::Stem { cx, top, bottom, r } => {
+                let (left, y) = at(cx - r, top - r);
+                format!(
+                    r#"        <Rectangle Canvas.Left="{left:.3}" Canvas.Top="{y:.3}" Width="{:.3}" Height="{:.3}"
+                   RadiusX="{0:.3}" RadiusY="{0:.3}" Stroke="{stroke}" StrokeThickness="{width:.3}"/>"#,
+                    of(2.0 * r),
+                    of(bottom - top + 2.0 * r),
+                )
+            }
+        };
+        drawn.push('\n');
+        drawn.push_str(&element);
+    }
+    format!(
+        r#"      <Canvas Width="{box_px}" Height="{box_px}"
+              VerticalAlignment="Center" HorizontalAlignment="Center">{drawn}
+      </Canvas>"#
+    )
+}
+
 /// The strip markup: two equal segments, output glyph then input glyph.
 ///
 /// The root needs an explicit `xmlns`: `XamlReader.Load` parses this standalone,
@@ -220,7 +364,6 @@ fn strip_markup(state: StripState) -> String {
     // as one outline.
     let segment = |name: &str, glyph: char, size: u32, width: u32, muted: bool, leading: bool| {
         let colour = if muted { Some(MUTED_TINT) } else { base };
-        let fg = colour.map_or(String::new(), |c| format!(r#" Foreground="{c}""#));
         // XAML order for CornerRadius: top-left, top-right, bottom-right,
         // bottom-left.
         let corners = if leading {
@@ -239,10 +382,9 @@ fn strip_markup(state: StripState) -> String {
             r##"    <Grid x:Name="{name}" Width="{width}" Background="Transparent">
       <Border x:Name="{name}Hover" Background="{plate}" Opacity="0"
               CornerRadius="{corners}"/>
-      <FontIcon FontFamily="Segoe Fluent Icons" Glyph="&#x{:04X};" FontSize="{size}"
-                VerticalAlignment="Center" HorizontalAlignment="Center"{fg}/>
+{}
     </Grid>"##,
-            glyph as u32
+            icon_markup(glyph, size, colour)
         )
     };
 

@@ -387,7 +387,7 @@ fn try_refresh(backend: &WasapiBackend, tray: &TrayIcon, config: &Config) -> Res
 /// use, so all three agree. They did not before: the strip drew fixed Volume and
 /// Microphone glyphs while the flyout showed the device's own icon, so the same
 /// speaker appeared as a laptop in one place and a speaker in the other.
-fn strip_icons(backend: &WasapiBackend, config: &Config) -> crate::taskbar::StripIcons {
+pub(crate) fn strip_icons(backend: &WasapiBackend, config: &Config) -> crate::taskbar::StripIcons {
     use crate::audio::Flow;
 
     let side = |flow: Flow| {
@@ -401,8 +401,8 @@ fn strip_icons(backend: &WasapiBackend, config: &Config) -> crate::taskbar::Stri
     let (output, output_muted) = side(Flow::Output);
     let (input, input_muted) = side(Flow::Input);
     crate::taskbar::StripIcons {
-        output: output.glyph(),
-        input: input.glyph(),
+        output: crate::taskbar::strip_glyph(output),
+        input: crate::taskbar::strip_glyph(input),
         output_muted,
         input_muted,
     }

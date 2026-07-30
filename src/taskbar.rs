@@ -250,6 +250,33 @@ impl Default for StripIcons {
     }
 }
 
+/// Codepoints standing in for the two icons Segoe Fluent has no glyph for.
+///
+/// **Plane 15 private use, not the BMP private-use area.** Segoe Fluent Icons
+/// itself occupies much of the latter (roughly U+E700..U+F8B3), so a BMP PUA
+/// codepoint could collide with a real glyph. These two are guaranteed not to.
+///
+/// The TAP recognises them and draws the shapes as XAML vectors rather than looking
+/// for a glyph. Must match `EARBUDS_WIRELESS` / `EARBUDS_ROUND` in the TAP's
+/// `decorate` module.
+const GLYPH_WIRELESS_EARBUDS: char = '\u{F0001}';
+const GLYPH_ROUND_EARBUDS: char = '\u{F0002}';
+
+/// The codepoint the strip should carry for an icon.
+///
+/// Mostly `IconId::glyph`, but the two earbud variants are hand-drawn rather than
+/// font glyphs — `glyph` returns the headphone codepoint for them as a deliberate
+/// fallback, which in the strip would silently show the wrong icon. This maps them
+/// to the markers above instead, so the TAP can draw the real shape.
+pub fn strip_glyph(icon: crate::icons::IconId) -> char {
+    use crate::icons::IconId;
+    match icon {
+        IconId::WirelessEarbuds => GLYPH_WIRELESS_EARBUDS,
+        IconId::RoundEarbuds => GLYPH_ROUND_EARBUDS,
+        other => other.glyph(),
+    }
+}
+
 /// Alpha applied to the accent fill, as hex. A fully opaque accent block is
 /// brighter than anything Windows puts in a taskbar; at half alpha the pill
 /// carries the same visual weight as the Control Center button beside it.

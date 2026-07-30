@@ -356,6 +356,20 @@ impl Flyout<'_> {
         self.surface.buf = vec![0u8; bytes];
     }
 
+    /// Push the current devices' glyphs to the injected taskbar strip.
+    ///
+    /// Called at the moment of each live change rather than left to the tray's
+    /// `refresh`, because while this flyout is open it owns the message loop — the
+    /// tray thread is blocked, so an endpoint-change notification is not processed
+    /// until the flyout closes. Waiting for that made the strip visibly lag the
+    /// selection the user had just made.
+    ///
+    /// A no-op when the feature is off: nothing is injected, so there is no window
+    /// to post to.
+    fn sync_strip(&self) {
+        crate::taskbar::restyle(crate::tray::strip_icons(self.backend, self.config));
+    }
+
     fn set_group_level(&mut self, group: usize, level: f32) {
         self.model.groups[group].level = level;
         if let Some(id) = self.model.groups[group].default_id.clone() {
@@ -505,6 +519,7 @@ impl Flyout<'_> {
                     eprintln!("mute failed: {e:#}");
                 }
                 self.model.groups[group].muted = muted;
+                self.sync_strip();
                 self.render_base();
                 self.compose();
                 self.surface.flush();
@@ -542,6 +557,7 @@ impl Flyout<'_> {
                         self.model.groups[group].muted = self.backend.is_muted(&id).unwrap_or(false);
                         self.model.groups[group].default_id = Some(id);
                         self.rewatch(group); // follow volume/mute of the new default
+                        self.sync_strip();
                         self.render_base();
                         self.compose();
                         self.surface.flush();
@@ -567,6 +583,7 @@ impl Flyout<'_> {
                     if let Err(e) = self.config.save() {
                         eprintln!("save config failed: {e:#}");
                     }
+                    self.sync_strip();
                     self.navigate(View::Main, false);
                 }
                 false

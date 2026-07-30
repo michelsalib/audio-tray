@@ -664,6 +664,42 @@ geometry — and for three rounds they didn't, because they drew the plate at th
 full pill height while the code was producing 21 epx. Verify a mockup against the
 running strip before trusting it.
 
+## Icons the font does not have
+
+The strip draws the *current devices'* icons, resolved through the same path as the
+flyout and the tray icon, so all three agree. Two of them — `WirelessEarbuds` and
+`RoundEarbuds` — have no Segoe Fluent glyph and the tray hand-draws them from
+circles and capsules. `IconId::glyph` returns the headphone codepoint for those as a
+deliberate fallback, which in the strip would quietly show the wrong icon.
+
+The strip carries a **Plane 15 private-use codepoint** for each instead (U+F0001,
+U+F0002), and the TAP redraws the shape as XAML `Ellipse`/`Rectangle` in a `Canvas`.
+Worth knowing why that route:
+
+* **Not BMP private use.** Segoe Fluent occupies much of it itself (roughly
+  U+E700..U+F8B3), so a BMP codepoint could collide with a real glyph.
+* **A codepoint rather than markup or a bitmap.** Both channels the app has —
+  the init-data string and the two-parameter `WM_TAP_RESTYLE` — already carry a
+  codepoint, so nothing new is needed. Passing XAML would have meant `WM_COPYDATA`;
+  passing a rendered bitmap would have meant a file on disk and an `Image` source.
+* Vectors also follow the accent-derived foreground and stay crisp at any scale,
+  which a bitmap would not.
+
+The coordinates are duplicated between the app's rasteriser and the TAP, and that is
+accepted: one is a signed-distance field, the other XAML shapes, so there is no
+shared code to have. `VECTOR_STROKE` is `2 × OUTLINE_HW` and has to stay in step.
+
+**Fit the ink to the box.** The normalised coordinates only span ~0.70 of it, which
+is invisible in the tray where an icon is never seen beside another — but in the
+strip they sit next to a font glyph whose ink fills the full 16 epx. Measured before
+fitting: 11.3 epx tall against the microphone's 16.0, reading as a smaller, weaker
+icon; after, 14.7. The scale is uniform about the centre and the **stroke is not
+scaled** — it is a weight, and it should stay matched to the font's.
+
+Shapes cannot inherit `Foreground` the way a `FontIcon` can, so `Stroke` is always
+explicit. With a pill there is always a colour (`on_accent` picks black or white);
+the bare-glyph mode falls back to white rather than guessing the taskbar's brush.
+
 ## Making the strip interactive — hover, left click, right click
 
 All three work. Handlers are Rust objects living in `explorer.exe`, attached from

@@ -42,14 +42,23 @@ pub const WM_TAP_REVERT: u32 = WM_APP + 21;
 /// Timer id for the periodic check that the strip is still there.
 const SWEEP_TIMER: usize = 1;
 
-/// How often that check runs.
+/// How often that check runs while there is still work to do.
 ///
-/// This is now the *only* thing that decorates — the visual-tree callback no
-/// longer does, because mutating from inside the event stream wedges the shell —
-/// so the interval also decides how quickly the strip appears. One second keeps
-/// that imperceptible while staying cheap: in the steady state a tick is one
-/// handle resolve and a runtime-class read.
-const SWEEP_MS: u32 = 1000;
+/// The sweep is now the *only* thing that mutates — the visual-tree callback no
+/// longer does, because mutating from inside the event stream wedges the shell — so
+/// this interval also decides how quickly the strip appears.
+const SWEEP_FAST_MS: u32 = 1000;
+
+/// How often it runs once everything is applied.
+///
+/// A settled tick is one handle resolve and a runtime-class read, but it runs on
+/// Explorer's UI thread, so it should not run more often than it needs to. Its only
+/// remaining job is noticing that the shell has overwritten our strip, and a few
+/// seconds is well inside "before the user finishes noticing".
+const SWEEP_IDLE_MS: u32 = 4000;
+
+/// The interval currently armed, so the timer is only re-armed when it changes.
+static SWEEP_INTERVAL: AtomicU32 = AtomicU32::new(0);
 
 /// The control window, or 0 before it exists. Also the "already created" flag.
 static WINDOW: AtomicIsize = AtomicIsize::new(0);
@@ -195,9 +204,10 @@ pub fn ensure_window() {
             // The sweep timer belongs to this window, so its `WM_TIMER` lands on
             // this thread — the only one that may touch XAML. Set here rather
             // than from `SetSite`, which runs elsewhere.
-            unsafe { SetTimer(Some(hwnd), SWEEP_TIMER, SWEEP_MS, None) };
+            SWEEP_INTERVAL.store(SWEEP_FAST_MS, Ordering::SeqCst);
+            unsafe { SetTimer(Some(hwnd), SWEEP_TIMER, SWEEP_FAST_MS, None) };
             logf!(
-                "control window 0x{:x} created on thread {}, sweeping every {SWEEP_MS}ms",
+                "control window 0x{:x} created on thread {}, sweeping every {SWEEP_FAST_MS}ms",
                 hwnd.0 as usize,
                 crate::tid()
             );
@@ -205,6 +215,36 @@ pub fn ensure_window() {
         Ok(_) => logf!("control window: CreateWindowEx returned null"),
         Err(err) => logf!("control window: CreateWindowEx failed ({err})"),
     }
+}
+
+/// Slows the sweep down once there is nothing left to apply, and speeds it back up
+/// if there is.
+///
+/// `SetTimer` with an existing id replaces that timer, so re-arming is how the
+/// cadence changes. Only called when the interval actually differs, to avoid
+/// resetting the countdown on every tick — which would delay the next sweep
+/// indefinitely.
+///
+/// # Safety
+/// Must run on the thread that owns the control window.
+pub unsafe fn set_sweep_pace(settled: bool) {
+    let wanted = if settled { SWEEP_IDLE_MS } else { SWEEP_FAST_MS };
+    if SWEEP_INTERVAL.swap(wanted, Ordering::SeqCst) == wanted {
+        return;
+    }
+    let hwnd = WINDOW.load(Ordering::SeqCst);
+    if hwnd == 0 {
+        return;
+    }
+    unsafe {
+        SetTimer(
+            Some(HWND(hwnd as *mut core::ffi::c_void)),
+            SWEEP_TIMER,
+            wanted,
+            None,
+        )
+    };
+    logf!("sweeping every {wanted}ms");
 }
 
 /// Watches the process that asked for the strip, and reverts when it goes away.

@@ -481,75 +481,34 @@ impl IVisualTreeServiceCallback_Impl for Tap_Impl {
                 return;
             }
 
-            // Claimed for the whole of the XAML work below, so the sweep timer
-            // cannot land in the middle of it — an STA thread pumps messages
-            // while a COM call is outstanding, which is exactly how a `WM_TIMER`
-            // gets dispatched inside `put_Content`. If something already holds
-            // it, this event's edits are skipped; the sweep re-checks in 3s.
-            let Some(_busy) = BusyGuard::claim() else {
-                return;
-            };
-
-            // The decoration point. We are on the XAML UI thread here (the only
-            // place WinRT calls succeed), and by the time a tray icon's
-            // `ContentPresenter` is announced its ancestors are already built.
+            // **Nothing below touches XAML.** This callback is by definition inside
+            // the visual-tree event stream, and any WinRT call against a tray
+            // element from in there can fail to return — taking Explorer's UI
+            // thread and the whole taskbar with it. Every mutation therefore lives
+            // in `sweep`, which waits for the stream to fall quiet first.
             //
-            //   SystemTray.NotifyIconView          <- identified by tooltip
-            //     Grid#ContainerGrid
-            //       ContentPresenter#ContentPresenter   <- we set .Content here
-            // XAML announces children *before* their parents, so walking up from a
-            // freshly-added ContentPresenter usually finds nothing — its grandparent
-            // has not been recorded yet. Instead, re-scan the recorded tree whenever
-            // a tray element arrives, which is order-independent.
-            // Nothing that touches XAML happens here. `AdviseVisualTreeChange`
-            // marshals through the UI thread, so while the replay is streaming
-            // that thread is blocked — work queued to it during the burst can
-            // never drain. The watchdog kicks the real work off once the tree
-            // goes quiet (see `on_tree_quiet`).
+            // What is left here is bookkeeping: recording the tree, above, and
+            // noting the two things that are identified by an event's *handle*
+            // rather than by the recorded tree, since deferring those would
+            // otherwise lose the handle.
 
-            // Explorer's own volume indicator, which our strip duplicates. It is
-            // a glyph *TextBlock* inside a SystemTray.IconView, so it is matched
-            // on the codepoint rather than a (translated) name.
+            // Explorer's own volume indicator, which our strip duplicates. It is a
+            // glyph *TextBlock* inside a SystemTray.IconView, so it is matched on
+            // the codepoint rather than a (translated) name — done in the sweep,
+            // because reading `Text` is itself a XAML call.
+            //
             // Not one-shot: Explorer rebuilds the tray on DPI and monitor changes,
-            // and the indicator would come back. Collapsing an already-collapsed
-            // element is harmless, so this just runs whenever one appears.
+            // and the indicator comes back.
             if added && name == "InnerTextBlock" {
-                self.try_hide_system_volume(element.handle);
+                enqueue(&PENDING_GLYPHS, element.handle);
             }
 
-            // Layout runs asynchronously, so the first collapse can land too
-            // early to free the slot. Keep saying it until it takes.
-            if VOLUME_RETRIES.load(Ordering::SeqCst) < VOLUME_MAX_RETRIES {
-                if let Some(diagnostics) = self.state().diagnostics.clone() {
-                    self.enforce_volume_hidden(&diagnostics);
-                }
-            }
-
-            // The reorder runs right here, on the callback thread. That is not
-            // the thread `GetDispatcher` points at, but it is demonstrably the
-            // one that owns the tray: `put_Content` succeeds from here, while
-            // the same call from the dispatcher's thread returns
-            // RPC_E_WRONG_THREAD. Tray elements also report a null
-            // `CoreDispatcher`, so there is no queue to post to either.
-            if added
-                && strip_placed()
-                && !REORDERED.load(Ordering::SeqCst)
-                && reorder::sections_ready()
-            {
-                self.try_reorder_here();
-            }
-
-            // Decoration is deliberately **not** attempted here. `put_Content` is
-            // only safe once the event stream has gone quiet, and this callback is
-            // by definition inside the stream — see `sweep`, which owns that step
-            // now. Recording, above, is all this does about the strip.
-
-            // Our own injected segments coming back to us. XAML announces
-            // children before parents, so by the time the segment `Grid` is
-            // reported its hover plate is already recorded and findable.
+            // Our own injected segments being announced back to us. XAML reports
+            // children before parents, so by the time the segment `Grid` arrives
+            // its hover plate is already recorded and findable by name.
             if added {
                 if let Some(segment) = interact::Segment::from_name(&name) {
-                    self.try_attach(segment, &name, element.handle);
+                    enqueue(&PENDING_SEGMENTS, (segment, name.clone(), element.handle));
                 }
             }
         }));
@@ -605,6 +564,36 @@ pub(crate) unsafe fn stand_down() {
     PROBED.store(false, Ordering::SeqCst);
     REPORTED.store(false, Ordering::SeqCst);
     logf!("stood down — the taskbar is as we found it");
+}
+
+/// Element handles the callback has noticed but not yet acted on.
+///
+/// The callback must not touch XAML at all — see [`sweep`] — but two of the steps
+/// are driven by the handle carried on an event rather than by the recorded tree.
+/// Deferring those means remembering the handle, so they are queued here and
+/// drained by the sweep.
+///
+/// Only ever pushed from the tray island's thread, so the handles are always that
+/// island's to use.
+static PENDING_GLYPHS: Mutex<Vec<xamlom::InstanceHandle>> = Mutex::new(Vec::new());
+static PENDING_SEGMENTS: Mutex<Vec<(interact::Segment, String, xamlom::InstanceHandle)>> =
+    Mutex::new(Vec::new());
+
+/// Takes everything queued, leaving the queue empty.
+fn drain<T>(queue: &Mutex<Vec<T>>) -> Vec<T> {
+    let mut held = match queue.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    std::mem::take(&mut *held)
+}
+
+fn enqueue<T>(queue: &Mutex<Vec<T>>, item: T) {
+    let mut held = match queue.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    held.push(item);
 }
 
 /// Set while we are inside a XAML call, so the sweep timer cannot re-enter.
@@ -676,10 +665,56 @@ pub(crate) unsafe fn sweep() {
     let Some(diagnostics) = diagnostics() else {
         return;
     };
-    // `try_decorate` already means "decorate unless it is already done", so it
-    // covers both a strip that was overwritten and an icon that arrived without
-    // any further tree event to notice it.
+
+    // Order matters. Finding the volume slot only records it, and has to happen
+    // whether or not the strip is up yet. Decoration comes next, because
+    // collapsing the volume icon and reordering the tray are both gated on the
+    // strip actually being on screen — that gate is what stops us taking Windows'
+    // controls away and putting nothing back.
+    for text_block in drain(&PENDING_GLYPHS) {
+        note_system_volume(&diagnostics, text_block);
+    }
+
+    // "Decorate unless it is already done", so this covers a strip the shell
+    // overwrote as well as an icon that arrived with no further event to notice it.
     try_decorate(&diagnostics);
+
+    if VOLUME_RETRIES.load(Ordering::SeqCst) < VOLUME_MAX_RETRIES {
+        enforce_volume_hidden(&diagnostics);
+    }
+
+    if strip_placed() && !REORDERED.load(Ordering::SeqCst) && reorder::sections_ready() {
+        reorder_now(&diagnostics);
+    }
+
+    // Drained last, and deliberately after `try_decorate`: the segments only exist
+    // once the strip has been placed, and their own announcements arrive
+    // re-entrantly *during* that `put_Content`. By the time we get here they are
+    // already queued, so hover is wired in the same tick that drew the strip.
+    for (segment, name, element) in drain(&PENDING_SEGMENTS) {
+        attach_segment(&diagnostics, segment, &name, element);
+    }
+
+    report_slot_metrics(&diagnostics);
+
+    // Nothing left to apply — drop to the slow cadence until something comes
+    // undone. `strip_placed` going false again (the shell re-binding the
+    // presenter's content) is what brings it back.
+    //
+    // The wiring check earns its place: our own segments are announced *after*
+    // `put_Content` returns rather than during it, so they are always queued for
+    // the following tick. Without it the pace dropped first and hover took an idle
+    // interval to arrive instead of a fast one.
+    let settled = strip_placed() && REORDERED.load(Ordering::SeqCst) && segments_wired();
+    lifecycle::set_sweep_pace(settled);
+}
+
+/// Whether the strip's segments have had their pointer handlers attached.
+fn segments_wired() -> bool {
+    match WIRED.lock() {
+        Ok(guard) => !guard.is_empty(),
+        Err(poisoned) => !poisoned.into_inner().is_empty(),
+    }
 }
 
 /// How long the visual-tree stream must be silent before we touch XAML.
@@ -767,80 +802,75 @@ fn ancestor_of_type(start: xamlom::InstanceHandle, wanted: &str, max_up: usize) 
     None
 }
 
-impl Tap_Impl {
-    /// Move the notification area next to the wifi/battery button.
-    ///
-    /// Retried until it succeeds: the tray's sections trickle in, so an early
-    /// attempt can run before both of the sections it needs are recorded.
-    ///
-    /// # Safety
-    /// Runs the column reorder inline, on the visual-tree callback thread.
-    ///
-    /// # Safety
-    /// Callback thread only.
-    unsafe fn try_reorder_here(&self) {
-        let Some(diagnostics) = self.state().diagnostics.clone() else {
-            return;
-        };
-        logf!("reorder running inline on thread {}", tid());
-        if !REPORTED.swap(true, Ordering::SeqCst) {
-            reorder::report(&diagnostics);
-        }
-        if reorder::move_after_language(&diagnostics) {
-            REORDERED.store(true, Ordering::SeqCst);
-        }
+/// Move the notification area next to the wifi/battery button.
+///
+/// Retried until it succeeds: the tray's sections trickle in, so an early attempt
+/// can run before both of the sections it needs are recorded.
+///
+/// # Safety
+/// XAML UI thread only, and only once the event stream is quiet — see [`sweep`].
+unsafe fn reorder_now(diagnostics: &xamlom::IXamlDiagnostics) {
+    if !REPORTED.swap(true, Ordering::SeqCst) {
+        reorder::report(diagnostics);
     }
-
-    /// Wires pointer handlers onto one of our segments, once per element.
-    ///
-    /// Keyed on the element handle rather than a plain "done" flag: Explorer
-    /// rebuilds the tray on DPI and monitor changes, which produces a fresh
-    /// strip that needs wiring again.
-    ///
-    /// # Safety
-    /// Callback thread only.
-    unsafe fn try_attach(&self, segment: interact::Segment, name: &str, element: u64) {
-        {
-            let mut wired = match WIRED.lock() {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            if wired.contains(&element) {
-                return;
-            }
-            wired.push(element);
-        }
-        let Some(diagnostics) = self.state().diagnostics.clone() else {
-            return;
-        };
-        // The plate is a child of the segment and shares its name plus a suffix,
-        // which is how the markup and this code stay in step.
-        let plate_name = format!("{name}Hover");
-        let Some(&plate) = tree::find_by_name(&plate_name).first() else {
-            logf!("no hover plate {plate_name:?} recorded yet for 0x{element:x}");
-            return;
-        };
-        interact::attach(&diagnostics, segment, element, plate);
+    if reorder::move_after_language(diagnostics) {
+        REORDERED.store(true, Ordering::SeqCst);
     }
+}
 
-    /// Note Explorer's own volume indicator if this text block is it.
-    ///
-    /// Only *records* the slot — collapsing it is [`Self::enforce_volume_hidden`]'s
-    /// job, gated on our strip actually being placed. The two have to be separate
-    /// because the volume glyph is announced during the replay, well before our
-    /// icon has been decorated; gating the search itself would mean the slot was
-    /// never found and the icon never hidden even when the strip does appear.
-    ///
-    /// # Safety
-    /// XAML UI thread only.
-    unsafe fn try_hide_system_volume(&self, text_block: xamlom::InstanceHandle) {
+/// Wires pointer handlers onto one of our segments, once per element.
+///
+/// Keyed on the element handle rather than a plain "done" flag: Explorer rebuilds
+/// the tray on DPI and monitor changes, which produces a fresh strip that needs
+/// wiring again.
+///
+/// # Safety
+/// XAML UI thread only, and only once the event stream is quiet — see [`sweep`].
+unsafe fn attach_segment(
+    diagnostics: &xamlom::IXamlDiagnostics,
+    segment: interact::Segment,
+    name: &str,
+    element: xamlom::InstanceHandle,
+) {
+    {
+        let mut wired = match WIRED.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if wired.contains(&element) {
+            return;
+        }
+        wired.push(element);
+    }
+    // The plate is a child of the segment and shares its name plus a suffix, which
+    // is how the markup and this code stay in step.
+    let plate_name = format!("{name}Hover");
+    let Some(&plate) = tree::find_by_name(&plate_name).first() else {
+        logf!("no hover plate {plate_name:?} recorded yet for 0x{element:x}");
+        return;
+    };
+    interact::attach(diagnostics, segment, element, plate);
+}
+
+/// Note Explorer's own volume indicator if this text block is it.
+///
+/// Only *records* the slot — collapsing it is [`enforce_volume_hidden`]'s job,
+/// gated on our strip actually being placed. The two have to be separate because
+/// the volume glyph is announced during the replay, well before our icon has been
+/// decorated; gating the search itself would mean the slot was never found and the
+/// icon never hidden even when the strip does appear.
+///
+/// # Safety
+/// XAML UI thread only, and only once the event stream is quiet — see [`sweep`].
+unsafe fn note_system_volume(
+    diagnostics: &xamlom::IXamlDiagnostics,
+    text_block: xamlom::InstanceHandle,
+) {
+    {
         if !strip_state().is_some_and(|s| s.hide_system_volume) {
             return;
         }
-        let Some(diagnostics) = self.state().diagnostics.clone() else {
-            return;
-        };
-        let Some(text) = decorate::text_of(&diagnostics, text_block) else {
+        let Some(text) = decorate::text_of(diagnostics, text_block) else {
             return;
         };
         let Some(glyph) = text.chars().next() else {
@@ -884,17 +914,19 @@ impl Tap_Impl {
             };
             *recorded = Some((icon, slot));
         }
-        self.enforce_volume_hidden(&diagnostics);
+        enforce_volume_hidden(diagnostics);
     }
+}
 
-    /// Re-applies the volume collapse until layout actually gives up the slot.
-    ///
-    /// Called on every mutation, so it costs one `ActualWidth` read per event
-    /// until it settles — then nothing.
-    ///
-    /// # Safety
-    /// Callback thread only.
-    unsafe fn enforce_volume_hidden(&self, diagnostics: &xamlom::IXamlDiagnostics) {
+/// Re-applies the volume collapse until layout actually gives up the slot.
+///
+/// Called on every sweep, so it costs one `ActualWidth` read per tick until it
+/// settles — then nothing.
+///
+/// # Safety
+/// XAML UI thread only, and only once the event stream is quiet — see [`sweep`].
+unsafe fn enforce_volume_hidden(diagnostics: &xamlom::IXamlDiagnostics) {
+    {
         // Windows' volume icon stays until ours is actually on the taskbar.
         if !strip_placed() {
             return;
@@ -930,7 +962,6 @@ impl Tap_Impl {
             logf!("system volume collapse re-applied {VOLUME_MAX_RETRIES}x — stopping");
         }
     }
-
 }
 
 /// Find the tray icon we were asked to decorate and replace its content.

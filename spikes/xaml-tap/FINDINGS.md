@@ -500,23 +500,45 @@ not. That is the coin flip that had the same binary behaving differently on
 consecutive runs — and why injecting *after* the icon already existed reproduced
 it every time, which was the clue that mattered.
 
-The fix is to defer every XAML mutation until the stream has gone quiet:
-
-* `tree::quiet_for(period)` — the tree already tracked `last_event` for the dump
-  watchdog; this reuses it.
-* The callback now only *records*. It attempts no decoration at all.
-* `sweep()` (the control window's `WM_TIMER`, on the tray thread) does the work,
-  and bails unless the stream has been silent for `QUIET_BEFORE_MUTATING` (400ms).
+So **`OnVisualTreeChange` touches no XAML at all.** It records the tree, and that
+is the whole of its job. Every mutation — decorate, collapse the volume slot,
+reorder the sections, attach the pointer handlers — moved into `sweep()`, the
+control window's `WM_TIMER`, which bails unless the stream has been silent for
+`QUIET_BEFORE_MUTATING` (400ms). `tree::quiet_for` reuses the `last_event` the dump
+watchdog already tracked.
 
 A `WM_TIMER` can itself be dispatched mid-burst, because an STA thread pumps while
-a call is outstanding — so the timer is only the *driver* here and the quiet check
-is the guard. `SWEEP_MS` dropped to 1000 because the sweep is now the only thing
-that decorates, so it also decides how fast the strip appears.
+a call is outstanding — so the timer is only the *driver* and the quiet check is
+the guard.
 
-Verified: injection succeeds with a 20s settle where 90s had been failing, and
-re-injecting into a fresh Explorer with the tray icon already present — previously
-a deterministic wedge — now decorates and leaves the taskbar alive (clock advancing
-over 68s, CPU normal).
+Two steps are identified by the *handle on an event* rather than by the recorded
+tree — the volume glyph's `TextBlock`, and our own segment `Grid`s — so deferring
+them would lose the handle. They are queued (`PENDING_GLYPHS`, `PENDING_SEGMENTS`)
+and drained by the sweep. Pushed only from the tray island's thread, so the handles
+are always that island's to use.
+
+Order within a sweep matters: find the volume slot (recording only), then decorate,
+then collapse and reorder — both of those are gated on the strip actually being on
+screen, which is what stops us removing Windows' controls and putting nothing back.
+
+The sweep paces itself: `SWEEP_FAST_MS` (1s) while there is work, `SWEEP_IDLE_MS`
+(4s) once the strip is placed, reordered *and* wired. The wiring term matters —
+our segments are announced after `put_Content` returns rather than during it, so
+they always land on the following tick, and without it the pace dropped first and
+hover arrived an idle interval late.
+
+Verified after the change, all five lifecycle paths, pixel-compared against a
+pre-injection baseline:
+
+| case | result |
+| --- | --- |
+| apply | strip up, segments wired |
+| toggle off (`--taskbar-revert`) | exact revert (differs from baseline only by our own icon, which is still registered) |
+| re-enable, same Explorer | 0 px from the first applied state |
+| owner killed | 0 px from baseline |
+| Explorer restart | re-injected, 0 px from before the restart |
+
+Injection now succeeds with a 15–20s settle where 90s had been failing.
 
 ### Three theories that were wrong on the way
 

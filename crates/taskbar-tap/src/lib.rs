@@ -711,6 +711,59 @@ pub(crate) unsafe fn sweep() {
     lifecycle::set_sweep_pace(settled);
 }
 
+/// Redraws the strip with new glyphs, because the default devices changed.
+///
+/// Only marks the strip as needing redoing — the actual `put_Content` has to wait
+/// for the event stream to fall quiet, so the sweep picks it up on its next tick.
+/// That is also why this is safe to call from a window procedure.
+///
+/// The restore record is untouched: [`restore::remember_content`] refuses to record
+/// our own strip, so redrawing cannot lose the shell's original visual.
+///
+/// # Safety
+/// Called from the control window's procedure, on the tray thread.
+pub(crate) unsafe fn restyle(
+    output: Option<char>,
+    output_muted: bool,
+    input: Option<char>,
+    input_muted: bool,
+) {
+    {
+        let mut strip = match STRIP.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let state = strip.get_or_insert_with(decorate::StripState::default);
+        if let Some(glyph) = output {
+            state.output_glyph = glyph;
+        }
+        if let Some(glyph) = input {
+            state.input_glyph = glyph;
+        }
+        state.output_muted = output_muted;
+        state.input_muted = input_muted;
+    }
+    logf!(
+        "restyle: out={:?} (muted {output_muted}) in={:?} (muted {input_muted})",
+        output,
+        input
+    );
+
+    // Clearing these is what makes the next sweep redraw and re-wire. The segment
+    // elements are replaced wholesale, so their old handles are of no further use.
+    {
+        let mut decorated = match DECORATED.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *decorated = None;
+    }
+    if let Ok(mut wired) = WIRED.lock() {
+        wired.clear();
+    }
+    lifecycle::set_sweep_pace(false);
+}
+
 /// Whether the strip's segments have had their pointer handlers attached.
 fn segments_wired() -> bool {
     match WIRED.lock() {

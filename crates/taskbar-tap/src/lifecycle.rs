@@ -39,6 +39,14 @@ pub const CONTROL_CLASS: &str = "AudioTrayTapControl";
 /// and when audio-tray exits.
 pub const WM_TAP_REVERT: u32 = WM_APP + 21;
 
+/// "The devices changed — redraw with these glyphs."
+///
+/// The init data is read once in `SetSite`, so it cannot carry a device switch.
+/// Both glyphs fit in the message parameters, so nothing has to be shared: `wParam`
+/// carries the output codepoint with its muted flag at bit 24, `lParam` the input.
+/// Must match `WM_TAP_RESTYLE` on the audio-tray side.
+pub const WM_TAP_RESTYLE: u32 = WM_APP + 23;
+
 /// Timer id for the periodic check that the strip is still there.
 const SWEEP_TIMER: usize = 1;
 
@@ -135,6 +143,24 @@ unsafe extern "system" fn control_proc(
         });
         if caught.is_err() {
             logf!("revert handler panicked");
+        }
+        return LRESULT(0);
+    }
+    if msg == WM_TAP_RESTYLE {
+        let caught = std::panic::catch_unwind(|| {
+            // Unpack: codepoint in the low bits, muted flag at bit 24.
+            let glyph = |packed: usize| {
+                (
+                    char::from_u32((packed & 0x00FF_FFFF) as u32),
+                    packed & (1 << 24) != 0,
+                )
+            };
+            let (out, out_muted) = glyph(wparam.0);
+            let (input, in_muted) = glyph(lparam.0 as usize);
+            unsafe { crate::restyle(out, out_muted, input, in_muted) };
+        });
+        if caught.is_err() {
+            logf!("restyle handler panicked");
         }
         return LRESULT(0);
     }

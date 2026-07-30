@@ -79,10 +79,10 @@ static LAST_INJECTED: std::sync::Mutex<Option<(u32, std::time::Instant)>> =
 
 /// Inject the TAP into the shell's Explorer. Best-effort by contract: every error
 /// means "feature stays off", and `enable`'s message says why.
-pub fn enable() -> Result<()> {
+pub fn enable(icons: StripIcons) -> Result<()> {
     let dll = tap_path()?;
     let pid = shell_pid()?;
-    unsafe { inject(pid, &dll)? };
+    unsafe { inject(pid, &dll, icons)? };
     if let Ok(mut last) = LAST_INJECTED.lock() {
         *last = Some((pid, std::time::Instant::now()));
     }
@@ -121,13 +121,29 @@ const WM_TAP_REVERT: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 21;
 /// Best-effort and quiet: a missing control window means nothing is injected, so
 /// there is nothing to put back.
 pub fn revert() {
-    use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
-    use windows::Win32::UI::WindowsAndMessaging::{EnumWindows, GetClassNameW, PostMessageW};
+    use windows::Win32::Foundation::{LPARAM, WPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
+
+    let Some(control) = control_window() else {
+        return;
+    };
+    // Posted, not sent: this must never block on Explorer's UI thread, and there
+    // is nothing to learn from the answer.
+    if let Err(e) = unsafe { PostMessageW(Some(control), WM_TAP_REVERT, WPARAM(0), LPARAM(0)) } {
+        eprintln!("taskbar: could not ask for a revert ({e})");
+    }
+}
+
+/// The injected TAP's control window, if there is one.
+///
+/// `EnumWindows` rather than `FindWindow`, which does not locate this window across
+/// processes — the same thing was measured in the other direction, for the TAP
+/// finding our receiver.
+fn control_window() -> Option<windows::Win32::Foundation::HWND> {
+    use windows::Win32::Foundation::{HWND, LPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::{EnumWindows, GetClassNameW};
     use windows_core::BOOL;
 
-    // `EnumWindows` rather than `FindWindow`, which does not locate this window
-    // across processes — the same thing was measured in the other direction, for
-    // the TAP finding our receiver.
     unsafe extern "system" fn visit(hwnd: HWND, lparam: LPARAM) -> BOOL {
         let mut class = [0u16; 64];
         let len = unsafe { GetClassNameW(hwnd, &mut class) };
@@ -140,14 +156,7 @@ pub fn revert() {
 
     let mut found = HWND(std::ptr::null_mut());
     let _ = unsafe { EnumWindows(Some(visit), LPARAM(&mut found as *mut HWND as isize)) };
-    if found.0.is_null() {
-        return;
-    }
-    // Posted, not sent: this must never block on Explorer's UI thread, and there
-    // is nothing to learn from the answer.
-    if let Err(e) = unsafe { PostMessageW(Some(found), WM_TAP_REVERT, WPARAM(0), LPARAM(0)) } {
-        eprintln!("taskbar: could not ask for a revert ({e})");
-    }
+    (!found.0.is_null()).then_some(found)
 }
 
 /// Turn the feature off: revert now, and report what the user will see.
@@ -171,7 +180,7 @@ fn shell_pid() -> Result<u32> {
     Ok(pid)
 }
 
-unsafe fn inject(pid: u32, dll: &std::path::Path) -> Result<()> {
+unsafe fn inject(pid: u32, dll: &std::path::Path, icons: StripIcons) -> Result<()> {
     // `InitializeXamlDiagnosticsEx` is exported from the system XAML runtime, which
     // has no import library — resolve it dynamically.
     let module = LoadLibraryW(PCWSTR(wide("Windows.UI.Xaml.dll").as_ptr()))
@@ -183,7 +192,7 @@ unsafe fn inject(pid: u32, dll: &std::path::Path) -> Result<()> {
     // Both DLL parameters get the TAP's own path, matching the known-good C++ TAPs.
     let endpoint = wide(ENDPOINT_NAME);
     let path = wide(&dll.to_string_lossy());
-    let init_data = wide(&init_data());
+    let init_data = wide(&init_data(icons));
 
     let hr = initialize(
         PCWSTR(endpoint.as_ptr()),
@@ -210,10 +219,36 @@ unsafe fn inject(pid: u32, dll: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-/// Segoe Fluent glyphs the strip draws by default: Volume and Microphone. They
-/// match the flyout's own unmuted icons so the two never disagree.
-const GLYPH_OUTPUT: u32 = 0xE767;
-const GLYPH_INPUT: u32 = 0xE720;
+/// What the strip should draw right now.
+///
+/// The glyphs are the *current devices'* icons, resolved exactly as the flyout and
+/// the tray icon resolve theirs — a per-device override from the config if there is
+/// one, otherwise the form-factor default. Sending fixed Volume/Microphone glyphs
+/// instead was wrong in a visible way: the flyout showed a laptop, the taskbar
+/// showed a speaker, for the same device.
+///
+/// One compromise carried over from [`crate::icons`]: the two earbud icons have no
+/// glyph in Segoe Fluent and the tray hand-draws them. The strip can only render a
+/// font glyph, so those fall back to the headphone glyph.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct StripIcons {
+    pub output: char,
+    pub input: char,
+    pub output_muted: bool,
+    pub input_muted: bool,
+}
+
+/// Fallbacks for when the devices cannot be resolved: Volume and Microphone.
+impl Default for StripIcons {
+    fn default() -> Self {
+        Self {
+            output: '\u{E767}',
+            input: '\u{E720}',
+            output_muted: false,
+            input_muted: false,
+        }
+    }
+}
 
 /// Alpha applied to the accent fill, as hex. A fully opaque accent block is
 /// brighter than anything Windows puts in a taskbar; at half alpha the pill
@@ -237,14 +272,52 @@ const PILL_ALPHA: &str = "80";
 /// quitting: the TAP waits on this process and reverts when it exits. Without it
 /// a `taskkill` would leave a strip behind whose every click is posted to a
 /// process that no longer exists.
-fn init_data() -> String {
+fn init_data(icons: StripIcons) -> String {
     let [r, g, b] = crate::flyout::theme::accent_rgb();
     format!(
-        "tooltip={};out={GLYPH_OUTPUT:04X};in={GLYPH_INPUT:04X};\
-         outmuted=0;inmuted=0;accent={r:02X}{g:02X}{b:02X};alpha={PILL_ALPHA};hidevolume=1;pid={}",
+        "tooltip={};out={:04X};in={:04X};\
+         outmuted={};inmuted={};accent={r:02X}{g:02X}{b:02X};alpha={PILL_ALPHA};hidevolume=1;pid={}",
         crate::tray::TRAY_MARKER,
+        icons.output as u32,
+        icons.input as u32,
+        u8::from(icons.output_muted),
+        u8::from(icons.input_muted),
         std::process::id()
     )
+}
+
+/// "Redraw the strip with these glyphs." Must match `WM_TAP_RESTYLE` in the TAP's
+/// `lifecycle` module.
+const WM_TAP_RESTYLE: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 23;
+
+/// Tell an injected TAP that the devices changed, so the strip follows them.
+///
+/// The init data is read once, in `SetSite`, so it cannot carry this — switching
+/// devices after injection would otherwise leave the strip showing the icon of a
+/// device that is no longer default.
+///
+/// Both glyphs fit in a message's parameters, so nothing has to be shared: the
+/// codepoint goes in the low bits and the muted flag above it. Best-effort and
+/// quiet, like [`revert`] — no control window means nothing is injected.
+pub fn restyle(icons: StripIcons) {
+    use windows::Win32::Foundation::{LPARAM, WPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
+
+    let Some(control) = control_window() else {
+        return;
+    };
+    let pack = |glyph: char, muted: bool| glyph as usize | (usize::from(muted) << 24);
+    let posted = unsafe {
+        PostMessageW(
+            Some(control),
+            WM_TAP_RESTYLE,
+            WPARAM(pack(icons.output, icons.output_muted)),
+            LPARAM(pack(icons.input, icons.input_muted) as isize),
+        )
+    };
+    if let Err(e) = posted {
+        eprintln!("taskbar: could not restyle the strip ({e})");
+    }
 }
 
 /// What the user did on the injected strip.
@@ -369,11 +442,11 @@ pub fn create_receiver() -> Result<windows::Win32::Foundation::HWND> {
 
 /// Apply the configured state at startup. Silent no-op when the opt-in is off,
 /// which is the default.
-pub fn apply_at_startup(enabled: bool) {
+pub fn apply_at_startup(enabled: bool, icons: StripIcons) {
     if !enabled {
         return;
     }
-    match enable() {
+    match enable(icons) {
         Ok(()) => eprintln!("taskbar: controls enabled"),
         Err(e) => eprintln!("taskbar: integration unavailable, using the plain tray icon ({e:#})"),
     }
@@ -388,7 +461,7 @@ pub fn apply_at_startup(enabled: bool) {
 ///
 /// Runs on the tray thread, where COM is already initialized, and inherits
 /// [`enable`]'s contract: a failure means the plain tray icon carries on alone.
-pub fn apply_at_restart(enabled: bool) {
+pub fn apply_at_restart(enabled: bool, icons: StripIcons) {
     if !enabled {
         return;
     }
@@ -405,7 +478,7 @@ pub fn apply_at_restart(enabled: bool) {
     if shell_pid().is_ok_and(just_injected) {
         return;
     }
-    match enable() {
+    match enable(icons) {
         Ok(()) => eprintln!("taskbar: Explorer restarted — controls re-injected"),
         Err(e) => eprintln!("taskbar: Explorer restarted, re-injection failed ({e:#})"),
     }

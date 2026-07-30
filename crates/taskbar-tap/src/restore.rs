@@ -97,9 +97,18 @@ pub unsafe fn remember_layout(diagnostics: &IXamlDiagnostics, handle: InstanceHa
 /// after that, the thing to put back at the end is the *new* shell visual, not
 /// the stale one from the first time round.
 ///
+/// With one exception: **never record our own strip.** Redrawing it — which a device
+/// switch does, via `crate::restyle` — would otherwise make the strip itself the
+/// thing we "restore", and the shell's original visual would be lost for good. This
+/// is the guard that makes redrawing safe, and it is here rather than at the call
+/// site so every path gets it.
+///
 /// # Safety
 /// XAML UI thread only.
 pub unsafe fn remember_content(diagnostics: &IXamlDiagnostics, presenter: InstanceHandle) {
+    if decorate::holds_our_strip(diagnostics, presenter) {
+        return;
+    }
     let Some(raw) = decorate::content_of(diagnostics, presenter) else {
         return;
     };

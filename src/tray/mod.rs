@@ -91,7 +91,7 @@ pub fn run(backend: WasapiBackend) -> Result<()> {
     // `put_Content` there simply never returns. Measured: the log stops at
     // "setting content on …" and the strip never appears. Letting the icon arrive
     // as a live delta afterwards is the ordering that works.
-    crate::taskbar::apply_at_startup(config.taskbar.enabled);
+    crate::taskbar::apply_at_startup(config.taskbar.enabled, strip_icons(&backend, &config));
 
     // At logon audio-tray can start ahead of `explorer.exe`, and registering the
     // icon then fails silently and permanently — hence the retry inside.
@@ -155,7 +155,7 @@ pub fn run(backend: WasapiBackend) -> Result<()> {
             // visible. `tray-icon` re-registers our plain notification icon on
             // the same signal, independently.
             if msg.message == crate::taskbar::WM_TASKBAR_RESTARTED {
-                crate::taskbar::apply_at_restart(config.taskbar.enabled);
+                crate::taskbar::apply_at_restart(config.taskbar.enabled, strip_icons(&backend, &config));
                 // The icon `tray-icon` just re-registered carries the defaults it
                 // was built with, so put the current device's icon and tooltip
                 // back on it — and this is also the retry for any refresh that
@@ -255,7 +255,7 @@ fn handle_flyout(
     // registered and keeps working whatever happens here.
     if let Some(enabled) = outcome.taskbar_toggled {
         if enabled {
-            match crate::taskbar::enable() {
+            match crate::taskbar::enable(strip_icons(backend, config)) {
                 Ok(()) => eprintln!("taskbar: controls enabled"),
                 Err(e) => eprintln!("taskbar: could not enable ({e:#})"),
             }
@@ -320,7 +320,7 @@ fn restart_app() {
 /// strictly better than quitting on it. Observed failure is `ERROR_TIMEOUT`
 /// (1460), and it can persist for minutes on a shell that has been restarted
 /// repeatedly.
-fn build_tray(backend: &impl AudioBackend, config: &Config) -> Result<TrayIcon> {
+fn build_tray(backend: &WasapiBackend, config: &Config) -> Result<TrayIcon> {
     const FIRST_GAP: Duration = Duration::from_millis(500);
     const MAX_GAP: Duration = Duration::from_secs(5);
     /// How often to repeat the "still waiting" line, in attempts at `MAX_GAP`.
@@ -364,18 +364,68 @@ fn build_tray(backend: &impl AudioBackend, config: &Config) -> Result<TrayIcon> 
 /// audio-tray started a few seconds too early exits with `E_FAIL` and the user is
 /// left with no tray at all. It is a transient condition, and `TaskbarCreated`
 /// is what puts the icon back.
-fn refresh(backend: &impl AudioBackend, tray: &TrayIcon, config: &Config) {
+fn refresh(backend: &WasapiBackend, tray: &TrayIcon, config: &Config) {
     if let Err(e) = try_refresh(backend, tray, config) {
         eprintln!("tray: could not update the icon, will retry when the taskbar is back ({e:#})");
     }
+    // The strip draws the current devices' own icons, so it has to follow a switch
+    // just as the tray icon does. A no-op when nothing is injected.
+    crate::taskbar::restyle(strip_icons(backend, config));
 }
 
-fn try_refresh(backend: &impl AudioBackend, tray: &TrayIcon, config: &Config) -> Result<()> {
+fn try_refresh(backend: &WasapiBackend, tray: &TrayIcon, config: &Config) -> Result<()> {
     let (name, icon_id) = resolve_current(backend, config);
     tray.set_icon(Some(icon_image(icon_id)?))?;
     tray.set_tooltip(Some(&tooltip_for(&name)))?;
     println!("refresh: default \"{name}\" -> icon {icon_id:?}");
     Ok(())
+}
+
+/// The glyphs the taskbar strip should draw for the current defaults.
+///
+/// Resolved through [`icon_for_flow`], the same path the flyout and the tray icon
+/// use, so all three agree. They did not before: the strip drew fixed Volume and
+/// Microphone glyphs while the flyout showed the device's own icon, so the same
+/// speaker appeared as a laptop in one place and a speaker in the other.
+fn strip_icons(backend: &WasapiBackend, config: &Config) -> crate::taskbar::StripIcons {
+    use crate::audio::Flow;
+
+    let side = |flow: Flow| {
+        let default = backend.default_of(flow).ok().flatten();
+        let muted = default
+            .as_ref()
+            .and_then(|id| backend.is_muted(id).ok())
+            .unwrap_or(false);
+        (icon_for_flow(backend, config, flow), muted)
+    };
+    let (output, output_muted) = side(Flow::Output);
+    let (input, input_muted) = side(Flow::Input);
+    crate::taskbar::StripIcons {
+        output: output.glyph(),
+        input: input.glyph(),
+        output_muted,
+        input_muted,
+    }
+}
+
+/// The icon for the current default of one flow: a per-device override from the
+/// config if there is one, otherwise the form-factor default.
+fn icon_for_flow(backend: &WasapiBackend, config: &Config, flow: crate::audio::Flow) -> IconId {
+    let Ok(Some(current)) = backend.default_of(flow) else {
+        return IconId::Unknown;
+    };
+    let Ok(devices) = backend.enumerate_flow(flow) else {
+        return IconId::Unknown;
+    };
+    devices
+        .into_iter()
+        .find(|d| d.id == current)
+        .map(|d| {
+            config
+                .icon_for(&d.id.0)
+                .unwrap_or_else(|| icons::default_icon(d.form_factor, &d.friendly_name))
+        })
+        .unwrap_or(IconId::Unknown)
 }
 
 /// Resolve the current default device to its display name and the icon to show for it:

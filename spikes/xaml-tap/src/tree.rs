@@ -69,7 +69,7 @@ pub fn record(
     num_children: u32,
 ) {
     let mut tree = lock();
-    if tree.adds + tree.removes < RAW_LOG_LIMIT {
+    if crate::log::verbose() && tree.adds + tree.removes < RAW_LOG_LIMIT {
         logf!(
             "raw[{}] {} parent=0x{:x} child=0x{:x} idx={} handle=0x{:x}{} kids={} type={:?} name={:?}",
             tree.adds + tree.removes,
@@ -221,7 +221,13 @@ pub fn root_handles() -> Vec<u64> {
 }
 
 /// Starts the dump watchdog exactly once.
+///
+/// Only in verbose mode: the dumps are the bulk of the log, and the tree they print
+/// is a spike-exploration aid rather than something the strip needs.
 pub fn start_watchdog() {
+    if !crate::log::verbose() {
+        return;
+    }
     static STARTED: AtomicBool = AtomicBool::new(false);
     if STARTED.swap(true, Ordering::SeqCst) {
         return;

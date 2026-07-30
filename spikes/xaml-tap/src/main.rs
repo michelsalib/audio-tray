@@ -3,7 +3,12 @@
 //!
 //! Usage:
 //!   xaml-tap-inject [--pid N] [--dll PATH] [--diag-dll PATH] [--wait SECS]
+//!                   [--debug]
 //!   xaml-tap-inject --revert
+//!
+//! `--debug` turns on the exploratory logging — the raw event trace and the
+//! periodic visual-tree dumps. Off by default: a single session with it on
+//! measured 15 MB and 197k lines, 92% of that the dumps.
 //!
 //! The TAP is never unloaded — it pins itself (`DllCanUnloadNow` returns
 //! `S_FALSE`), and the undo is a revert rather than an eject: `--revert` asks the
@@ -84,8 +89,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `--owner PID` is what audio-tray passes as its own process id: the TAP
     // waits on that process and reverts when it dies, so a killed or crashed
     // owner does not leave a dead strip on the taskbar.
+    // `--debug` turns on the exploratory logging: the raw event trace and the
+    // periodic visual-tree dumps. Off by default because it is measured in
+    // megabytes per session, and nothing the strip does needs it.
     let init_data = format!(
-        "tooltip={};out={};in={};outmuted={};inmuted={};accent={};alpha={};hidevolume={};pid={}",
+        "tooltip={};out={};in={};outmuted={};inmuted={};accent={};alpha={};hidevolume={};pid={};debug={}",
         flag("--tooltip").unwrap_or_default(),
         flag("--out").unwrap_or_else(|| "E767".into()),
         flag("--in").unwrap_or_else(|| "E720".into()),
@@ -96,6 +104,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         flag("--alpha").unwrap_or_else(|| "80".into()),
         u8::from(has("--hide-system-volume")),
         flag("--owner").unwrap_or_default(),
+        u8::from(has("--debug")),
     );
 
     println!("target pid  : {pid}");

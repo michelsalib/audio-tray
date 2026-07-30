@@ -353,6 +353,8 @@ impl Tap_Impl {
                 } else {
                     String::new()
                 };
+                // Before any other logging, so the flag governs the whole session.
+                log::set_verbose(value_from(&data, "debug").as_deref() == Some("1"));
                 logf!("SetSite: IXamlDiagnostics ok, init data = {data:?}");
                 // The injector passes both which icon to decorate and what to
                 // draw in it, as a `key=value;` payload.

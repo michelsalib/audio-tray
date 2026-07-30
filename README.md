@@ -18,6 +18,10 @@ A tiny Windows system-tray app for **controlling your audio without digging thro
 - **Scroll** the mouse wheel over the tray icon to change the current output volume.
 - **Starts at sign-in** (optional, chosen at install time).
 - **Auto-updates** itself from GitHub Releases.
+- **Taskbar controls** (opt-in, off by default) — replaces the tray icon with a pair
+  of buttons in the notification area, one for output and one for input, and hides
+  Windows' own volume icon since it becomes a duplicate. Turn it on from the flyout's
+  **More** section. See [taskbar controls](#taskbar-controls-opt-in).
 
 ## Install
 
@@ -53,10 +57,38 @@ audio-tray            run the tray (default)
 audio-tray --list     print the current default + all active output devices
 audio-tray --set <q>  switch default output to a device by name substring or id
 audio-tray --update   check GitHub Releases and self-update now
+audio-tray --taskbar-revert
+                      put the taskbar back, as turning the controls off does
 ```
 
 Configuration (per-device icon overrides) is stored at
 `%APPDATA%\AudioTray\config\config.toml`.
+
+## Taskbar controls (opt-in)
+
+Off by default. Enable it from the flyout's **More** section, and the single tray
+icon is replaced by two buttons — output and input — drawn directly into the
+notification area. Left-click either one to cycle that endpoint to the next device;
+right-click opens the usual flyout. Windows' own volume icon is hidden while this is
+on, because the output button duplicates it.
+
+It works by loading `audio_tray_tap.dll` into `explorer.exe` through the XAML
+Diagnostics interface — the same mechanism TranslucentTB and Windhawk use. Some
+things worth knowing before turning it on:
+
+- **The plain tray icon is never at risk.** It is registered unconditionally, and
+  every failure here falls back to it.
+- **Everything is undone on the way out.** Turning it off, quitting, or being killed
+  all restore the taskbar exactly as it was; so does Explorer restarting, which
+  simply discards the DLL. Verified by pixel comparison against a pre-injection
+  capture.
+- **One consumer at a time.** If TranslucentTB, Windhawk or a similar taskbar tool
+  is running, enabling this may fail — they share the one diagnostics endpoint.
+- **Your icon must be on the taskbar, not in the overflow.** Nothing is changed if
+  it is hidden behind the chevron.
+
+The engineering notes, including the failure modes found along the way, are in
+[crates/taskbar-tap/FINDINGS.md](crates/taskbar-tap/FINDINGS.md).
 
 ## Auto-update
 

@@ -22,7 +22,6 @@ pub(super) const TEXT_X: f32 = 48.0; // left inset of a row's label
 pub(super) const HEADER_X: f32 = 15.0; // left inset of a section-header label
 pub(super) const RIGHT_PAD: f32 = 16.0;
 pub(super) const MIN_W: f32 = 340.0; // panel minimum width
-pub(super) const MENU_MIN_W: f32 = 200.0; // right-click menu minimum width
 pub(super) const MAX_W: f32 = 420.0; // cap on the panel width (driven by device-name length)
 pub(super) const ROW_MARGIN: f32 = 4.0; // side margin of the row highlight/pill
 pub(super) const ROW_RADIUS: f32 = 4.0; // corner radius of the row highlight
@@ -32,6 +31,8 @@ pub(super) const PENCIL_W: f32 = 42.0; // right-hand space reserved for the edit
 pub(super) const PENCIL_BTN: f32 = 30.0; // the pencil's round hover-button diameter
 pub(super) const PENCIL_RIGHT: f32 = 9.0; // gap from the panel's right edge to the button
 pub(super) const BATTERY_W: f32 = 96.0; // right-hand space reserved on battery rows (fits battery + hover pencil)
+pub(super) const CHECK_W: f32 = 40.0; // right-hand space reserved on a toggle row for its checkmark
+pub(super) const CHECK_RIGHT: f32 = 16.0; // gap from the panel's right edge to the checkmark
 // slider geometry
 pub(super) const TRACK_X0: f32 = 52.0; // track left edge
 pub(super) const VALUE_W: f32 = 46.0; // reserved right area for the percentage
@@ -61,6 +62,8 @@ pub(super) const GLYPH_SETTINGS: char = '\u{E713}';
 pub(super) const GLYPH_CANCEL: char = '\u{E711}';
 pub(super) const GLYPH_BACK: char = '\u{E72B}'; // Back (leftward arrow) — the picker's cancel affordance
 pub(super) const GLYPH_UPDATE: char = '\u{E72C}'; // Refresh (circular arrow) — restart-to-update banner
+pub(super) const GLYPH_CHEVRON_UP: char = '\u{E70E}'; // ChevronUp — the taskbar-controls opt-in row
+pub(super) const GLYPH_CHECK: char = '\u{E73E}'; // CheckMark — trailing tick on an enabled toggle row
 
 // Colours (RGB); alpha applied at blend time.
 pub(super) const TINT: [u8; 3] = [0x2C, 0x2C, 0x2C]; // panel base (semi-transparent, acrylic shows through)
@@ -94,7 +97,7 @@ pub(super) fn ui_font_semibold() -> Option<&'static FontVec> {
 /// Windows uses the *Light2* shade of the accent palette rather than the base accent —
 /// matching that keeps us in step with the native flyout. Falls back to the DWM base
 /// accent, then the Win11 default.
-pub(super) fn accent_rgb() -> [u8; 3] {
+pub(crate) fn accent_rgb() -> [u8; 3] {
     accent_palette_light2().unwrap_or_else(dwm_accent_rgb)
 }
 

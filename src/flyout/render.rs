@@ -148,7 +148,21 @@ pub(super) fn render_page(ctx: &Ctx, elems: &[LaidElem], out: &mut [u8]) {
                 }
                 if let Some(f) = font {
                     let base = cy as f32 + text_px * 0.34;
-                    cv.draw_text(f, text_px, (d(TEXT_X) as f32, base), TEXT, 1.0, k.label());
+                    // Unrounded TEXT_X, matching how `content_width` measured it —
+                    // using the rounded inset here can shave a fraction of a pixel
+                    // and ellipsise a label that was sized to fit.
+                    let maxw = w as f32
+                        - TEXT_X * scale
+                        - if k.is_toggle() { CHECK_W } else { RIGHT_PAD } * scale;
+                    let label = fit_label(f, text_px, k.label(), maxw);
+                    cv.draw_text(f, text_px, (d(TEXT_X) as f32, base), TEXT, 1.0, &label);
+                }
+                // A toggle row shows a trailing accent tick while it is on.
+                if k.is_toggle() && ctx.model.taskbar_enabled {
+                    if let Ok((rgba, gw, gh)) = icons::render_glyph(GLYPH_CHECK, icon_px, accent) {
+                        let x = w - ((CHECK_RIGHT * scale).round() as i32) - gw as i32;
+                        cv.blit(x, cy - gh as i32 / 2, &rgba, gw, gh, 1.0);
+                    }
                 }
             }
             Elem::UpdateBanner => {

@@ -8,8 +8,9 @@
 //! corners from DWM. Rows and controls are laid out and hit-tested by hand; the flyout is
 //! modal via mouse capture, like a menu, but stays open while you operate it.
 //!
-//! Left-click opens the full [`Trigger::LeftClick`] panel; right-click opens the tiny
-//! [`Trigger::RightClick`] menu (Sound settings + Quit).
+//! Either mouse button opens the same panel. What used to be a separate right-click
+//! quick menu is now a "More" section at the bottom of it, so the taskbar strip can
+//! spend its clicks on switching devices rather than on opening menus.
 //!
 //! This module is the **controller**: it owns the modal message pump and coordinates the
 //! focused pieces it delegates to — the display [`model`], pure [`layout`], the [`render`]
@@ -19,7 +20,7 @@ mod canvas;
 mod layout;
 mod model;
 mod render;
-mod theme;
+pub(crate) mod theme;
 mod window;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -49,15 +50,6 @@ use model::{build_groups, Model};
 use theme::{accent_rgb, TRACK_X0};
 use window::Surface;
 
-/// Which entry point opened the flyout.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Trigger {
-    /// The full audio control panel.
-    LeftClick,
-    /// The tiny quick menu (Sound settings + Quit).
-    RightClick,
-}
-
 /// What the caller must do after the flyout closes.
 pub struct Outcome {
     pub quit: bool,
@@ -69,6 +61,9 @@ pub struct Outcome {
     /// The user clicked the "restart to update" entry — the caller should relaunch the
     /// (already-updated on disk) exe and exit.
     pub restart: bool,
+    /// The user flipped the opt-in Explorer integration. The new state is in the config
+    /// (already saved); the caller applies or reports it. `None` if untouched.
+    pub taskbar_toggled: Option<bool>,
 }
 
 /// Where to open the flyout: horizontally centred on the tray icon (`cx`), sitting just
@@ -133,9 +128,8 @@ pub fn show(
     backend: &WasapiBackend,
     config: &mut Config,
     anchor: Option<Anchor>,
-    trigger: Trigger,
 ) -> Outcome {
-    unsafe { show_inner(backend, config, anchor, trigger, false) }
+    unsafe { show_inner(backend, config, anchor, false) }
 }
 
 /// Dev preview: open straight onto the first output device's icon-picker screen (so the
@@ -145,35 +139,30 @@ pub fn show_icons_preview(
     config: &mut Config,
     anchor: Option<Anchor>,
 ) -> Outcome {
-    unsafe { show_inner(backend, config, anchor, Trigger::LeftClick, true) }
+    unsafe { show_inner(backend, config, anchor, true) }
 }
 
 unsafe fn show_inner(
     backend: &WasapiBackend,
     config: &mut Config,
     anchor: Option<Anchor>,
-    trigger: Trigger,
     start_icons: bool,
 ) -> Outcome {
     let scale = (GetDpiForSystem() as f32 / 96.0).max(1.0);
     let accent = accent_rgb();
 
-    let groups = match trigger {
-        Trigger::LeftClick => build_groups(backend, config),
-        Trigger::RightClick => Vec::new(),
-    };
-    // Only the full left-click panel offers the restart-to-update entry.
-    let update = match trigger {
-        Trigger::LeftClick => crate::update::pending_version(),
-        Trigger::RightClick => None,
-    };
+    let groups = build_groups(backend, config);
+    let update = crate::update::pending_version();
+
+    // Read before `config` is moved into the struct below.
+    let taskbar_enabled = config.taskbar.enabled;
 
     let mut fly = Flyout {
         backend,
         config,
         scale,
         accent,
-        model: Model::new(trigger, groups, update),
+        model: Model::new(groups, update, taskbar_enabled),
         hit: Interaction::default(),
         surface: Surface::new((8.0 * scale) as i32),
         watches: Vec::new(),
@@ -210,7 +199,13 @@ unsafe fn show_inner(
 
     if let Err(e) = fly.surface.create_window() {
         eprintln!("flyout: create_window failed: {e:?}");
-        return Outcome { quit: false, config_changed: false, output_changed: false, restart: false };
+        return Outcome {
+            quit: false,
+            config_changed: false,
+            output_changed: false,
+            restart: false,
+            taskbar_toggled: None,
+        };
     }
 
     fly.render_base();
@@ -337,6 +332,7 @@ unsafe fn show_inner(
         config_changed: fly.model.config_changed,
         output_changed: fly.model.output_changed,
         restart: fly.model.restart,
+        taskbar_toggled: fly.model.taskbar_toggled.then_some(fly.model.taskbar_enabled),
     }
 }
 
@@ -582,6 +578,18 @@ impl Flyout<'_> {
             }
             Elem::Action(ActionKind::SoundSettings) => {
                 open_sound_settings();
+                true
+            }
+            Elem::Action(ActionKind::TaskbarStrip) => {
+                // Persist immediately: the caller applies the new state after we close,
+                // and the plain tray icon keeps working either way.
+                let enabled = self.config.toggle_taskbar();
+                self.model.taskbar_enabled = enabled;
+                self.model.taskbar_toggled = true;
+                self.model.config_changed = true;
+                if let Err(e) = self.config.save() {
+                    eprintln!("save config failed: {e:#}");
+                }
                 true
             }
             Elem::Action(ActionKind::Quit) => {

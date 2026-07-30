@@ -14,6 +14,21 @@ use crate::icons::IconId;
 pub struct Config {
     /// endpoint id string -> chosen built-in icon
     pub icons: HashMap<String, IconId>,
+    /// Opt-in Explorer integration. See [`Taskbar`].
+    pub taskbar: Taskbar,
+}
+
+/// The `[taskbar]` section: the experimental in-Explorer icon.
+///
+/// Off by default, and deliberately so. Enabling it injects a DLL into
+/// `explorer.exe` (see `crate::taskbar`), which is unsupported by Windows, breaks
+/// on Explorer updates, and conflicts with TranslucentTB / Windhawk. The plain
+/// `Shell_NotifyIcon` tray entry is always registered regardless, so turning this
+/// off — or having it fail — leaves the app behaving exactly as it always has.
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Taskbar {
+    pub enabled: bool,
 }
 
 impl Config {
@@ -63,5 +78,42 @@ impl Config {
 
     pub fn set_icon(&mut self, device_id: String, icon: IconId) {
         self.icons.insert(device_id, icon);
+    }
+
+    /// Flip the opt-in Explorer integration, returning the new state.
+    pub fn toggle_taskbar(&mut self) -> bool {
+        self.taskbar.enabled = !self.taskbar.enabled;
+        self.taskbar.enabled
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// TOML requires plain values before tables, so adding a struct field after a
+    /// map is exactly the kind of change that makes `save()` fail at runtime while
+    /// still compiling. Round-trip it.
+    #[test]
+    fn round_trips_with_the_taskbar_section() {
+        let mut cfg = Config::default();
+        cfg.set_icon("{0.0.0.00000000}.{abc}".into(), IconId::Speakers);
+        assert!(cfg.toggle_taskbar());
+
+        let text = toml::to_string_pretty(&cfg).expect("serialize");
+        let back: Config = toml::from_str(&text).expect("deserialize");
+
+        assert!(back.taskbar.enabled);
+        assert_eq!(back.icon_for("{0.0.0.00000000}.{abc}"), Some(IconId::Speakers));
+    }
+
+    /// A config written before the opt-in existed must still load, with the
+    /// feature off — the default behaviour is the plain tray icon.
+    #[test]
+    fn legacy_config_without_taskbar_section_defaults_to_off() {
+        let legacy = "[icons]\n\"{0.0.0.00000000}.{abc}\" = \"Speakers\"\n";
+        let cfg: Config = toml::from_str(legacy).expect("deserialize legacy");
+        assert!(!cfg.taskbar.enabled);
+        assert_eq!(cfg.icon_for("{0.0.0.00000000}.{abc}"), Some(IconId::Speakers));
     }
 }

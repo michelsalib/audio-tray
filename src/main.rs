@@ -17,6 +17,10 @@
 //!                         staged update so the restart banner shows)
 //!   audio-tray --meter    sample the default output+input peak meters for 4s (diagnostic)
 //!   audio-tray --update   check GitHub releases and self-update now (see update.rs)
+//!   audio-tray --taskbar-revert
+//!                         ask an injected TAP to put the taskbar back, exactly as
+//!                         turning "Show controls in the taskbar" off does. Does not
+//!                         touch the config, so the running tray keeps its own state.
 
 use anyhow::{bail, Context, Result};
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
@@ -29,6 +33,7 @@ mod audio;
 mod config;
 mod flyout;
 mod icons;
+mod taskbar;
 mod tray;
 mod update;
 
@@ -63,20 +68,19 @@ fn main() -> Result<()> {
             // `--flyout update` fakes a staged update so the restart banner shows.
             let mut config = Config::load();
             let outcome = match args.get(1).map(String::as_str) {
-                Some("menu") => flyout::show(&backend, &mut config, None, flyout::Trigger::RightClick),
-                Some("icons") => flyout::show_icons_preview(&backend, &mut config, None),
+                                Some("icons") => flyout::show_icons_preview(&backend, &mut config, None),
                 Some("update") => {
                     update::set_pending_version("9.9.9");
-                    flyout::show(&backend, &mut config, None, flyout::Trigger::LeftClick)
+                    flyout::show(&backend, &mut config, None)
                 }
-                _ => flyout::show(&backend, &mut config, None, flyout::Trigger::LeftClick),
+                _ => flyout::show(&backend, &mut config, None),
             };
             if outcome.config_changed {
                 config.save()?;
             }
             println!(
-                "flyout: closed (config_changed={}, quit={}, restart={})",
-                outcome.config_changed, outcome.quit, outcome.restart
+                "flyout: closed (config_changed={}, quit={}, restart={}, taskbar_toggled={:?})",
+                outcome.config_changed, outcome.quit, outcome.restart, outcome.taskbar_toggled
             );
         }
         Some("--list") => list(&backend)?,
@@ -134,6 +138,13 @@ fn main() -> Result<()> {
             }
         }
         Some("--update") => update::run_manual()?,
+        Some("--taskbar-revert") => {
+            // The same call the flyout's toggle makes, reachable without driving
+            // the UI — the strip's own right-click cannot be synthesised (see
+            // `spikes/xaml-tap/FINDINGS.md`), so this is how that path gets
+            // exercised end to end.
+            println!("taskbar: {}", taskbar::disable());
+        }
         _ => {
             // Fire-and-forget auto-update: checks GitHub releases in the background
             // and self-replaces the on-disk exe (applied on next launch). No-op in

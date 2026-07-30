@@ -13,7 +13,6 @@ use crate::icons::IconId;
 use super::canvas::measure;
 use super::model::Model;
 use super::theme::*;
-use super::Trigger;
 
 /// Which screen the flyout is showing. The icon picker is a *dedicated* sub-screen you
 /// slide to from a device row's edit pencil (rather than an inline row), so it can lay its
@@ -26,24 +25,37 @@ pub(super) enum View {
     IconPicker { group: usize, dev: usize },
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum ActionKind {
     SoundSettings,
+    /// Opt-in toggle for the experimental in-Explorer taskbar controls.
+    /// Renders a trailing checkmark while enabled.
+    TaskbarStrip,
     Quit,
 }
 
 impl ActionKind {
+    /// The rows of the panel's "More" section, in order.
+    pub(super) const MENU: [ActionKind; 3] =
+        [ActionKind::SoundSettings, ActionKind::TaskbarStrip, ActionKind::Quit];
+
     pub(super) fn label(self) -> &'static str {
         match self {
             ActionKind::SoundSettings => "Sound settings",
+            ActionKind::TaskbarStrip => "Show controls in taskbar",
             ActionKind::Quit => "Quit Audio Tray",
         }
     }
     pub(super) fn glyph(self) -> char {
         match self {
             ActionKind::SoundSettings => GLYPH_SETTINGS,
+            ActionKind::TaskbarStrip => GLYPH_CHEVRON_UP,
             ActionKind::Quit => GLYPH_CANCEL,
         }
+    }
+    /// Whether the row reserves trailing space for a checkmark.
+    pub(super) fn is_toggle(self) -> bool {
+        matches!(self, ActionKind::TaskbarStrip)
     }
 }
 
@@ -80,42 +92,36 @@ pub(super) fn content_width(model: &Model, scale: f32) -> i32 {
     let mw = |f: Option<&FontVec>, px: f32, s: &str| f.map(|f| measure(f, px, s)).unwrap_or(0.0);
 
     let mut max_w = 0.0f32;
-    match model.trigger {
-        Trigger::RightClick => {
-            for k in [ActionKind::SoundSettings, ActionKind::Quit] {
-                max_w = max_w.max(TEXT_X * scale + mw(font, text_px, k.label()) + RIGHT_PAD * scale);
-            }
+    for g in &model.groups {
+        max_w = max_w.max(HEADER_X * scale + mw(font_sb, hdr_px, g.title) + RIGHT_PAD * scale);
+        if g.default_id.is_some() {
+            max_w = max_w.max((TRACK_X0 + 130.0 + VALUE_W) * scale);
         }
-        Trigger::LeftClick => {
-            for g in &model.groups {
-                max_w = max_w.max(HEADER_X * scale + mw(font_sb, hdr_px, g.title) + RIGHT_PAD * scale);
-                if g.default_id.is_some() {
-                    max_w = max_w.max((TRACK_X0 + 130.0 + VALUE_W) * scale);
-                }
-                for row in &g.devices {
-                    let reserve = if row.battery.is_some() { BATTERY_W } else { PENCIL_W };
-                    max_w = max_w.max(TEXT_X * scale + mw(font, text_px, &row.label) + reserve * scale);
-                }
-            }
-            if let Some(label) = model.update_label() {
-                max_w = max_w.max(TEXT_X * scale + mw(font, text_px, &label) + RIGHT_PAD * scale);
-            }
+        for row in &g.devices {
+            let reserve = if row.battery.is_some() { BATTERY_W } else { PENCIL_W };
+            max_w = max_w.max(TEXT_X * scale + mw(font, text_px, &row.label) + reserve * scale);
         }
     }
-    let min_w = match model.trigger {
-        Trigger::LeftClick => MIN_W,
-        Trigger::RightClick => MENU_MIN_W,
-    };
-    max_w.clamp(min_w * scale, MAX_W * scale).round() as i32
+    if let Some(label) = model.update_label() {
+        max_w = max_w.max(TEXT_X * scale + mw(font, text_px, &label) + RIGHT_PAD * scale);
+    }
+    // The former right-click menu now lives at the bottom of this same panel.
+    for k in ActionKind::MENU {
+        // A toggle row reserves room for its trailing checkmark.
+        let reserve = if k.is_toggle() { CHECK_W } else { RIGHT_PAD };
+        max_w = max_w.max(TEXT_X * scale + mw(font, text_px, k.label()) + reserve * scale);
+    }
+    // `ceil`, not `round`: rounding down by a fraction of a pixel makes the panel
+    // narrower than the text it was measured from, which then gets ellipsised by
+    // `fit_label` even though it was supposed to fit exactly.
+    max_w.clamp(MIN_W * scale, MAX_W * scale).ceil() as i32
 }
 
 /// The fixed panel height shared by every screen: the taller of the main panel and the icon
 /// picker (in practice the main panel, which has the sliders + device lists).
 pub(super) fn panel_height(model: &Model, scale: f32, width: i32) -> i32 {
     let main_h = build_view(model, scale, width, View::Main, 0).1;
-    let picker_h = if matches!(model.trigger, Trigger::LeftClick)
-        && model.groups.iter().any(|g| !g.devices.is_empty())
-    {
+    let picker_h = if model.groups.iter().any(|g| !g.devices.is_empty()) {
         build_view(model, scale, width, View::IconPicker { group: 0, dev: 0 }, 0).1
     } else {
         0
@@ -134,12 +140,8 @@ pub(super) fn panel_height(model: &Model, scale: f32, width: i32) -> i32 {
 pub(super) fn build_view(model: &Model, scale: f32, width: i32, view: View, fill_h: i32) -> (Vec<LaidElem>, i32) {
     let d = |v: f32| (v * scale).round() as i32;
     let mut kinds: Vec<Elem> = Vec::new();
-    match (model.trigger, view) {
-        (Trigger::RightClick, _) => {
-            kinds.push(Elem::Action(ActionKind::SoundSettings));
-            kinds.push(Elem::Action(ActionKind::Quit));
-        }
-        (Trigger::LeftClick, View::Main) => {
+    match view {
+        View::Main => {
             for (gi, g) in model.groups.iter().enumerate() {
                 kinds.push(Elem::Header(g.title));
                 if g.default_id.is_some() {
@@ -149,12 +151,17 @@ pub(super) fn build_view(model: &Model, scale: f32, width: i32, view: View, fill
                     kinds.push(Elem::Device { group: gi, dev: di });
                 }
             }
-            // A staged update gets a restart call-to-action pinned to the very bottom.
+            // A staged update gets a restart call-to-action.
             if model.update.is_some() {
                 kinds.push(Elem::UpdateBanner);
             }
+            // The former right-click menu, now a section at the bottom.
+            kinds.push(Elem::Header("More"));
+            for k in ActionKind::MENU {
+                kinds.push(Elem::Action(k));
+            }
         }
-        (Trigger::LeftClick, View::IconPicker { group, dev }) => {
+        View::IconPicker { group, dev } => {
             kinds.push(Elem::PickerHeader { group, dev });
             kinds.push(Elem::IconGrid { group, dev });
         }
@@ -288,7 +295,6 @@ mod tests {
     use super::*;
     use crate::audio::{DeviceId, Flow};
     use crate::flyout::model::{DeviceRow, Group, Model};
-    use crate::flyout::Trigger;
 
     fn dev(label: &str, battery: Option<u8>) -> DeviceRow {
         DeviceRow {
@@ -300,8 +306,8 @@ mod tests {
         }
     }
 
-    fn model(trigger: Trigger, groups: Vec<Group>, update: Option<&str>) -> Model {
-        Model::new(trigger, groups, update.map(str::to_string))
+    fn model(groups: Vec<Group>, update: Option<&str>) -> Model {
+        Model::new(groups, update.map(str::to_string), false)
     }
 
     fn output_group(devices: Vec<DeviceRow>) -> Group {
@@ -319,7 +325,7 @@ mod tests {
     #[test]
     fn content_width_always_within_min_max() {
         for scale in [1.0_f32, 1.5, 2.0] {
-            let m = model(Trigger::LeftClick, vec![output_group(vec![dev("Speakers", None)])], None);
+            let m = model(vec![output_group(vec![dev("Speakers", None)])], None);
             let w = content_width(&m, scale);
             assert!(w >= (MIN_W * scale).round() as i32, "w={w} below min at scale {scale}");
             assert!(w <= (MAX_W * scale).round() as i32, "w={w} above max at scale {scale}");
@@ -327,16 +333,45 @@ mod tests {
     }
 
     #[test]
-    fn content_width_empty_menu_is_menu_min() {
-        // No fonts needed: with no measurable text the width collapses to the clamp floor.
-        let m = model(Trigger::RightClick, vec![], None);
-        assert_eq!(content_width(&m, 1.0), MENU_MIN_W.round() as i32);
+    fn content_width_fits_the_more_section_even_with_no_devices() {
+        // With no devices the width comes purely from the "More" action labels, and
+        // the toggle row still has to leave room for its trailing tick.
+        for scale in [1.0_f32, 1.5, 2.0] {
+            let m = model(vec![], None);
+            let w = content_width(&m, scale);
+            assert!(w >= (MIN_W * scale).round() as i32, "w={w} below the panel floor");
+            assert!(w <= (MAX_W * scale).round() as i32, "w={w} above the cap");
+            assert!(
+                w as f32 >= (TEXT_X + CHECK_W) * scale,
+                "w={w} leaves no room for the checkmark at scale {scale}"
+            );
+        }
+    }
+
+    #[test]
+    fn main_view_always_ends_with_the_more_section() {
+        // The former right-click menu is only reachable through this section now, so
+        // losing it would strand Quit and the taskbar toggle.
+        let m = model(vec![output_group(vec![dev("Speakers", None)])], None);
+        let (elems, _) = build_view(&m, 1.0, 400, View::Main, 0);
+        let actions: Vec<_> = elems
+            .iter()
+            .filter_map(|le| match le.elem {
+                Elem::Action(k) => Some(k),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(actions.len(), ActionKind::MENU.len());
+        assert!(matches!(
+            elems.last().map(|le| le.elem),
+            Some(Elem::Action(ActionKind::Quit))
+        ));
     }
 
     #[test]
     fn grid_metrics_fits_and_centres() {
         let scale = 1.5;
-        let width = content_width(&model(Trigger::LeftClick, vec![output_group(vec![])], None), scale);
+        let width = content_width(&model(vec![output_group(vec![])], None), scale);
         let (cols, left, chip, step) = grid_metrics(width, scale);
         assert!(cols >= 1 && cols <= IconId::ALL.len() as i32);
         assert_eq!(chip, (GRID_CHIP * scale).round() as i32);

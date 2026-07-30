@@ -12,7 +12,6 @@ use crate::config::Config;
 use crate::icons::{self, IconId};
 
 use super::layout::View;
-use super::Trigger;
 
 pub(super) struct DeviceRow {
     pub id: DeviceId,
@@ -35,28 +34,36 @@ pub(super) struct Group {
 /// Everything the flyout paints, plus the outcome flags the caller reads back when it
 /// closes. No live audio handles — see the module docs.
 pub(super) struct Model {
-    pub trigger: Trigger,
     pub groups: Vec<Group>,
     pub view: View, // which screen is shown (main panel / an icon picker)
     pub update: Option<String>, // staged update's version, if any → bottom "restart to update" row
+    /// Current state of the opt-in Explorer integration, for the menu's checkmark.
+    pub taskbar_enabled: bool,
     // outcome, accumulated while the flyout is open
     pub config_changed: bool,
     pub output_changed: bool,
     pub quit: bool,
     pub restart: bool,
+    /// The user flipped the taskbar opt-in; the caller applies it.
+    pub taskbar_toggled: bool,
 }
 
 impl Model {
-    pub(super) fn new(trigger: Trigger, groups: Vec<Group>, update: Option<String>) -> Self {
+    pub(super) fn new(
+        groups: Vec<Group>,
+        update: Option<String>,
+        taskbar_enabled: bool,
+    ) -> Self {
         Model {
-            trigger,
             groups,
             view: View::Main,
             update,
+            taskbar_enabled,
             config_changed: false,
             output_changed: false,
             quit: false,
             restart: false,
+            taskbar_toggled: false,
         }
     }
 

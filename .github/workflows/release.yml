@@ -36,15 +36,23 @@ jobs:
           fi
           echo "version=$TAG_VERSION" >> "$GITHUB_OUTPUT"
 
+      # --workspace so the taskbar TAP (crates/taskbar-tap -> audio_tray_tap.dll)
+      # is built alongside the exe. It ships next to it and is what the opt-in
+      # taskbar strip loads into explorer.exe.
       - name: Build release
-        run: cargo build --release --locked
+        run: cargo build --release --locked --workspace
 
-      - name: Package self-update asset (zipped exe)
+      # The zip is what the in-app self-updater downloads (src/update.rs). It
+      # replaces the exe only, so a release whose *TAP* changed needs the installer
+      # to land the new DLL — see RELEASING.md. The DLL is in here anyway so the
+      # asset is a complete copy of what was built.
+      - name: Package self-update asset (zipped exe + TAP)
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force packaging/dist | Out-Null
           Copy-Item target/release/audio-tray.exe packaging/dist/audio-tray.exe -Force
-          Compress-Archive -Path packaging/dist/audio-tray.exe `
+          Copy-Item target/release/audio_tray_tap.dll packaging/dist/audio_tray_tap.dll -Force
+          Compress-Archive -Path packaging/dist/audio-tray.exe, packaging/dist/audio_tray_tap.dll `
             -DestinationPath packaging/dist/audio-tray-x86_64-pc-windows-msvc.zip -Force
 
       - name: Build Inno Setup installer
@@ -55,7 +63,8 @@ jobs:
             choco install innosetup -y --no-progress
           }
           $exe = (Resolve-Path target/release/audio-tray.exe).Path
-          & $iscc "/DAppVersion=${{ steps.ver.outputs.version }}" "/DSourceExe=$exe" packaging/audio-tray.iss
+          $tap = (Resolve-Path target/release/audio_tray_tap.dll).Path
+          & $iscc "/DAppVersion=${{ steps.ver.outputs.version }}" "/DSourceExe=$exe" "/DSourceTap=$tap" packaging/audio-tray.iss
           if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit code $LASTEXITCODE" }
 
       - name: Create GitHub Release

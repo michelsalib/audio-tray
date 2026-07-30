@@ -141,7 +141,7 @@ fn main() -> Result<()> {
         Some("--taskbar-revert") => {
             // The same call the flyout's toggle makes, reachable without driving
             // the UI — the strip's own right-click cannot be synthesised (see
-            // `spikes/xaml-tap/FINDINGS.md`), so this is how that path gets
+            // `crates/taskbar-tap/FINDINGS.md`), so this is how that path gets
             // exercised end to end.
             println!("taskbar: {}", taskbar::disable());
         }

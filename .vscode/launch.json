@@ -2,13 +2,18 @@
   // Requires the "C/C++" extension (ms-vscode.cpptools). cppvsdbg reads MSVC PDB debug
   // info natively — the right debugger for the x86_64-pc-windows-msvc toolchain.
   //
-  // Every configuration builds the TAP too and stages it as `audio_tray_tap.dll`
-  // next to the exe, which is where `taskbar::enable()` looks. Without that, the
-  // panel's "Show controls in taskbar" toggle flips the setting and then fails
-  // with "audio_tray_tap.dll not found next to the exe".
+  // These build only `audio-tray`, not the TAP. Explorer pins the DLL while it is
+  // loaded, so building it would fail exactly when the strip is up — and debugging
+  // the app should not depend on that. Run the "cargo build TAP (debug)" task when
+  // you have changed the TAP; it writes `target/debug/audio_tray_tap.dll`, which is
+  // where `taskbar::enable()` looks.
   //
-  // Note the TAP runs inside `explorer.exe`, not here: this debugger will not
-  // stop in it. Its log is `%TEMP%\xaml-tap.log`.
+  // If that DLL has never been built, the panel's "Show controls in the taskbar"
+  // toggle flips the setting and then reports the DLL as missing.
+  //
+  // Note the TAP runs inside `explorer.exe`, not here: this debugger will not stop
+  // in it. Its log is `%TEMP%\xaml-tap.log`, and `--debug` in the init data turns on
+  // the verbose tree dumps.
   "version": "0.2.0",
   "configurations": [
     {
@@ -19,7 +24,7 @@
       "args": [],
       "cwd": "${workspaceFolder}",
       "console": "integratedTerminal",
-      "preLaunchTask": "build all (debug)"
+      "preLaunchTask": "cargo build (debug)"
     },
     {
       "name": "Debug --list",
@@ -29,7 +34,7 @@
       "args": ["--list"],
       "cwd": "${workspaceFolder}",
       "console": "integratedTerminal",
-      "preLaunchTask": "build all (debug)"
+      "preLaunchTask": "cargo build (debug)"
     }
   ]
 }

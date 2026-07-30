@@ -1,6 +1,5 @@
-# Rust build output. The spike keeps its own workspace, so it has its own target.
+# Rust build output (one workspace target dir covers every member)
 /target
-/spikes/*/target
 
 # Backup / editor files
 *.bak

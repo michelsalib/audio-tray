@@ -1,18 +1,22 @@
-# M1 spike for the "rich taskbar UI" plan: inject a no-op TAP into explorer.exe
-# and dump its XAML visual tree.
+# The XAML Diagnostics TAP: a COM DLL loaded into explorer.exe that draws
+# audio-tray's controls into the notification area. See FINDINGS.md.
 #
-# Deliberately its own workspace root (empty `[workspace]` below) so it stays out
-# of the shipping `audio-tray` package — cargo-release, the CI matrix and the Inno
-# installer all keep seeing a single-crate repo.
+# A workspace member rather than its own workspace root, so CI, clippy and
+# cargo-release all see it. Note `cargo build` at the repo root still builds only
+# the root package — which is what you want, because the DLL cannot be relinked
+# while Explorer has it loaded and a plain build should not start failing for
+# that. `cargo build --workspace` (or `-p taskbar-tap`) builds this one.
 [package]
-name = "xaml-tap"
+name = "taskbar-tap"
 version = "0.0.0"
 edition = "2021"
 publish = false
 
-[workspace]
-
 [lib]
+# Named for what `taskbar::enable()` loads, so a workspace build drops the DLL
+# straight where the app looks for it — no staging step, no second name to keep
+# in step.
+name = "audio_tray_tap"
 # cdylib = the TAP itself, loaded into explorer.exe.
 # rlib   = lets the injector bin share the CLSID/endpoint constants.
 crate-type = ["cdylib", "rlib"]
@@ -22,8 +26,8 @@ name = "xaml-tap-inject"
 path = "src/main.rs"
 
 [dependencies]
-# Must match the main crate's pin so the two can merge later without a version
-# skew on GUID/HRESULT/BSTR types.
+# Shares the main crate's pin — same workspace now, so a skew on GUID/HRESULT/BSTR
+# types is impossible rather than merely discouraged.
 windows-core = "0.61"
 
 [dependencies.windows]

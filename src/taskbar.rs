@@ -5,7 +5,7 @@
 //! If injection is disabled, unavailable, or fails, the app behaves exactly as it
 //! always has — callers treat every error as "feature off", never as fatal.
 //!
-//! Mechanism (see `spikes/xaml-tap/FINDINGS.md` for the measurements behind it):
+//! Mechanism (see `crates/taskbar-tap/FINDINGS.md` for the measurements behind it):
 //! `InitializeXamlDiagnosticsEx` loads `audio_tray_tap.dll` into `explorer.exe`,
 //! where it implements `IVisualTreeServiceCallback2`, watches the XAML tree for
 //! our `SystemTray.NotifyIconView`, and restyles it.

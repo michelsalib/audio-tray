@@ -49,12 +49,31 @@ git tag v0.1.1
 git push origin v0.1.1
 ```
 
-The workflow builds `--release`, then publishes a GitHub Release with two assets:
+The workflow builds `--release --workspace` — the workspace part matters, because it
+is what produces `audio_tray_tap.dll` from `crates/taskbar-tap` alongside the exe.
+It then publishes a GitHub Release with two assets:
 
-- **`AudioTray-0.1.1-Setup.exe`** — the Inno installer (humans + winget).
-- **`audio-tray-x86_64-pc-windows-msvc.zip`** — zipped `audio-tray.exe`, consumed by the in-app updater.
+- **`AudioTray-0.1.1-Setup.exe`** — the Inno installer (humans + winget). Ships the
+  exe **and** the TAP.
+- **`audio-tray-x86_64-pc-windows-msvc.zip`** — zipped `audio-tray.exe` plus the
+  TAP, consumed by the in-app updater.
 
 Both asset names are load-bearing — see the regex in `winget.yml` and `TARGET` in `src/update.rs`.
+
+### If you changed the TAP
+
+**The self-updater replaces the exe only.** `self_update` is configured with a
+`bin_name`, so a user who auto-updates gets the new `audio-tray.exe` next to the
+*old* `audio_tray_tap.dll`. Two consequences:
+
+- Keep the init-data protocol backwards compatible. It already tolerates this by
+  construction — unknown `key=value` pairs are ignored and missing ones fall back to
+  defaults — so an old TAP with a new exe degrades rather than breaks. Do not add a
+  key the DLL must have.
+- If a TAP change is one users actually need, say so in the release notes and point
+  them at the installer. Explorer pins the DLL while the strip is enabled, so even
+  the installer defers the replacement to the next reboot (`restartreplace`) unless
+  the feature is toggled off first.
 
 ---
 

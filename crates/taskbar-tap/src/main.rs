@@ -1,5 +1,5 @@
 //! The injector — runs as a normal user process and asks XAML diagnostics to
-//! load `xaml_tap.dll` into `explorer.exe`.
+//! load `audio_tray_tap.dll` into `explorer.exe`.
 //!
 //! Usage:
 //!   xaml-tap-inject [--pid N] [--dll PATH] [--diag-dll PATH] [--wait SECS]
@@ -20,8 +20,8 @@ use std::path::PathBuf;
 use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 use windows::Win32::UI::WindowsAndMessaging::{GetShellWindow, GetWindowThreadProcessId};
 use windows_core::{GUID, HRESULT, PCSTR, PCWSTR};
-use xaml_tap::lifecycle::{CONTROL_CLASS, WM_TAP_REVERT};
-use xaml_tap::{wide, CLSID_TAP, ENDPOINT_NAME, XAML_DLL};
+use audio_tray_tap::lifecycle::{CONTROL_CLASS, WM_TAP_REVERT};
+use audio_tray_tap::{wide, CLSID_TAP, ENDPOINT_NAME, XAML_DLL};
 
 type InitializeXamlDiagnosticsEx = unsafe extern "system" fn(
     end_point_name: PCWSTR,
@@ -59,7 +59,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => std::env::current_exe()?
             .parent()
             .ok_or("exe has no parent dir")?
-            .join("xaml_tap.dll"),
+            .join("audio_tray_tap.dll"),
     };
     if !dll.is_file() {
         return Err(format!("TAP dll not found: {}", dll.display()).into());

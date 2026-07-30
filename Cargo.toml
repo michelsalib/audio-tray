@@ -1,3 +1,9 @@
+[workspace]
+# The TAP DLL that draws our controls into the taskbar. A member so CI, clippy and
+# cargo-release cover it; `cargo build` here still builds only audio-tray, since
+# the DLL cannot be relinked while Explorer holds it loaded.
+members = ["crates/taskbar-tap"]
+
 [package]
 name = "audio-tray"
 version = "0.5.0"

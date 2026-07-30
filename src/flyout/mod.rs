@@ -25,6 +25,7 @@ mod window;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{LPARAM, POINT};
@@ -45,7 +46,7 @@ use crate::config::Config;
 use crate::icons::IconId;
 
 use canvas::Canvas;
-use layout::{ActionKind, Elem, View};
+use layout::{ActionKind, Elem, LaidElem, View};
 use model::{build_groups, Model};
 use theme::{accent_rgb, TRACK_X0};
 use window::Surface;
@@ -86,6 +87,13 @@ const WM_FLYOUT_CLOSE: u32 = WM_APP + 11;
 // (IAudioMeterInformation) so the slider fill reacts to real audio while we're open.
 const METER_TIMER_ID: usize = 1;
 const METER_INTERVAL_MS: u32 = 33;
+// A second timer drives the screen-to-screen slide (see [`Flyout::navigate`]). 10 ms is the
+// Win32 floor (`USER_TIMER_MINIMUM`), and the ~15 ms system tick rounds it up anyway — each
+// frame is placed by *elapsed time*, not by tick count, so the slide always takes
+// [`ANIM_SECS`] whatever rate the ticks actually arrive at.
+const ANIM_TIMER_ID: usize = 2;
+const ANIM_INTERVAL_MS: u32 = 10;
+const ANIM_SECS: f32 = 0.14;
 // Per-tick fall-off of the displayed peak: instant attack, gentle release (a VU-meter feel).
 const METER_DECAY: f32 = 0.82;
 // Volume change per wheel notch (`WHEEL_DELTA`) when scrolling over the flyout — 2%, matching
@@ -105,6 +113,20 @@ struct Interaction {
     pending: Option<usize>,    // index pressed on button-down, acted on button-up
 }
 
+/// A slide between two screens, in flight. Its frames are advanced from the modal loop's
+/// [`ANIM_TIMER_ID`] tick rather than from a blocking loop inside [`Flyout::navigate`]:
+/// the flyout holds the *mouse capture*, so a pump that stops pumping to sleep between
+/// frames starves pointer input — the cursor visibly freezes for the length of the slide.
+struct Transition {
+    to: View,
+    elems: Vec<LaidElem>, // the destination screen's layout, adopted when the slide lands
+    src: Vec<u8>,         // the outgoing screen, as it looked when the slide started
+    dst: Vec<u8>,         // the incoming screen, rendered once up front
+    frame: Vec<u8>,       // scratch the two are composited into, reused every tick
+    forward: bool,        // drilling in (new screen enters from the right) vs backing out
+    start: Instant,
+}
+
 /// The flyout controller. Slim on purpose: the shared services it borrows (`backend`,
 /// `config`), the render context (`scale`, `accent`), and three cohesive pieces — the
 /// display [`Model`], the pointer [`Interaction`], and the [`Surface`] (window + pixels) —
@@ -121,6 +143,7 @@ struct Flyout<'a> {
     watches: Vec<Option<VolumeWatch>>, // per-group volume/mute change subscriptions
     meters: Vec<Option<Meter>>,        // per-group live peak meters (polled on a timer)
     vol_dirty: Arc<AtomicBool>,        // shared coalescing flag for the volume callbacks
+    anim: Option<Transition>,          // the in-flight screen slide, if any
 }
 
 /// Show the flyout near the tray and operate it until the user dismisses it.
@@ -168,6 +191,7 @@ unsafe fn show_inner(
         watches: Vec::new(),
         meters: Vec::new(),
         vol_dirty: Arc::new(AtomicBool::new(false)),
+        anim: None,
     };
 
     // Resolve the anchor: bottom-right above the tray icon, else the cursor.
@@ -225,7 +249,15 @@ unsafe fn show_inner(
 
     let mut msg = MSG::default();
     'pump: while GetMessageW(&mut msg, None, 0, 0).0 > 0 {
+        // A slide is in flight (see [`Flyout::navigate`]). The pump keeps running — that is
+        // the whole point, so the captured pointer stays live — but the two half-slid
+        // screens aren't hit-testable and `elems` still describes the outgoing one, so
+        // pointer input is dropped for the ~140 ms it lasts. Escape and losing the capture
+        // still dismiss.
+        let sliding = fly.anim.is_some();
         match msg.message {
+            WM_MOUSEMOVE | WM_LBUTTONDOWN | WM_LBUTTONUP | WM_RBUTTONDOWN | WM_MOUSEWHEEL
+                if sliding => {}
             WM_MOUSEMOVE => {
                 let (mx, my) = mouse_xy(msg.lParam);
                 if let Some(si) = fly.hit.drag {
@@ -235,32 +267,9 @@ unsafe fn show_inner(
                         fly.compose();
                         fly.surface.flush();
                     }
-                } else {
-                    let inside = layout::inside(fly.surface.width, fly.surface.height, mx, my);
-                    let hover = if inside { layout::elem_at(&fly.surface.elems, my) } else { None };
-                    let kind = hover.map(|i| fly.surface.elems[i].elem);
-                    let on_pencil = matches!(kind, Some(Elem::Device { .. }))
-                        && layout::over_pencil(fly.surface.width, fly.scale, mx);
-                    let on_back = matches!(kind, Some(Elem::PickerHeader { .. }))
-                        && layout::over_back(fly.scale, mx);
-                    let on_chip = match (kind, hover) {
-                        (Some(Elem::IconGrid { .. }), Some(i)) => {
-                            layout::grid_chip_at(fly.surface.width, fly.scale, mx, my, fly.surface.elems[i].top)
-                        }
-                        _ => None,
-                    };
-                    if hover != fly.hit.hover
-                        || on_pencil != fly.hit.hover_pencil
-                        || on_back != fly.hit.hover_back
-                        || on_chip != fly.hit.hover_chip
-                    {
-                        fly.hit.hover = hover;
-                        fly.hit.hover_pencil = on_pencil;
-                        fly.hit.hover_back = on_back;
-                        fly.hit.hover_chip = on_chip;
-                        fly.compose();
-                        fly.surface.flush();
-                    }
+                } else if fly.set_hover(mx, my) {
+                    fly.compose();
+                    fly.surface.flush();
                 }
             }
             WM_LBUTTONDOWN => {
@@ -312,6 +321,7 @@ unsafe fn show_inner(
                 fly.scroll_volume(sy - fly.surface.y, delta);
             }
             WM_VOL_CHANGED => fly.refresh_volumes(),
+            WM_TIMER if msg.wParam.0 == ANIM_TIMER_ID => fly.tick_transition(),
             WM_TIMER => fly.tick_meters(),
             WM_KEYDOWN if msg.wParam.0 as u16 == VK_ESCAPE.0 => break 'pump,
             WM_FLYOUT_CLOSE => break 'pump, // lost capture (Start menu, Alt-Tab, …)
@@ -323,6 +333,9 @@ unsafe fn show_inner(
     }
 
     let _ = KillTimer(Some(fly.surface.hwnd), METER_TIMER_ID);
+    if fly.anim.is_some() {
+        let _ = KillTimer(Some(fly.surface.hwnd), ANIM_TIMER_ID); // dismissed mid-slide
+    }
     fly.watches.clear(); // unregister the volume callbacks before the window goes away
     fly.meters.clear(); // release the peak-meter interfaces too
     let _ = ReleaseCapture();
@@ -458,7 +471,9 @@ impl Flyout<'_> {
             }
             g.peak = shown;
         }
-        if changed {
+        // Mid-slide the screen belongs to the transition — keep tracking the peaks, but let
+        // it paint. The screen it lands on is composed from this same model.
+        if changed && self.anim.is_none() {
             self.compose();
             self.surface.flush();
         }
@@ -495,6 +510,11 @@ impl Flyout<'_> {
                     mute_changed = true;
                 }
             }
+        }
+        // Mid-slide the screen belongs to the transition (as in `tick_meters`): the model is
+        // up to date and the screen it lands on is rendered from it.
+        if self.anim.is_some() {
+            return;
         }
         // A mute flip swaps the slider's leading glyph (which lives in `base`); a plain
         // volume change only moves the fill/thumb/number, all drawn in the cheap `compose`
@@ -617,16 +637,20 @@ impl Flyout<'_> {
         }
     }
 
-    /// Slide-transition from the current screen to `to`, then commit it. `forward` slides
-    /// the new screen in from the right (drilling into the picker); otherwise it comes from
-    /// the left (backing out). The window keeps a constant size — the width and height are
-    /// both fixed — so this is a pure horizontal slide with no resize.
+    /// Start a slide-transition from the current screen to `to`. `forward` slides the new
+    /// screen in from the right (drilling into the picker); otherwise it comes from the left
+    /// (backing out). The window keeps a constant size — the width and height are both fixed
+    /// — so this is a pure horizontal slide with no resize.
+    ///
+    /// Returns as soon as the first frame is up; the rest is driven by [`ANIM_TIMER_ID`] from
+    /// the modal loop (see [`Transition`]), so the pump keeps servicing input — and the
+    /// pointer keeps moving — for the whole slide.
     fn navigate(&mut self, to: View, forward: bool) {
         let (w, h) = (self.surface.width, self.surface.height);
         let n = (w * h * 4) as usize;
         // Outgoing screen: reuse the current composed frame (keeps its slider fills etc.).
         let src = self.surface.buf.clone();
-        let (dst_elems, _) = layout::build_view(&self.model, self.scale, w, to, h);
+        let (elems, _) = layout::build_view(&self.model, self.scale, w, to, h);
         let mut dst = vec![0u8; n];
         let ctx = render::Ctx {
             model: &self.model,
@@ -635,35 +659,98 @@ impl Flyout<'_> {
             width: w,
             height: h,
         };
-        render::render_page(&ctx, &dst_elems, &mut dst);
-        let mut frame = vec![0u8; n];
+        render::render_page(&ctx, &elems, &mut dst);
+        self.anim = Some(Transition {
+            to,
+            elems,
+            src,
+            dst,
+            frame: vec![0u8; n],
+            forward,
+            start: Instant::now(),
+        });
+        unsafe { SetTimer(Some(self.surface.hwnd), ANIM_TIMER_ID, ANIM_INTERVAL_MS, None) };
+        self.tick_transition(); // put the first frame up without waiting for a tick
+    }
 
-        let frames = 9;
-        for i in 1..=frames {
-            let t = i as f32 / frames as f32;
-            let ease = 1.0 - (1.0 - t) * (1.0 - t); // ease-out quad
-            let off = (ease * w as f32).round() as i32;
-            // Forward: old slides left out, new enters from the right; back is the mirror.
-            let (dx_src, dx_dst) = if forward { (-off, w - off) } else { (off, off - w) };
-            {
-                let mut cv = Canvas::new(&mut frame, w, h);
-                cv.clear();
-                cv.blit_shift(&src, dx_src);
-                cv.blit_shift(&dst, dx_dst);
-            }
-            self.surface.present_buf(&frame, w, h, self.surface.x, self.surface.y, 255);
-            std::thread::sleep(std::time::Duration::from_millis(9));
+    /// Draw the in-flight slide wherever it should be *now*, and adopt the destination screen
+    /// once it lands. Placing each frame by elapsed time (rather than counting ticks) keeps
+    /// the slide the same length whether the ticks arrive every 10 ms or every 16.
+    fn tick_transition(&mut self) {
+        let Some(mut anim) = self.anim.take() else {
+            return;
+        };
+        let (w, h) = (self.surface.width, self.surface.height);
+        let t = (anim.start.elapsed().as_secs_f32() / ANIM_SECS).clamp(0.0, 1.0);
+        let ease = 1.0 - (1.0 - t) * (1.0 - t); // ease-out quad
+        let off = (ease * w as f32).round() as i32;
+        // Forward: old slides left out, new enters from the right; back is the mirror.
+        let (dx_src, dx_dst) = if anim.forward { (-off, w - off) } else { (off, off - w) };
+        {
+            let mut cv = Canvas::new(&mut anim.frame, w, h);
+            cv.clear();
+            cv.blit_shift(&anim.src, dx_src);
+            cv.blit_shift(&anim.dst, dx_dst);
         }
+        self.surface.present_buf(&anim.frame, w, h, self.surface.x, self.surface.y, 255);
+        if t >= 1.0 {
+            self.land(anim);
+        } else {
+            self.anim = Some(anim);
+        }
+    }
 
-        // Commit the destination screen.
-        self.model.view = to;
-        self.surface.elems = dst_elems;
+    /// The slide has arrived: adopt the destination screen and go back to normal painting.
+    fn land(&mut self, anim: Transition) {
+        let _ = unsafe { KillTimer(Some(self.surface.hwnd), ANIM_TIMER_ID) };
+        let n = (self.surface.width * self.surface.height * 4) as usize;
+        self.model.view = anim.to;
+        self.surface.elems = anim.elems;
         self.reset_hover();
         self.surface.base = vec![0u8; n];
         self.surface.buf = vec![0u8; n];
+        // The screen changed under a pointer that need not have moved — pick up what it is
+        // over *now* rather than sitting hover-less until the next WM_MOUSEMOVE.
+        self.sync_hover_to_cursor();
         self.render_base();
         self.compose();
         self.surface.flush();
+    }
+
+    /// Recompute what the pointer is over from client position `(mx, my)`. Returns whether
+    /// anything changed — i.e. whether the caller needs to repaint.
+    fn set_hover(&mut self, mx: i32, my: i32) -> bool {
+        let inside = layout::inside(self.surface.width, self.surface.height, mx, my);
+        let hover = if inside { layout::elem_at(&self.surface.elems, my) } else { None };
+        let kind = hover.map(|i| self.surface.elems[i].elem);
+        let on_pencil = matches!(kind, Some(Elem::Device { .. }))
+            && layout::over_pencil(self.surface.width, self.scale, mx);
+        let on_back =
+            matches!(kind, Some(Elem::PickerHeader { .. })) && layout::over_back(self.scale, mx);
+        let on_chip = match (kind, hover) {
+            (Some(Elem::IconGrid { .. }), Some(i)) => {
+                layout::grid_chip_at(self.surface.width, self.scale, mx, my, self.surface.elems[i].top)
+            }
+            _ => None,
+        };
+        let changed = hover != self.hit.hover
+            || on_pencil != self.hit.hover_pencil
+            || on_back != self.hit.hover_back
+            || on_chip != self.hit.hover_chip;
+        self.hit.hover = hover;
+        self.hit.hover_pencil = on_pencil;
+        self.hit.hover_back = on_back;
+        self.hit.hover_chip = on_chip;
+        changed
+    }
+
+    /// Seed the hover state from where the cursor actually is. The panel never moves while
+    /// it is open, so screen → client is a plain translation by its top-left corner.
+    fn sync_hover_to_cursor(&mut self) {
+        let mut p = POINT::default();
+        if unsafe { GetCursorPos(&mut p) }.is_ok() {
+            self.set_hover(p.x - self.surface.x, p.y - self.surface.y);
+        }
     }
 
     /// Render the current view's static layer into the surface's `base` buffer. Slider

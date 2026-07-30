@@ -286,6 +286,7 @@ fn strip_markup(state: StripState) -> String {
             format!(
                 r##"<Border xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="{XAML_NS_X}"
+        AutomationProperties.Name="{STRIP_NAME}"
         Background="#{a:02X}{r:02X}{g:02X}{b:02X}" CornerRadius="{PILL_RADIUS}"
         Height="{PILL_H}" Margin="{PILL_MARGIN}" VerticalAlignment="Center">
 {strip}
@@ -295,6 +296,7 @@ fn strip_markup(state: StripState) -> String {
         None => format!(
             r#"<StackPanel xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
             xmlns:x="{XAML_NS_X}"
+            AutomationProperties.Name="{STRIP_NAME}"
             Orientation="Horizontal" VerticalAlignment="Center" HorizontalAlignment="Center">
 {strip}
 </StackPanel>"#
@@ -591,11 +593,25 @@ pub unsafe fn holds_our_strip(
         return false;
     }
     let content = core::mem::transmute::<*mut c_void, IInspectable>(raw);
-    content
-        .GetRuntimeClassName()
-        .map(|n| n == "Windows.UI.Xaml.Controls.Border")
-        .unwrap_or(false)
+    // Identity, not shape. This used to accept any `Border`, but the shell can
+    // legitimately put its own there — and mistaking one for ours means concluding
+    // the strip is up when it is not, which leaves the volume icon hidden and the
+    // tray reordered with nothing drawn in their place. Matching the automation
+    // name also works for the no-pill mode, whose root is a `StackPanel`.
+    let mut handle: InstanceHandle = 0;
+    if diagnostics.GetHandleFromIInspectable(content.as_raw(), &mut handle) != S_OK || handle == 0 {
+        return false;
+    }
+    automation_name(diagnostics, handle).as_deref() == Some(STRIP_NAME)
 }
+
+/// Automation name on the strip's root, so [`holds_our_strip`] can recognise our
+/// own content rather than merely something Border-shaped.
+///
+/// Not localised and never shown: `AutomationProperties.Name` on a decorative root
+/// is the cheapest identity XAML will carry for us, and it is readable back through
+/// the statics we already use to identify the tray icon itself.
+pub const STRIP_NAME: &str = "AudioTrayStrip";
 
 /// Segoe Fluent codepoints Explorer uses for the taskbar volume indicator:
 /// muted, the generic speaker, and the four level glyphs. Matching on the glyph

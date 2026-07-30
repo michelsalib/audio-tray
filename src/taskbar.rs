@@ -71,12 +71,35 @@ fn tap_path() -> Result<PathBuf> {
     Ok(dll)
 }
 
+/// Shell process and time of the last successful injection.
+///
+/// Only used to suppress an immediate duplicate; see [`apply_at_restart`].
+static LAST_INJECTED: std::sync::Mutex<Option<(u32, std::time::Instant)>> =
+    std::sync::Mutex::new(None);
+
 /// Inject the TAP into the shell's Explorer. Best-effort by contract: every error
 /// means "feature stays off", and `enable`'s message says why.
 pub fn enable() -> Result<()> {
     let dll = tap_path()?;
     let pid = shell_pid()?;
-    unsafe { inject(pid, &dll) }
+    unsafe { inject(pid, &dll)? };
+    if let Ok(mut last) = LAST_INJECTED.lock() {
+        *last = Some((pid, std::time::Instant::now()));
+    }
+    Ok(())
+}
+
+/// Whether we injected into this same Explorer a moment ago.
+fn just_injected(pid: u32) -> bool {
+    /// Long enough to cover "audio-tray started as the shell came up", short enough
+    /// that a deliberate toggle off and back on is never mistaken for a duplicate.
+    const WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
+
+    LAST_INJECTED
+        .lock()
+        .ok()
+        .and_then(|last| *last)
+        .is_some_and(|(was, at)| was == pid && at.elapsed() < WINDOW)
 }
 
 /// Window class of the TAP's control window, inside `explorer.exe`. Must match
@@ -171,8 +194,15 @@ unsafe fn inject(pid: u32, dll: &std::path::Path) -> Result<()> {
         PCWSTR(init_data.as_ptr()),
     );
     if hr.is_err() {
+        // XAML Diagnostics is effectively single-consumer: TranslucentTB and
+        // Windhawk's Taskbar Styler connect to this same `VisualDiagConnection1`
+        // endpoint. A bare HRESULT sends people hunting for a bug in our code, so
+        // name the likeliest cause alongside it.
         bail!(
-            "InitializeXamlDiagnosticsEx failed: 0x{:08x} ({})",
+            "InitializeXamlDiagnosticsEx failed: 0x{:08x} ({}). \
+             The {ENDPOINT_NAME} endpoint takes one consumer at a time — if \
+             TranslucentTB, Windhawk or another taskbar tool is running, that is \
+             the first thing to rule out.",
             hr.0,
             windows_core::Error::from(hr).message()
         );
@@ -360,6 +390,19 @@ pub fn apply_at_startup(enabled: bool) {
 /// [`enable`]'s contract: a failure means the plain tray icon carries on alone.
 pub fn apply_at_restart(enabled: bool) {
     if !enabled {
+        return;
+    }
+    // A shell that has just restarted broadcasts `TaskbarCreated`, and audio-tray
+    // starting up injects on its own account. Both can land within a second of each
+    // other, which put two TAP instances in one Explorer — observed in the log as a
+    // second `SetSite` for the same pid. The duplicate is harmless (the newer
+    // generation supersedes the older) but it costs a COM object and an owner-watch
+    // thread for nothing.
+    //
+    // Deliberately *not* a check for "is a TAP already loaded": after a revert the
+    // DLL and its control window are still there, so that test would refuse the
+    // toggle-on it is meant to allow.
+    if shell_pid().is_ok_and(just_injected) {
         return;
     }
     match enable() {

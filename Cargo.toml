@@ -66,6 +66,9 @@ features = [
     "Win32_System_LibraryLoader",
     "Win32_System_Console",
     "Win32_UI_HiDpi",
+    # MoveFileExW, for handing the TAP's replacement to the next boot when
+    # Explorer has the DLL open (see update.rs).
+    "Win32_Storage_FileSystem",
 ]
 
 [build-dependencies]

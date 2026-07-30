@@ -62,18 +62,26 @@ Both asset names are load-bearing — see the regex in `winget.yml` and `TARGET`
 
 ### If you changed the TAP
 
-**The self-updater replaces the exe only.** `self_update` is configured with a
-`bin_name`, so a user who auto-updates gets the new `audio-tray.exe` next to the
-*old* `audio_tray_tap.dll`. Two consequences:
+`self_update` replaces exactly one file — the one named by `bin_name` — so the DLL
+gets its own pass in `update::update_tap`, which runs only when an update was
+actually applied. Where it lands depends on whether the strip is switched on:
 
-- Keep the init-data protocol backwards compatible. It already tolerates this by
-  construction — unknown `key=value` pairs are ignored and missing ones fall back to
-  defaults — so an old TAP with a new exe degrades rather than breaks. Do not add a
-  key the DLL must have.
-- If a TAP change is one users actually need, say so in the release notes and point
-  them at the installer. Explorer pins the DLL while the strip is enabled, so even
-  the installer defers the replacement to the next reboot (`restartreplace`) unless
-  the feature is toggled off first.
+| strip state | when the new DLL takes effect |
+|---|---|
+| off (DLL not loaded) | immediately, alongside the exe |
+| on (Explorer holds it) | **next reboot** — handed to `MoveFileExW` with `MOVEFILE_DELAY_UNTIL_REBOOT` |
+
+That second row is the same mechanism as the installer's `restartreplace`. Users who
+toggle the feature off, let the update run, then toggle it back on skip the reboot.
+
+Failing to place the DLL is logged and otherwise ignored: the exe has already been
+replaced by then, and turning a good update into a bad one over the DLL would be the
+wrong trade.
+
+**Still keep the init-data protocol backwards compatible.** A stale DLL is always
+possible — the reboot may not have happened yet — and it degrades rather than breaks
+because unknown `key=value` pairs are ignored and missing ones fall back to defaults.
+Do not add a key the DLL must have.
 
 ---
 

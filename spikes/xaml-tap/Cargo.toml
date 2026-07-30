@@ -1,0 +1,45 @@
+# M1 spike for the "rich taskbar UI" plan: inject a no-op TAP into explorer.exe
+# and dump its XAML visual tree.
+#
+# Deliberately its own workspace root (empty `[workspace]` below) so it stays out
+# of the shipping `audio-tray` package — cargo-release, the CI matrix and the Inno
+# installer all keep seeing a single-crate repo.
+[package]
+name = "xaml-tap"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[lib]
+# cdylib = the TAP itself, loaded into explorer.exe.
+# rlib   = lets the injector bin share the CLSID/endpoint constants.
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "xaml-tap-inject"
+path = "src/main.rs"
+
+[dependencies]
+# Must match the main crate's pin so the two can merge later without a version
+# skew on GUID/HRESULT/BSTR types.
+windows-core = "0.61"
+
+[dependencies.windows]
+version = "0.61"
+features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_System_Ole",             # IObjectWithSite (the TAP site contract)
+    "Win32_System_LibraryLoader",   # GetProcAddress / GetModuleFileNameW
+    "Win32_System_Threading",
+    "Win32_System_Registry",              # accent colour
+    "Win32_System_Diagnostics_ToolHelp", # explorer.exe PID lookup
+    "Win32_System_Diagnostics_Debug",    # OutputDebugStringW
+    "Win32_System_WinRT",                # RoGetActivationFactory
+    "Win32_UI_WindowsAndMessaging",      # GetShellWindow
+    # `RegisterClassW`/`WNDCLASSW` are gated behind Gdi (the struct carries
+    # HBRUSH/HICON), and the revert channel needs its own window class.
+    "Win32_Graphics_Gdi",
+]

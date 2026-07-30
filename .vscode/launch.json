@@ -1,6 +1,14 @@
 {
   // Requires the "C/C++" extension (ms-vscode.cpptools). cppvsdbg reads MSVC PDB debug
   // info natively — the right debugger for the x86_64-pc-windows-msvc toolchain.
+  //
+  // Every configuration builds the TAP too and stages it as `audio_tray_tap.dll`
+  // next to the exe, which is where `taskbar::enable()` looks. Without that, the
+  // panel's "Show controls in taskbar" toggle flips the setting and then fails
+  // with "audio_tray_tap.dll not found next to the exe".
+  //
+  // Note the TAP runs inside `explorer.exe`, not here: this debugger will not
+  // stop in it. Its log is `%TEMP%\xaml-tap.log`.
   "version": "0.2.0",
   "configurations": [
     {
@@ -11,7 +19,7 @@
       "args": [],
       "cwd": "${workspaceFolder}",
       "console": "integratedTerminal",
-      "preLaunchTask": "cargo build (debug)"
+      "preLaunchTask": "build all (debug)"
     },
     {
       "name": "Debug --list",
@@ -21,7 +29,7 @@
       "args": ["--list"],
       "cwd": "${workspaceFolder}",
       "console": "integratedTerminal",
-      "preLaunchTask": "cargo build (debug)"
+      "preLaunchTask": "build all (debug)"
     }
   ]
 }

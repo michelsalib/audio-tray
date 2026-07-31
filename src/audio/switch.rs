@@ -22,6 +22,9 @@ pub fn set_default(id: &DeviceId) -> Result<()> {
     let name = PCWSTR(wide.as_ptr());
 
     unsafe {
+        // Creating the object is free next to the calls themselves — measured at
+        // 0.07–0.9ms against 25 + 66 + 64ms for the three roles — so there is
+        // nothing to gain by caching it between switches.
         let policy: IPolicyConfig = CoCreateInstance(&PolicyConfigClient, None, CLSCTX_ALL)
             .context("create PolicyConfigClient (IPolicyConfig)")?;
         for role in [eConsole, eMultimedia, eCommunications] {

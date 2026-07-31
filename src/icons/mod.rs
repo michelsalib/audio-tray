@@ -58,7 +58,7 @@ impl IconId {
     /// Segoe Fluent Icons code point for this icon. The two earbud variants have no
     /// entry: the font ships no earbuds glyph, so [`render`](Self::render) hand-draws
     /// them instead (this returns the headphone glyph only as a harmless fallback).
-    fn glyph(self) -> char {
+    pub fn glyph(self) -> char {
         match self {
             IconId::WirelessEarbuds => '\u{E7F6}', // Headphone (no earbuds glyph; see render)
             IconId::RoundEarbuds => '\u{E7F6}',    // Headphone (no earbuds glyph; see render)

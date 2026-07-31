@@ -12,7 +12,10 @@ use crate::audio::Flow;
 use crate::icons::{self, IconId};
 
 use super::canvas::{fit_label, lerp3, measure, Canvas, Rect};
-use super::layout::{grid_metrics, pencil_center_x, Elem, LaidElem};
+use super::layout::{
+    footer_btn_center_x, footer_buttons, footer_item_right, grid_metrics, pencil_center_x,
+    ActionKind, Elem, LaidElem,
+};
 use super::model::Model;
 use super::theme::*;
 use super::Interaction;
@@ -141,30 +144,55 @@ pub(super) fn render_page(ctx: &Ctx, elems: &[LaidElem], out: &mut [u8]) {
                     }
                 }
             }
-            Elem::Action(k) => {
+            Elem::Footer => {
+                // The strip is a shade darker than the panel body and closed off by a
+                // full-bleed hairline — the way the Win11 quick-settings footer reads. It
+                // runs to the bottom edge, so its fill has to follow the panel's corners.
+                let top = le.top as f32;
+                let bottom = (le.top + le.height) as f32;
+                cv.fill_round_rect_bottom(
+                    Rect::new(0.0, top, w as f32, bottom),
+                    d(CORNER) as f32,
+                    FOOTER_SHADE,
+                    FOOTER_SHADE_A,
+                );
+                let line = scale.round().max(1.0);
+                cv.fill_round_rect(Rect::new(0.0, top, w as f32, top + line), 0.0, TEXT, DIVIDER_A);
                 let cy = le.top + le.height / 2;
-                if let Ok((rgba, gw, gh)) = icons::render_glyph(k.glyph(), icon_px, TEXT) {
-                    cv.blit(d(ICON_X), cy - gh as i32 / 2, &rgba, gw, gh, 1.0);
+                let fpx = (FOOTER_ICON_PX * scale).round() as u32;
+                // Left: the labelled item (glyph + text), like the battery readout.
+                if let Ok((rgba, gw, gh)) = icons::render_glyph(ActionKind::LEFT.glyph(), fpx, TEXT) {
+                    let x = ((FOOTER_ICON_X + FOOTER_ICON_PX / 2.0) * scale).round() as i32 - gw as i32 / 2;
+                    cv.blit(x, cy - gh as i32 / 2, &rgba, gw, gh, 1.0);
                 }
                 if let Some(f) = font {
-                    let base = cy as f32 + text_px * 0.34;
-                    cv.draw_text(f, text_px, (d(TEXT_X) as f32, base), TEXT, 1.0, k.label());
+                    let lpx = FOOTER_TEXT_PX * scale;
+                    let base = cy as f32 + lpx * 0.34;
+                    // Unrounded FOOTER_TEXT_X, matching how `content_width` measured it —
+                    // using a rounded inset here can shave a fraction of a pixel and
+                    // ellipsise a label that was sized to fit.
+                    // Stop short of the *leftmost* button, whichever that is.
+                    let last = footer_buttons(ctx.model).len() - 1;
+                    let maxw = footer_btn_center_x(w, scale, last) - FOOTER_BTN * scale / 2.0
+                        - (FOOTER_TEXT_X + FOOTER_GAP) * scale;
+                    let label = fit_label(f, lpx, ActionKind::LEFT.label(), maxw);
+                    cv.draw_text(f, lpx, (d(FOOTER_TEXT_X) as f32, base), TEXT, 1.0, &label);
                 }
-            }
-            Elem::UpdateBanner => {
-                let cy = le.top + le.height / 2;
-                // A subtle accent band marks it as a call-to-action.
-                let ry0 = le.top as f32 + 1.0;
-                let ry1 = (le.top + le.height) as f32 - 1.0;
-                cv.fill_round_rect(Rect::new(mx, ry0, w as f32 - mx, ry1), d(ROW_RADIUS) as f32, accent, 0.16);
-                if let Ok((rgba, gw, gh)) = icons::render_glyph(GLYPH_UPDATE, icon_px, accent) {
-                    cv.blit(d(ICON_X), cy - gh as i32 / 2, &rgba, gw, gh, 1.0);
-                }
-                if let (Some(f), Some(label)) = (font, ctx.model.update_label()) {
-                    let base = cy as f32 + text_px * 0.34;
-                    let maxw = w as f32 - d(TEXT_X) as f32 - RIGHT_PAD * scale;
-                    let label = fit_label(f, text_px, &label, maxw);
-                    cv.draw_text(f, text_px, (d(TEXT_X) as f32, base), TEXT, 1.0, &label);
+                // Right: the icon buttons, rightmost first. They are bare glyphs until
+                // hovered — except a call-to-action (the staged update), which carries a
+                // standing accent disc so it is noticed without a label to say so.
+                for (i, k) in footer_buttons(ctx.model).into_iter().enumerate() {
+                    let cxb = footer_btn_center_x(w, scale, i);
+                    let col = if k == ActionKind::Restart { accent } else { TEXT };
+                    if k == ActionKind::Restart {
+                        let r = FOOTER_BTN * scale / 2.0;
+                        let cyf = cy as f32;
+                        cv.fill_round_rect(Rect::new(cxb - r, cyf - r, cxb + r, cyf + r), r, accent, FOOTER_CTA_A);
+                    }
+                    if let Ok((rgba, gw, gh)) = icons::render_glyph(k.glyph(), fpx, col) {
+                        let x = (cxb - gw as f32 / 2.0).round() as i32;
+                        cv.blit(x, cy - gh as i32 / 2, &rgba, gw, gh, 1.0);
+                    }
                 }
             }
         }
@@ -299,16 +327,29 @@ pub(super) fn compose(ctx: &Ctx, hit: &Interaction, elems: &[LaidElem], base: &[
                     cv.fill_round_rect(Rect::new(cx0 as f32, cy0 as f32, (cx0 + chip) as f32, (cy0 + chip) as f32), r, TEXT, a);
                 }
             }
-            Elem::Action(_) if hovered => {
-                let ry0 = le.top as f32 + 1.0;
-                let ry1 = (le.top + le.height) as f32 - 1.0;
-                cv.fill_round_rect(Rect::new(mx, ry0, w as f32 - mx, ry1), d(ROW_RADIUS) as f32, TEXT, HOVER_A);
-            }
-            Elem::UpdateBanner if hovered => {
-                // Deepen the accent band on hover.
-                let ry0 = le.top as f32 + 1.0;
-                let ry1 = (le.top + le.height) as f32 - 1.0;
-                cv.fill_round_rect(Rect::new(mx, ry0, w as f32 - mx, ry1), d(ROW_RADIUS) as f32, accent, 0.14);
+            // Only the hovered footer *item* lights up — a pill around the labelled one, a
+            // round button behind an icon one — never the whole strip.
+            Elem::Footer if hovered => {
+                let cy = (le.top + le.height / 2) as f32;
+                if hit.hover_footer == Some(ActionKind::LEFT) {
+                    let h = FOOTER_ITEM_H * scale / 2.0;
+                    let x1 = footer_item_right(scale);
+                    cv.fill_round_rect(Rect::new(mx, cy - h, x1, cy + h), d(ROW_RADIUS) as f32, TEXT, HOVER_A);
+                }
+                for (i, k) in footer_buttons(ctx.model).into_iter().enumerate() {
+                    if hit.hover_footer != Some(k) {
+                        continue;
+                    }
+                    // A call-to-action deepens its own accent disc; the rest get the
+                    // neutral round button.
+                    let (col, a) = match k {
+                        ActionKind::Restart => (accent, FOOTER_CTA_HOVER_A - FOOTER_CTA_A),
+                        _ => (TEXT, 0.10),
+                    };
+                    let r = FOOTER_BTN * scale / 2.0;
+                    let cxb = footer_btn_center_x(w, scale, i);
+                    cv.fill_round_rect(Rect::new(cxb - r, cy - r, cxb + r, cy + r), r, col, a);
+                }
             }
             _ => {}
         }

@@ -1,4 +1,4 @@
-# Rust build output
+# Rust build output (one workspace target dir covers every member)
 /target
 
 # Backup / editor files

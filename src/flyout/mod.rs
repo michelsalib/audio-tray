@@ -8,8 +8,10 @@
 //! corners from DWM. Rows and controls are laid out and hit-tested by hand; the flyout is
 //! modal via mouse capture, like a menu, but stays open while you operate it.
 //!
-//! Left-click opens the full [`Trigger::LeftClick`] panel; right-click opens the tiny
-//! [`Trigger::RightClick`] menu (Sound settings + Quit).
+//! Either mouse button opens the same panel. What used to be a separate right-click
+//! quick menu is now the footer strip that closes it — Quit on the left, a Sound settings
+//! button on the right, modelled on the Win11 quick-settings footer — so the taskbar strip
+//! can spend its clicks on switching devices rather than on opening menus.
 //!
 //! This module is the **controller**: it owns the modal message pump and coordinates the
 //! focused pieces it delegates to — the display [`model`], pure [`layout`], the [`render`]
@@ -19,11 +21,12 @@ mod canvas;
 mod layout;
 mod model;
 mod render;
-mod theme;
+pub(crate) mod theme;
 mod window;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{LPARAM, POINT};
@@ -44,19 +47,10 @@ use crate::config::Config;
 use crate::icons::IconId;
 
 use canvas::Canvas;
-use layout::{ActionKind, Elem, View};
+use layout::{ActionKind, Elem, LaidElem, View};
 use model::{build_groups, Model};
 use theme::{accent_rgb, TRACK_X0};
 use window::Surface;
-
-/// Which entry point opened the flyout.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Trigger {
-    /// The full audio control panel.
-    LeftClick,
-    /// The tiny quick menu (Sound settings + Quit).
-    RightClick,
-}
 
 /// What the caller must do after the flyout closes.
 pub struct Outcome {
@@ -91,6 +85,13 @@ const WM_FLYOUT_CLOSE: u32 = WM_APP + 11;
 // (IAudioMeterInformation) so the slider fill reacts to real audio while we're open.
 const METER_TIMER_ID: usize = 1;
 const METER_INTERVAL_MS: u32 = 33;
+// A second timer drives the screen-to-screen slide (see [`Flyout::navigate`]). 10 ms is the
+// Win32 floor (`USER_TIMER_MINIMUM`), and the ~15 ms system tick rounds it up anyway — each
+// frame is placed by *elapsed time*, not by tick count, so the slide always takes
+// [`ANIM_SECS`] whatever rate the ticks actually arrive at.
+const ANIM_TIMER_ID: usize = 2;
+const ANIM_INTERVAL_MS: u32 = 10;
+const ANIM_SECS: f32 = 0.14;
 // Per-tick fall-off of the displayed peak: instant attack, gentle release (a VU-meter feel).
 const METER_DECAY: f32 = 0.82;
 // Volume change per wheel notch (`WHEEL_DELTA`) when scrolling over the flyout — 2%, matching
@@ -106,8 +107,23 @@ struct Interaction {
     hover_pencil: bool,        // the cursor is over the hovered device row's edit pencil
     hover_back: bool,          // the cursor is over the picker's back button
     hover_chip: Option<usize>, // chip index the cursor is over, within the icon grid
+    hover_footer: Option<ActionKind>, // which footer action the cursor is over, if any
     drag: Option<usize>,       // index into elems of the slider being dragged
     pending: Option<usize>,    // index pressed on button-down, acted on button-up
+}
+
+/// A slide between two screens, in flight. Its frames are advanced from the modal loop's
+/// [`ANIM_TIMER_ID`] tick rather than from a blocking loop inside [`Flyout::navigate`]:
+/// the flyout holds the *mouse capture*, so a pump that stops pumping to sleep between
+/// frames starves pointer input — the cursor visibly freezes for the length of the slide.
+struct Transition {
+    to: View,
+    elems: Vec<LaidElem>, // the destination screen's layout, adopted when the slide lands
+    src: Vec<u8>,         // the outgoing screen, as it looked when the slide started
+    dst: Vec<u8>,         // the incoming screen, rendered once up front
+    frame: Vec<u8>,       // scratch the two are composited into, reused every tick
+    forward: bool,        // drilling in (new screen enters from the right) vs backing out
+    start: Instant,
 }
 
 /// The flyout controller. Slim on purpose: the shared services it borrows (`backend`,
@@ -126,6 +142,7 @@ struct Flyout<'a> {
     watches: Vec<Option<VolumeWatch>>, // per-group volume/mute change subscriptions
     meters: Vec<Option<Meter>>,        // per-group live peak meters (polled on a timer)
     vol_dirty: Arc<AtomicBool>,        // shared coalescing flag for the volume callbacks
+    anim: Option<Transition>,          // the in-flight screen slide, if any
 }
 
 /// Show the flyout near the tray and operate it until the user dismisses it.
@@ -133,9 +150,8 @@ pub fn show(
     backend: &WasapiBackend,
     config: &mut Config,
     anchor: Option<Anchor>,
-    trigger: Trigger,
 ) -> Outcome {
-    unsafe { show_inner(backend, config, anchor, trigger, false) }
+    unsafe { show_inner(backend, config, anchor, false) }
 }
 
 /// Dev preview: open straight onto the first output device's icon-picker screen (so the
@@ -145,40 +161,33 @@ pub fn show_icons_preview(
     config: &mut Config,
     anchor: Option<Anchor>,
 ) -> Outcome {
-    unsafe { show_inner(backend, config, anchor, Trigger::LeftClick, true) }
+    unsafe { show_inner(backend, config, anchor, true) }
 }
 
 unsafe fn show_inner(
     backend: &WasapiBackend,
     config: &mut Config,
     anchor: Option<Anchor>,
-    trigger: Trigger,
     start_icons: bool,
 ) -> Outcome {
     let scale = (GetDpiForSystem() as f32 / 96.0).max(1.0);
     let accent = accent_rgb();
 
-    let groups = match trigger {
-        Trigger::LeftClick => build_groups(backend, config),
-        Trigger::RightClick => Vec::new(),
-    };
-    // Only the full left-click panel offers the restart-to-update entry.
-    let update = match trigger {
-        Trigger::LeftClick => crate::update::pending_version(),
-        Trigger::RightClick => None,
-    };
+    let groups = build_groups(backend, config);
+    let update = crate::update::pending_version();
 
     let mut fly = Flyout {
         backend,
         config,
         scale,
         accent,
-        model: Model::new(trigger, groups, update),
+        model: Model::new(groups, update),
         hit: Interaction::default(),
         surface: Surface::new((8.0 * scale) as i32),
         watches: Vec::new(),
         meters: Vec::new(),
         vol_dirty: Arc::new(AtomicBool::new(false)),
+        anim: None,
     };
 
     // Resolve the anchor: bottom-right above the tray icon, else the cursor.
@@ -210,7 +219,12 @@ unsafe fn show_inner(
 
     if let Err(e) = fly.surface.create_window() {
         eprintln!("flyout: create_window failed: {e:?}");
-        return Outcome { quit: false, config_changed: false, output_changed: false, restart: false };
+        return Outcome {
+            quit: false,
+            config_changed: false,
+            output_changed: false,
+            restart: false,
+        };
     }
 
     fly.render_base();
@@ -230,7 +244,15 @@ unsafe fn show_inner(
 
     let mut msg = MSG::default();
     'pump: while GetMessageW(&mut msg, None, 0, 0).0 > 0 {
+        // A slide is in flight (see [`Flyout::navigate`]). The pump keeps running — that is
+        // the whole point, so the captured pointer stays live — but the two half-slid
+        // screens aren't hit-testable and `elems` still describes the outgoing one, so
+        // pointer input is dropped for the ~140 ms it lasts. Escape and losing the capture
+        // still dismiss.
+        let sliding = fly.anim.is_some();
         match msg.message {
+            WM_MOUSEMOVE | WM_LBUTTONDOWN | WM_LBUTTONUP | WM_RBUTTONDOWN | WM_MOUSEWHEEL
+                if sliding => {}
             WM_MOUSEMOVE => {
                 let (mx, my) = mouse_xy(msg.lParam);
                 if let Some(si) = fly.hit.drag {
@@ -240,32 +262,9 @@ unsafe fn show_inner(
                         fly.compose();
                         fly.surface.flush();
                     }
-                } else {
-                    let inside = layout::inside(fly.surface.width, fly.surface.height, mx, my);
-                    let hover = if inside { layout::elem_at(&fly.surface.elems, my) } else { None };
-                    let kind = hover.map(|i| fly.surface.elems[i].elem);
-                    let on_pencil = matches!(kind, Some(Elem::Device { .. }))
-                        && layout::over_pencil(fly.surface.width, fly.scale, mx);
-                    let on_back = matches!(kind, Some(Elem::PickerHeader { .. }))
-                        && layout::over_back(fly.scale, mx);
-                    let on_chip = match (kind, hover) {
-                        (Some(Elem::IconGrid { .. }), Some(i)) => {
-                            layout::grid_chip_at(fly.surface.width, fly.scale, mx, my, fly.surface.elems[i].top)
-                        }
-                        _ => None,
-                    };
-                    if hover != fly.hit.hover
-                        || on_pencil != fly.hit.hover_pencil
-                        || on_back != fly.hit.hover_back
-                        || on_chip != fly.hit.hover_chip
-                    {
-                        fly.hit.hover = hover;
-                        fly.hit.hover_pencil = on_pencil;
-                        fly.hit.hover_back = on_back;
-                        fly.hit.hover_chip = on_chip;
-                        fly.compose();
-                        fly.surface.flush();
-                    }
+                } else if fly.set_hover(mx, my) {
+                    fly.compose();
+                    fly.surface.flush();
                 }
             }
             WM_LBUTTONDOWN => {
@@ -317,6 +316,7 @@ unsafe fn show_inner(
                 fly.scroll_volume(sy - fly.surface.y, delta);
             }
             WM_VOL_CHANGED => fly.refresh_volumes(),
+            WM_TIMER if msg.wParam.0 == ANIM_TIMER_ID => fly.tick_transition(),
             WM_TIMER => fly.tick_meters(),
             WM_KEYDOWN if msg.wParam.0 as u16 == VK_ESCAPE.0 => break 'pump,
             WM_FLYOUT_CLOSE => break 'pump, // lost capture (Start menu, Alt-Tab, …)
@@ -328,6 +328,9 @@ unsafe fn show_inner(
     }
 
     let _ = KillTimer(Some(fly.surface.hwnd), METER_TIMER_ID);
+    if fly.anim.is_some() {
+        let _ = KillTimer(Some(fly.surface.hwnd), ANIM_TIMER_ID); // dismissed mid-slide
+    }
     fly.watches.clear(); // unregister the volume callbacks before the window goes away
     fly.meters.clear(); // release the peak-meter interfaces too
     let _ = ReleaseCapture();
@@ -358,6 +361,23 @@ impl Flyout<'_> {
         let bytes = (self.surface.width * self.surface.height * 4) as usize;
         self.surface.base = vec![0u8; bytes];
         self.surface.buf = vec![0u8; bytes];
+    }
+
+    /// Push the current devices' glyphs to the injected taskbar strip.
+    ///
+    /// Called at the moment of each live change rather than left to the tray's
+    /// `refresh`, because while this flyout is open it owns the message loop — the
+    /// tray thread is blocked, so an endpoint-change notification is not processed
+    /// until the flyout closes. Waiting for that made the strip visibly lag the
+    /// selection the user had just made.
+    ///
+    /// A no-op when there is no strip — an Explorer that refused the injection has
+    /// no window for us to post to — and also when the strip already shows this,
+    /// which is why it goes through the tray rather than straight to `taskbar`: the
+    /// tray owns the record of what has been posted, and a redundant restyle costs
+    /// the TAP a full rebuild.
+    fn sync_strip(&self) {
+        crate::tray::restyle_strip(self.backend, self.config);
     }
 
     fn set_group_level(&mut self, group: usize, level: f32) {
@@ -448,7 +468,9 @@ impl Flyout<'_> {
             }
             g.peak = shown;
         }
-        if changed {
+        // Mid-slide the screen belongs to the transition — keep tracking the peaks, but let
+        // it paint. The screen it lands on is composed from this same model.
+        if changed && self.anim.is_none() {
             self.compose();
             self.surface.flush();
         }
@@ -486,6 +508,11 @@ impl Flyout<'_> {
                 }
             }
         }
+        // Mid-slide the screen belongs to the transition (as in `tick_meters`): the model is
+        // up to date and the screen it lands on is rendered from it.
+        if self.anim.is_some() {
+            return;
+        }
         // A mute flip swaps the slider's leading glyph (which lives in `base`); a plain
         // volume change only moves the fill/thumb/number, all drawn in the cheap `compose`
         // overlay — so avoid re-rasterizing every glyph for a mere volume tick (a mic's
@@ -509,6 +536,7 @@ impl Flyout<'_> {
                     eprintln!("mute failed: {e:#}");
                 }
                 self.model.groups[group].muted = muted;
+                self.sync_strip();
                 self.render_base();
                 self.compose();
                 self.surface.flush();
@@ -546,6 +574,7 @@ impl Flyout<'_> {
                         self.model.groups[group].muted = self.backend.is_muted(&id).unwrap_or(false);
                         self.model.groups[group].default_id = Some(id);
                         self.rewatch(group); // follow volume/mute of the new default
+                        self.sync_strip();
                         self.render_base();
                         self.compose();
                         self.surface.flush();
@@ -571,37 +600,47 @@ impl Flyout<'_> {
                     if let Err(e) = self.config.save() {
                         eprintln!("save config failed: {e:#}");
                     }
+                    self.sync_strip();
                     self.navigate(View::Main, false);
                 }
                 false
             }
-            Elem::UpdateBanner => {
-                // The update is already on disk; the caller relaunches the exe and exits.
-                self.model.restart = true;
-                true
-            }
-            Elem::Action(ActionKind::SoundSettings) => {
-                open_sound_settings();
-                true
-            }
-            Elem::Action(ActionKind::Quit) => {
-                self.model.quit = true;
-                true
-            }
+            // The footer carries its targets side by side; the inert strip between them
+            // (`None`) leaves the flyout open.
+            Elem::Footer => match layout::footer_hit(&self.model, self.surface.width, self.scale, mx) {
+                Some(ActionKind::SoundSettings) => {
+                    open_sound_settings();
+                    true
+                }
+                Some(ActionKind::Quit) => {
+                    self.model.quit = true;
+                    true
+                }
+                Some(ActionKind::Restart) => {
+                    // The update is already on disk; the caller relaunches the exe and exits.
+                    self.model.restart = true;
+                    true
+                }
+                None => false,
+            },
             _ => false,
         }
     }
 
-    /// Slide-transition from the current screen to `to`, then commit it. `forward` slides
-    /// the new screen in from the right (drilling into the picker); otherwise it comes from
-    /// the left (backing out). The window keeps a constant size — the width and height are
-    /// both fixed — so this is a pure horizontal slide with no resize.
+    /// Start a slide-transition from the current screen to `to`. `forward` slides the new
+    /// screen in from the right (drilling into the picker); otherwise it comes from the left
+    /// (backing out). The window keeps a constant size — the width and height are both fixed
+    /// — so this is a pure horizontal slide with no resize.
+    ///
+    /// Returns as soon as the first frame is up; the rest is driven by [`ANIM_TIMER_ID`] from
+    /// the modal loop (see [`Transition`]), so the pump keeps servicing input — and the
+    /// pointer keeps moving — for the whole slide.
     fn navigate(&mut self, to: View, forward: bool) {
         let (w, h) = (self.surface.width, self.surface.height);
         let n = (w * h * 4) as usize;
         // Outgoing screen: reuse the current composed frame (keeps its slider fills etc.).
         let src = self.surface.buf.clone();
-        let (dst_elems, _) = layout::build_view(&self.model, self.scale, w, to, h);
+        let (elems, _) = layout::build_view(&self.model, self.scale, w, to, h);
         let mut dst = vec![0u8; n];
         let ctx = render::Ctx {
             model: &self.model,
@@ -610,35 +649,104 @@ impl Flyout<'_> {
             width: w,
             height: h,
         };
-        render::render_page(&ctx, &dst_elems, &mut dst);
-        let mut frame = vec![0u8; n];
+        render::render_page(&ctx, &elems, &mut dst);
+        self.anim = Some(Transition {
+            to,
+            elems,
+            src,
+            dst,
+            frame: vec![0u8; n],
+            forward,
+            start: Instant::now(),
+        });
+        unsafe { SetTimer(Some(self.surface.hwnd), ANIM_TIMER_ID, ANIM_INTERVAL_MS, None) };
+        self.tick_transition(); // put the first frame up without waiting for a tick
+    }
 
-        let frames = 9;
-        for i in 1..=frames {
-            let t = i as f32 / frames as f32;
-            let ease = 1.0 - (1.0 - t) * (1.0 - t); // ease-out quad
-            let off = (ease * w as f32).round() as i32;
-            // Forward: old slides left out, new enters from the right; back is the mirror.
-            let (dx_src, dx_dst) = if forward { (-off, w - off) } else { (off, off - w) };
-            {
-                let mut cv = Canvas::new(&mut frame, w, h);
-                cv.clear();
-                cv.blit_shift(&src, dx_src);
-                cv.blit_shift(&dst, dx_dst);
-            }
-            self.surface.present_buf(&frame, w, h, self.surface.x, self.surface.y, 255);
-            std::thread::sleep(std::time::Duration::from_millis(9));
+    /// Draw the in-flight slide wherever it should be *now*, and adopt the destination screen
+    /// once it lands. Placing each frame by elapsed time (rather than counting ticks) keeps
+    /// the slide the same length whether the ticks arrive every 10 ms or every 16.
+    fn tick_transition(&mut self) {
+        let Some(mut anim) = self.anim.take() else {
+            return;
+        };
+        let (w, h) = (self.surface.width, self.surface.height);
+        let t = (anim.start.elapsed().as_secs_f32() / ANIM_SECS).clamp(0.0, 1.0);
+        let ease = 1.0 - (1.0 - t) * (1.0 - t); // ease-out quad
+        let off = (ease * w as f32).round() as i32;
+        // Forward: old slides left out, new enters from the right; back is the mirror.
+        let (dx_src, dx_dst) = if anim.forward { (-off, w - off) } else { (off, off - w) };
+        {
+            let mut cv = Canvas::new(&mut anim.frame, w, h);
+            cv.clear();
+            cv.blit_shift(&anim.src, dx_src);
+            cv.blit_shift(&anim.dst, dx_dst);
         }
+        self.surface.present_buf(&anim.frame, w, h, self.surface.x, self.surface.y, 255);
+        if t >= 1.0 {
+            self.land(anim);
+        } else {
+            self.anim = Some(anim);
+        }
+    }
 
-        // Commit the destination screen.
-        self.model.view = to;
-        self.surface.elems = dst_elems;
+    /// The slide has arrived: adopt the destination screen and go back to normal painting.
+    fn land(&mut self, anim: Transition) {
+        let _ = unsafe { KillTimer(Some(self.surface.hwnd), ANIM_TIMER_ID) };
+        let n = (self.surface.width * self.surface.height * 4) as usize;
+        self.model.view = anim.to;
+        self.surface.elems = anim.elems;
         self.reset_hover();
         self.surface.base = vec![0u8; n];
         self.surface.buf = vec![0u8; n];
+        // The screen changed under a pointer that need not have moved — pick up what it is
+        // over *now* rather than sitting hover-less until the next WM_MOUSEMOVE.
+        self.sync_hover_to_cursor();
         self.render_base();
         self.compose();
         self.surface.flush();
+    }
+
+    /// Recompute what the pointer is over from client position `(mx, my)`. Returns whether
+    /// anything changed — i.e. whether the caller needs to repaint.
+    fn set_hover(&mut self, mx: i32, my: i32) -> bool {
+        let inside = layout::inside(self.surface.width, self.surface.height, mx, my);
+        let hover = if inside { layout::elem_at(&self.surface.elems, my) } else { None };
+        let kind = hover.map(|i| self.surface.elems[i].elem);
+        let on_pencil = matches!(kind, Some(Elem::Device { .. }))
+            && layout::over_pencil(self.surface.width, self.scale, mx);
+        let on_back =
+            matches!(kind, Some(Elem::PickerHeader { .. })) && layout::over_back(self.scale, mx);
+        let on_chip = match (kind, hover) {
+            (Some(Elem::IconGrid { .. }), Some(i)) => {
+                layout::grid_chip_at(self.surface.width, self.scale, mx, my, self.surface.elems[i].top)
+            }
+            _ => None,
+        };
+        let on_footer = match kind {
+            Some(Elem::Footer) => layout::footer_hit(&self.model, self.surface.width, self.scale, mx),
+            _ => None,
+        };
+        let changed = hover != self.hit.hover
+            || on_pencil != self.hit.hover_pencil
+            || on_back != self.hit.hover_back
+            || on_chip != self.hit.hover_chip
+            || on_footer != self.hit.hover_footer;
+        self.hit.hover = hover;
+        self.hit.hover_pencil = on_pencil;
+        self.hit.hover_back = on_back;
+        self.hit.hover_chip = on_chip;
+        self.hit.hover_footer = on_footer;
+        changed
+    }
+
+    /// Seed the hover state from where the cursor actually is. The panel never moves while
+    /// it is open, so screen → client is a plain translation by its top-left corner.
+    fn sync_hover_to_cursor(&mut self) {
+        let mut p = POINT::default();
+        if unsafe { GetCursorPos(&mut p) }.is_ok() {
+            self.set_hover(p.x - self.surface.x, p.y - self.surface.y);
+        }
     }
 
     /// Render the current view's static layer into the surface's `base` buffer. Slider

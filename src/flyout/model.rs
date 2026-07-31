@@ -12,7 +12,6 @@ use crate::config::Config;
 use crate::icons::{self, IconId};
 
 use super::layout::View;
-use super::Trigger;
 
 pub(super) struct DeviceRow {
     pub id: DeviceId,
@@ -35,10 +34,9 @@ pub(super) struct Group {
 /// Everything the flyout paints, plus the outcome flags the caller reads back when it
 /// closes. No live audio handles — see the module docs.
 pub(super) struct Model {
-    pub trigger: Trigger,
     pub groups: Vec<Group>,
     pub view: View, // which screen is shown (main panel / an icon picker)
-    pub update: Option<String>, // staged update's version, if any → bottom "restart to update" row
+    pub update: Option<String>, // staged update's version, if any → the footer's restart button
     // outcome, accumulated while the flyout is open
     pub config_changed: bool,
     pub output_changed: bool,
@@ -47,9 +45,8 @@ pub(super) struct Model {
 }
 
 impl Model {
-    pub(super) fn new(trigger: Trigger, groups: Vec<Group>, update: Option<String>) -> Self {
+    pub(super) fn new(groups: Vec<Group>, update: Option<String>) -> Self {
         Model {
-            trigger,
             groups,
             view: View::Main,
             update,
@@ -58,11 +55,6 @@ impl Model {
             quit: false,
             restart: false,
         }
-    }
-
-    /// The label for the restart-to-update banner, if an update is staged.
-    pub(super) fn update_label(&self) -> Option<String> {
-        self.update.as_ref().map(|v| format!("Restart to update to v{v}"))
     }
 }
 

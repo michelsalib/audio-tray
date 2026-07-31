@@ -14,6 +14,11 @@
 #ifndef SourceExe
   #define SourceExe "..\target\release\audio-tray.exe"
 #endif
+; The taskbar TAP, loaded into explorer.exe to draw the taskbar strip. Optional:
+; without it the app falls back to the plain tray icon and logs the DLL as missing.
+#ifndef SourceTap
+  #define SourceTap "..\target\release\audio_tray_tap.dll"
+#endif
 
 #define AppName "Audio Tray"
 #define AppPublisher "MichelSalib"
@@ -61,6 +66,11 @@ Name: "autostart"; Description: "Start {#AppName} automatically when I sign in";
 
 [Files]
 Source: "{#SourceExe}"; DestDir: "{app}"; Flags: ignoreversion
+; `skipifsourcedoesntexist` so a build without the TAP still produces an installer.
+; Explorer keeps the DLL loaded once the strip has been injected, so it cannot be
+; replaced in place — `restartreplace` defers it to the next reboot rather than
+; failing the install.
+Source: "{#SourceTap}"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist restartreplace uninsrestartdelete
 
 [Icons]
 Name: "{autoprograms}\{#AppName}"; Filename: "{app}\{#AppExeName}"

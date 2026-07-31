@@ -49,12 +49,41 @@ git tag v0.1.1
 git push origin v0.1.1
 ```
 
-The workflow builds `--release`, then publishes a GitHub Release with two assets:
+The workflow builds `--release --workspace` — the workspace part matters, because it
+is what produces `audio_tray_tap.dll` from `crates/taskbar-tap` alongside the exe.
+It then publishes a GitHub Release with two assets:
 
-- **`AudioTray-0.1.1-Setup.exe`** — the Inno installer (humans + winget).
-- **`audio-tray-x86_64-pc-windows-msvc.zip`** — zipped `audio-tray.exe`, consumed by the in-app updater.
+- **`AudioTray-0.1.1-Setup.exe`** — the Inno installer (humans + winget). Ships the
+  exe **and** the TAP.
+- **`audio-tray-x86_64-pc-windows-msvc.zip`** — zipped `audio-tray.exe` plus the
+  TAP, consumed by the in-app updater.
 
 Both asset names are load-bearing — see the regex in `winget.yml` and `TARGET` in `src/update.rs`.
+
+### If you changed the TAP
+
+`self_update` replaces exactly one file — the one named by `bin_name` — so the DLL
+gets its own pass in `update::update_tap`, which runs only when an update was
+actually applied. Where it lands depends on whether Explorer has the DLL open:
+
+| DLL state | when the new DLL takes effect |
+|---|---|
+| not loaded (the injection never landed) | immediately, alongside the exe |
+| loaded — the normal case | **next reboot** — handed to `MoveFileExW` with `MOVEFILE_DELAY_UNTIL_REBOOT` |
+
+That second row is the same mechanism as the installer's `restartreplace`, and it is
+now the usual outcome: the strip is injected on every start. `--taskbar-revert` does
+not help — the revert deliberately leaves the DLL pinned in `explorer.exe` (see
+`src/taskbar.rs`), so the file stays locked. Restarting Explorer is what frees it.
+
+Failing to place the DLL is logged and otherwise ignored: the exe has already been
+replaced by then, and turning a good update into a bad one over the DLL would be the
+wrong trade.
+
+**Still keep the init-data protocol backwards compatible.** A stale DLL is always
+possible — the reboot may not have happened yet — and it degrades rather than breaks
+because unknown `key=value` pairs are ignored and missing ones fall back to defaults.
+Do not add a key the DLL must have.
 
 ---
 

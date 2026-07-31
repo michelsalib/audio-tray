@@ -4,9 +4,13 @@
 
 //! Windows audio output tray app.
 //!
-//! Mode dispatch (plan §6): default = tray. Left-click opens the acrylic control panel
-//! (volume, mute, output/input switching, per-device icons); right-click opens the quick
-//! menu (Sound settings + Quit).
+//! Mode dispatch (plan §6): default = tray, which draws the taskbar strip (an output
+//! and an input button) over its notification icon. Left-click a button steps that
+//! endpoint around its own cycle — each active device in turn, then muted — and does
+//! nothing else; opening the acrylic control panel (volume, mute, output/input
+//! switching, per-device icons, Sound settings, Quit) is the right click's alone. On
+//! the plain tray icon we fall back to — see `taskbar` — either button opens the panel,
+//! there being no segment to cycle.
 //! Dev utilities retained from the early slices:
 //!   audio-tray            run the tray (default)
 //!   audio-tray --list     print current default + active output devices
@@ -14,9 +18,17 @@
 //!                         contains <q> (case-insensitive), or whose id equals <q>
 //!   audio-tray --flyout [menu|icons|update]  preview the panel (menu = right-click;
 //!                         icons = the first device's icon-picker screen; update = fake a
-//!                         staged update so the restart banner shows)
+//!                         staged update so the footer's restart button shows)
 //!   audio-tray --meter    sample the default output+input peak meters for 4s (diagnostic)
 //!   audio-tray --update   check GitHub releases and self-update now (see update.rs)
+//!   audio-tray --taskbar-click <out|in|panel>
+//!                         send a running tray the gesture a strip click would —
+//!                         the only way to exercise the cycling, since clicks on the
+//!                         taskbar itself cannot be synthesised
+//!   audio-tray --taskbar-revert
+//!                         ask an injected TAP to put the taskbar back. Leaves the
+//!                         running tray alone — it will put the strip up again the
+//!                         next time it starts, or when Explorer restarts.
 
 use anyhow::{bail, Context, Result};
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
@@ -29,6 +41,7 @@ mod audio;
 mod config;
 mod flyout;
 mod icons;
+mod taskbar;
 mod tray;
 mod update;
 
@@ -60,16 +73,15 @@ fn main() -> Result<()> {
         Some("--flyout") => {
             // Dev: show the flyout once. `--flyout menu` previews the right-click menu;
             // `--flyout icons` jumps straight to the first device's icon-picker screen;
-            // `--flyout update` fakes a staged update so the restart banner shows.
+            // `--flyout update` fakes a staged update so the footer's restart button shows.
             let mut config = Config::load();
             let outcome = match args.get(1).map(String::as_str) {
-                Some("menu") => flyout::show(&backend, &mut config, None, flyout::Trigger::RightClick),
-                Some("icons") => flyout::show_icons_preview(&backend, &mut config, None),
+                                Some("icons") => flyout::show_icons_preview(&backend, &mut config, None),
                 Some("update") => {
                     update::set_pending_version("9.9.9");
-                    flyout::show(&backend, &mut config, None, flyout::Trigger::LeftClick)
+                    flyout::show(&backend, &mut config, None)
                 }
-                _ => flyout::show(&backend, &mut config, None, flyout::Trigger::LeftClick),
+                _ => flyout::show(&backend, &mut config, None),
             };
             if outcome.config_changed {
                 config.save()?;
@@ -134,6 +146,28 @@ fn main() -> Result<()> {
             }
         }
         Some("--update") => update::run_manual()?,
+        Some("--taskbar-click") => {
+            // Dev: drive the strip's gestures against the running tray. Real clicks
+            // on the taskbar cannot be synthesised (see `crates/taskbar-tap/FINDINGS.md`),
+            // so this is the only way to exercise the cycling from a script.
+            let action = match args.get(1).map(String::as_str) {
+                Some("out") => taskbar::Action::CycleOutput,
+                Some("in") => taskbar::Action::CycleInput,
+                Some("panel") => taskbar::Action::OpenPanel,
+                other => bail!("usage: audio-tray --taskbar-click <out|in|panel> (got {other:?})"),
+            };
+            taskbar::post_action(action)?;
+            println!("taskbar: posted {action:?} to the running tray.");
+        }
+        Some("--taskbar-revert") => {
+            // Ask whatever TAP is loaded to put the taskbar back, without touching
+            // the running tray. Both an escape hatch (a strip left behind by a
+            // process that died badly) and how the revert path gets exercised end
+            // to end — the strip's own gestures cannot be synthesised, see
+            // `crates/taskbar-tap/FINDINGS.md`.
+            taskbar::revert();
+            println!("taskbar: controls removed.");
+        }
         _ => {
             // Fire-and-forget auto-update: checks GitHub releases in the background
             // and self-replaces the on-disk exe (applied on next launch). No-op in

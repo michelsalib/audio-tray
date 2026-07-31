@@ -24,13 +24,17 @@ jobs:
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2
 
+      # `--workspace` covers crates/taskbar-tap, the DLL that draws our controls
+      # into the taskbar. Building it here is the only automated check it gets:
+      # what it does can only be verified against a live explorer.exe.
+      #
       # Lints are informational (no `-D warnings`) so pre-existing style warnings
       # don't fail the build. Tighten later if you adopt a lint policy.
       - name: Clippy
-        run: cargo clippy --all-targets --locked
+        run: cargo clippy --all-targets --locked --workspace
 
       - name: Build
-        run: cargo build --release --locked
+        run: cargo build --release --locked --workspace
 
       - name: Test
-        run: cargo test --locked
+        run: cargo test --locked --workspace

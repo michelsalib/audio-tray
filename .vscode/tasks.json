@@ -2,6 +2,10 @@
   "version": "2.0.0",
   "tasks": [
     {
+      // The default build, and what the launch configs use. Builds only the
+      // `audio-tray` package: cargo does not build workspace members unless asked,
+      // which is deliberate here — the TAP DLL cannot be relinked while Explorer
+      // has it loaded, and debugging the app should never fail for that reason.
       "label": "cargo build (debug)",
       "type": "shell",
       "command": "cargo",
@@ -20,6 +24,43 @@
       },
       "presentation": {
         "clear": true,
+        "reveal": "silent"
+      }
+    },
+    {
+      // Run this when you have changed the TAP. It writes
+      // `target/debug/audio_tray_tap.dll`, which is exactly what
+      // `taskbar::enable()` loads — there is no separate staging step any more.
+      //
+      // It fails with "Accès refusé" / "access denied" while a TAP is loaded,
+      // because Explorer pins the DLL. Restart Explorer and run it again; a rebuilt
+      // TAP needs an Explorer restart to take effect regardless.
+      "label": "cargo build TAP (debug)",
+      "type": "shell",
+      "command": "cargo",
+      "args": ["build", "-p", "taskbar-tap"],
+      "options": {
+        "env": {
+          "PATH": "${env:USERPROFILE}\\.cargo\\bin;${env:PATH}"
+        }
+      },
+      "problemMatcher": ["$rustc"],
+      "presentation": {
+        "reveal": "silent"
+      }
+    },
+    {
+      "label": "cargo build all (debug)",
+      "type": "shell",
+      "command": "cargo",
+      "args": ["build", "--workspace"],
+      "options": {
+        "env": {
+          "PATH": "${env:USERPROFILE}\\.cargo\\bin;${env:PATH}"
+        }
+      },
+      "problemMatcher": ["$rustc"],
+      "presentation": {
         "reveal": "silent"
       }
     }

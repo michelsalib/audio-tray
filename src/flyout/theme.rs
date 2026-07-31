@@ -22,7 +22,6 @@ pub(super) const TEXT_X: f32 = 48.0; // left inset of a row's label
 pub(super) const HEADER_X: f32 = 15.0; // left inset of a section-header label
 pub(super) const RIGHT_PAD: f32 = 16.0;
 pub(super) const MIN_W: f32 = 340.0; // panel minimum width
-pub(super) const MENU_MIN_W: f32 = 200.0; // right-click menu minimum width
 pub(super) const MAX_W: f32 = 420.0; // cap on the panel width (driven by device-name length)
 pub(super) const ROW_MARGIN: f32 = 4.0; // side margin of the row highlight/pill
 pub(super) const ROW_RADIUS: f32 = 4.0; // corner radius of the row highlight
@@ -37,6 +36,25 @@ pub(super) const TRACK_X0: f32 = 52.0; // track left edge
 pub(super) const VALUE_W: f32 = 46.0; // reserved right area for the percentage
 pub(super) const TRACK_H: f32 = 4.0;
 pub(super) const THUMB_R: f32 = 7.0;
+// footer bar (the panel's last row, modelled on the Win11 quick-settings footer): a
+// hairline across the full width, a labelled action on the left, a round icon button right
+pub(super) const FOOTER_TOP_GAP: f32 = 6.0; // standoff above the hairline (the panel's old closing pad)
+pub(super) const FOOTER_H: f32 = 52.0; // the strip itself: hairline down to the panel's bottom edge
+pub(super) const FOOTER_ICON_X: f32 = 16.0; // left inset of the footer item's glyph
+pub(super) const FOOTER_ICON_PX: f32 = 16.0; // footer glyph size (smaller than a row's)
+pub(super) const FOOTER_TEXT_X: f32 = 44.0; // left inset of the footer item's label
+pub(super) const FOOTER_TEXT_PX: f32 = 13.5; // footer label em size
+pub(super) const FOOTER_ITEM_PAD: f32 = 10.0; // trailing pad inside the left item's hover pill
+pub(super) const FOOTER_ITEM_H: f32 = 32.0; // height of the left item's hover pill
+pub(super) const FOOTER_BTN: f32 = 32.0; // the right-hand button's round hover target
+pub(super) const FOOTER_BTN_RIGHT: f32 = 9.0; // gap from the panel's right edge to the last button
+pub(super) const FOOTER_BTN_GAP: f32 = 4.0; // gap between two icon buttons
+pub(super) const FOOTER_CTA_A: f32 = 0.20; // accent disc under a call-to-action button (idle)
+pub(super) const FOOTER_CTA_HOVER_A: f32 = 0.34; // …and under the pointer
+pub(super) const FOOTER_GAP: f32 = 8.0; // minimum gap between the left item and the button
+pub(super) const DIVIDER_A: f32 = 0.14; // footer hairline (below ~0.1 it vanishes into the acrylic)
+pub(super) const FOOTER_SHADE: [u8; 3] = [0x00, 0x00, 0x00]; // the strip sits a shade darker than the body
+pub(super) const FOOTER_SHADE_A: f32 = 0.18;
 // icon-picker page (a dedicated screen you slide to from a device's edit pencil)
 pub(super) const PICKER_HEADER_H: f32 = 46.0; // back-arrow + device-name title row
 pub(super) const BACK_LEFT: f32 = 7.0; // left inset of the back button
@@ -60,7 +78,7 @@ pub(super) const GLYPH_EDIT: char = '\u{E70F}';
 pub(super) const GLYPH_SETTINGS: char = '\u{E713}';
 pub(super) const GLYPH_CANCEL: char = '\u{E711}';
 pub(super) const GLYPH_BACK: char = '\u{E72B}'; // Back (leftward arrow) — the picker's cancel affordance
-pub(super) const GLYPH_UPDATE: char = '\u{E72C}'; // Refresh (circular arrow) — restart-to-update banner
+pub(super) const GLYPH_UPDATE: char = '\u{E72C}'; // Refresh (circular arrow) — restart-to-update button
 
 // Colours (RGB); alpha applied at blend time.
 pub(super) const TINT: [u8; 3] = [0x2C, 0x2C, 0x2C]; // panel base (semi-transparent, acrylic shows through)
@@ -94,7 +112,7 @@ pub(super) fn ui_font_semibold() -> Option<&'static FontVec> {
 /// Windows uses the *Light2* shade of the accent palette rather than the base accent —
 /// matching that keeps us in step with the native flyout. Falls back to the DWM base
 /// accent, then the Win11 default.
-pub(super) fn accent_rgb() -> [u8; 3] {
+pub(crate) fn accent_rgb() -> [u8; 3] {
     accent_palette_light2().unwrap_or_else(dwm_accent_rgb)
 }
 

@@ -15,6 +15,14 @@
 
 publish = false                                 # not a crates.io crate — skip `cargo publish`
 tag-name = "v{{version}}"                       # matches release.yml + the existing v0.4.x tags
+# `taskbar-tap` joined the workspace after v0.5.0, and cargo-release writes ONE
+# shared commit for a workspace. It refuses to render `{{version}}` into that
+# shared message unless the members agree on a version — which is what
+# `shared-version` asserts. Without it the commit lands literally titled
+# "Release v{{version}}" (that happened in v0.6.0); the tag is unaffected, since
+# it is per-package. The DLL ships in lockstep with the exe anyway, so one
+# version across the workspace is also the honest description.
+shared-version = true
 pre-release-commit-message = "Release v{{version}}"
 push = true                                     # push the release commit + tag to origin
 allow-branch = ["main"]                         # only ever release from the default branch

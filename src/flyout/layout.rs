@@ -25,26 +25,31 @@ pub(super) enum View {
     IconPicker { group: usize, dev: usize },
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum ActionKind {
     SoundSettings,
     Quit,
+    /// Relaunch into an update already staged on disk. Only offered while there is one.
+    Restart,
 }
 
 impl ActionKind {
-    /// The rows of the panel's "More" section, in order.
-    pub(super) const MENU: [ActionKind; 2] = [ActionKind::SoundSettings, ActionKind::Quit];
+    /// The footer's labelled left-hand item (glyph + text, like the battery readout in the
+    /// Win11 quick-settings footer).
+    pub(super) const LEFT: ActionKind = ActionKind::Quit;
 
     pub(super) fn label(self) -> &'static str {
         match self {
             ActionKind::SoundSettings => "Sound settings",
             ActionKind::Quit => "Quit Audio Tray",
+            ActionKind::Restart => "Restart to update",
         }
     }
     pub(super) fn glyph(self) -> char {
         match self {
             ActionKind::SoundSettings => GLYPH_SETTINGS,
             ActionKind::Quit => GLYPH_CANCEL,
+            ActionKind::Restart => GLYPH_UPDATE,
         }
     }
 }
@@ -58,10 +63,9 @@ pub(super) enum Elem {
     PickerHeader { group: usize, dev: usize },
     /// The icon-picker screen's wrapping grid of selectable icons.
     IconGrid { group: usize, dev: usize },
-    /// A "restart to update to v…" call-to-action at the bottom of the main panel, shown
-    /// only when a background update has been staged on disk.
-    UpdateBanner,
-    Action(ActionKind),
+    /// The panel's closing strip: a hairline, [`ActionKind::LEFT`] as a labelled item on
+    /// the left and [`footer_buttons`] as round icon buttons on the right.
+    Footer,
 }
 
 pub(super) struct LaidElem {
@@ -92,13 +96,9 @@ pub(super) fn content_width(model: &Model, scale: f32) -> i32 {
             max_w = max_w.max(TEXT_X * scale + mw(font, text_px, &row.label) + reserve * scale);
         }
     }
-    if let Some(label) = model.update_label() {
-        max_w = max_w.max(TEXT_X * scale + mw(font, text_px, &label) + RIGHT_PAD * scale);
-    }
-    // The former right-click menu now lives at the bottom of this same panel.
-    for k in ActionKind::MENU {
-        max_w = max_w.max(TEXT_X * scale + mw(font, text_px, k.label()) + RIGHT_PAD * scale);
-    }
+    // The former right-click menu now lives in the footer strip: its labelled item and its
+    // icon buttons sit on the same line, so the panel has to be wide enough for both.
+    max_w = max_w.max(footer_min_width(model, scale));
     // `ceil`, not `round`: rounding down by a fraction of a pixel makes the panel
     // narrower than the text it was measured from, which then gets ellipsised by
     // `fit_label` even though it was supposed to fit exactly.
@@ -139,15 +139,9 @@ pub(super) fn build_view(model: &Model, scale: f32, width: i32, view: View, fill
                     kinds.push(Elem::Device { group: gi, dev: di });
                 }
             }
-            // A staged update gets a restart call-to-action.
-            if model.update.is_some() {
-                kinds.push(Elem::UpdateBanner);
-            }
-            // The former right-click menu, now a section at the bottom.
-            kinds.push(Elem::Header("More"));
-            for k in ActionKind::MENU {
-                kinds.push(Elem::Action(k));
-            }
+            // The former right-click menu, now the strip that closes the panel. A staged
+            // update rides in it too, as an extra button (see [`footer_buttons`]).
+            kinds.push(Elem::Footer);
         }
         View::IconPicker { group, dev } => {
             kinds.push(Elem::PickerHeader { group, dev });
@@ -158,6 +152,12 @@ pub(super) fn build_view(model: &Model, scale: f32, width: i32, view: View, fill
     let mut elems = Vec::with_capacity(kinds.len());
     let mut y = d(PAD_V);
     for (i, elem) in kinds.into_iter().enumerate() {
+        // The footer stands off from the row above it, and the gap stays *outside* the
+        // element — so the strip's hover/hit band starts at its hairline, not under the
+        // last device row.
+        if matches!(elem, Elem::Footer) {
+            y += d(FOOTER_TOP_GAP);
+        }
         let height = match elem {
             // The first header sits at the very top (small gap); a later header separates
             // one group from the one above it.
@@ -166,22 +166,27 @@ pub(super) fn build_view(model: &Model, scale: f32, width: i32, view: View, fill
             Elem::Device { .. } => d(ITEM_H),
             Elem::PickerHeader { .. } => d(PICKER_HEADER_H),
             Elem::IconGrid { .. } => grid_px_height(width, scale),
-            Elem::UpdateBanner => d(ITEM_H),
-            Elem::Action(_) => d(ITEM_H),
+            Elem::Footer => d(FOOTER_H),
         };
         elems.push(LaidElem { elem, top: y, height });
         y += height;
     }
-    let natural = y + d(PAD_V);
+    // The footer runs to the panel's bottom edge (its own height is the padding), so it
+    // replaces the closing gap rather than sitting above one.
+    let ends_flush = matches!(elems.last().map(|le| le.elem), Some(Elem::Footer));
+    let natural = y + if ends_flush { 0 } else { d(PAD_V) };
     let total = natural.max(fill_h);
 
-    // Centre the icon grid in any extra vertical space, so the picker fills the shared panel
-    // height without a big empty band at the bottom (the header stays pinned top).
+    // Spend any extra vertical space: centre the icon grid in it, so the picker fills the
+    // shared panel height without a big empty band at the bottom (the header stays pinned
+    // top), and keep the footer flush against the bottom edge.
     let slack = total - natural;
     if slack > 0 {
         for le in &mut elems {
-            if matches!(le.elem, Elem::IconGrid { .. }) {
-                le.top += slack / 2;
+            match le.elem {
+                Elem::IconGrid { .. } => le.top += slack / 2,
+                Elem::Footer => le.top += slack,
+                _ => {}
             }
         }
     }
@@ -215,6 +220,52 @@ pub(super) fn grid_px_height(width: i32, scale: f32) -> i32 {
         + (GRID_BOTTOM_PAD * scale).round() as i32
 }
 
+/// The footer's round icon buttons, **rightmost first**: the settings gear always, and a
+/// restart-to-update button to its left while an update is staged on disk (which is where
+/// the old full-width "restart to update to v…" banner went).
+pub(super) fn footer_buttons(model: &Model) -> Vec<ActionKind> {
+    let mut buttons = vec![ActionKind::SoundSettings];
+    if model.update.is_some() {
+        buttons.push(ActionKind::Restart);
+    }
+    buttons
+}
+
+/// Horizontal centre (px) of footer button `i`, counted from the right — shared by
+/// hit-testing, the hover circle, and the glyph so they always coincide.
+pub(super) fn footer_btn_center_x(width: i32, scale: f32, i: usize) -> f32 {
+    let step = (FOOTER_BTN + FOOTER_BTN_GAP) * scale;
+    width as f32 - (FOOTER_BTN_RIGHT + FOOTER_BTN / 2.0) * scale - i as f32 * step
+}
+
+/// Right edge (px) of the footer's labelled left item: its hover pill *and* its hit target,
+/// so the pill is exactly the area that responds — it never stretches across the strip.
+pub(super) fn footer_item_right(scale: f32) -> f32 {
+    let label_w = ui_font()
+        .map(|f| measure(f, FOOTER_TEXT_PX * scale, ActionKind::LEFT.label()))
+        .unwrap_or(0.0);
+    (FOOTER_TEXT_X + FOOTER_ITEM_PAD) * scale + label_w
+}
+
+/// The narrowest panel the footer fits in: the left item, a gap, then the icon buttons.
+pub(super) fn footer_min_width(model: &Model, scale: f32) -> f32 {
+    let n = footer_buttons(model).len() as f32;
+    let buttons = n * FOOTER_BTN + (n - 1.0) * FOOTER_BTN_GAP;
+    footer_item_right(scale) + (FOOTER_GAP + buttons + FOOTER_BTN_RIGHT) * scale
+}
+
+/// Which footer action (if any) is under `mx`. The strip between the labelled item and the
+/// buttons is inert, so a click on the empty middle does nothing rather than quitting.
+pub(super) fn footer_hit(model: &Model, width: i32, scale: f32, mx: i32) -> Option<ActionKind> {
+    let x = mx as f32;
+    for (i, k) in footer_buttons(model).into_iter().enumerate() {
+        if (x - footer_btn_center_x(width, scale, i)).abs() <= FOOTER_BTN * scale / 2.0 {
+            return Some(k);
+        }
+    }
+    (x >= ROW_MARGIN * scale && x <= footer_item_right(scale)).then_some(ActionKind::LEFT)
+}
+
 pub(super) fn inside(width: i32, height: i32, mx: i32, my: i32) -> bool {
     (0..width).contains(&mx) && (0..height).contains(&my)
 }
@@ -228,8 +279,7 @@ pub(super) fn elem_at(elems: &[LaidElem], y: i32) -> Option<usize> {
                 | Elem::Device { .. }
                 | Elem::PickerHeader { .. }
                 | Elem::IconGrid { .. }
-                | Elem::UpdateBanner
-                | Elem::Action(_)
+                | Elem::Footer
         );
         actionable && y >= le.top && y < le.top + le.height
     })
@@ -321,39 +371,90 @@ mod tests {
     }
 
     #[test]
-    fn content_width_fits_the_more_section_even_with_no_devices() {
-        // With no devices the width comes purely from the "More" action labels, which
-        // still have to fit inside the panel with their right-hand padding.
+    fn content_width_fits_the_footer_even_with_no_devices() {
+        // With no devices the width comes purely from the footer, whose labelled item and
+        // icon button share one line — too narrow and they would overlap.
         for scale in [1.0_f32, 1.5, 2.0] {
             let m = model(vec![], None);
             let w = content_width(&m, scale);
             assert!(w >= (MIN_W * scale).round() as i32, "w={w} below the panel floor");
             assert!(w <= (MAX_W * scale).round() as i32, "w={w} above the cap");
             assert!(
-                w as f32 >= (TEXT_X + RIGHT_PAD) * scale,
-                "w={w} leaves no room for a label at scale {scale}"
+                w as f32 >= footer_min_width(&m, scale),
+                "w={w} squeezes the footer at scale {scale}"
             );
         }
     }
 
     #[test]
-    fn main_view_always_ends_with_the_more_section() {
-        // The former right-click menu is only reachable through this section now, so
-        // losing it would strand Sound settings and Quit.
+    fn main_view_always_ends_with_the_footer() {
+        // The former right-click menu is only reachable through the footer now, so losing
+        // it would strand Sound settings and Quit.
         let m = model(vec![output_group(vec![dev("Speakers", None)])], None);
-        let (elems, _) = build_view(&m, 1.0, 400, View::Main, 0);
-        let actions: Vec<_> = elems
-            .iter()
-            .filter_map(|le| match le.elem {
-                Elem::Action(k) => Some(k),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(actions.len(), ActionKind::MENU.len());
-        assert!(matches!(
-            elems.last().map(|le| le.elem),
-            Some(Elem::Action(ActionKind::Quit))
-        ));
+        let (elems, total) = build_view(&m, 1.0, 400, View::Main, 0);
+        let last = elems.last().expect("main view is never empty");
+        assert!(matches!(last.elem, Elem::Footer));
+        // Flush with the bottom edge — no padding band under the strip.
+        assert_eq!(last.top + last.height, total);
+    }
+
+    #[test]
+    fn footer_stays_pinned_to_the_bottom_when_the_panel_is_stretched() {
+        // The panel is as tall as its tallest screen, so the main view can be handed more
+        // height than it needs; the footer must follow the bottom edge, not float.
+        let m = model(vec![output_group(vec![dev("Speakers", None)])], None);
+        let (elems, natural) = build_view(&m, 1.0, 400, View::Main, 0);
+        let natural_top = elems.last().map(|le| le.top).unwrap();
+        let (elems, total) = build_view(&m, 1.0, 400, View::Main, natural + 120);
+        let last = elems.last().unwrap();
+        assert_eq!(total, natural + 120);
+        assert_eq!(last.top, natural_top + 120);
+        assert_eq!(last.top + last.height, total);
+    }
+
+    #[test]
+    fn footer_hit_targets_its_actions_and_nothing_between() {
+        for scale in [1.0_f32, 1.5, 2.0] {
+            let m = model(vec![], None);
+            let width = content_width(&m, scale);
+            let btn = footer_btn_center_x(width, scale, 0).round() as i32;
+            assert_eq!(footer_hit(&m, width, scale, btn), Some(ActionKind::SoundSettings));
+            let item = ((FOOTER_TEXT_X + 2.0) * scale).round() as i32;
+            assert_eq!(footer_hit(&m, width, scale, item), Some(ActionKind::LEFT));
+            // The gap between the label and the buttons is inert.
+            let gap = ((footer_item_right(scale) + footer_btn_center_x(width, scale, 0)
+                - FOOTER_BTN * scale / 2.0)
+                / 2.0)
+                .round() as i32;
+            assert_eq!(footer_hit(&m, width, scale, gap), None, "gap at {gap} is clickable");
+        }
+    }
+
+    #[test]
+    fn a_staged_update_adds_a_restart_button_left_of_the_gear() {
+        // The banner row is gone, so this button is the only way to take a staged
+        // update from the panel — and it must not land on top of the gear.
+        let scale = 1.5;
+        let staged = model(vec![output_group(vec![dev("Speakers", None)])], Some("9.9.9"));
+        let plain = model(vec![output_group(vec![dev("Speakers", None)])], None);
+        assert_eq!(footer_buttons(&plain), vec![ActionKind::SoundSettings]);
+        assert_eq!(
+            footer_buttons(&staged),
+            vec![ActionKind::SoundSettings, ActionKind::Restart]
+        );
+
+        let width = content_width(&staged, scale);
+        let gear = footer_btn_center_x(width, scale, 0);
+        let restart = footer_btn_center_x(width, scale, 1);
+        assert!(restart < gear - FOOTER_BTN * scale, "buttons overlap: {restart} vs {gear}");
+        assert_eq!(
+            footer_hit(&staged, width, scale, restart.round() as i32),
+            Some(ActionKind::Restart)
+        );
+        // The same spot is the inert middle when nothing is staged.
+        assert_eq!(footer_hit(&plain, width, scale, restart.round() as i32), None);
+        // …and the panel is wide enough to hold the extra button clear of the label.
+        assert!(restart - FOOTER_BTN * scale / 2.0 > footer_item_right(scale));
     }
 
     #[test]

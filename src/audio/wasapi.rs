@@ -403,11 +403,6 @@ impl AudioBackend for WasapiBackend {
         self.enumerate_flow(Flow::Output)
     }
 
-    fn current_default(&self) -> Result<DeviceId> {
-        self.default_for_role(eConsole)?
-            .context("no default render endpoint for eConsole role")
-    }
-
     fn set_default(&self, id: &DeviceId) -> Result<()> {
         super::switch::set_default(id)
     }

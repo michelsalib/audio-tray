@@ -143,7 +143,10 @@ pub fn hover_opacity(accent: Option<[u8; 3]>) -> f64 {
 const PILL_ALPHA: u8 = 0x80;
 
 /// What the strip should currently show.
-#[derive(Clone, Copy)]
+///
+/// `PartialEq` so a restyle can be compared against what is already up and dropped
+/// if it would change nothing — a rebuild is far too expensive to do for nothing.
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct StripState {
     pub output_glyph: char,
     pub input_glyph: char,

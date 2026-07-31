@@ -120,8 +120,10 @@ how the spike demos itself.
 ### The agreed design
 
 Layout is the "even triad": output glyph, input glyph, chevron. Output and input
-cycle their device on click; with no alternative device the click mutes instead.
-The chevron opens the full flyout.
+each cycle on click, through their active devices and then a muted stop — so a
+machine with one device still has a cycle, mute and unmute (this supersedes the
+earlier "mute only when there is no alternative device"). The chevron opens the
+full flyout.
 
 Geometry is "V2 — shell-matched", chosen from mockups because it mirrors the
 Control Center button's metrics and so reads as a peer of that control. All values
@@ -729,6 +731,19 @@ Three things that each cost a debugging round:
    new one) with a 500 ms bound only to guard against COM recycling the address.
    The underlying cause in the taskbar's input hosting was not identified.
 
+4. **The shell still invokes the icon under the strip.** Replacing the
+   `ContentPresenter`'s content does not take the notify icon out of the shell's
+   own input path, so one click on a segment is delivered twice at *two levels*:
+   once to our XAML handler, and once to audio-tray as an ordinary
+   `Shell_NotifyIcon` click. That is invisible while both mean the same thing, and
+   it showed up the moment they diverged — left click began cycling the device
+   *and* opening the flyout. Fixed on the audio-tray side (`taskbar::strip_is_up`
+   gates the icon's left click) rather than by marking the routed args handled:
+   the shell's handler sits on an ancestor and may well be watching pointer
+   events rather than `Tapped`, and with clicks unsynthesisable there is no way to
+   measure which. A right click doubles the same way but harmlessly — both
+   deliveries mean "open the panel", and the reopen guard absorbs the second.
+
 Hover is a pre-built white plate at `Opacity="0"` that handlers raise to `0.16`,
 so nothing has to construct a brush inside Explorer. Verified by measuring mean
 luminance per segment band: hovering the output half read 119.4 against 113.6 for
@@ -801,9 +816,40 @@ at all. Real clicks work; they were verified by hand.
 Consequence for testing: anything behind a click on the taskbar — left-click
 cycling, right-click opening the panel — cannot be driven from a script here.
 `audio-tray --taskbar-revert` exists so at least the revert path is reachable
-without the UI. Making clicks work would
-mean `CreateSyntheticPointerDevice` + `InjectSyntheticPointerInput` rather than
+without the UI, and `audio-tray --taskbar-click <out|in|panel>` posts the gesture
+straight to the receiver window, which covers everything from `WM_TASKBAR_ACTION`
+inward (the cycle, the mute stop, the restyle, the redraw) but *not* the shell's
+own delivery of the click. Making real clicks work would mean
+`CreateSyntheticPointerDevice` + `InjectSyntheticPointerInput` rather than
 `SendInput`, which produces a real pointer frame; untried.
+
+## Why the switch felt slow — 2.3s, and where it went
+
+Measured end to end by screenshotting the pill in a loop around a click and
+hashing each frame: **2343ms** from click to the glyph changing. Four costs, none
+of them the audio stack:
+
+| | |
+| --- | --- |
+| the redraw waited for the next sweep tick | up to 1000ms, ×2 |
+| `restyle` cleared `DECORATED` → full rebuild, per message | ~2 rebuilds/click |
+| audio-tray refreshed 2–3× per click (its own switch, then the endpoint-change notification for that same switch) | 164–252ms each |
+| each refresh worked the same answer out three times over — 3 endpoint enumerations, 6 `default_of`, 2 `is_muted` | 119–383ms of it |
+
+Fixes: the restyle handler now sweeps *inline* (safe, because `sweep` is what
+carries the "tree has been quiet" check — if it declines, the timer still
+retries); a restyle equal to the current `StripState` is dropped before it costs a
+rebuild; `SWEEP_FAST_MS` went 1000 → 250 so a declined sweep retries promptly;
+and on the audio-tray side one `Current::read` feeds both surfaces, identical
+restyles are suppressed, and the strip is posted *before* the tray icon's
+DirectWrite render.
+
+That got it to 252–620ms, at which point the remaining cost was the switch
+itself — `CoCreateInstance` for `IPolicyConfig` is free (0.07–0.9ms) but the three
+`SetDefaultEndpoint` roles are 25 + 66 + 64ms, plus up to ~150ms of
+`IAudioEndpointVolume` activations for the mute reads. The glyph does not depend
+on any of it, so audio-tray now posts the outcome first and does the work after:
+**50–200ms**, typical case 50–65ms.
 
 The doubled-click workaround in `interact::already_seen` is therefore still
 unverified against current code. It was measured once (same sender, same args

@@ -9,8 +9,9 @@
 //! modal via mouse capture, like a menu, but stays open while you operate it.
 //!
 //! Either mouse button opens the same panel. What used to be a separate right-click
-//! quick menu is now a "More" section at the bottom of it, so the taskbar strip can
-//! spend its clicks on switching devices rather than on opening menus.
+//! quick menu is now the footer strip that closes it — Quit on the left, a Sound settings
+//! button on the right, modelled on the Win11 quick-settings footer — so the taskbar strip
+//! can spend its clicks on switching devices rather than on opening menus.
 //!
 //! This module is the **controller**: it owns the modal message pump and coordinates the
 //! focused pieces it delegates to — the display [`model`], pure [`layout`], the [`render`]
@@ -106,6 +107,7 @@ struct Interaction {
     hover_pencil: bool,        // the cursor is over the hovered device row's edit pencil
     hover_back: bool,          // the cursor is over the picker's back button
     hover_chip: Option<usize>, // chip index the cursor is over, within the icon grid
+    hover_footer: Option<ActionKind>, // which footer action the cursor is over, if any
     drag: Option<usize>,       // index into elems of the slider being dragged
     pending: Option<usize>,    // index pressed on button-down, acted on button-up
 }
@@ -370,9 +372,12 @@ impl Flyout<'_> {
     /// selection the user had just made.
     ///
     /// A no-op when there is no strip — an Explorer that refused the injection has
-    /// no window for us to post to.
+    /// no window for us to post to — and also when the strip already shows this,
+    /// which is why it goes through the tray rather than straight to `taskbar`: the
+    /// tray owns the record of what has been posted, and a redundant restyle costs
+    /// the TAP a full rebuild.
     fn sync_strip(&self) {
-        crate::taskbar::restyle(crate::tray::strip_icons(self.backend, self.config));
+        crate::tray::restyle_strip(self.backend, self.config);
     }
 
     fn set_group_level(&mut self, group: usize, level: f32) {
@@ -600,19 +605,24 @@ impl Flyout<'_> {
                 }
                 false
             }
-            Elem::UpdateBanner => {
-                // The update is already on disk; the caller relaunches the exe and exits.
-                self.model.restart = true;
-                true
-            }
-            Elem::Action(ActionKind::SoundSettings) => {
-                open_sound_settings();
-                true
-            }
-            Elem::Action(ActionKind::Quit) => {
-                self.model.quit = true;
-                true
-            }
+            // The footer carries its targets side by side; the inert strip between them
+            // (`None`) leaves the flyout open.
+            Elem::Footer => match layout::footer_hit(&self.model, self.surface.width, self.scale, mx) {
+                Some(ActionKind::SoundSettings) => {
+                    open_sound_settings();
+                    true
+                }
+                Some(ActionKind::Quit) => {
+                    self.model.quit = true;
+                    true
+                }
+                Some(ActionKind::Restart) => {
+                    // The update is already on disk; the caller relaunches the exe and exits.
+                    self.model.restart = true;
+                    true
+                }
+                None => false,
+            },
             _ => false,
         }
     }
@@ -713,14 +723,20 @@ impl Flyout<'_> {
             }
             _ => None,
         };
+        let on_footer = match kind {
+            Some(Elem::Footer) => layout::footer_hit(&self.model, self.surface.width, self.scale, mx),
+            _ => None,
+        };
         let changed = hover != self.hit.hover
             || on_pencil != self.hit.hover_pencil
             || on_back != self.hit.hover_back
-            || on_chip != self.hit.hover_chip;
+            || on_chip != self.hit.hover_chip
+            || on_footer != self.hit.hover_footer;
         self.hit.hover = hover;
         self.hit.hover_pencil = on_pencil;
         self.hit.hover_back = on_back;
         self.hit.hover_chip = on_chip;
+        self.hit.hover_footer = on_footer;
         changed
     }
 

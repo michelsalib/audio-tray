@@ -36,7 +36,7 @@ pub(super) struct Group {
 pub(super) struct Model {
     pub groups: Vec<Group>,
     pub view: View, // which screen is shown (main panel / an icon picker)
-    pub update: Option<String>, // staged update's version, if any → bottom "restart to update" row
+    pub update: Option<String>, // staged update's version, if any → the footer's restart button
     // outcome, accumulated while the flyout is open
     pub config_changed: bool,
     pub output_changed: bool,
@@ -55,11 +55,6 @@ impl Model {
             quit: false,
             restart: false,
         }
-    }
-
-    /// The label for the restart-to-update banner, if an update is staged.
-    pub(super) fn update_label(&self) -> Option<String> {
-        self.update.as_ref().map(|v| format!("Restart to update to v{v}"))
     }
 }
 

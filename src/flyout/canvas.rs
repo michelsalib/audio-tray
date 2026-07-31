@@ -94,6 +94,37 @@ impl<'a> Canvas<'a> {
         }
     }
 
+    /// Fill a rectangle whose **bottom** corners are rounded and whose top edge is square —
+    /// the shape of a strip that closes a rounded panel, so a fill of the panel's last band
+    /// follows its corners instead of spilling into them.
+    ///
+    /// Same SDF as [`Self::fill_round_rect`] but with the vertical mirror dropped (only the
+    /// bottom corners curve), intersected (`max`) with the half-plane below the top edge —
+    /// which is what puts the missing top boundary back.
+    pub(super) fn fill_round_rect_bottom(&mut self, rect: Rect, r: f32, col: [u8; 3], alpha: f32) {
+        let Rect { x0, y0, x1, y1 } = rect;
+        let cx = (x0 + x1) / 2.0;
+        let cy = (y0 + y1) / 2.0;
+        let hx = (x1 - x0) / 2.0;
+        let hy = (y1 - y0) / 2.0;
+        let r = r.min(hx).min(hy);
+        for y in y0.floor() as i32..y1.ceil() as i32 {
+            for x in x0.floor() as i32..x1.ceil() as i32 {
+                let px = x as f32 + 0.5;
+                let py = y as f32 + 0.5;
+                let qx = (px - cx).abs() - (hx - r);
+                let qy = (py - cy) - (hy - r);
+                let outside = qx.max(0.0).hypot(qy.max(0.0));
+                let inside = qx.max(qy).min(0.0);
+                let sd = (outside + inside - r).max(y0 - py);
+                let cov = (0.5 - sd).clamp(0.0, 1.0);
+                if cov > 0.0 {
+                    self.blend(x, y, col, alpha * cov);
+                }
+            }
+        }
+    }
+
     /// Blit a straight-alpha RGBA sprite (its own colour) at `(x0, y0)`, scaling its alpha
     /// by `alpha` (pass `1.0` for an opaque blit, `<1.0` to dim it).
     pub(super) fn blit(&mut self, x0: i32, y0: i32, rgba: &[u8], sw: u32, sh: u32, alpha: f32) {

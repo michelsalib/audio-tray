@@ -713,9 +713,13 @@ pub(crate) unsafe fn sweep() {
 
 /// Redraws the strip with new glyphs, because the default devices changed.
 ///
-/// Only marks the strip as needing redoing — the actual `put_Content` has to wait
-/// for the event stream to fall quiet, so the sweep picks it up on its next tick.
-/// That is also why this is safe to call from a window procedure.
+/// Marks the strip as needing redoing and then attempts it at once. The attempt is
+/// [`sweep`], not a `put_Content` from here: that is what carries the "the event
+/// stream has been quiet" check which mutating a tray element safely depends on. If
+/// the stream is mid-burst the sweep declines and the timer retries, so this is
+/// still safe to call from a window procedure — it just no longer *waits* for the
+/// timer in the common case, which was costing a redraw up to a full tick after the
+/// click that asked for it.
 ///
 /// The restore record is untouched: [`restore::remember_content`] refuses to record
 /// our own strip, so redrawing cannot lose the shell's original visual.
@@ -734,14 +738,23 @@ pub(crate) unsafe fn restyle(
             Err(poisoned) => poisoned.into_inner(),
         };
         let state = strip.get_or_insert_with(decorate::StripState::default);
-        if let Some(glyph) = output {
-            state.output_glyph = glyph;
+        let wanted = decorate::StripState {
+            output_glyph: output.unwrap_or(state.output_glyph),
+            input_glyph: input.unwrap_or(state.input_glyph),
+            output_muted,
+            input_muted,
+            ..*state
+        };
+        // A restyle that changes nothing is dropped here, before it costs a
+        // rebuild. audio-tray suppresses its own duplicates, so one arriving means
+        // a genuinely new state *or* an older audio-tray that does not: either way
+        // this is what keeps a redundant message from tearing down a strip that is
+        // already correct.
+        if wanted == *state {
+            logf!("restyle: already showing that — nothing to do");
+            return;
         }
-        if let Some(glyph) = input {
-            state.input_glyph = glyph;
-        }
-        state.output_muted = output_muted;
-        state.input_muted = input_muted;
+        *state = wanted;
     }
     logf!(
         "restyle: out={:?} (muted {output_muted}) in={:?} (muted {input_muted})",
@@ -749,7 +762,7 @@ pub(crate) unsafe fn restyle(
         input
     );
 
-    // Clearing these is what makes the next sweep redraw and re-wire. The segment
+    // Clearing these is what makes the redraw happen and re-wire. The segment
     // elements are replaced wholesale, so their old handles are of no further use.
     {
         let mut decorated = match DECORATED.lock() {
@@ -761,7 +774,10 @@ pub(crate) unsafe fn restyle(
     if let Ok(mut wired) = WIRED.lock() {
         wired.clear();
     }
+    // Fast pace first, so that if the sweep below declines the retry is the short
+    // interval and not the idle one.
     lifecycle::set_sweep_pace(false);
+    unsafe { sweep() };
 }
 
 /// Whether the strip's segments have had their pointer handlers attached.

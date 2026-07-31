@@ -1,14 +1,18 @@
 //! System-tray icon, click handling, and the Win32 message loop that drives them.
 //!
 //! The tray owns no window of its own — `tray-icon` provides the icon and posts click
-//! events through a global channel that we drain after each dispatched message. Either
-//! button opens our acrylic control flyout (volume, mute, output/input switching,
-//! per-device icons, and a More section — see [`crate::flyout`]).
+//! events through a global channel that we drain after each dispatched message. Right
+//! click opens our acrylic control flyout (volume, mute, output/input switching,
+//! per-device icons, and a footer strip — see [`crate::flyout`]); left click opens it
+//! too, but only when there is no strip.
 //!
 //! Normally the icon is not what the user sees or clicks: [`crate::taskbar`] draws the
 //! strip's two buttons over it on every start, and their gestures arrive as
 //! [`crate::taskbar::WM_TASKBAR_ACTION`] instead (see [`handle_taskbar_action`]). The
-//! icon clicks above are the path for when that injection is unavailable.
+//! icon clicks above are the path for when that injection is unavailable — and, since
+//! the shell keeps invoking the icon under the strip, also a second delivery of the
+//! strip's own clicks, which is why the left one defers to
+//! [`crate::taskbar::strip_is_up`].
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
@@ -110,13 +114,19 @@ pub fn run(backend: WasapiBackend) -> Result<()> {
     let _volume_hook = ScrollVolumeHook::install(thread_id);
 
     let devices = backend.enumerate().map(|d| d.len()).unwrap_or(0);
-    println!("tray: created ({devices} output device(s)); either button opens the panel.");
+    // Which of the two click routings is live, since it depends on whether the
+    // injection above took and that is the first thing to know when a gesture
+    // does the wrong thing.
+    let gestures = if crate::taskbar::strip_is_up() {
+        "left click cycles a segment, right click opens the panel"
+    } else {
+        "no strip — either button opens the panel"
+    };
+    println!("tray: created ({devices} output device(s)); {gestures}.");
 
     let tray_rx = TrayIconEvent::receiver();
-    // The click that dismisses an open flyout (it has mouse capture) is also reported by
-    // the shell as a fresh tray click. This guard ignores tray clicks for a brief window
-    // after a flyout closes, so a second click on the icon reads as "close", not "close
-    // then immediately reopen".
+    // Gestures older than this are the flyout's own opening or dismissing click
+    // arriving again — see [`settle_after_flyout`].
     let mut reopen_guard = Instant::now();
     let mut msg = MSG::default();
     unsafe {
@@ -150,7 +160,32 @@ pub fn run(backend: WasapiBackend) -> Result<()> {
             // arrives.
             if msg.message == crate::taskbar::WM_TASKBAR_ACTION {
                 if let Some(action) = crate::taskbar::Action::from_code(msg.wParam.0) {
-                    handle_taskbar_action(&backend, &mut config, &tray, action)?;
+                    // The click that dismissed the flyout lands on the strip like any
+                    // other, and `Tapped` completes on release — after the flyout has
+                    // already closed on the press. Acting on it would cycle or reopen
+                    // on the click the user meant as "go away".
+                    if Instant::now() < reopen_guard {
+                        println!("taskbar: {action:?} ignored — that click dismissed the panel");
+                        continue;
+                    }
+                    // Never propagated: this is COM against endpoints that can go
+                    // away mid-click, and letting one failed gesture out of the
+                    // loop would exit the app — the same trap `try_refresh`
+                    // documents. A lost click is recoverable; a lost tray is not.
+                    if let Err(e) = handle_taskbar_action(&backend, &mut config, &tray, action) {
+                        eprintln!("taskbar: {action:?} failed ({e:#})");
+                        // The strip may be previewing a switch that then failed, and
+                        // the refresh that would have corrected it was skipped along
+                        // with the rest. Put the truth back.
+                        invalidate_strip();
+                        refresh(&backend, &tray, &config);
+                    }
+                    // The panel has been and gone by the time that returns, so this
+                    // is where a strip-opened flyout gets its settling — the branch
+                    // below only covers one opened from the icon.
+                    if action == crate::taskbar::Action::OpenPanel {
+                        settle_after_flyout(&mut reopen_guard);
+                    }
                 }
                 continue;
             }
@@ -160,6 +195,10 @@ pub fn run(backend: WasapiBackend) -> Result<()> {
             // visible. `tray-icon` re-registers our plain notification icon on
             // the same signal, independently.
             if msg.message == crate::taskbar::WM_TASKBAR_RESTARTED {
+                // Whatever the strip was showing died with the old Explorer, so
+                // "unchanged since last time" no longer means "already on screen"
+                // — the refresh below has to post again.
+                invalidate_strip();
                 crate::taskbar::apply_at_restart(strip_icons(&backend, &config));
                 // The icon `tray-icon` just re-registered carries the defaults it
                 // was built with, so put the current device's icon and tooltip
@@ -181,15 +220,41 @@ pub fn run(backend: WasapiBackend) -> Result<()> {
                     if Instant::now() < reopen_guard {
                         continue; // this is the click that just closed the flyout
                     }
-                    // Both buttons open the same panel; the strip's own segments
-                    // are what differentiate a left click, once zone routing lands.
-                    if matches!(button, MouseButton::Left | MouseButton::Right) {
+                    // Right click always opens the panel. Left click only does so
+                    // when there is no strip.
+                    //
+                    // The strip is drawn over this icon and the shell goes on
+                    // invoking the icon underneath it, so a left click on a
+                    // segment lands twice: once as the cycle, through
+                    // `WM_TASKBAR_ACTION`, and once here. Acting on both made one
+                    // click cycle the device *and* open the flyout. The panel
+                    // belongs to the right click alone.
+                    //
+                    // A right click doubles the same way, and both deliveries mean
+                    // "open the panel", so it needs no such test — the second one is
+                    // absorbed by [`settle_after_flyout`] instead. Leaving it
+                    // unconditional is also what keeps the panel reachable if the
+                    // strip injected without managing to draw.
+                    let opens_panel = match button {
+                        MouseButton::Left if crate::taskbar::strip_is_up() => {
+                            // The one visible sign this suppression happened, and
+                            // the only way to tell it apart from a click the shell
+                            // never delivered — worth a line, since a real click
+                            // is the only thing that exercises this path.
+                            println!("tray: left click on the strip — cycling, not opening");
+                            false
+                        }
+                        MouseButton::Left => true,
+                        MouseButton::Right => true,
+                        _ => false,
+                    };
+                    if opens_panel {
                         let anchor = flyout::Anchor {
                             cx: (rect.position.x + rect.size.width as f64 / 2.0) as i32,
                             bottom: rect.position.y as i32,
                         };
                         handle_flyout(&backend, &mut config, &tray, Some(anchor))?;
-                        reopen_guard = Instant::now() + Duration::from_millis(350);
+                        settle_after_flyout(&mut reopen_guard);
                     }
                 }
             }
@@ -198,11 +263,63 @@ pub fn run(backend: WasapiBackend) -> Result<()> {
     Ok(())
 }
 
+/// Settles the input that a just-closed flyout leaves behind, so the click that
+/// opened or dismissed it cannot open it again.
+///
+/// Two separate leftovers, and the reopen-on-dismiss bug needed both handled:
+///
+///   * **Clicks queued while the flyout was up.** The gesture that opens the panel
+///     is delivered twice — our handler *and* the shell invoking the notification
+///     icon underneath the strip. The flyout is modal, so while it runs, that
+///     second delivery is pumped by *its* loop into `tray-icon`'s channel and waits
+///     there. Draining is the only fix available: it is already in the channel by
+///     the time we get back, so no time-based guard can be armed early enough, and
+///     it surfaces on whatever message happens to be dispatched next — which looked
+///     exactly like the dismissing click reopening the panel, however long the
+///     flyout had been open.
+///   * **The dismissing click itself.** It has to reach the flyout (which holds
+///     capture) to close it, and the shell reports it as a tray click too; on the
+///     strip, `Tapped` completes on release, by which time the flyout has already
+///     gone. Hence the short window, checked by both click paths.
+///
+/// Everything in the channel is stale by construction: nothing else could have put
+/// a click there while the flyout owned the loop.
+fn settle_after_flyout(reopen_guard: &mut Instant) {
+    /// Long enough to cover the release half of the dismissing click, short enough
+    /// that a deliberate second click never feels swallowed.
+    const SETTLE: Duration = Duration::from_millis(350);
+
+    let drained = TrayIconEvent::receiver().try_iter().count();
+    if drained > 0 {
+        println!("tray: dropped {drained} click(s) queued while the panel was open");
+    }
+    *reopen_guard = Instant::now() + SETTLE;
+}
+
 /// Act on a click from the injected taskbar strip.
 ///
-/// Left click cycles that endpoint to the next active device; right click opens
-/// the full panel. Cycling wraps, and a single-device system is a deliberate
-/// no-op rather than an error — there is nothing to switch to.
+/// Right click opens the full panel. Left click advances that endpoint one step
+/// around a cycle whose stops are the active devices, each unmuted, plus a single
+/// muted stop that sits between the last device and the wrap:
+///
+/// ```text
+/// device 1 → device 2 → … → device N → device N, muted → device 1 → …
+/// ```
+///
+/// Mute is a stop in the cycle rather than a gesture of its own because the strip
+/// gives each endpoint exactly one left click, and it is what gives a one-device
+/// machine somewhere to go — there the cycle is just mute and unmute, where it
+/// used to be a silent no-op.
+///
+/// Every device stop is an unmuted one, in both directions:
+///
+///   * arriving at a device that was left muted (from the panel, a media key, or
+///     another app) unmutes it. Without that the position in the cycle would be
+///     ambiguous — "on device 2 and muted" is not one of the stops — and the click
+///     would have landed on a device that stays silent.
+///   * stepping off the muted stop takes the mute with it, so the cycle never
+///     leaves a muted device behind. It used to: after wrapping, that device was
+///     still muted, and choosing it again from the panel got silence.
 fn handle_taskbar_action(
     backend: &WasapiBackend,
     config: &mut Config,
@@ -221,16 +338,71 @@ fn handle_taskbar_action(
     };
 
     let devices = backend.enumerate_flow(flow)?;
-    if devices.len() < 2 {
-        return Ok(());
+    if devices.is_empty() {
+        return Ok(()); // nothing plugged in for this direction
     }
     let current = backend.default_of(flow)?;
-    // Unknown current default starts the cycle at the first device rather than
-    // failing — the user asked for "something else", and any switch satisfies it.
-    let next = current
-        .and_then(|id| devices.iter().position(|d| d.id == id))
-        .map_or(0, |at| (at + 1) % devices.len());
-    backend.set_default_of(&devices[next].id)?;
+    let at = current
+        .as_ref()
+        .and_then(|id| devices.iter().position(|d| &d.id == id));
+    let muted = current
+        .as_ref()
+        .and_then(|id| backend.is_muted(id).ok())
+        .unwrap_or(false);
+
+    // Which device the click lands on, or `None` for the muted stop.
+    let next = match at {
+        // On the muted stop: unmute and move on. The wrap is what normally
+        // happens here, since the cycle only mutes on the last device — but a
+        // mute that came from somewhere else is picked up wherever it left us.
+        Some(i) if muted => Some((i + 1) % devices.len()),
+        // Past the last device is the muted stop, on that same device.
+        Some(i) if i + 1 == devices.len() => None,
+        Some(i) => Some(i + 1),
+        // Unknown current default: any switch satisfies "something else", so
+        // start the cycle at the top rather than failing.
+        None => Some(0),
+    };
+
+    // The strip can say where the click landed before any of the work below, which
+    // is what the switch's latency was mostly made of. See [`preview_strip`].
+    match next {
+        Some(next) => preview_strip(flow, Some(icon_of(&devices[next], config)), false),
+        None => preview_strip(flow, None, true),
+    }
+
+    match next {
+        Some(next) => {
+            let id = &devices[next].id;
+            if current.as_ref() != Some(id) {
+                backend.set_default_of(id)?;
+            }
+            // Unmute the device we are leaving *after* the switch: by then it is no
+            // longer the default, so coming back off mute makes no sound.
+            if muted {
+                if let Some(left) = current.as_ref().filter(|left| *left != id) {
+                    backend.set_muted(left, false)?;
+                }
+            }
+            if backend.is_muted(id).unwrap_or(false) {
+                backend.set_muted(id, false)?;
+            }
+        }
+        // Muting the current default, in place — `current` is `Some` here, since
+        // `at` only matches on a device we resolved from it.
+        None => {
+            if let Some(id) = &current {
+                backend.set_muted(id, true)?;
+            }
+        }
+    }
+
+    // Brings the tray icon and the tooltip along, and confirms the preview above
+    // against what actually happened — a no-op for the strip when they agree, which
+    // is the normal case.
+    //
+    // Also the only thing that updates the strip after a *mute*: that raises no
+    // endpoint-default notification, so nothing else would.
     refresh(backend, tray, config);
     Ok(())
 }
@@ -319,7 +491,7 @@ fn build_tray(backend: &WasapiBackend, config: &Config) -> Result<TrayIcon> {
     /// How often to repeat the "still waiting" line, in attempts at `MAX_GAP`.
     const NAG_EVERY: u32 = 12;
 
-    let (_, initial_icon) = resolve_current(backend, config);
+    let initial_icon = Endpoint::read(backend, config, crate::audio::Flow::Output).icon;
     let mut gap = FIRST_GAP;
     for attempt in 1.. {
         // Clicks are handled via TrayIconEvent — we deliberately don't hand a
@@ -358,85 +530,200 @@ fn build_tray(backend: &WasapiBackend, config: &Config) -> Result<TrayIcon> {
 /// left with no tray at all. It is a transient condition, and `TaskbarCreated`
 /// is what puts the icon back.
 fn refresh(backend: &WasapiBackend, tray: &TrayIcon, config: &Config) {
-    if let Err(e) = try_refresh(backend, tray, config) {
+    let state = Current::read(backend, config);
+
+    // The strip first, and the tray icon second, because the strip is drawn *over*
+    // the icon: it is the surface the user is watching, and the icon underneath it
+    // is not even visible while a strip is up. Doing it in the other order put a
+    // DirectWrite glyph render (measured 40–85ms) in front of the thing that had to
+    // change.
+    //
+    // Skipped entirely when it would change nothing. Not a micro-optimisation: our
+    // own switch is followed by the endpoint-change notification for the same
+    // switch, so a click produces two or three refreshes, and every restyle makes
+    // the TAP tear the strip down and rebuild it. Only the first of them has
+    // anything to say.
+    push_strip(state.strip_icons());
+
+    if let Err(e) = state.output.apply_to(tray) {
         eprintln!("tray: could not update the icon, will retry when the taskbar is back ({e:#})");
     }
-    // The strip draws the current devices' own icons, so it has to follow a switch
-    // just as the tray icon does. A no-op when nothing is injected.
-    crate::taskbar::restyle(strip_icons(backend, config));
+}
+
+/// Tell the strip what to draw, unless it is already drawing exactly that.
+fn push_strip(icons: crate::taskbar::StripIcons) {
+    let mut applied = match STRIP_APPLIED.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    // Only recorded when the post actually went out, so a restyle dropped for want
+    // of a control window is retried rather than assumed.
+    if *applied != Some(icons) && crate::taskbar::restyle(icons) {
+        *applied = Some(icons);
+    }
+}
+
+/// Push the current defaults to the strip, for the flyout — which changes devices
+/// and mute live while it owns the message loop, so the tray's own [`refresh`]
+/// cannot do it until the flyout closes.
+pub(crate) fn restyle_strip(backend: &WasapiBackend, config: &Config) {
+    push_strip(strip_icons(backend, config));
+}
+
+fn strip_applied() -> Option<crate::taskbar::StripIcons> {
+    match STRIP_APPLIED.lock() {
+        Ok(guard) => *guard,
+        Err(poisoned) => *poisoned.into_inner(),
+    }
+}
+
+/// Show the outcome of a click on the strip *before* doing the audio work that
+/// realises it.
+///
+/// The work is the slow part and the glyph has nothing to learn from it: which
+/// device is next is decided before a single COM call is made, and the switch
+/// itself is three `SetDefaultEndpoint` calls (measured 25 + 66 + 64ms) plus up to
+/// ~150ms of mute reads on the target. Posting afterwards meant the segment the
+/// user just clicked sat unchanged for all of that, which is most of what made the
+/// switch feel slow.
+///
+/// `None` for `icon` keeps the glyph and changes only the mute — the muted stop
+/// stays on the same device, and the TAP picks the muted glyph itself.
+///
+/// A no-op until a refresh has recorded a state to amend: without one there is
+/// nothing to say about the *other* segment, and the refresh at the end of the
+/// click covers it.
+fn preview_strip(flow: crate::audio::Flow, icon: Option<IconId>, muted: bool) {
+    use crate::audio::Flow;
+
+    let Some(mut icons) = strip_applied() else {
+        return;
+    };
+    let glyph = icon.map(crate::taskbar::strip_glyph);
+    match flow {
+        Flow::Output => {
+            icons.output = glyph.unwrap_or(icons.output);
+            icons.output_muted = muted;
+        }
+        Flow::Input => {
+            icons.input = glyph.unwrap_or(icons.input);
+            icons.input_muted = muted;
+        }
+    }
+    push_strip(icons);
+}
+
+/// The icon for a device: a per-device override from the config if there is one,
+/// otherwise the form-factor default.
+fn icon_of(device: &crate::audio::Device, config: &Config) -> IconId {
+    config
+        .icon_for(&device.id.0)
+        .unwrap_or_else(|| icons::default_icon(device.form_factor, &device.friendly_name))
+}
+
+/// The strip state we last asked the TAP for, so an identical restyle can be
+/// dropped before it costs a rebuild.
+///
+/// A static because [`refresh`] is reached from the flyout and the click handler as
+/// well as the message loop, none of which own tray state — and it is only ever
+/// touched from the tray thread. Deliberately *not* extended to the tray icon:
+/// that write is how [`build_tray`] proves the shell accepted the icon at all, and
+/// re-applying it is the retry when the taskbar comes back.
+static STRIP_APPLIED: std::sync::Mutex<Option<crate::taskbar::StripIcons>> =
+    std::sync::Mutex::new(None);
+
+/// Forget what the strip is showing, so the next [`refresh`] posts a restyle even
+/// if the devices have not changed.
+///
+/// For when the strip is gone rather than wrong: after an Explorer restart the new
+/// TAP starts from the init data, and after a revert there is nothing there at all.
+fn invalidate_strip() {
+    match STRIP_APPLIED.lock() {
+        Ok(mut guard) => *guard = None,
+        Err(poisoned) => *poisoned.into_inner() = None,
+    }
 }
 
 fn try_refresh(backend: &WasapiBackend, tray: &TrayIcon, config: &Config) -> Result<()> {
-    let (name, icon_id) = resolve_current(backend, config);
-    tray.set_icon(Some(icon_image(icon_id)?))?;
-    tray.set_tooltip(Some(&tooltip_for(&name)))?;
-    println!("refresh: default \"{name}\" -> icon {icon_id:?}");
-    Ok(())
+    Endpoint::read(backend, config, crate::audio::Flow::Output).apply_to(tray)
 }
 
-/// The glyphs the taskbar strip should draw for the current defaults.
-///
-/// Resolved through [`icon_for_flow`], the same path the flyout and the tray icon
-/// use, so all three agree. They did not before: the strip drew fixed Volume and
-/// Microphone glyphs while the flyout showed the device's own icon, so the same
-/// speaker appeared as a laptop in one place and a speaker in the other.
-pub(crate) fn strip_icons(backend: &WasapiBackend, config: &Config) -> crate::taskbar::StripIcons {
-    use crate::audio::Flow;
+/// The current default of one flow, as both surfaces need it.
+struct Endpoint {
+    name: String,
+    icon: IconId,
+    muted: bool,
+}
 
-    let side = |flow: Flow| {
+impl Endpoint {
+    /// One `enumerate_flow`, one `default_of` and one `is_muted` — where working
+    /// this out per surface cost three enumerations and six `default_of`s for the
+    /// same answer (measured at 119–383ms per refresh, on the critical path of
+    /// every click).
+    fn read(backend: &WasapiBackend, config: &Config, flow: crate::audio::Flow) -> Self {
         let default = backend.default_of(flow).ok().flatten();
-        let muted = default
-            .as_ref()
-            .and_then(|id| backend.is_muted(id).ok())
-            .unwrap_or(false);
-        (icon_for_flow(backend, config, flow), muted)
-    };
-    let (output, output_muted) = side(Flow::Output);
-    let (input, input_muted) = side(Flow::Input);
-    crate::taskbar::StripIcons {
-        output: crate::taskbar::strip_glyph(output),
-        input: crate::taskbar::strip_glyph(input),
-        output_muted,
-        input_muted,
-    }
-}
-
-/// The icon for the current default of one flow: a per-device override from the
-/// config if there is one, otherwise the form-factor default.
-fn icon_for_flow(backend: &WasapiBackend, config: &Config, flow: crate::audio::Flow) -> IconId {
-    let Ok(Some(current)) = backend.default_of(flow) else {
-        return IconId::Unknown;
-    };
-    let Ok(devices) = backend.enumerate_flow(flow) else {
-        return IconId::Unknown;
-    };
-    devices
-        .into_iter()
-        .find(|d| d.id == current)
-        .map(|d| {
-            config
-                .icon_for(&d.id.0)
-                .unwrap_or_else(|| icons::default_icon(d.form_factor, &d.friendly_name))
-        })
-        .unwrap_or(IconId::Unknown)
-}
-
-/// Resolve the current default device to its display name and the icon to show for it:
-/// a per-device config override wins, otherwise `default_icon` picks a starting glyph.
-fn resolve_current(backend: &impl AudioBackend, config: &Config) -> (String, IconId) {
-    let device = backend
-        .current_default()
-        .ok()
-        .and_then(|cur| backend.enumerate().ok()?.into_iter().find(|d| d.id == cur));
-    match device {
-        Some(d) => {
-            let icon = config
-                .icon_for(&d.id.0)
-                .unwrap_or_else(|| icons::default_icon(d.form_factor, &d.friendly_name));
-            (d.friendly_name, icon)
+        let Some(id) = default else {
+            return Self { name: "Audio output".to_string(), icon: IconId::Unknown, muted: false };
+        };
+        let muted = backend.is_muted(&id).unwrap_or(false);
+        let device = backend
+            .enumerate_flow(flow)
+            .ok()
+            .and_then(|devices| devices.into_iter().find(|d| d.id == id));
+        match device {
+            Some(d) => Self {
+                icon: icon_of(&d, config),
+                name: d.friendly_name,
+                muted,
+            },
+            None => Self { name: "Audio output".to_string(), icon: IconId::Unknown, muted },
         }
-        None => ("Audio output".to_string(), IconId::Unknown),
     }
+
+    /// Put this endpoint on the notification icon: its glyph and its tooltip.
+    fn apply_to(&self, tray: &TrayIcon) -> Result<()> {
+        tray.set_icon(Some(icon_image(self.icon)?))?;
+        tray.set_tooltip(Some(&tooltip_for(&self.name)))?;
+        println!("refresh: default \"{}\" -> icon {:?}", self.name, self.icon);
+        Ok(())
+    }
+}
+
+/// Both defaults at once — what the strip draws, and what the tray icon shows.
+struct Current {
+    output: Endpoint,
+    input: Endpoint,
+}
+
+impl Current {
+    fn read(backend: &WasapiBackend, config: &Config) -> Self {
+        use crate::audio::Flow;
+        Self {
+            output: Endpoint::read(backend, config, Flow::Output),
+            input: Endpoint::read(backend, config, Flow::Input),
+        }
+    }
+
+    /// The glyphs the taskbar strip should draw.
+    ///
+    /// Resolved from the same [`Endpoint`]s the tray icon uses, so all three of
+    /// strip, icon and flyout agree. They did not before: the strip drew fixed
+    /// Volume and Microphone glyphs while the flyout showed the device's own icon,
+    /// so the same speaker appeared as a laptop in one place and a speaker in the
+    /// other.
+    fn strip_icons(&self) -> crate::taskbar::StripIcons {
+        crate::taskbar::StripIcons {
+            output: crate::taskbar::strip_glyph(self.output.icon),
+            input: crate::taskbar::strip_glyph(self.input.icon),
+            output_muted: self.output.muted,
+            input_muted: self.input.muted,
+        }
+    }
+}
+
+/// The glyphs for the current defaults, for the injection's init data.
+pub(crate) fn strip_icons(backend: &WasapiBackend, config: &Config) -> crate::taskbar::StripIcons {
+    Current::read(backend, config).strip_icons()
 }
 
 fn icon_image(id: IconId) -> Result<Icon> {

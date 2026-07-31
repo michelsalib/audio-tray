@@ -80,15 +80,40 @@ fn tap_path() -> Result<PathBuf> {
 static LAST_INJECTED: std::sync::Mutex<Option<(u32, std::time::Instant)>> =
     std::sync::Mutex::new(None);
 
+/// Whether a strip of ours is currently up, as far as we know.
+///
+/// This decides what a click on the plain notification icon means, so it is not
+/// merely informational — see [`strip_is_up`].
+static STRIP_UP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the strip is up, and so owns the gestures over our tray icon.
+///
+/// The shell goes on invoking the notification icon *underneath* the strip, so a
+/// click on a segment is also delivered as an ordinary tray-icon click. The two
+/// deliveries are one gesture and must not both act on it: the strip's own
+/// handlers are the ones that know which segment was hit.
+///
+/// Tracks our own injections and reverts, which is all it claims — a strip that
+/// injected but never managed to draw still reads as up. That is why the icon's
+/// *right* click stays live either way: it keeps the panel, and Quit, reachable
+/// even if this is optimistic.
+pub fn strip_is_up() -> bool {
+    STRIP_UP.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 /// Inject the TAP into the shell's Explorer. Best-effort by contract: every error
 /// means "no strip this time", and the message says why.
 fn enable(icons: StripIcons) -> Result<()> {
+    // Cleared up front so that any failure below leaves it false; only the
+    // success path at the end sets it.
+    STRIP_UP.store(false, std::sync::atomic::Ordering::SeqCst);
     let dll = tap_path()?;
     let pid = shell_pid()?;
     unsafe { inject(pid, &dll, icons)? };
     if let Ok(mut last) = LAST_INJECTED.lock() {
         *last = Some((pid, std::time::Instant::now()));
     }
+    STRIP_UP.store(true, std::sync::atomic::Ordering::SeqCst);
     Ok(())
 }
 
@@ -127,6 +152,10 @@ pub fn revert() {
     use windows::Win32::Foundation::{LPARAM, WPARAM};
     use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 
+    // Before the post, and unconditionally: from here on the plain icon is the
+    // whole of the UI again, so its clicks have to go back to being the ones that
+    // matter. Nothing about a failed post would make a strip reappear.
+    STRIP_UP.store(false, std::sync::atomic::Ordering::SeqCst);
     let Some(control) = control_window() else {
         return;
     };
@@ -138,28 +167,39 @@ pub fn revert() {
 }
 
 /// The injected TAP's control window, if there is one.
-///
-/// `EnumWindows` rather than `FindWindow`, which does not locate this window across
-/// processes — the same thing was measured in the other direction, for the TAP
-/// finding our receiver.
 fn control_window() -> Option<windows::Win32::Foundation::HWND> {
+    window_by_class(TAP_CONTROL_CLASS)
+}
+
+/// A top-level window with this exact class name, in any process.
+///
+/// `EnumWindows` rather than `FindWindow`, which does not locate these windows
+/// across processes — measured in both directions, for us finding the TAP's
+/// control window and for the TAP finding our receiver.
+fn window_by_class(class_name: &str) -> Option<windows::Win32::Foundation::HWND> {
     use windows::Win32::Foundation::{HWND, LPARAM};
     use windows::Win32::UI::WindowsAndMessaging::{EnumWindows, GetClassNameW};
     use windows_core::BOOL;
 
+    struct Search<'a> {
+        wanted: &'a str,
+        found: HWND,
+    }
+
     unsafe extern "system" fn visit(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        let search = unsafe { &mut *(lparam.0 as *mut Search) };
         let mut class = [0u16; 64];
         let len = unsafe { GetClassNameW(hwnd, &mut class) };
-        if len > 0 && String::from_utf16_lossy(&class[..len as usize]) == TAP_CONTROL_CLASS {
-            unsafe { *(lparam.0 as *mut HWND) = hwnd };
+        if len > 0 && String::from_utf16_lossy(&class[..len as usize]) == search.wanted {
+            search.found = hwnd;
             return BOOL(0);
         }
         BOOL(1)
     }
 
-    let mut found = HWND(std::ptr::null_mut());
-    let _ = unsafe { EnumWindows(Some(visit), LPARAM(&mut found as *mut HWND as isize)) };
-    (!found.0.is_null()).then_some(found)
+    let mut search = Search { wanted: class_name, found: HWND(std::ptr::null_mut()) };
+    let _ = unsafe { EnumWindows(Some(visit), LPARAM(&mut search as *mut Search as isize)) };
+    (!search.found.0.is_null()).then_some(search.found)
 }
 
 /// The process owning the desktop window — the Explorer that hosts the taskbar,
@@ -323,12 +363,19 @@ const WM_TAP_RESTYLE: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 23
 /// Both glyphs fit in a message's parameters, so nothing has to be shared: the
 /// codepoint goes in the low bits and the muted flag above it. Best-effort and
 /// quiet, like [`revert`] — no control window means nothing is injected.
-pub fn restyle(icons: StripIcons) {
+///
+/// Returns whether the strip was actually told. The caller remembers what it has
+/// posted so it can skip an identical restyle, and a post that never happened must
+/// not be remembered as one that did: the control window does not exist until the
+/// TAP's first visual-tree callback, so an early switch can land in that gap and
+/// would otherwise leave the strip showing the injection's glyphs for good.
+#[must_use]
+pub fn restyle(icons: StripIcons) -> bool {
     use windows::Win32::Foundation::{LPARAM, WPARAM};
     use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 
     let Some(control) = control_window() else {
-        return;
+        return false;
     };
     let pack = |glyph: char, muted: bool| glyph as usize | (usize::from(muted) << 24);
     let posted = unsafe {
@@ -341,7 +388,9 @@ pub fn restyle(icons: StripIcons) {
     };
     if let Err(e) = posted {
         eprintln!("taskbar: could not restyle the strip ({e})");
+        return false;
     }
+    true
 }
 
 /// What the user did on the injected strip.
@@ -367,10 +416,44 @@ impl Action {
             _ => None,
         }
     }
+
+    /// The same codes in the other direction, for [`post_action`].
+    fn code(self) -> usize {
+        match self {
+            Self::CycleOutput => 1,
+            Self::CycleInput => 2,
+            Self::OpenPanel => 3,
+        }
+    }
+}
+
+/// Dev: hand a running tray the gesture the strip would have sent.
+///
+/// Clicks on the Win11 taskbar cannot be synthesised — `SendInput` moves the
+/// pointer (the hover plate lights up) but produces no `Tapped`, and the same is
+/// true of the plain tray icon, so it is the shell's input path rather than our
+/// wiring. That leaves the cycling behaviour unreachable from a script, which is
+/// what this exists for: it posts to the receiver window, so everything from
+/// [`WM_TASKBAR_ACTION`] inward runs exactly as it does for a real click. What it
+/// does *not* prove is the TAP's own half — the handlers, the segment routing and
+/// the doubled-event coalescing still only get exercised by a finger.
+pub fn post_action(action: Action) -> Result<()> {
+    use windows::Win32::Foundation::{LPARAM, WPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
+
+    let receiver = window_by_class(RECEIVER_CLASS_NAME)
+        .context("no receiver window — audio-tray is not running")?;
+    unsafe { PostMessageW(Some(receiver), WM_TASKBAR_ACTION, WPARAM(action.code()), LPARAM(0)) }
+        .context("post the action to the tray")
 }
 
 /// Window class of the receiver. Must match `RECEIVER_CLASS` in the TAP's `ipc`
 /// module — the TAP finds this window by class name.
+const RECEIVER_CLASS_NAME: &str = "AudioTrayTaskbarIpc";
+
+/// The same name, wide and NUL-terminated, for `RegisterClassW`. `w!` takes a
+/// literal and there is no const way back from it to a `&str`, so the two are
+/// spelled out separately — keep them identical.
 const RECEIVER_CLASS: PCWSTR = windows::core::w!("AudioTrayTaskbarIpc");
 
 /// Message the TAP posts; `wParam` carries the [`Action`] code.

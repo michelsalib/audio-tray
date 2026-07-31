@@ -53,10 +53,16 @@ const SWEEP_TIMER: usize = 1;
 
 /// How often that check runs while there is still work to do.
 ///
-/// The sweep is now the *only* thing that mutates — the visual-tree callback no
-/// longer does, because mutating from inside the event stream wedges the shell — so
-/// this interval also decides how quickly the strip appears.
-const SWEEP_FAST_MS: u32 = 1000;
+/// The sweep is the *only* thing that mutates — the visual-tree callback no longer
+/// does, because mutating from inside the event stream wedges the shell — so this
+/// interval also decides how quickly the strip appears, and how quickly a redraw
+/// lands when the sweep `restyle` asks for declines because the tree is mid-burst.
+///
+/// 250ms rather than a second because that wait is user-visible: a click's new
+/// glyph arriving a second later reads as the switch itself being slow. A tick that
+/// has nothing to do is one handle resolve and a runtime-class read, and this pace
+/// only runs while there is something outstanding.
+const SWEEP_FAST_MS: u32 = 250;
 
 /// How often it runs once everything is applied.
 ///

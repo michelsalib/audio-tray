@@ -49,8 +49,9 @@ pub struct Device {
 pub trait AudioBackend {
     /// Active render (output) endpoints only.
     fn enumerate(&self) -> anyhow::Result<Vec<Device>>;
-    /// Current default render endpoint (`eConsole` role).
-    fn current_default(&self) -> anyhow::Result<DeviceId>;
     /// Set the default render endpoint across all three roles (plan §2.3).
     fn set_default(&self, id: &DeviceId) -> anyhow::Result<()>;
 }
+// A `current_default` (render, `eConsole`) used to sit here. Everything now reads the
+// default per direction through `WasapiBackend::default_of`, which answers the same
+// question for either flow.

@@ -21,7 +21,10 @@ A tiny Windows system-tray app for **controlling your audio without digging thro
   set output **and** input volume, mute/unmute, switch the default output and input
   device, pick a per-device icon, and see the battery level of Bluetooth devices that
   report one.
-- **Scroll** the mouse wheel over the buttons to change the current output volume.
+- **Scroll** over a button — mouse wheel or touchpad — to change *that* endpoint's
+  volume: the output button for playback, the input button for the microphone. A level
+  bar appears next to the buttons while you scroll and fades away three seconds after
+  the last change.
 - **Falls back to a plain tray icon** if the taskbar controls cannot be drawn — an
   icon reflecting the current output device (speakers, headphones, headset, HDMI…),
   rendered from Segoe Fluent Icons and themed to your taskbar. Either button opens
@@ -55,7 +58,8 @@ input:
 |--------|--------|
 | Left-click a button | Switch that endpoint to the next device |
 | Right-click a button | Open the Audio Tray control flyout (volume, mute, switch output/input, pick icon, Sound settings, Quit) |
-| Scroll wheel | Adjust the current output volume |
+| Scroll a button (wheel or touchpad) | Adjust that endpoint's volume, 2% per notch, with a level bar beside the buttons |
+| Scroll elsewhere on the taskbar | Adjust the output volume |
 
 On the fallback single tray icon, either button opens the flyout.
 
@@ -87,6 +91,10 @@ things worth knowing:
 - **The plain tray icon is never at risk.** It is registered unconditionally, the
   buttons are drawn on top of it, and every failure here leaves it as the whole of
   the UI — the app then behaves exactly as it did before the buttons existed.
+- **Touchpad scrolling comes through the buttons.** Two-finger scroll never reaches a
+  global mouse hook — Windows delivers it straight to the window under the pointer — so
+  it is the injected buttons that pick it up. Without them, scroll-to-volume is
+  wheel-only.
 - **Everything is undone on the way out.** Quitting, being killed, or running
   `audio-tray --taskbar-revert` all restore the taskbar exactly as it was; so does
   Explorer restarting, which simply discards the DLL. Verified by pixel comparison

@@ -17,11 +17,14 @@
 use crate::decorate;
 use crate::log::logf;
 use crate::winrt::{
-    IPointerEventHandler, IPointerEventHandler_Impl, IRightTappedEventHandler,
-    IRightTappedEventHandler_Impl, ITappedEventHandler, ITappedEventHandler_Impl, IUIElement,
+    IPointerEventHandler, IPointerEventHandler_Impl, IPointerPoint, IPointerPointProperties,
+    IPointerRoutedEventArgs, IRightTappedEventHandler, IRightTappedEventHandler_Impl,
+    ITappedEventHandler, ITappedEventHandler_Impl, IUIElement,
 };
 use crate::xamlom::{IXamlDiagnostics, InstanceHandle};
 use core::ffi::c_void;
+use core::sync::atomic::{AtomicBool, Ordering};
+use std::mem::ManuallyDrop;
 use std::sync::Mutex;
 use windows::Win32::Foundation::S_OK;
 use windows_core::{implement, IInspectable, Interface, HRESULT};
@@ -138,6 +141,102 @@ impl IRightTappedEventHandler_Impl for RightTap_Impl {
     }
 }
 
+/// Wheel or two-finger scroll over a segment — changes that endpoint's volume.
+///
+/// This is the *touchpad's* way in, and the reason it exists at all. A precision touchpad's
+/// two-finger scroll never reaches a global mouse hook — Windows routes it straight to the
+/// window under the pointer — so audio-tray's own hook, which has handled the wheel since
+/// before the strip existed, cannot see it. It does arrive here, on the element the finger is
+/// over, which also means the segment comes for free rather than being worked out from
+/// coordinates.
+///
+/// The two paths cannot both act on one notch: audio-tray's hook *swallows* the wheel event
+/// it acts on, so XAML never delivers that one here.
+///
+/// Deliberately **not** put through [`already_seen`], unlike the tap handlers. That test keys
+/// on the identity of the args object, and it is only sound where events are far apart: a
+/// touchpad emits tens of these a second, and if XAML ever pools the args (which the
+/// dedup's own `RECYCLE_WINDOW` exists because COM does) it would silently eat half a
+/// gesture. A doubled delivery here costs a slightly faster scroll; a dropped one costs a
+/// gesture that stutters. audio-tray sums the deltas either way.
+#[implement(IPointerEventHandler)]
+struct Wheel(Segment);
+
+impl IPointerEventHandler_Impl for Wheel_Impl {
+    unsafe fn Invoke(&self, _sender: *mut c_void, args: *mut c_void) -> HRESULT {
+        guard("wheel", || {
+            let Some(delta) = claim_wheel(args) else {
+                return;
+            };
+            log_wheel(self.0, delta);
+            crate::ipc::send_scroll(self.0, delta);
+        })
+    }
+}
+
+/// The wheel delta on a `PointerWheelChanged` args object, in `WHEEL_DELTA` units — and, when
+/// there is one, the event marked handled so the shell does not get a second go at the same
+/// scroll.
+///
+/// `None` for anything that is not a vertical scroll to act on: a *horizontal* two-finger
+/// swipe raises this same event and must not touch the volume, and a zero delta says nothing.
+/// Those are left unhandled, so whatever the shell wants to do with them it still can.
+///
+/// # Safety
+/// `args` is the borrowed pointer XAML passed to the handler — it must not be released here,
+/// hence the [`ManuallyDrop`]. The two objects fetched below *are* ours and are dropped.
+unsafe fn claim_wheel(args: *mut c_void) -> Option<i32> {
+    if args.is_null() {
+        return None;
+    }
+    let borrowed = ManuallyDrop::new(core::mem::transmute::<*mut c_void, IInspectable>(args));
+    let event = borrowed.cast::<IPointerRoutedEventArgs>().ok()?;
+
+    // `relativeTo` is null: the position is of no interest, only the properties hanging off
+    // the point, and null asks for coordinates relative to the app rather than an element.
+    let mut raw_point: *mut c_void = core::ptr::null_mut();
+    if event.GetCurrentPoint(core::ptr::null_mut(), &mut raw_point) != S_OK || raw_point.is_null() {
+        return None;
+    }
+    let point = core::mem::transmute::<*mut c_void, IPointerPoint>(raw_point);
+    let mut raw_properties: *mut c_void = core::ptr::null_mut();
+    if point.get_Properties(&mut raw_properties) != S_OK || raw_properties.is_null() {
+        return None;
+    }
+    let properties =
+        core::mem::transmute::<*mut c_void, IPointerPointProperties>(raw_properties);
+
+    let mut horizontal = 0u8;
+    if properties.get_IsHorizontalMouseWheel(&mut horizontal) == S_OK && horizontal != 0 {
+        return None;
+    }
+    let mut delta = 0i32;
+    if properties.get_MouseWheelDelta(&mut delta) != S_OK || delta == 0 {
+        return None;
+    }
+    // Unchecked, and unlogged: a property set on the args cannot meaningfully fail, and
+    // anything said here would be said once per event of a gesture.
+    let _ = event.put_Handled(1);
+    Some(delta)
+}
+
+/// The first scroll on each segment, and then only under `debug=1`.
+///
+/// A line per event is not an option — a touchpad gesture is tens of them — but the first one
+/// is exactly what a bug report needs: it says the route works at all, and what the device
+/// reports per step (±120 for a wheel notch, a fraction of that for a touchpad).
+fn log_wheel(segment: Segment, delta: i32) {
+    static LOGGED_OUTPUT: AtomicBool = AtomicBool::new(false);
+    static LOGGED_INPUT: AtomicBool = AtomicBool::new(false);
+    let logged = match segment {
+        Segment::Output => &LOGGED_OUTPUT,
+        Segment::Input => &LOGGED_INPUT,
+    };
+    if !logged.swap(true, Ordering::SeqCst) || crate::log::verbose() {
+        logf!("scroll on {} segment: delta {delta}", segment.label());
+    }
+}
+
 unsafe fn ui_element(
     diagnostics: &IXamlDiagnostics,
     handle: InstanceHandle,
@@ -150,7 +249,7 @@ unsafe fn ui_element(
     object.cast::<IUIElement>().ok()
 }
 
-/// Wires hover, left click and right click onto one segment.
+/// Wires hover, left click, right click and scroll onto one segment.
 ///
 /// The delegates are handed to XAML, which takes its own reference — dropping
 /// our side afterwards is correct and is why no tokens are kept. Nothing here is
@@ -189,7 +288,12 @@ pub unsafe fn attach(
     let right: IRightTappedEventHandler = RightTap(segment).into();
     let right_tap = target.add_RightTapped(right.as_raw(), &mut token);
 
-    let ok = entered == S_OK && exited == S_OK && tap == S_OK && right_tap == S_OK;
+    // Shares `PointerEventHandler` with hover — same delegate type, different event.
+    let wheel: IPointerEventHandler = Wheel(segment).into();
+    let wheeled = target.add_PointerWheelChanged(wheel.as_raw(), &mut token);
+
+    let ok =
+        entered == S_OK && exited == S_OK && tap == S_OK && right_tap == S_OK && wheeled == S_OK;
     if ok {
         logf!(
             "{} segment wired: element 0x{element:x}, hover plate 0x{plate:x}",
@@ -197,12 +301,13 @@ pub unsafe fn attach(
         );
     } else {
         logf!(
-            "{} segment wiring failed: entered=0x{:08x} exited=0x{:08x} tapped=0x{:08x} right=0x{:08x}",
+            "{} segment wiring failed: entered=0x{:08x} exited=0x{:08x} tapped=0x{:08x} right=0x{:08x} wheel=0x{:08x}",
             segment.label(),
             entered.0,
             exited.0,
             tap.0,
-            right_tap.0
+            right_tap.0,
+            wheeled.0
         );
     }
     ok

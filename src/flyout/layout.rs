@@ -10,7 +10,7 @@ use ab_glyph::FontVec;
 
 use crate::icons::IconId;
 
-use super::canvas::measure;
+use crate::canvas::measure;
 use super::model::Model;
 use super::theme::*;
 

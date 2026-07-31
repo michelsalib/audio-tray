@@ -13,30 +13,50 @@
 //! the shell keeps invoking the icon under the strip, also a second delivery of the
 //! strip's own clicks, which is why the left one defers to
 //! [`crate::taskbar::strip_is_up`].
+//!
+//! Scrolling a button changes *that* endpoint's volume, and it arrives here by two
+//! different roads, because no single one carries both pointing devices:
+//!
+//!   * **The wheel**, through the low-level mouse hook below ([`ScrollVolumeHook`]). It sees
+//!     the pointer in screen coordinates, so which button it is over comes from the icon's
+//!     own slot rect — see [`flow_at`].
+//!   * **A precision touchpad**, through the TAP: two-finger scroll never enters a global
+//!     mouse hook at all (Windows routes it straight to the hovered window), but it does
+//!     reach the XAML element under the pointer, so the strip's own
+//!     `PointerWheelChanged` handler posts it to us. That handler knows exactly which
+//!     segment it belongs to.
+//!
+//! They cannot double up: the hook swallows the wheel event it acts on, so XAML never sees
+//! that one. Both arrive as [`crate::taskbar::WM_TASKBAR_SCROLL`] and are coalesced by
+//! [`drain_scrolls`], and the level they land on is shown beside the buttons by
+//! [`crate::osd`].
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, DispatchMessageW, GetAncestor, GetClassNameW, GetMessageW, PeekMessageW,
     PostQuitMessage, PostThreadMessageW, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx,
-    WindowFromPoint, GA_ROOT, HHOOK, MSG, MSLLHOOKSTRUCT, PM_REMOVE, WH_MOUSE_LL, WM_APP,
-    WM_MOUSEWHEEL,
+    WindowFromPoint, GA_ROOT, HHOOK, MSG, MSLLHOOKSTRUCT, PM_REMOVE, WH_MOUSE_LL, WHEEL_DELTA,
+    WM_MOUSEWHEEL, WM_TIMER,
 };
 
 use crate::audio::wasapi::WasapiBackend;
-use crate::audio::{notify, AudioBackend};
+use crate::audio::{notify, AudioBackend, Flow};
 use crate::config::Config;
 use crate::flyout;
 use crate::icons::{self, IconId};
+use crate::osd::Osd;
+use crate::taskbar::WM_TASKBAR_SCROLL;
 
-/// Posted (from the mouse hook) when the user scrolls over the taskbar/tray; wParam is
-/// 1 for volume up, 0 for down.
-const WM_VOLUME_STEP: u32 = WM_APP + 3;
+/// Volume change per wheel notch — 2%, the same step Windows' own volume keys take, and the
+/// same one the flyout uses when you scroll over its sliders. `pub(crate)` so `--vol up` is
+/// a notch too, rather than its own idea of a step.
+pub(crate) const SCROLL_STEP: f32 = 0.02;
 
 /// Stable marker appended to the tray icon's tooltip.
 ///
@@ -110,8 +130,11 @@ pub fn run(backend: WasapiBackend) -> Result<()> {
     let thread_id = unsafe { GetCurrentThreadId() };
     let _notifications = notify::register(thread_id)?;
 
-    // Scroll over the taskbar/tray to change the default device's volume.
+    // Scroll over the taskbar/tray to change a device's volume.
     let _volume_hook = ScrollVolumeHook::install(thread_id);
+    // The level bar that scrolling puts up beside the buttons. Its window is created on
+    // first use, so a tray that is never scrolled never makes one.
+    let mut osd = Osd::new();
 
     let devices = backend.enumerate().map(|d| d.len()).unwrap_or(0);
     // Which of the two click routings is live, since it depends on whether the
@@ -150,15 +173,26 @@ pub fn run(backend: WasapiBackend) -> Result<()> {
                 refresh(&backend, &tray, &config);
                 continue;
             }
-            // Scroll-over-tray → nudge the default device's volume.
-            if msg.message == WM_VOLUME_STEP {
-                let _ = backend.step_volume(msg.wParam.0 != 0);
+            // Scroll over a button (or anywhere on the tray, from the wheel hook) → nudge
+            // that endpoint's volume and show the level beside the buttons.
+            if msg.message == WM_TASKBAR_SCROLL {
+                let flow = crate::taskbar::flow_from_code(msg.wParam.0);
+                handle_scroll(&backend, &tray, &mut osd, flow, msg.lParam.0 as i32);
+                continue;
+            }
+            // The readout's hold-then-fade. Its own window's timer, so it cannot be
+            // confused with anyone else's.
+            if msg.message == WM_TIMER && osd.owns(msg.hwnd) {
+                osd.tick();
                 continue;
             }
             // A click on the injected taskbar strip, relayed by the TAP running
             // inside Explorer. If there is no strip, this message simply never
             // arrives.
             if msg.message == crate::taskbar::WM_TASKBAR_ACTION {
+                // Whatever the readout is showing is about to be stale — this click either
+                // opens the panel over it or switches the endpoint it was reporting.
+                osd.hide();
                 if let Some(action) = crate::taskbar::Action::from_code(msg.wParam.0) {
                     // The click that dismissed the flyout lands on the strip like any
                     // other, and `Tapped` completes on release — after the flyout has
@@ -253,6 +287,7 @@ pub fn run(backend: WasapiBackend) -> Result<()> {
                             cx: (rect.position.x + rect.size.width as f64 / 2.0) as i32,
                             bottom: rect.position.y as i32,
                         };
+                        osd.hide(); // the panel supersedes it, and covers where it sits
                         handle_flyout(&backend, &mut config, &tray, Some(anchor))?;
                         settle_after_flyout(&mut reopen_guard);
                     }
@@ -261,6 +296,108 @@ pub fn run(backend: WasapiBackend) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Apply a scroll over the taskbar buttons: move that endpoint's volume, and show where it
+/// landed beside the buttons.
+///
+/// `flow`/`delta` are the message that got us here; everything else already queued is folded
+/// in with it — see [`drain_scrolls`].
+fn handle_scroll(
+    backend: &WasapiBackend,
+    tray: &TrayIcon,
+    osd: &mut Osd,
+    flow: Flow,
+    delta: i32,
+) {
+    // Asked for now rather than remembered from last time: the icon moves whenever the tray
+    // is rearranged, and this is also what keeps the wheel hook's routing current.
+    let slot = refresh_icon_rect(tray);
+    for (code, notches) in drain_scrolls(flow, delta).into_iter().enumerate() {
+        if notches == 0.0 {
+            continue;
+        }
+        let flow = crate::taskbar::flow_from_code(code);
+        // Never propagated, for the reason `handle_taskbar_action`'s caller documents: this
+        // is COM against an endpoint that can be unplugged mid-gesture, and one failed
+        // scroll must not take the tray down with it.
+        match backend.nudge_volume(flow, notches * SCROLL_STEP) {
+            Ok((level, muted)) => osd.show(flow, level, muted, slot),
+            Err(e) => eprintln!("scroll: could not change the {flow:?} volume ({e:#})"),
+        }
+    }
+}
+
+/// Fold every queued scroll into one nudge per direction, returning the accumulated notches
+/// indexed by [`crate::taskbar::flow_code`].
+///
+/// A precision touchpad reports a *stream* of sub-notch deltas — tens per gesture — and each
+/// one taken on its own costs an endpoint `Activate` plus a get/set/get round trip. Handled
+/// one at a time the volume would still be catching up long after the finger stopped.
+/// Draining is self-throttling instead: whatever arrives while the audio work is in flight is
+/// summed and applied in a single step, so the gesture stays live however fast the events
+/// come. The wheel produces one message per notch and so drains nothing — it just takes this
+/// same path.
+fn drain_scrolls(flow: Flow, delta: i32) -> [f32; 2] {
+    let mut totals = [0i32; 2];
+    totals[crate::taskbar::flow_code(flow)] += delta;
+    let mut extra = MSG::default();
+    while unsafe {
+        PeekMessageW(&mut extra, None, WM_TASKBAR_SCROLL, WM_TASKBAR_SCROLL, PM_REMOVE)
+    }
+    .as_bool()
+    {
+        let flow = crate::taskbar::flow_from_code(extra.wParam.0);
+        totals[crate::taskbar::flow_code(flow)] += extra.lParam.0 as i32;
+    }
+    totals.map(|delta| delta as f32 / WHEEL_DELTA as f32)
+}
+
+/// The tray icon's slot on the taskbar, as the shell last reported it.
+///
+/// A static purely because of who needs it: [`flow_at`] tells the two buttons apart by which
+/// half of the slot the pointer is on, and it is called from the mouse hook — a bare `fn`
+/// with no tray icon in hand. Everything else asks [`refresh_icon_rect`] directly.
+///
+/// Only ever touched from the tray thread (the hook is called on the thread that installed
+/// it), so the lock is never contended.
+static ICON_RECT: std::sync::Mutex<Option<RECT>> = std::sync::Mutex::new(None);
+
+fn icon_rect() -> Option<RECT> {
+    match ICON_RECT.lock() {
+        Ok(guard) => *guard,
+        Err(poisoned) => *poisoned.into_inner(),
+    }
+}
+
+/// Ask the shell where our notification icon is, remember it for [`flow_at`], and hand it
+/// back to whoever is about to place the readout.
+///
+/// `Shell_NotifyIconGetRect` under the covers, so the answer is current rather than inferred:
+/// the slot moves whenever tray icons are added, removed or reordered, and after every
+/// Explorer restart. `None` while the icon is not on the taskbar at all — it has not been
+/// registered yet, or it is in the overflow flyout — and the callers fall back rather than
+/// fail.
+fn refresh_icon_rect(tray: &TrayIcon) -> Option<RECT> {
+    let rect = tray.rect()?;
+    let (left, top) = (rect.position.x as i32, rect.position.y as i32);
+    let slot = RECT {
+        left,
+        top,
+        right: left + rect.size.width as i32,
+        bottom: top + rect.size.height as i32,
+    };
+    let mut held = match ICON_RECT.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    // On change only: it decides where the readout appears and how the wheel is routed, and
+    // this runs on every refresh — a line per refresh would drown the log it belongs in.
+    if *held != Some(slot) {
+        println!("tray: icon slot at {left},{top} {}x{}", rect.size.width, rect.size.height);
+    }
+    *held = Some(slot);
+    Some(slot)
 }
 
 /// Settles the input that a just-closed flyout leaves behind, so the click that
@@ -545,6 +682,11 @@ fn refresh(backend: &WasapiBackend, tray: &TrayIcon, config: &Config) {
     // anything to say.
     push_strip(state.strip_icons());
 
+    // Where the icon is now — so the *first* scroll of a session is routed and placed as
+    // well as every later one, and so an Explorer restart (which re-registers the icon,
+    // often somewhere else) is picked up without waiting for a gesture.
+    refresh_icon_rect(tray);
+
     if let Err(e) = state.output.apply_to(tray) {
         eprintln!("tray: could not update the icon, will retry when the taskbar is back ({e:#})");
     }
@@ -742,18 +884,18 @@ fn small_icon_size() -> u32 {
     if px <= 0 { 16 } else { px as u32 }
 }
 
-/// A low-level mouse hook that turns wheel-over-taskbar into a volume step. The hook
-/// callback stays trivial (it just posts [`WM_VOLUME_STEP`] to the tray loop) so it
+/// A low-level mouse hook that turns wheel-over-taskbar into a volume change. The hook
+/// callback stays trivial (it just posts [`WM_TASKBAR_SCROLL`] to the tray loop) so it
 /// never trips the OS low-level-hook timeout. Unhooks on drop.
 struct ScrollVolumeHook(HHOOK);
 
 impl ScrollVolumeHook {
     fn install(tray_thread: u32) -> Option<Self> {
         TRAY_TID.store(tray_thread, Ordering::SeqCst);
-        // Note: only physical mouse-wheel scroll reaches a low-level mouse hook.
-        // Precision-touchpad two-finger scroll is routed by Windows' Direct Manipulation
-        // straight to the hovered window and never enters this stream — touchpad users
-        // use the volume slider in the native sound flyout (left-click) instead.
+        // Only the physical wheel reaches a low-level mouse hook. Precision-touchpad
+        // two-finger scroll is routed by Windows straight to the hovered window and never
+        // enters this stream at all — that half of the gesture comes in from the TAP's own
+        // `PointerWheelChanged` handler instead (see the module docs).
         unsafe { SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook), None, 0) }
             .ok()
             .map(ScrollVolumeHook)
@@ -775,13 +917,45 @@ unsafe extern "system" fn mouse_hook(code: i32, wparam: WPARAM, lparam: LPARAM) 
             let delta = (info.mouseData >> 16) as i16;
             let tid = TRAY_TID.load(Ordering::SeqCst);
             if tid != 0 && delta != 0 {
-                let up: usize = if delta > 0 { 1 } else { 0 };
-                let _ = PostThreadMessageW(tid, WM_VOLUME_STEP, WPARAM(up), LPARAM(0));
+                let flow = crate::taskbar::flow_code(flow_at(info.pt));
+                let _ = PostThreadMessageW(
+                    tid,
+                    WM_TASKBAR_SCROLL,
+                    WPARAM(flow),
+                    LPARAM(delta as isize),
+                );
             }
-            return LRESULT(1); // swallow so the shell doesn't also scroll
+            // Swallowed so the shell doesn't also scroll — and so XAML never sees it, which
+            // is what keeps the TAP's own wheel handler from acting on the same notch.
+            return LRESULT(1);
         }
     }
     CallNextHookEx(None, code, wparam, lparam)
+}
+
+/// Which endpoint a wheel at this screen point belongs to.
+///
+/// The two buttons split the icon's slot down the middle — the pill is centred in it and its
+/// halves are equal, 32 epx each (see the TAP's `decorate` module) — so the slot's midpoint is
+/// the whole test. Anywhere else on the taskbar keeps the wheel's original meaning, the output
+/// volume; so does a wheel over the icon when there is no strip, where there are no halves to
+/// tell apart.
+fn flow_at(pt: POINT) -> Flow {
+    if !crate::taskbar::strip_is_up() {
+        return Flow::Output;
+    }
+    match icon_rect() {
+        Some(slot)
+            if pt.x >= slot.left && pt.x < slot.right && pt.y >= slot.top && pt.y < slot.bottom =>
+        {
+            if pt.x < (slot.left + slot.right) / 2 {
+                Flow::Output
+            } else {
+                Flow::Input
+            }
+        }
+        _ => Flow::Output,
+    }
 }
 
 /// Is the screen point over the taskbar / notification area (incl. the Win11 tray

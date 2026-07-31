@@ -1,17 +1,21 @@
-//! A tiny straight-alpha RGBA software canvas: the flyout's whole 2D drawing surface.
+//! A tiny straight-alpha RGBA software canvas: every pixel this app draws by hand goes
+//! through here — the control flyout ([`crate::flyout`]) and the scroll readout
+//! ([`crate::osd`]) both paint into one.
 //!
 //! It owns nothing — it borrows a `width`×`height` RGBA byte slice and paints into it —
 //! and knows nothing about Win32, the audio model, or the layout. Every primitive is a
 //! method on [`Canvas`], so callers no longer thread `(buf, w, h)` through every draw call
 //! (which is what forced the old `#[allow(clippy::too_many_arguments)]`s). Because it's
 //! pure, its geometry and blending are unit-testable in isolation.
+//!
+//! [`crate::layered`] is the other half: this fills a buffer, that puts it on the screen.
 
 use ab_glyph::{Font, FontVec, PxScale, ScaleFont};
 
 /// An axis-aligned rectangle in pixel space (`x0,y0` top-left → `x1,y1` bottom-right). Lets
 /// [`Canvas::fill_round_rect`] take one geometry argument instead of four loose floats.
 #[derive(Clone, Copy)]
-pub(super) struct Rect {
+pub(crate) struct Rect {
     pub x0: f32,
     pub y0: f32,
     pub x1: f32,
@@ -19,26 +23,26 @@ pub(super) struct Rect {
 }
 
 impl Rect {
-    pub(super) fn new(x0: f32, y0: f32, x1: f32, y1: f32) -> Self {
+    pub(crate) fn new(x0: f32, y0: f32, x1: f32, y1: f32) -> Self {
         Rect { x0, y0, x1, y1 }
     }
 }
 
 /// A mutable view over a straight-alpha RGBA pixel buffer, `w`×`h`, row-major, 4 bytes per
 /// pixel (R, G, B, A). All drawing clips to these bounds.
-pub(super) struct Canvas<'a> {
+pub(crate) struct Canvas<'a> {
     buf: &'a mut [u8],
     w: i32,
     h: i32,
 }
 
 impl<'a> Canvas<'a> {
-    pub(super) fn new(buf: &'a mut [u8], w: i32, h: i32) -> Self {
+    pub(crate) fn new(buf: &'a mut [u8], w: i32, h: i32) -> Self {
         Canvas { buf, w, h }
     }
 
     /// Reset every pixel to transparent black.
-    pub(super) fn clear(&mut self) {
+    pub(crate) fn clear(&mut self) {
         for p in self.buf.iter_mut() {
             *p = 0;
         }
@@ -70,7 +74,7 @@ impl<'a> Canvas<'a> {
 
     /// Fill a rounded rectangle (SDF-based, anti-aliased at the edge) with a straight-alpha
     /// colour. `r` is clamped to half the smaller side.
-    pub(super) fn fill_round_rect(&mut self, rect: Rect, r: f32, col: [u8; 3], alpha: f32) {
+    pub(crate) fn fill_round_rect(&mut self, rect: Rect, r: f32, col: [u8; 3], alpha: f32) {
         let Rect { x0, y0, x1, y1 } = rect;
         let cx = (x0 + x1) / 2.0;
         let cy = (y0 + y1) / 2.0;
@@ -101,7 +105,7 @@ impl<'a> Canvas<'a> {
     /// Same SDF as [`Self::fill_round_rect`] but with the vertical mirror dropped (only the
     /// bottom corners curve), intersected (`max`) with the half-plane below the top edge —
     /// which is what puts the missing top boundary back.
-    pub(super) fn fill_round_rect_bottom(&mut self, rect: Rect, r: f32, col: [u8; 3], alpha: f32) {
+    pub(crate) fn fill_round_rect_bottom(&mut self, rect: Rect, r: f32, col: [u8; 3], alpha: f32) {
         let Rect { x0, y0, x1, y1 } = rect;
         let cx = (x0 + x1) / 2.0;
         let cy = (y0 + y1) / 2.0;
@@ -127,7 +131,7 @@ impl<'a> Canvas<'a> {
 
     /// Blit a straight-alpha RGBA sprite (its own colour) at `(x0, y0)`, scaling its alpha
     /// by `alpha` (pass `1.0` for an opaque blit, `<1.0` to dim it).
-    pub(super) fn blit(&mut self, x0: i32, y0: i32, rgba: &[u8], sw: u32, sh: u32, alpha: f32) {
+    pub(crate) fn blit(&mut self, x0: i32, y0: i32, rgba: &[u8], sw: u32, sh: u32, alpha: f32) {
         for sy in 0..sh as i32 {
             for sx in 0..sw as i32 {
                 let i = ((sy as u32 * sw + sx as u32) * 4) as usize;
@@ -143,7 +147,7 @@ impl<'a> Canvas<'a> {
     /// Copy a same-size (`w`×`h`) page buffer into this canvas shifted horizontally by `dx`
     /// (opaque copy, no blending), clipping to bounds. Used to slide two pre-rendered
     /// screens across each other during a navigation transition.
-    pub(super) fn blit_shift(&mut self, page: &[u8], dx: i32) {
+    pub(crate) fn blit_shift(&mut self, page: &[u8], dx: i32) {
         let (w, h) = (self.w, self.h);
         let x_lo = dx.max(0);
         let x_hi = (w + dx).min(w);
@@ -162,7 +166,7 @@ impl<'a> Canvas<'a> {
 
     /// Draw a text run in `col` at `alpha`, sized to em `px`, starting at pen position
     /// `at` = (pen-x, baseline-y) in px. Advances glyph by glyph.
-    pub(super) fn draw_text(&mut self, font: &FontVec, px: f32, at: (f32, f32), col: [u8; 3], alpha: f32, text: &str) {
+    pub(crate) fn draw_text(&mut self, font: &FontVec, px: f32, at: (f32, f32), col: [u8; 3], alpha: f32, text: &str) {
         let (mut pen, baseline) = at;
         let scale = em_scale(font, px);
         let sf = font.as_scaled(scale);
@@ -185,7 +189,7 @@ impl<'a> Canvas<'a> {
 /// Convert a desired **em size** (in px) into the ab_glyph `PxScale` that actually yields
 /// it. ab_glyph scales a font by its *height*, so a plain `PxScale::from(px)` renders an
 /// em of only ~0.75·px for Segoe UI. Sizing by em keeps our text matched to Windows.
-pub(super) fn em_scale(font: &FontVec, em_px: f32) -> PxScale {
+pub(crate) fn em_scale(font: &FontVec, em_px: f32) -> PxScale {
     match font.units_per_em() {
         Some(upem) => PxScale::from(em_px * font.height_unscaled() / upem),
         None => PxScale::from(em_px),
@@ -193,14 +197,14 @@ pub(super) fn em_scale(font: &FontVec, em_px: f32) -> PxScale {
 }
 
 /// Total advance width (px) of `text` at em size `px`.
-pub(super) fn measure(font: &FontVec, px: f32, text: &str) -> f32 {
+pub(crate) fn measure(font: &FontVec, px: f32, text: &str) -> f32 {
     let sf = font.as_scaled(em_scale(font, px));
     text.chars().map(|c| sf.h_advance(font.glyph_id(c))).sum()
 }
 
 /// Truncate `text` with a trailing ellipsis so it fits within `max_w` px. Returned as-is
 /// when it already fits.
-pub(super) fn fit_label(font: &FontVec, px: f32, text: &str, max_w: f32) -> String {
+pub(crate) fn fit_label(font: &FontVec, px: f32, text: &str, max_w: f32) -> String {
     let sf = font.as_scaled(em_scale(font, px));
     let advance = |c: char| sf.h_advance(font.glyph_id(c));
     if text.chars().map(advance).sum::<f32>() <= max_w {
@@ -223,7 +227,7 @@ pub(super) fn fit_label(font: &FontVec, px: f32, text: &str, max_w: f32) -> Stri
 
 /// Linear interpolation between two RGB colours (`t` clamped to 0..=1). Used to lighten
 /// the slider fill toward white as live audio activity rises.
-pub(super) fn lerp3(a: [u8; 3], b: [u8; 3], t: f32) -> [u8; 3] {
+pub(crate) fn lerp3(a: [u8; 3], b: [u8; 3], t: f32) -> [u8; 3] {
     let t = t.clamp(0.0, 1.0);
     let l = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
     [l(a[0], b[0]), l(a[1], b[1]), l(a[2], b[2])]

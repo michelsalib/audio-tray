@@ -447,6 +447,31 @@ pub fn post_action(action: Action) -> Result<()> {
         .context("post the action to the tray")
 }
 
+/// Dev: hand a running tray the scroll the TAP would have sent for `notches` wheel notches
+/// over one button.
+///
+/// The counterpart of [`post_action`], and it exists for the same reason plus one more: the
+/// touchpad half of the gesture cannot be synthesised at all (its deltas arrive from XAML,
+/// inside Explorer), so this is the only way to drive fractional notches — and the readout's
+/// coalescing and fade — from a script.
+pub fn post_scroll(flow: crate::audio::Flow, notches: f32) -> Result<()> {
+    use windows::Win32::Foundation::{LPARAM, WPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WHEEL_DELTA};
+
+    let receiver = window_by_class(RECEIVER_CLASS_NAME)
+        .context("no receiver window — audio-tray is not running")?;
+    let delta = (notches * WHEEL_DELTA as f32).round() as i32;
+    unsafe {
+        PostMessageW(
+            Some(receiver),
+            WM_TASKBAR_SCROLL,
+            WPARAM(flow_code(flow)),
+            LPARAM(delta as isize),
+        )
+    }
+    .context("post the scroll to the tray")
+}
+
 /// Window class of the receiver. Must match `RECEIVER_CLASS` in the TAP's `ipc`
 /// module — the TAP finds this window by class name.
 const RECEIVER_CLASS_NAME: &str = "AudioTrayTaskbarIpc";
@@ -459,6 +484,38 @@ const RECEIVER_CLASS: PCWSTR = windows::core::w!("AudioTrayTaskbarIpc");
 /// Message the TAP posts; `wParam` carries the [`Action`] code.
 pub const WM_TASKBAR_ACTION: u32 =
     windows::Win32::UI::WindowsAndMessaging::WM_APP + 20;
+
+/// A scroll over one of the buttons: `wParam` is the direction ([`flow_code`]) and `lParam`
+/// the signed wheel delta, in `WHEEL_DELTA` units.
+///
+/// Its own message rather than another [`Action`] code, because the tray *coalesces* these —
+/// a precision touchpad produces a stream of sub-notch deltas, and one round of COM per
+/// delta would fall behind the finger. Coalescing means draining every one that is queued,
+/// and draining `WM_TASKBAR_ACTION` would swallow queued clicks with them.
+///
+/// Posted from two places, which is why the payload is this and not a pointer: the TAP, for
+/// a scroll that XAML delivered over a button (the touchpad's only route in — see
+/// [`crate::tray`]), and the tray's own mouse hook, as a thread message. Must match
+/// `WM_TASKBAR_SCROLL` in the TAP's `ipc` module.
+pub const WM_TASKBAR_SCROLL: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 24;
+
+/// Wire code for a direction in [`WM_TASKBAR_SCROLL`]'s `wParam`. Explicit on both sides, so
+/// the exe and the DLL can be built separately without agreeing by accident.
+pub fn flow_code(flow: crate::audio::Flow) -> usize {
+    match flow {
+        crate::audio::Flow::Output => 0,
+        crate::audio::Flow::Input => 1,
+    }
+}
+
+/// The other direction of [`flow_code`]. Anything unrecognised reads as output — the
+/// direction the wheel has always adjusted.
+pub fn flow_from_code(code: usize) -> crate::audio::Flow {
+    match code {
+        1 => crate::audio::Flow::Input,
+        _ => crate::audio::Flow::Output,
+    }
+}
 
 /// Explorer restarted — re-inject. Posted to itself by the receiver's window
 /// procedure; see [`create_receiver`] for why it cannot be observed directly.

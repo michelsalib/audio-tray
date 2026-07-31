@@ -2,6 +2,11 @@
 //! DPI at show time), the colour palette, the Segoe Fluent control glyphs, the UI fonts,
 //! and the user's Windows accent colour. Everything visual and tunable lives here, so the
 //! rest of the flyout reads as structure rather than magic numbers.
+//!
+//! The palette, the endpoint glyphs, the track height and the UI font are `pub(crate)`
+//! rather than private to the flyout: [`crate::osd`] is a second surface in the same design
+//! language (a volume readout beside the taskbar), and it has to *be* the same dark tint,
+//! the same white, the same speaker/microphone glyphs. Only its geometry is its own.
 
 use std::sync::OnceLock;
 
@@ -34,7 +39,7 @@ pub(super) const BATTERY_W: f32 = 96.0; // right-hand space reserved on battery 
 // slider geometry
 pub(super) const TRACK_X0: f32 = 52.0; // track left edge
 pub(super) const VALUE_W: f32 = 46.0; // reserved right area for the percentage
-pub(super) const TRACK_H: f32 = 4.0;
+pub(crate) const TRACK_H: f32 = 4.0;
 pub(super) const THUMB_R: f32 = 7.0;
 // footer bar (the panel's last row, modelled on the Win11 quick-settings footer): a
 // hairline across the full width, a labelled action on the left, a round icon button right
@@ -70,10 +75,10 @@ pub(super) const GRID_BOTTOM_PAD: f32 = 10.0; // gap below the last grid row
 pub(super) const GRID_ICON_RATIO: f32 = 0.55; // glyph size inside a cell
 
 // Fluent glyphs painted directly (not from the built-in IconId set).
-pub(super) const GLYPH_VOLUME: char = '\u{E767}';
-pub(super) const GLYPH_MUTE: char = '\u{E74F}';
-pub(super) const GLYPH_MIC: char = '\u{E720}';
-pub(super) const GLYPH_MIC_OFF: char = '\u{EC54}';
+pub(crate) const GLYPH_VOLUME: char = '\u{E767}';
+pub(crate) const GLYPH_MUTE: char = '\u{E74F}';
+pub(crate) const GLYPH_MIC: char = '\u{E720}';
+pub(crate) const GLYPH_MIC_OFF: char = '\u{EC54}';
 pub(super) const GLYPH_EDIT: char = '\u{E70F}';
 pub(super) const GLYPH_SETTINGS: char = '\u{E713}';
 pub(super) const GLYPH_CANCEL: char = '\u{E711}';
@@ -81,14 +86,14 @@ pub(super) const GLYPH_BACK: char = '\u{E72B}'; // Back (leftward arrow) — the
 pub(super) const GLYPH_UPDATE: char = '\u{E72C}'; // Refresh (circular arrow) — restart-to-update button
 
 // Colours (RGB); alpha applied at blend time.
-pub(super) const TINT: [u8; 3] = [0x2C, 0x2C, 0x2C]; // panel base (semi-transparent, acrylic shows through)
-pub(super) const TINT_A: f32 = 0.82;
-pub(super) const TEXT: [u8; 3] = [0xFF, 0xFF, 0xFF]; // primary text + glyphs
+pub(crate) const TINT: [u8; 3] = [0x2C, 0x2C, 0x2C]; // panel base (semi-transparent, acrylic shows through)
+pub(crate) const TINT_A: f32 = 0.82;
+pub(crate) const TEXT: [u8; 3] = [0xFF, 0xFF, 0xFF]; // primary text + glyphs
 pub(super) const DARK_GLYPH: [u8; 3] = [0x12, 0x16, 0x1C]; // icon colour on a solid accent chip
 pub(super) const HOVER_A: f32 = 0.06; // white overlay for hover
 pub(super) const SEL_A: f32 = 0.09; // white overlay for the selected row
 
-pub(super) fn ui_font() -> Option<&'static FontVec> {
+pub(crate) fn ui_font() -> Option<&'static FontVec> {
     static FONT: OnceLock<Option<FontVec>> = OnceLock::new();
     FONT.get_or_init(|| {
         let bytes = std::fs::read(r"C:\Windows\Fonts\segoeui.ttf").ok()?;

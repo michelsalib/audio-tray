@@ -20,11 +20,19 @@
 //!                         icons = the first device's icon-picker screen; update = fake a
 //!                         staged update so the footer's restart button shows)
 //!   audio-tray --meter    sample the default output+input peak meters for 4s (diagnostic)
+//!   audio-tray --vol <up|down|get>
+//!                         nudge (or read) the default output volume, one scroll notch
+//!   audio-tray --osd [out|in] [level%]
+//!                         preview the scroll readout — the level bar a scroll puts up
+//!                         beside the buttons — beside the cursor, until it fades
 //!   audio-tray --update   check GitHub releases and self-update now (see update.rs)
 //!   audio-tray --taskbar-click <out|in|panel>
 //!                         send a running tray the gesture a strip click would —
 //!                         the only way to exercise the cycling, since clicks on the
 //!                         taskbar itself cannot be synthesised
+//!   audio-tray --taskbar-scroll <out|in> [notches]
+//!                         send a running tray the scroll a strip button would, which is
+//!                         the only way to drive the touchpad half of that gesture
 //!   audio-tray --taskbar-revert
 //!                         ask an injected TAP to put the taskbar back. Leaves the
 //!                         running tray alone — it will put the strip up again the
@@ -41,9 +49,12 @@ use windows::Win32::UI::HiDpi::{
 };
 
 mod audio;
+mod canvas;
 mod config;
 mod flyout;
 mod icons;
+mod layered;
+mod osd;
 mod taskbar;
 mod tray;
 mod update;
@@ -123,15 +134,41 @@ fn main() -> Result<()> {
             );
         }
         Some("--vol") => {
+            // One notch, so this moves the volume by exactly as much as a scroll over the
+            // output button does.
             let before = backend.master_volume()?;
             match args.get(1).map(String::as_str) {
-                Some("up") => backend.step_volume(true)?,
-                Some("down") => backend.step_volume(false)?,
+                Some("up") => {
+                    backend.nudge_volume(Flow::Output, tray::SCROLL_STEP)?;
+                }
+                Some("down") => {
+                    backend.nudge_volume(Flow::Output, -tray::SCROLL_STEP)?;
+                }
                 Some("get") | None => {}
                 Some(other) => bail!("usage: audio-tray --vol <up|down|get> (got {other:?})"),
             }
             let after = backend.master_volume()?;
             println!("volume: {:.0}% -> {:.0}%", before * 100.0, after * 100.0);
+        }
+        Some("--osd") => {
+            // Dev: show the scroll readout on its own, next to the cursor, and wait for it
+            // to fade. The only way to iterate on it (and screenshot it) without a taskbar
+            // strip to scroll — and with an explicit level, without touching the device.
+            let flow = match args.get(1).map(String::as_str) {
+                Some("in") => Flow::Input,
+                Some("out") | None => Flow::Output,
+                Some(other) => bail!("usage: audio-tray --osd [out|in] [level%] (got {other:?})"),
+            };
+            let level = match args.get(2) {
+                Some(value) => Some(
+                    value
+                        .parse::<f32>()
+                        .with_context(|| format!("{value:?} is not a level in percent"))?
+                        / 100.0,
+                ),
+                None => None,
+            };
+            osd::preview(&backend, flow, level)?;
         }
         Some("--meter") => {
             // Dev: sample the default output + input peak meters (IAudioMeterInformation)
@@ -161,6 +198,27 @@ fn main() -> Result<()> {
             };
             taskbar::post_action(action)?;
             println!("taskbar: posted {action:?} to the running tray.");
+        }
+        Some("--taskbar-scroll") => {
+            // Dev: the wheel/touchpad half of the strip's gestures. The wheel can be tested
+            // by hand; the touchpad's sub-notch deltas arrive from inside Explorer and
+            // cannot be synthesised, so this stands in for them — fractional notches
+            // included.
+            let flow = match args.get(1).map(String::as_str) {
+                Some("out") => Flow::Output,
+                Some("in") => Flow::Input,
+                other => {
+                    bail!("usage: audio-tray --taskbar-scroll <out|in> [notches] (got {other:?})")
+                }
+            };
+            let notches = match args.get(2) {
+                Some(value) => value
+                    .parse::<f32>()
+                    .with_context(|| format!("{value:?} is not a number of notches"))?,
+                None => 1.0,
+            };
+            taskbar::post_scroll(flow, notches)?;
+            println!("taskbar: posted a {notches} notch {flow:?} scroll to the running tray.");
         }
         Some("--taskbar-restart") => {
             // Restarts the shell, the same as the flyout footer's button. Here for the same

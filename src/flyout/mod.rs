@@ -15,9 +15,8 @@
 //!
 //! This module is the **controller**: it owns the modal message pump and coordinates the
 //! focused pieces it delegates to — the display [`model`], pure [`layout`], the [`render`]
-//! passes, the drawing [`canvas`], the [`window`] surface, and the [`theme`] tokens.
+//! passes, the drawing [`crate::canvas`], the [`window`] surface, and the [`theme`] tokens.
 
-mod canvas;
 mod layout;
 mod model;
 mod render;
@@ -46,7 +45,7 @@ use crate::audio::Flow;
 use crate::config::Config;
 use crate::icons::IconId;
 
-use canvas::Canvas;
+use crate::canvas::Canvas;
 use layout::{ActionKind, Elem, LaidElem, View};
 use model::{build_groups, Model};
 use theme::{accent_rgb, TRACK_X0};

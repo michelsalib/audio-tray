@@ -205,15 +205,95 @@ pub unsafe trait IUIElement: IUnknown {
     pub fn remove_RightTapped(&self, token: i64) -> HRESULT;
 }
 
+// Pointer event args, for the one handler that reads them. Hover and the two tap handlers
+// ignore theirs entirely — which element was hit and which handler fired is all they need —
+// but a scroll has to get at the wheel delta, and that sits two hops down: the args yield a
+// `PointerPoint`, whose properties carry it.
+
+/// `Windows.UI.Xaml.Input.IPointerRoutedEventArgs` — the args of `PointerWheelChanged`
+/// (and of every other pointer event, whose args we never look at).
+///
+/// Needed for two things a scroll cannot do without. The delta is *not* on the args — it
+/// comes from `GetCurrentPoint(null).Properties.MouseWheelDelta`, which is why
+/// [`IPointerPoint`] and [`IPointerPointProperties`] are transcribed below as well — and
+/// `put_Handled` is how a scroll we have acted on is kept from also reaching the shell.
+///
+/// Slot order is the header's: the three `IInspectable` ones, then `Pointer`,
+/// `KeyModifiers`, `Handled` (get and put), and only then `GetCurrentPoint`.
+#[interface("da628f0a-9752-49e2-bde2-49eccab9194d")]
+pub unsafe trait IPointerRoutedEventArgs: IUnknown {
+    pub fn GetIids(&self, count: *mut u32, iids: *mut *mut windows_core::GUID) -> HRESULT;
+    pub fn GetRuntimeClassName(&self, name: *mut *mut c_void) -> HRESULT;
+    pub fn GetTrustLevel(&self, level: *mut i32) -> HRESULT;
+    pub fn get_Pointer(&self, value: *mut *mut c_void) -> HRESULT;
+    pub fn get_KeyModifiers(&self, value: *mut i32) -> HRESULT;
+    pub fn get_Handled(&self, value: *mut u8) -> HRESULT;
+    pub fn put_Handled(&self, value: u8) -> HRESULT;
+    pub fn GetCurrentPoint(
+        &self,
+        relative_to: *mut c_void,
+        result: *mut *mut c_void,
+    ) -> HRESULT;
+    pub fn GetIntermediatePoints(
+        &self,
+        relative_to: *mut c_void,
+        result: *mut *mut c_void,
+    ) -> HRESULT;
+}
+
+/// `Windows.UI.Input.IPointerPoint`. Only `get_Properties` is called; the seven slots
+/// before it are the header's own order.
+#[interface("e995317d-7296-42d9-8233-c5be73b74a4a")]
+pub unsafe trait IPointerPoint: IUnknown {
+    pub fn GetIids(&self, count: *mut u32, iids: *mut *mut windows_core::GUID) -> HRESULT;
+    pub fn GetRuntimeClassName(&self, name: *mut *mut c_void) -> HRESULT;
+    pub fn GetTrustLevel(&self, level: *mut i32) -> HRESULT;
+    pub fn get_PointerDevice(&self, value: *mut *mut c_void) -> HRESULT;
+    pub fn get_Position(&self, value: *mut Point) -> HRESULT;
+    pub fn get_RawPosition(&self, value: *mut Point) -> HRESULT;
+    pub fn get_PointerId(&self, value: *mut u32) -> HRESULT;
+    pub fn get_FrameId(&self, value: *mut u32) -> HRESULT;
+    pub fn get_Timestamp(&self, value: *mut u64) -> HRESULT;
+    pub fn get_IsInContact(&self, value: *mut u8) -> HRESULT;
+    pub fn get_Properties(&self, value: *mut *mut c_void) -> HRESULT;
+}
+
+/// `Windows.UI.Input.IPointerPointProperties`, for the two members a scroll needs.
+///
+/// `get_MouseWheelDelta` is the 14th of the interface's own methods and
+/// `get_IsHorizontalMouseWheel` the 15th, so the thirteen pen/touch/button properties ahead
+/// of them are placeholders. The horizontal flag is not optional: a touchpad's *sideways*
+/// two-finger scroll arrives as this same event, and without the test it would change the
+/// volume too.
+#[interface("c79d8a4b-c163-4ee7-803f-67ce79f9972d")]
+pub unsafe trait IPointerPointProperties: IUnknown {
+    pub fn GetIids(&self, count: *mut u32, iids: *mut *mut windows_core::GUID) -> HRESULT;
+    pub fn GetRuntimeClassName(&self, name: *mut *mut c_void) -> HRESULT;
+    pub fn GetTrustLevel(&self, level: *mut i32) -> HRESULT;
+    pub fn _reserved01(&self) -> HRESULT; // Pressure
+    pub fn _reserved02(&self) -> HRESULT; // IsInverted
+    pub fn _reserved03(&self) -> HRESULT; // IsEraser
+    pub fn _reserved04(&self) -> HRESULT; // Orientation
+    pub fn _reserved05(&self) -> HRESULT; // XTilt
+    pub fn _reserved06(&self) -> HRESULT; // YTilt
+    pub fn _reserved07(&self) -> HRESULT; // Twist
+    pub fn _reserved08(&self) -> HRESULT; // ContactRect
+    pub fn _reserved09(&self) -> HRESULT; // ContactRectRaw
+    pub fn _reserved10(&self) -> HRESULT; // TouchConfidence
+    pub fn _reserved11(&self) -> HRESULT; // IsLeftButtonPressed
+    pub fn _reserved12(&self) -> HRESULT; // IsRightButtonPressed
+    pub fn _reserved13(&self) -> HRESULT; // IsMiddleButtonPressed
+    pub fn get_MouseWheelDelta(&self, value: *mut i32) -> HRESULT;
+    pub fn get_IsHorizontalMouseWheel(&self, value: *mut u8) -> HRESULT;
+}
+
 // WinRT delegates. Unlike the interfaces above these derive from `IUnknown`, not
 // `IInspectable` — `Invoke` is slot 3 with no `GetIids`/`GetRuntimeClassName`/
 // `GetTrustLevel` ahead of it. Getting that wrong calls the wrong function
 // pointer, so it is worth stating explicitly.
-//
-// The event args are never inspected — which segment was hit and which handler
-// fired is all the strip needs — so they stay opaque `IInspectable`s.
 
-/// `Windows.UI.Xaml.Input.PointerEventHandler`, for hover enter/exit.
+/// `Windows.UI.Xaml.Input.PointerEventHandler`, for hover enter/exit — and for
+/// `PointerWheelChanged`, which uses this same delegate type.
 #[interface("e4385929-c004-4bcf-8970-359486e39f88")]
 pub unsafe trait IPointerEventHandler: IUnknown {
     pub fn Invoke(&self, sender: *mut c_void, args: *mut c_void) -> HRESULT;

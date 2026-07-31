@@ -208,25 +208,40 @@ impl WasapiBackend {
         }
     }
 
-    /// Nudge the current default endpoint's master volume one step up/down (uses the
-    /// endpoint's own step increment, matching the volume keys).
-    pub fn step_volume(&self, up: bool) -> Result<()> {
+    /// Move the default endpoint of one direction by `by` (a signed fraction of full
+    /// scale), and report where it landed — the level and whether it is muted.
+    ///
+    /// The reading comes back because every caller needs it: this is what a scroll over the
+    /// taskbar buttons calls, and the readout beside them ([`crate::osd`]) has to draw the
+    /// level the endpoint actually took, which is not `current + by` at either end of the
+    /// range. Reading it separately would mean a second `Activate` on the same endpoint.
+    ///
+    /// A *proportional* nudge rather than `VolumeStepUp`/`Down`, deliberately: the wheel is
+    /// no longer the only thing that gets here. Precision-touchpad scroll arrives as a
+    /// stream of sub-notch deltas, and one endpoint step per delta would run the volume from
+    /// 0 to 100 in a flick — where a fraction of the per-notch step tracks the finger. One
+    /// notch still comes to the same 2% Windows itself uses (see `tray::SCROLL_STEP`).
+    ///
+    /// Mute is reported, never changed. Muting from the taskbar buttons is a deliberate stop
+    /// in their click cycle (see `tray::handle_taskbar_action`), so a scroll silently
+    /// clearing it would fight the gesture the user just made.
+    pub fn nudge_volume(&self, flow: Flow, by: f32) -> Result<(f32, bool)> {
         unsafe {
             let device = self
                 .enumerator
-                .GetDefaultAudioEndpoint(eRender, eConsole)
+                .GetDefaultAudioEndpoint(flow.data_flow(), eConsole)
                 .context("default endpoint for volume")?;
             let volume: IAudioEndpointVolume = device
                 .Activate(CLSCTX_ALL, None)
                 .context("activate IAudioEndpointVolume")?;
-            if up {
-                volume.VolumeStepUp(std::ptr::null())
-            } else {
-                volume.VolumeStepDown(std::ptr::null())
-            }
-            .context("volume step")?;
+            let level = (volume.GetMasterVolumeLevelScalar().context("get volume")? + by)
+                .clamp(0.0, 1.0);
+            volume
+                .SetMasterVolumeLevelScalar(level, std::ptr::null())
+                .context("set volume")?;
+            let muted = volume.GetMute().is_ok_and(|muted| muted.as_bool());
+            Ok((level, muted))
         }
-        Ok(())
     }
 
     /// Master volume of the current default endpoint, 0.0..=1.0.

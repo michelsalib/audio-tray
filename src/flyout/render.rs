@@ -11,7 +11,7 @@ use ab_glyph::FontVec;
 use crate::audio::Flow;
 use crate::icons::{self, IconId};
 
-use super::canvas::{fit_label, lerp3, measure, Canvas, Rect};
+use crate::canvas::{fit_label, lerp3, measure, Canvas, Rect};
 use super::layout::{
     footer_btn_center_x, footer_buttons, footer_item_right, grid_metrics, pencil_center_x,
     ActionKind, Elem, LaidElem,

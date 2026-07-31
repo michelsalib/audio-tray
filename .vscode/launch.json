@@ -8,8 +8,8 @@
   // you have changed the TAP; it writes `target/debug/audio_tray_tap.dll`, which is
   // where `taskbar::enable()` looks.
   //
-  // If that DLL has never been built, the panel's "Show controls in the taskbar"
-  // toggle flips the setting and then reports the DLL as missing.
+  // If that DLL has never been built, startup logs the strip as unavailable and the
+  // app runs with the plain tray icon.
   //
   // Note the TAP runs inside `explorer.exe`, not here: this debugger will not stop
   // in it. Its log is `%TEMP%\xaml-tap.log`, and `--debug` in the init data turns on

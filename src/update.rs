@@ -9,9 +9,9 @@
 //! picks up the update at next sign-in.
 //!
 //! Two files ship together, and `self_update` only ever replaces one of them, so
-//! `update_tap` handles `audio_tray_tap.dll` separately. It can usually be copied
-//! straight into place; if the taskbar strip is enabled then Explorer has it open,
-//! and the replacement is handed to the OS for the next boot instead.
+//! `update_tap` handles `audio_tray_tap.dll` separately. Explorer normally has it
+//! open — the taskbar strip is injected on every start — so the replacement is
+//! usually handed to the OS for the next boot rather than copied into place.
 //!
 //! Gated to release builds: `cargo run` / debug builds never self-replace, so
 //! development is never disrupted. Force a check any time with
@@ -111,10 +111,11 @@ fn check_and_apply(verbose: bool) -> Result<self_update::Status> {
 
 /// Ships the new `audio_tray_tap.dll` alongside the freshly updated exe.
 ///
-/// Explorer keeps the DLL loaded for as long as the taskbar strip is enabled, so
-/// overwriting it usually fails. That case is not an error: the replacement is
-/// handed to the OS with `MOVEFILE_DELAY_UNTIL_REBOOT` and lands on the next boot,
-/// which is the same mechanism the installer's `restartreplace` uses.
+/// Explorer keeps the DLL loaded from the moment the strip is injected — and it
+/// stays loaded even after a revert (see [`crate::taskbar`]) — so overwriting it
+/// usually fails. That case is not an error: the replacement is handed to the OS
+/// with `MOVEFILE_DELAY_UNTIL_REBOOT` and lands on the next boot, which is the same
+/// mechanism the installer's `restartreplace` uses.
 fn update_tap(version: &str, verbose: bool) -> Result<()> {
     use std::fs;
 
@@ -168,8 +169,8 @@ fn update_tap(version: &str, verbose: bool) -> Result<()> {
             let _ = fs::remove_dir_all(&staging);
             Ok(())
         }
-        // Almost certainly ERROR_SHARING_VIOLATION: the strip is enabled and
-        // Explorer holds the DLL. Queue it for the next boot instead.
+        // Almost certainly ERROR_SHARING_VIOLATION: Explorer holds the DLL, which
+        // is the normal state. Queue it for the next boot instead.
         Err(_) => schedule_replace_at_boot(&fresh, &target, verbose),
     }
 }

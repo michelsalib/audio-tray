@@ -122,8 +122,8 @@ pub unsafe fn remember_content(diagnostics: &IXamlDiagnostics, presenter: Instan
 ///
 /// Safe to call when nothing was ever changed, and safe to call twice — the
 /// record is taken, so the second call has nothing left to do. That matters
-/// because the two triggers overlap: a user who toggles the feature off and then
-/// quits sends both.
+/// because the two triggers overlap: a user who asks for the taskbar back and then
+/// quits audio-tray sends both.
 ///
 /// # Safety
 /// XAML UI thread only.

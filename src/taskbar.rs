@@ -1,30 +1,33 @@
-//! Opt-in Explorer integration: the icon + chevron drawn inside the taskbar itself.
+//! Explorer integration: the pair of controls drawn inside the taskbar itself.
 //!
-//! **This is never on by default.** The plain `Shell_NotifyIcon` tray entry is
-//! registered unconditionally by `crate::tray`, and everything here is additive.
-//! If injection is disabled, unavailable, or fails, the app behaves exactly as it
-//! always has — callers treat every error as "feature off", never as fatal.
+//! This is how audio-tray presents itself in the notification area, and it is
+//! attempted on every start. It is still not a *requirement*: the plain
+//! `Shell_NotifyIcon` tray entry is registered unconditionally by `crate::tray`
+//! and the strip decorates it, so an injection that is unavailable or fails leaves
+//! the app behaving exactly as it did before the strip existed. Callers treat
+//! every error here as "the plain icon carries on alone", never as fatal.
 //!
 //! Mechanism (see `crates/taskbar-tap/FINDINGS.md` for the measurements behind it):
 //! `InitializeXamlDiagnosticsEx` loads `audio_tray_tap.dll` into `explorer.exe`,
 //! where it implements `IVisualTreeServiceCallback2`, watches the XAML tree for
 //! our `SystemTray.NotifyIconView`, and restyles it.
 //!
-//! Turning it off is a revert, not an unload. The TAP pins itself in
+//! Taking the strip back down is a revert, not an unload. The TAP pins itself in
 //! `explorer.exe` and stays there, but everything it changed — the tray icon's
 //! content, the tray sections' columns, Explorer's own volume slot — is an
 //! ordinary property edit that it recorded before making and can undo in place.
-//! [`revert`] asks for that; the DLL then sits inert until the feature is turned
-//! back on. Unloading it instead would gain a page of memory and risk freeing
-//! code Explorer still holds callbacks into.
+//! [`revert`] asks for that; the DLL then sits inert until the next injection.
+//! Unloading it instead would gain a page of memory and risk freeing code Explorer
+//! still holds callbacks into.
 //!
 //! Four things have to lead to that revert, and each has its own trigger:
-//!   * the user turns the feature off       → [`disable`]
 //!   * audio-tray quits                     → [`revert`], from the tray loop
 //!   * audio-tray is killed or crashes      → the TAP waits on our process id,
 //!     passed in [`init_data`], and reverts when it exits
 //!   * Explorer restarts                    → nothing to revert; the DLL died
 //!     with it, and [`apply_at_restart`] injects into the new one
+//!   * the user asks for the taskbar back   → [`revert`], via
+//!     `audio-tray --taskbar-revert`, which leaves the running tray untouched
 //!
 //! Remaining caveat: XAML Diagnostics is effectively single-consumer — TranslucentTB
 //! and Windhawk's Taskbar Styler use the same `VisualDiagConnection1` endpoint.
@@ -78,8 +81,8 @@ static LAST_INJECTED: std::sync::Mutex<Option<(u32, std::time::Instant)>> =
     std::sync::Mutex::new(None);
 
 /// Inject the TAP into the shell's Explorer. Best-effort by contract: every error
-/// means "feature stays off", and `enable`'s message says why.
-pub fn enable(icons: StripIcons) -> Result<()> {
+/// means "no strip this time", and the message says why.
+fn enable(icons: StripIcons) -> Result<()> {
     let dll = tap_path()?;
     let pid = shell_pid()?;
     unsafe { inject(pid, &dll, icons)? };
@@ -92,7 +95,7 @@ pub fn enable(icons: StripIcons) -> Result<()> {
 /// Whether we injected into this same Explorer a moment ago.
 fn just_injected(pid: u32) -> bool {
     /// Long enough to cover "audio-tray started as the shell came up", short enough
-    /// that a deliberate toggle off and back on is never mistaken for a duplicate.
+    /// that a deliberate revert and re-inject is never mistaken for a duplicate.
     const WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
 
     LAST_INJECTED
@@ -157,12 +160,6 @@ fn control_window() -> Option<windows::Win32::Foundation::HWND> {
     let mut found = HWND(std::ptr::null_mut());
     let _ = unsafe { EnumWindows(Some(visit), LPARAM(&mut found as *mut HWND as isize)) };
     (!found.0.is_null()).then_some(found)
-}
-
-/// Turn the feature off: revert now, and report what the user will see.
-pub fn disable() -> &'static str {
-    revert();
-    "Taskbar controls removed."
 }
 
 /// The process owning the desktop window — the Explorer that hosts the taskbar,
@@ -467,12 +464,9 @@ pub fn create_receiver() -> Result<windows::Win32::Foundation::HWND> {
     }
 }
 
-/// Apply the configured state at startup. Silent no-op when the opt-in is off,
-/// which is the default.
-pub fn apply_at_startup(enabled: bool, icons: StripIcons) {
-    if !enabled {
-        return;
-    }
+/// Put the strip up at startup. Never fatal: a failure here leaves the plain tray
+/// icon as the whole of the UI, which is what the app looked like before the strip.
+pub fn apply_at_startup(icons: StripIcons) {
     match enable(icons) {
         Ok(()) => eprintln!("taskbar: controls enabled"),
         Err(e) => eprintln!("taskbar: integration unavailable, using the plain tray icon ({e:#})"),
@@ -483,15 +477,12 @@ pub fn apply_at_startup(enabled: bool, icons: StripIcons) {
 ///
 /// The TAP lives inside `explorer.exe` and dies with it, taking the strip along.
 /// Nothing needs reverting in that case — the process that held our changes is
-/// gone — but without this the feature would stay silently off until audio-tray
-/// itself was restarted.
+/// gone — but without this the strip would stay gone until audio-tray itself was
+/// restarted.
 ///
 /// Runs on the tray thread, where COM is already initialized, and inherits
 /// [`enable`]'s contract: a failure means the plain tray icon carries on alone.
-pub fn apply_at_restart(enabled: bool, icons: StripIcons) {
-    if !enabled {
-        return;
-    }
+pub fn apply_at_restart(icons: StripIcons) {
     // A shell that has just restarted broadcasts `TaskbarCreated`, and audio-tray
     // starting up injects on its own account. Both can land within a second of each
     // other, which put two TAP instances in one Explorer — observed in the log as a
@@ -501,7 +492,7 @@ pub fn apply_at_restart(enabled: bool, icons: StripIcons) {
     //
     // Deliberately *not* a check for "is a TAP already loaded": after a revert the
     // DLL and its control window are still there, so that test would refuse the
-    // toggle-on it is meant to allow.
+    // re-injection it is meant to allow.
     if shell_pid().is_ok_and(just_injected) {
         return;
     }

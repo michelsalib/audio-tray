@@ -37,8 +37,8 @@ jobs:
           echo "version=$TAG_VERSION" >> "$GITHUB_OUTPUT"
 
       # --workspace so the taskbar TAP (crates/taskbar-tap -> audio_tray_tap.dll)
-      # is built alongside the exe. It ships next to it and is what the opt-in
-      # taskbar strip loads into explorer.exe.
+      # is built alongside the exe. It ships next to it and is what the taskbar
+      # strip loads into explorer.exe.
       - name: Build release
         run: cargo build --release --locked --workspace
 

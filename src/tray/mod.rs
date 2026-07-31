@@ -4,6 +4,11 @@
 //! events through a global channel that we drain after each dispatched message. Either
 //! button opens our acrylic control flyout (volume, mute, output/input switching,
 //! per-device icons, and a More section — see [`crate::flyout`]).
+//!
+//! Normally the icon is not what the user sees or clicks: [`crate::taskbar`] draws the
+//! strip's two buttons over it on every start, and their gestures arrive as
+//! [`crate::taskbar::WM_TASKBAR_ACTION`] instead (see [`handle_taskbar_action`]). The
+//! icon clicks above are the path for when that injection is unavailable.
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
@@ -67,10 +72,9 @@ static TRAY_TID: AtomicU32 = AtomicU32::new(0);
 pub fn run(backend: WasapiBackend) -> Result<()> {
     let mut config = Config::load();
 
-    // Receives clicks from the injected strip. Created unconditionally and
-    // cheaply: it costs one message-only window, and having it always present
-    // means enabling the feature needs no restart to become clickable.
-    // Also how we learn that Explorer restarted — see `create_receiver`.
+    // Receives clicks from the injected strip. Created before the injection, so a
+    // strip that comes up immediately already has somewhere to post to. Also how we
+    // learn that Explorer restarted — see `create_receiver`.
     let _receiver = match crate::taskbar::create_receiver() {
         Ok(hwnd) => {
             println!("taskbar: click receiver window {:?}", hwnd.0);
@@ -82,7 +86,8 @@ pub fn run(backend: WasapiBackend) -> Result<()> {
         }
     };
 
-    // Opt-in and off by default; a failure here never blocks the tray.
+    // The taskbar strip. A failure here never blocks the tray — the plain icon
+    // registered just below is the fallback, and the whole of the UI without it.
     //
     // Deliberately *before* the tray icon exists. Injecting afterwards looks
     // tidier — the TAP would find the icon on its first pass instead of waiting
@@ -91,7 +96,7 @@ pub fn run(backend: WasapiBackend) -> Result<()> {
     // `put_Content` there simply never returns. Measured: the log stops at
     // "setting content on …" and the strip never appears. Letting the icon arrive
     // as a live delta afterwards is the ordering that works.
-    crate::taskbar::apply_at_startup(config.taskbar.enabled, strip_icons(&backend, &config));
+    crate::taskbar::apply_at_startup(strip_icons(&backend, &config));
 
     // At logon audio-tray can start ahead of `explorer.exe`, and registering the
     // icon then fails silently and permanently — hence the retry inside.
@@ -141,8 +146,8 @@ pub fn run(backend: WasapiBackend) -> Result<()> {
                 continue;
             }
             // A click on the injected taskbar strip, relayed by the TAP running
-            // inside Explorer. Only ever additive — if the feature is off, this
-            // message simply never arrives.
+            // inside Explorer. If there is no strip, this message simply never
+            // arrives.
             if msg.message == crate::taskbar::WM_TASKBAR_ACTION {
                 if let Some(action) = crate::taskbar::Action::from_code(msg.wParam.0) {
                     handle_taskbar_action(&backend, &mut config, &tray, action)?;
@@ -155,7 +160,7 @@ pub fn run(backend: WasapiBackend) -> Result<()> {
             // visible. `tray-icon` re-registers our plain notification icon on
             // the same signal, independently.
             if msg.message == crate::taskbar::WM_TASKBAR_RESTARTED {
-                crate::taskbar::apply_at_restart(config.taskbar.enabled, strip_icons(&backend, &config));
+                crate::taskbar::apply_at_restart(strip_icons(&backend, &config));
                 // The icon `tray-icon` just re-registered carries the defaults it
                 // was built with, so put the current device's icon and tooltip
                 // back on it — and this is also the retry for any refresh that
@@ -250,18 +255,6 @@ fn handle_flyout(
     // endpoint-change notifications, so refresh here when the config or the default changed.
     if outcome.config_changed || outcome.output_changed {
         refresh(backend, tray, config);
-    }
-    // Opt-in Explorer integration. Purely additive: the tray icon above is already
-    // registered and keeps working whatever happens here.
-    if let Some(enabled) = outcome.taskbar_toggled {
-        if enabled {
-            match crate::taskbar::enable(strip_icons(backend, config)) {
-                Ok(()) => eprintln!("taskbar: controls enabled"),
-                Err(e) => eprintln!("taskbar: could not enable ({e:#})"),
-            }
-        } else {
-            eprintln!("taskbar: {}", crate::taskbar::disable());
-        }
     }
     if outcome.restart {
         restart_app();

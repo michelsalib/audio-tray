@@ -64,15 +64,17 @@ Both asset names are load-bearing — see the regex in `winget.yml` and `TARGET`
 
 `self_update` replaces exactly one file — the one named by `bin_name` — so the DLL
 gets its own pass in `update::update_tap`, which runs only when an update was
-actually applied. Where it lands depends on whether the strip is switched on:
+actually applied. Where it lands depends on whether Explorer has the DLL open:
 
-| strip state | when the new DLL takes effect |
+| DLL state | when the new DLL takes effect |
 |---|---|
-| off (DLL not loaded) | immediately, alongside the exe |
-| on (Explorer holds it) | **next reboot** — handed to `MoveFileExW` with `MOVEFILE_DELAY_UNTIL_REBOOT` |
+| not loaded (the injection never landed) | immediately, alongside the exe |
+| loaded — the normal case | **next reboot** — handed to `MoveFileExW` with `MOVEFILE_DELAY_UNTIL_REBOOT` |
 
-That second row is the same mechanism as the installer's `restartreplace`. Users who
-toggle the feature off, let the update run, then toggle it back on skip the reboot.
+That second row is the same mechanism as the installer's `restartreplace`, and it is
+now the usual outcome: the strip is injected on every start. `--taskbar-revert` does
+not help — the revert deliberately leaves the DLL pinned in `explorer.exe` (see
+`src/taskbar.rs`), so the file stays locked. Restarting Explorer is what frees it.
 
 Failing to place the DLL is logged and otherwise ignored: the exe has already been
 replaced by then, and turning a good update into a bad one over the DLL would be the

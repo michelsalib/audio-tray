@@ -4,9 +4,11 @@
 
 //! Windows audio output tray app.
 //!
-//! Mode dispatch (plan §6): default = tray. Left-click opens the acrylic control panel
-//! (volume, mute, output/input switching, per-device icons); right-click opens the quick
-//! menu (Sound settings + Quit).
+//! Mode dispatch (plan §6): default = tray, which draws the taskbar strip (an output
+//! and an input button) over its notification icon. Left-click a button switches that
+//! endpoint to the next device; right-click opens the acrylic control panel (volume,
+//! mute, output/input switching, per-device icons, Sound settings, Quit). On the plain
+//! tray icon we fall back to — see `taskbar` — either button opens the panel.
 //! Dev utilities retained from the early slices:
 //!   audio-tray            run the tray (default)
 //!   audio-tray --list     print current default + active output devices
@@ -18,9 +20,9 @@
 //!   audio-tray --meter    sample the default output+input peak meters for 4s (diagnostic)
 //!   audio-tray --update   check GitHub releases and self-update now (see update.rs)
 //!   audio-tray --taskbar-revert
-//!                         ask an injected TAP to put the taskbar back, exactly as
-//!                         turning "Show controls in the taskbar" off does. Does not
-//!                         touch the config, so the running tray keeps its own state.
+//!                         ask an injected TAP to put the taskbar back. Leaves the
+//!                         running tray alone — it will put the strip up again the
+//!                         next time it starts, or when Explorer restarts.
 
 use anyhow::{bail, Context, Result};
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
@@ -79,8 +81,8 @@ fn main() -> Result<()> {
                 config.save()?;
             }
             println!(
-                "flyout: closed (config_changed={}, quit={}, restart={}, taskbar_toggled={:?})",
-                outcome.config_changed, outcome.quit, outcome.restart, outcome.taskbar_toggled
+                "flyout: closed (config_changed={}, quit={}, restart={})",
+                outcome.config_changed, outcome.quit, outcome.restart
             );
         }
         Some("--list") => list(&backend)?,
@@ -139,11 +141,13 @@ fn main() -> Result<()> {
         }
         Some("--update") => update::run_manual()?,
         Some("--taskbar-revert") => {
-            // The same call the flyout's toggle makes, reachable without driving
-            // the UI — the strip's own right-click cannot be synthesised (see
-            // `crates/taskbar-tap/FINDINGS.md`), so this is how that path gets
-            // exercised end to end.
-            println!("taskbar: {}", taskbar::disable());
+            // Ask whatever TAP is loaded to put the taskbar back, without touching
+            // the running tray. Both an escape hatch (a strip left behind by a
+            // process that died badly) and how the revert path gets exercised end
+            // to end — the strip's own gestures cannot be synthesised, see
+            // `crates/taskbar-tap/FINDINGS.md`.
+            taskbar::revert();
+            println!("taskbar: controls removed.");
         }
         _ => {
             // Fire-and-forget auto-update: checks GitHub releases in the background

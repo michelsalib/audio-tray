@@ -12,16 +12,22 @@ A tiny Windows system-tray app for **controlling your audio without digging thro
 
 ## Features
 
-- **Lives in the system tray** with an icon that reflects the current output device (speakers, headphones, headset, HDMI…), rendered from Segoe Fluent Icons and themed to your taskbar.
-- **Left-click** → a compact acrylic flyout that replaces the native sound flyout: set output **and** input volume, mute/unmute, switch the default output and input device, pick a per-device icon, and see the battery level of Bluetooth devices that report one.
-- **Right-click** → a small quick menu: open Windows' Sound settings, or quit.
-- **Scroll** the mouse wheel over the tray icon to change the current output volume.
+- **Taskbar controls** — a pair of buttons drawn into the notification area, one for
+  output and one for input, each showing that device's own icon. Windows' own volume
+  icon is hidden, since the output button duplicates it. See
+  [taskbar controls](#taskbar-controls).
+- **Left-click** either button to switch that endpoint to the next device;
+  **right-click** for a compact acrylic flyout that replaces the native sound flyout:
+  set output **and** input volume, mute/unmute, switch the default output and input
+  device, pick a per-device icon, and see the battery level of Bluetooth devices that
+  report one.
+- **Scroll** the mouse wheel over the buttons to change the current output volume.
+- **Falls back to a plain tray icon** if the taskbar controls cannot be drawn — an
+  icon reflecting the current output device (speakers, headphones, headset, HDMI…),
+  rendered from Segoe Fluent Icons and themed to your taskbar. Either button opens
+  the flyout.
 - **Starts at sign-in** (optional, chosen at install time).
 - **Auto-updates** itself from GitHub Releases.
-- **Taskbar controls** (opt-in, off by default) — replaces the tray icon with a pair
-  of buttons in the notification area, one for output and one for input, and hides
-  Windows' own volume icon since it becomes a duplicate. Turn it on from the flyout's
-  **More** section. See [taskbar controls](#taskbar-controls-opt-in).
 
 ## Install
 
@@ -42,13 +48,16 @@ It installs per-user (no administrator rights required).
 
 ## Usage
 
-Once running, Audio Tray sits in the notification area:
+Once running, Audio Tray sits in the notification area as two buttons — output and
+input:
 
 | Action | Result |
 |--------|--------|
-| Left-click | Open the Audio Tray control flyout (volume, mute, switch output/input, pick icon, Sound settings) |
-| Right-click | Quick menu — Sound settings / Quit |
+| Left-click a button | Switch that endpoint to the next device |
+| Right-click a button | Open the Audio Tray control flyout (volume, mute, switch output/input, pick icon, Sound settings, Quit) |
 | Scroll wheel | Adjust the current output volume |
+
+On the fallback single tray icon, either button opens the flyout.
 
 ### Command-line (dev/diagnostics)
 
@@ -58,34 +67,35 @@ audio-tray --list     print the current default + all active output devices
 audio-tray --set <q>  switch default output to a device by name substring or id
 audio-tray --update   check GitHub Releases and self-update now
 audio-tray --taskbar-revert
-                      put the taskbar back, as turning the controls off does
+                      put the taskbar back, without stopping the running tray
 ```
 
 Configuration (per-device icon overrides) is stored at
 `%APPDATA%\AudioTray\config\config.toml`.
 
-## Taskbar controls (opt-in)
+## Taskbar controls
 
-Off by default. Enable it from the flyout's **More** section, and the single tray
-icon is replaced by two buttons — output and input — drawn directly into the
-notification area. Left-click either one to cycle that endpoint to the next device;
-right-click opens the usual flyout. Windows' own volume icon is hidden while this is
-on, because the output button duplicates it.
+Audio Tray's notification-area presence is two buttons — output and input — drawn
+directly into the taskbar. Left-click either one to cycle that endpoint to the next
+device; right-click opens the flyout. Windows' own volume icon is hidden, because the
+output button duplicates it.
 
 It works by loading `audio_tray_tap.dll` into `explorer.exe` through the XAML
 Diagnostics interface — the same mechanism TranslucentTB and Windhawk use. Some
-things worth knowing before turning it on:
+things worth knowing:
 
-- **The plain tray icon is never at risk.** It is registered unconditionally, and
-  every failure here falls back to it.
-- **Everything is undone on the way out.** Turning it off, quitting, or being killed
-  all restore the taskbar exactly as it was; so does Explorer restarting, which
-  simply discards the DLL. Verified by pixel comparison against a pre-injection
-  capture.
+- **The plain tray icon is never at risk.** It is registered unconditionally, the
+  buttons are drawn on top of it, and every failure here leaves it as the whole of
+  the UI — the app then behaves exactly as it did before the buttons existed.
+- **Everything is undone on the way out.** Quitting, being killed, or running
+  `audio-tray --taskbar-revert` all restore the taskbar exactly as it was; so does
+  Explorer restarting, which simply discards the DLL. Verified by pixel comparison
+  against a pre-injection capture.
 - **One consumer at a time.** If TranslucentTB, Windhawk or a similar taskbar tool
-  is running, enabling this may fail — they share the one diagnostics endpoint.
-- **Your icon must be on the taskbar, not in the overflow.** Nothing is changed if
-  it is hidden behind the chevron.
+  is running, the injection may fail — they share the one diagnostics endpoint. You
+  keep the plain tray icon.
+- **Your icon must be on the taskbar, not in the overflow.** Nothing is drawn if it
+  is hidden behind the chevron.
 
 The engineering notes, including the failure modes found along the way, are in
 [crates/taskbar-tap/FINDINGS.md](crates/taskbar-tap/FINDINGS.md).

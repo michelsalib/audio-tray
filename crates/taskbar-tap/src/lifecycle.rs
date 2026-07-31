@@ -3,7 +3,8 @@
 //! Everything the TAP changes about the shell — the presenter's content, the
 //! notification area's column, Explorer's own volume slot — can only be touched
 //! from the visual-tree callback thread. audio-tray, which knows *when* to revert
-//! (the user toggled the feature off, or quit), is a different process entirely.
+//! (it is quitting, or the user asked for the taskbar back), is a different
+//! process entirely.
 //!
 //! The bridge is a hidden window created **on the callback thread itself**.
 //! Explorer already pumps messages there, so a cross-process `PostMessage` is

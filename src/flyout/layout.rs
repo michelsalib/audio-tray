@@ -28,34 +28,24 @@ pub(super) enum View {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum ActionKind {
     SoundSettings,
-    /// Opt-in toggle for the experimental in-Explorer taskbar controls.
-    /// Renders a trailing checkmark while enabled.
-    TaskbarStrip,
     Quit,
 }
 
 impl ActionKind {
     /// The rows of the panel's "More" section, in order.
-    pub(super) const MENU: [ActionKind; 3] =
-        [ActionKind::SoundSettings, ActionKind::TaskbarStrip, ActionKind::Quit];
+    pub(super) const MENU: [ActionKind; 2] = [ActionKind::SoundSettings, ActionKind::Quit];
 
     pub(super) fn label(self) -> &'static str {
         match self {
             ActionKind::SoundSettings => "Sound settings",
-            ActionKind::TaskbarStrip => "Show controls in taskbar",
             ActionKind::Quit => "Quit Audio Tray",
         }
     }
     pub(super) fn glyph(self) -> char {
         match self {
             ActionKind::SoundSettings => GLYPH_SETTINGS,
-            ActionKind::TaskbarStrip => GLYPH_CHEVRON_UP,
             ActionKind::Quit => GLYPH_CANCEL,
         }
-    }
-    /// Whether the row reserves trailing space for a checkmark.
-    pub(super) fn is_toggle(self) -> bool {
-        matches!(self, ActionKind::TaskbarStrip)
     }
 }
 
@@ -107,9 +97,7 @@ pub(super) fn content_width(model: &Model, scale: f32) -> i32 {
     }
     // The former right-click menu now lives at the bottom of this same panel.
     for k in ActionKind::MENU {
-        // A toggle row reserves room for its trailing checkmark.
-        let reserve = if k.is_toggle() { CHECK_W } else { RIGHT_PAD };
-        max_w = max_w.max(TEXT_X * scale + mw(font, text_px, k.label()) + reserve * scale);
+        max_w = max_w.max(TEXT_X * scale + mw(font, text_px, k.label()) + RIGHT_PAD * scale);
     }
     // `ceil`, not `round`: rounding down by a fraction of a pixel makes the panel
     // narrower than the text it was measured from, which then gets ellipsised by
@@ -307,7 +295,7 @@ mod tests {
     }
 
     fn model(groups: Vec<Group>, update: Option<&str>) -> Model {
-        Model::new(groups, update.map(str::to_string), false)
+        Model::new(groups, update.map(str::to_string))
     }
 
     fn output_group(devices: Vec<DeviceRow>) -> Group {
@@ -334,16 +322,16 @@ mod tests {
 
     #[test]
     fn content_width_fits_the_more_section_even_with_no_devices() {
-        // With no devices the width comes purely from the "More" action labels, and
-        // the toggle row still has to leave room for its trailing tick.
+        // With no devices the width comes purely from the "More" action labels, which
+        // still have to fit inside the panel with their right-hand padding.
         for scale in [1.0_f32, 1.5, 2.0] {
             let m = model(vec![], None);
             let w = content_width(&m, scale);
             assert!(w >= (MIN_W * scale).round() as i32, "w={w} below the panel floor");
             assert!(w <= (MAX_W * scale).round() as i32, "w={w} above the cap");
             assert!(
-                w as f32 >= (TEXT_X + CHECK_W) * scale,
-                "w={w} leaves no room for the checkmark at scale {scale}"
+                w as f32 >= (TEXT_X + RIGHT_PAD) * scale,
+                "w={w} leaves no room for a label at scale {scale}"
             );
         }
     }
@@ -351,7 +339,7 @@ mod tests {
     #[test]
     fn main_view_always_ends_with_the_more_section() {
         // The former right-click menu is only reachable through this section now, so
-        // losing it would strand Quit and the taskbar toggle.
+        // losing it would strand Sound settings and Quit.
         let m = model(vec![output_group(vec![dev("Speakers", None)])], None);
         let (elems, _) = build_view(&m, 1.0, 400, View::Main, 0);
         let actions: Vec<_> = elems

@@ -62,9 +62,6 @@ pub struct Outcome {
     /// The user clicked the "restart to update" entry — the caller should relaunch the
     /// (already-updated on disk) exe and exit.
     pub restart: bool,
-    /// The user flipped the opt-in Explorer integration. The new state is in the config
-    /// (already saved); the caller applies or reports it. `None` if untouched.
-    pub taskbar_toggled: Option<bool>,
 }
 
 /// Where to open the flyout: horizontally centred on the tray icon (`cx`), sitting just
@@ -177,15 +174,12 @@ unsafe fn show_inner(
     let groups = build_groups(backend, config);
     let update = crate::update::pending_version();
 
-    // Read before `config` is moved into the struct below.
-    let taskbar_enabled = config.taskbar.enabled;
-
     let mut fly = Flyout {
         backend,
         config,
         scale,
         accent,
-        model: Model::new(groups, update, taskbar_enabled),
+        model: Model::new(groups, update),
         hit: Interaction::default(),
         surface: Surface::new((8.0 * scale) as i32),
         watches: Vec::new(),
@@ -228,7 +222,6 @@ unsafe fn show_inner(
             config_changed: false,
             output_changed: false,
             restart: false,
-            taskbar_toggled: None,
         };
     }
 
@@ -345,7 +338,6 @@ unsafe fn show_inner(
         config_changed: fly.model.config_changed,
         output_changed: fly.model.output_changed,
         restart: fly.model.restart,
-        taskbar_toggled: fly.model.taskbar_toggled.then_some(fly.model.taskbar_enabled),
     }
 }
 
@@ -377,8 +369,8 @@ impl Flyout<'_> {
     /// until the flyout closes. Waiting for that made the strip visibly lag the
     /// selection the user had just made.
     ///
-    /// A no-op when the feature is off: nothing is injected, so there is no window
-    /// to post to.
+    /// A no-op when there is no strip — an Explorer that refused the injection has
+    /// no window for us to post to.
     fn sync_strip(&self) {
         crate::taskbar::restyle(crate::tray::strip_icons(self.backend, self.config));
     }
@@ -615,18 +607,6 @@ impl Flyout<'_> {
             }
             Elem::Action(ActionKind::SoundSettings) => {
                 open_sound_settings();
-                true
-            }
-            Elem::Action(ActionKind::TaskbarStrip) => {
-                // Persist immediately: the caller applies the new state after we close,
-                // and the plain tray icon keeps working either way.
-                let enabled = self.config.toggle_taskbar();
-                self.model.taskbar_enabled = enabled;
-                self.model.taskbar_toggled = true;
-                self.model.config_changed = true;
-                if let Err(e) = self.config.save() {
-                    eprintln!("save config failed: {e:#}");
-                }
                 true
             }
             Elem::Action(ActionKind::Quit) => {

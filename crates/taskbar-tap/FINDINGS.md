@@ -533,8 +533,8 @@ pre-injection baseline:
 | case | result |
 | --- | --- |
 | apply | strip up, segments wired |
-| toggle off (`--taskbar-revert`) | exact revert (differs from baseline only by our own icon, which is still registered) |
-| re-enable, same Explorer | 0 px from the first applied state |
+| revert (`--taskbar-revert`) | exact revert (differs from baseline only by our own icon, which is still registered) |
+| re-inject, same Explorer | 0 px from the first applied state |
 | owner killed | 0 px from baseline |
 | Explorer restart | re-injected, 0 px from before the restart |
 
@@ -799,9 +799,9 @@ event wiring — synthetic mouse clicks do not drive the Win11 taskbar's input p
 at all. Real clicks work; they were verified by hand.
 
 Consequence for testing: anything behind a click on the taskbar — left-click
-cycling, right-click opening the panel, the "Show controls in the taskbar" toggle
-— cannot be driven from a script here. `audio-tray --taskbar-revert` exists so at
-least the toggle's *effect* is reachable without the UI. Making clicks work would
+cycling, right-click opening the panel — cannot be driven from a script here.
+`audio-tray --taskbar-revert` exists so at least the revert path is reachable
+without the UI. Making clicks work would
 mean `CreateSyntheticPointerDevice` + `InjectSyntheticPointerInput` rather than
 `SendInput`, which produces a real pointer frame; untried.
 

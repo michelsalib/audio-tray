@@ -37,33 +37,23 @@ pub(super) struct Model {
     pub groups: Vec<Group>,
     pub view: View, // which screen is shown (main panel / an icon picker)
     pub update: Option<String>, // staged update's version, if any → bottom "restart to update" row
-    /// Current state of the opt-in Explorer integration, for the menu's checkmark.
-    pub taskbar_enabled: bool,
     // outcome, accumulated while the flyout is open
     pub config_changed: bool,
     pub output_changed: bool,
     pub quit: bool,
     pub restart: bool,
-    /// The user flipped the taskbar opt-in; the caller applies it.
-    pub taskbar_toggled: bool,
 }
 
 impl Model {
-    pub(super) fn new(
-        groups: Vec<Group>,
-        update: Option<String>,
-        taskbar_enabled: bool,
-    ) -> Self {
+    pub(super) fn new(groups: Vec<Group>, update: Option<String>) -> Self {
         Model {
             groups,
             view: View::Main,
             update,
-            taskbar_enabled,
             config_changed: false,
             output_changed: false,
             quit: false,
             restart: false,
-            taskbar_toggled: false,
         }
     }
 

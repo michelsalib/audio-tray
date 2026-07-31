@@ -76,15 +76,21 @@ now the usual outcome: the strip is injected on every start. `--taskbar-revert` 
 not help — the revert deliberately leaves the DLL pinned in `explorer.exe` (see
 `src/taskbar.rs`), so the file stays locked. Restarting Explorer is what frees it.
 
-**Users do not have to wait for that reboot.** The flyout's footer has a *Restart
-Explorer* button (`taskbar::restart_explorer`, also on the CLI as
-`audio-tray --taskbar-restart`), which turns accent-coloured while an update is staged.
-It waits for the old shell to exit and, in that gap
-— the one moment nothing holds the DLL — calls `update::place_staged_tap` to copy the
-new one in before launching the replacement shell. The pending boot rename is left
-standing regardless, so this is an accelerator, not a mechanism you can rely on: it only
-works within the same tray process that did the download, since that is what remembers
-where the staged file is.
+**Users do not usually wait for that reboot.** Taking the update applies the DLL too,
+without anyone asking for it:
+
+1. `restart_app` relaunches audio-tray into the new exe.
+2. The new process starts, and `taskbar::apply_at_startup` finds the *old* process's TAP
+   still loaded in Explorer (the shell keeps it for its own lifetime). Rather than inject
+   alongside it, it calls `taskbar::restart_explorer`.
+3. That waits for the old shell to exit and, in the gap where nothing holds the DLL,
+   calls `update::place_staged_tap` — which finds the staging directory for its *own*
+   `CARGO_PKG_VERSION`, so it does not matter that a different process downloaded it.
+4. The fresh Explorer is injected into off `TaskbarCreated`, with the new DLL.
+
+The pending boot rename is left scheduled throughout, so a reboot remains the fallback if
+any of that does not happen. Note step 2 is also the general repair path — it is not
+update-specific — and it is budgeted to one restart per run.
 
 Failing to place the DLL is logged and otherwise ignored: the exe has already been
 replaced by then, and turning a good update into a bad one over the DLL would be the

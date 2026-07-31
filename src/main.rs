@@ -18,9 +18,7 @@
 //!                         contains <q> (case-insensitive), or whose id equals <q>
 //!   audio-tray --flyout [menu|icons|update]  preview the panel (menu = right-click;
 //!                         icons = the first device's icon-picker screen; update = fake a
-//!                         staged update so the footer's restart button shows). No strip is
-//!                         injected in this mode, so the restart-Explorer button always
-//!                         shows — and clicking it really does restart Explorer.
+//!                         staged update so the footer's restart button shows)
 //!   audio-tray --meter    sample the default output+input peak meters for 4s (diagnostic)
 //!   audio-tray --update   check GitHub releases and self-update now (see update.rs)
 //!   audio-tray --taskbar-click <out|in|panel>
@@ -92,15 +90,9 @@ fn main() -> Result<()> {
                 config.save()?;
             }
             println!(
-                "flyout: closed (config_changed={}, quit={}, restart={}, restart_explorer={})",
-                outcome.config_changed, outcome.quit, outcome.restart, outcome.restart_explorer
+                "flyout: closed (config_changed={}, quit={}, restart={})",
+                outcome.config_changed, outcome.quit, outcome.restart
             );
-            // Honoured here, not just reported: clicks on the taskbar cannot be synthesised,
-            // so this preview is the only way to exercise the restart end to end. Synchronous
-            // is fine — unlike the tray, this mode has no message loop to keep alive.
-            if outcome.restart_explorer {
-                taskbar::restart_explorer()?;
-            }
         }
         Some("--list") => list(&backend)?,
         Some("--set") => {

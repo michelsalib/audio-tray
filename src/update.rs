@@ -38,10 +38,16 @@ const TAP_DLL: &str = "audio_tray_tap.dll";
 /// binary only takes effect once the process restarts.
 static PENDING: Mutex<Option<String>> = Mutex::new(None);
 
-/// A downloaded TAP that could not be copied into place, as `(fresh, target)` — set when the
-/// replacement had to be handed to the next boot instead (see [`schedule_replace_at_boot`]),
-/// and consumed by [`place_staged_tap`] if the DLL is freed before then.
-static STAGED_TAP: Mutex<Option<(std::path::PathBuf, std::path::PathBuf)>> = Mutex::new(None);
+/// Where a downloaded TAP waits when it could not be copied into place.
+///
+/// Deterministic rather than remembered in a global, because the process that *downloads* an
+/// update is never the one that gets to install the DLL: taking the update relaunches
+/// audio-tray, and it is the new process that meets the old TAP, restarts Explorer and so frees
+/// the file (see `taskbar::apply_at_startup`). Keyed by version — and the version that matters
+/// to a reader is the one it is running, which is exactly the version that was staged.
+fn staging_dir(version: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("audio-tray-tap-{version}"))
+}
 
 /// The version an applied-but-not-yet-running update will upgrade to, if any.
 pub fn pending_version() -> Option<String> {
@@ -145,9 +151,10 @@ fn update_tap(version: &str, verbose: bool) -> Result<()> {
         .with_context(|| format!("v{version} has no {TARGET} asset"))?;
 
     // A plain directory rather than a `TempDir`, because when the copy below is
-    // blocked the file has to survive this process until the next boot — a
+    // blocked the file has to outlive this process — until the next boot, or until
+    // some later run of audio-tray frees the DLL and calls [`place_staged_tap`]. A
     // self-deleting temp dir would take the pending replacement with it.
-    let staging = std::env::temp_dir().join(format!("audio-tray-tap-{version}"));
+    let staging = staging_dir(version);
     fs::create_dir_all(&staging).context("creating a staging directory")?;
 
     let archive = staging.join(&asset.name);
@@ -206,42 +213,39 @@ fn schedule_replace_at_boot(
     }
     .with_context(|| format!("scheduling {TAP_DLL} for replacement at next boot"))?;
 
-    // Remembered so that freeing the DLL before then can still place it: restarting Explorer
-    // does exactly that, and the flyout offers a button for it while an update is staged.
-    if let Ok(mut staged) = STAGED_TAP.lock() {
-        *staged = Some((fresh.to_path_buf(), target.to_path_buf()));
-    }
-
     if verbose {
         println!("{TAP_DLL} is in use by Explorer; it will be replaced on the next restart.");
     }
     Ok(())
 }
 
-/// Place a TAP replacement that is waiting for the next boot, now that its DLL has been
-/// freed. Restarting Explorer is what frees it — see [`crate::taskbar::restart_explorer`],
-/// which calls this in the gap between the old shell exiting and the new one starting.
+/// Place a TAP replacement that is waiting for the next boot, now that its DLL has been freed.
+/// Restarting Explorer is what frees it — see [`crate::taskbar::restart_explorer`], which calls
+/// this in the gap between the old shell exiting and the new one starting.
 ///
-/// Returns whether the new DLL is now in place. Best-effort in both directions: usually there
+/// Looks for a staging of *the running version*: an update is downloaded by the old build and
+/// installed by the new one, so by the time anybody can place this DLL, `CARGO_PKG_VERSION` is
+/// the version it belongs to.
+///
+/// Returns whether the new DLL is now in place. Best-effort in both directions — usually there
 /// is nothing staged at all (no update, or one whose copy succeeded outright), and a copy that
-/// fails changes nothing — the boot-time rename scheduled alongside it still stands.
-///
-/// Knows only about a staging done by *this* process. A tray restarted since the download has
-/// forgotten where the file is, and that update waits for the boot rename as it would have
-/// anyway — which is why this is an opportunistic improvement rather than the mechanism.
+/// fails changes nothing, since the boot-time rename scheduled alongside it still stands.
 pub fn place_staged_tap() -> bool {
-    let Some((fresh, target)) = STAGED_TAP.lock().ok().and_then(|staged| staged.clone()) else {
+    let fresh = staging_dir(self_update::cargo_crate_version!()).join(TAP_DLL);
+    if !fresh.is_file() {
         return false;
+    }
+    let target = match std::env::current_exe().ok().and_then(|exe| exe.parent().map(|d| d.join(TAP_DLL))) {
+        Some(target) => target,
+        None => return false,
     };
     match std::fs::copy(&fresh, &target) {
         Ok(_) => {
             println!("audio-tray: placed the pending {TAP_DLL} — no reboot needed.");
-            // The pending boot rename is deliberately left standing rather than cancelled:
-            // it writes the same bytes to the same place, so at worst it is redundant, and it
-            // stays as the fallback if this copy is somehow lost.
-            if let Ok(mut staged) = STAGED_TAP.lock() {
-                *staged = None;
-            }
+            // Now redundant, and its absence is what makes this idempotent: the pending boot
+            // rename simply fails with nothing to move, and a later restart finds nothing to
+            // place rather than recopying the same bytes on every one.
+            let _ = std::fs::remove_dir_all(fresh.parent().unwrap_or(&fresh));
             true
         }
         Err(e) => {

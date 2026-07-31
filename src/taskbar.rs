@@ -547,12 +547,106 @@ pub fn create_receiver() -> Result<windows::Win32::Foundation::HWND> {
     }
 }
 
+/// Whether this process has already restarted Explorer to repair the strip.
+///
+/// One restart is the budget for the life of the process, and both repair triggers draw on that
+/// same one. The failures they answer can be permanent — an endpoint held by another
+/// XAML-diagnostics consumer survives any number of restarts — and a self-healing loop that
+/// rebuilds the shell over and over would be far worse than having no strip.
+static HEALED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Rebuild Explorer to get a clean injection, at most once per process. Returns whether one
+/// was started.
+///
+/// The waiting happens on a worker thread because the caller is the tray thread, and
+/// `TaskbarCreated` is *sent* to our receiver window rather than posted (see
+/// [`create_receiver`]) — only a thread sitting in `GetMessage` receives it, and that message is
+/// what re-registers the notification icon and re-injects the strip. Blocking here would stall
+/// the very restart we asked for.
+fn heal_explorer(reason: &str) -> bool {
+    if HEALED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        eprintln!("taskbar: {reason}, but Explorer has been restarted once already — leaving it");
+        return false;
+    }
+    eprintln!("taskbar: {reason} — restarting Explorer for a clean injection");
+    std::thread::spawn(|| {
+        if let Err(e) = restart_explorer() {
+            eprintln!("taskbar: could not restart Explorer ({e:#})");
+        }
+    });
+    true
+}
+
+/// Whether a TAP is *already* live in this Explorer, before we have injected — so one left
+/// behind by an earlier audio-tray, which the shell keeps loaded for its own lifetime whether
+/// or not it reverted (see the module docs).
+///
+/// Detected by its control window: every TAP instance creates its own (the class registration is
+/// shared, the window is not), and the window belongs to `explorer.exe`, so it outlives the
+/// audio-tray that put it there. Cheaper than reading Explorer's module list, and needs no
+/// rights over another process.
+fn tap_already_present() -> bool {
+    control_window().is_some()
+}
+
+/// Attempts, and the gap between them, before an injection failure is treated as real.
+///
+/// What this absorbs is a shell that is not ready *yet* rather than one that never will be:
+/// audio-tray autostarts at sign-in, where it can easily beat Explorer's XAML runtime to being
+/// ready. Seconds spent retrying are cheap in a case that is already broken, and it keeps the
+/// Explorer restart below for failures that are genuinely persistent — rebuilding the shell in
+/// the middle of sign-in would be both disruptive and useless.
+const ENABLE_TRIES: u32 = 3;
+const ENABLE_GAP: std::time::Duration = std::time::Duration::from_millis(750);
+
+/// [`enable`], retried — see [`ENABLE_TRIES`].
+fn enable_with_retries(icons: StripIcons) -> Result<()> {
+    let mut last = None;
+    for attempt in 1..=ENABLE_TRIES {
+        match enable(icons) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                if attempt < ENABLE_TRIES {
+                    eprintln!("taskbar: injection attempt {attempt} failed ({e:#}); retrying");
+                    std::thread::sleep(ENABLE_GAP);
+                }
+                last = Some(e);
+            }
+        }
+    }
+    Err(last.expect("the loop runs at least once"))
+}
+
 /// Put the strip up at startup. Never fatal: a failure here leaves the plain tray
 /// icon as the whole of the UI, which is what the app looked like before the strip.
+///
+/// Rather than settle for that, this repairs the shell in the two situations where a fresh
+/// Explorer is what is actually needed — each at most once, see [`heal_explorer`].
 pub fn apply_at_startup(icons: StripIcons) {
-    match enable(icons) {
+    // A TAP already in this Explorer means an earlier audio-tray injected into it and the DLL is
+    // still there. Injecting now would make ours the *second*, and two TAPs in one shell is not
+    // benign: observed live, the older one's owner-watch fired its revert and undid the
+    // decoration the newer one had just applied — leaving a bare notification icon, and
+    // Explorer's own volume slot back, while every signal we have said the strip was up.
+    //
+    // So rebuild the shell and let `TaskbarCreated` inject into a clean one. This is also what
+    // completes an update: taking one relaunches audio-tray, so the new process meets the old
+    // process's TAP right here, and the restart that clears it is the same restart that frees
+    // `audio_tray_tap.dll` for `crate::update::place_staged_tap`.
+    //
+    // Silent in the normal case — at sign-in Explorer is new and carries no TAP.
+    if tap_already_present() && heal_explorer("another TAP is already loaded in Explorer") {
+        return;
+    }
+    match enable_with_retries(icons) {
         Ok(()) => eprintln!("taskbar: controls enabled"),
-        Err(e) => eprintln!("taskbar: integration unavailable, using the plain tray icon ({e:#})"),
+        Err(e) => {
+            eprintln!("taskbar: integration unavailable, using the plain tray icon ({e:#})");
+            // Deliberately only from here and not from `apply_at_restart`: an injection failure
+            // straight after an Explorer restart the *user* performed should not be answered by
+            // restarting it again underneath them.
+            heal_explorer("the injection failed");
+        }
     }
 }
 

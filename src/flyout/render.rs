@@ -179,14 +179,12 @@ pub(super) fn render_page(ctx: &Ctx, elems: &[LaidElem], out: &mut [u8]) {
                     cv.draw_text(f, lpx, (d(FOOTER_TEXT_X) as f32, base), TEXT, 1.0, &label);
                 }
                 // Right: the icon buttons, rightmost first. They are bare glyphs until
-                // hovered — except a call-to-action (a restart with a reason behind it, see
-                // `ActionKind::is_cta`), which carries a standing accent disc so it is noticed
-                // without a label to say so.
+                // hovered — except a call-to-action (the staged update), which carries a
+                // standing accent disc so it is noticed without a label to say so.
                 for (i, k) in footer_buttons(ctx.model).into_iter().enumerate() {
                     let cxb = footer_btn_center_x(w, scale, i);
-                    let cta = k.is_cta(ctx.model);
-                    let col = if cta { accent } else { TEXT };
-                    if cta {
+                    let col = if k == ActionKind::Restart { accent } else { TEXT };
+                    if k == ActionKind::Restart {
                         let r = FOOTER_BTN * scale / 2.0;
                         let cyf = cy as f32;
                         cv.fill_round_rect(Rect::new(cxb - r, cyf - r, cxb + r, cyf + r), r, accent, FOOTER_CTA_A);
@@ -344,10 +342,9 @@ pub(super) fn compose(ctx: &Ctx, hit: &Interaction, elems: &[LaidElem], base: &[
                     }
                     // A call-to-action deepens its own accent disc; the rest get the
                     // neutral round button.
-                    let (col, a) = if k.is_cta(ctx.model) {
-                        (accent, FOOTER_CTA_HOVER_A - FOOTER_CTA_A)
-                    } else {
-                        (TEXT, 0.10)
+                    let (col, a) = match k {
+                        ActionKind::Restart => (accent, FOOTER_CTA_HOVER_A - FOOTER_CTA_A),
+                        _ => (TEXT, 0.10),
                     };
                     let r = FOOTER_BTN * scale / 2.0;
                     let cxb = footer_btn_center_x(w, scale, i);

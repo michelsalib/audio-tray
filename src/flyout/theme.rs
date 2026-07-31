@@ -79,11 +79,6 @@ pub(super) const GLYPH_SETTINGS: char = '\u{E713}';
 pub(super) const GLYPH_CANCEL: char = '\u{E711}';
 pub(super) const GLYPH_BACK: char = '\u{E72B}'; // Back (leftward arrow) — the picker's cancel affordance
 pub(super) const GLYPH_UPDATE: char = '\u{E72C}'; // Refresh (circular arrow) — restart-to-update button
-// Overlapping windows — "restart Explorer", i.e. the shell that hosts the strip. Two shapes
-// were ruled out by looking at the rendered panel: another circular arrow (the update button
-// owns that, and the two sit side by side while an update is staged) and a display, which is
-// the leading icon of any monitor's own audio endpoint a few rows above.
-pub(super) const GLYPH_RESTART_SHELL: char = '\u{E7C4}';
 
 // Colours (RGB); alpha applied at blend time.
 pub(super) const TINT: [u8; 3] = [0x2C, 0x2C, 0x2C]; // panel base (semi-transparent, acrylic shows through)

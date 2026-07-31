@@ -94,12 +94,13 @@ things worth knowing:
 - **One consumer at a time.** If TranslucentTB, Windhawk or a similar taskbar tool
   is running, the injection may fail — they share the one diagnostics endpoint. You
   keep the plain tray icon.
-- **There is a retry, in the flyout.** If the buttons are missing — or are there but
-  wrong — the flyout's footer has a *Restart Explorer* button (the overlapping-windows
-  glyph, left of the gear). Explorer is injected into as it comes back up, so this is
-  usually all it takes, most often after closing whichever tool was holding the
-  endpoint. It turns accent-coloured when something is known to need it: a failed
-  injection, or a staged update (see [Auto-update](#auto-update)).
+- **It repairs itself by restarting Explorer.** Two situations need a fresh shell, and
+  audio-tray handles both on startup without asking: an injection that fails (after a
+  couple of retries, which is usually all a shell that is merely slow to be ready
+  needs), and a TAP from an earlier audio-tray still loaded in Explorer — injecting
+  alongside that one is what leaves you with a taskbar that looks untouched. At most
+  one restart per run, so a machine where the injection can never succeed is not
+  restarted round and round. `audio-tray --taskbar-restart` does the same by hand.
 - **Your icon must be on the taskbar, not in the overflow.** Nothing is drawn if it
   is hidden behind the chevron.
 
@@ -113,14 +114,14 @@ download and replace the executable in place (per-user install → no admin
 needed). The update is applied the **next** time the app starts, so the running
 tray is never interrupted. Run `audio-tray --update` to check on demand.
 
-Once one is downloaded, the flyout's footer offers two buttons for taking it:
+Once one is downloaded, the flyout's footer offers a *Restart to update* button
+(circular arrow) that relaunches into the new version straight away.
 
-| Button | What it does |
-|--------|--------------|
-| Restart to update (circular arrow) | Relaunches Audio Tray into the new version |
-| Restart Explorer (overlapping windows) | Applies the new taskbar component, which Explorer holds open — otherwise it waits for your next reboot |
-
-Neither is required; both just bring the update forward.
+The update also carries a new taskbar component, which Explorer holds open and so
+cannot simply be overwritten. Taking the update handles that too: the relaunched app
+finds the old component still loaded, restarts Explorer, and installs the new one in
+the moment nothing is holding it. Ignore the button and it all happens at your next
+reboot instead — nothing is left half-applied either way.
 
 ## Build from source
 

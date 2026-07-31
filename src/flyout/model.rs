@@ -37,23 +37,31 @@ pub(super) struct Model {
     pub groups: Vec<Group>,
     pub view: View, // which screen is shown (main panel / an icon picker)
     pub update: Option<String>, // staged update's version, if any → the footer's restart button
+    /// Whether the taskbar strip is up (`crate::taskbar::strip_is_up` at open time), as far as
+    /// anyone here can tell — it is optimistic, and a `true` does **not** mean the strip is
+    /// drawn. Only the footer reads it, and only to decide whether the restart-Explorer button
+    /// draws attention; see `layout::ActionKind::is_cta`.
+    pub strip_up: bool,
     // outcome, accumulated while the flyout is open
     pub config_changed: bool,
     pub output_changed: bool,
     pub quit: bool,
     pub restart: bool,
+    pub restart_explorer: bool,
 }
 
 impl Model {
-    pub(super) fn new(groups: Vec<Group>, update: Option<String>) -> Self {
+    pub(super) fn new(groups: Vec<Group>, update: Option<String>, strip_up: bool) -> Self {
         Model {
             groups,
             view: View::Main,
             update,
+            strip_up,
             config_changed: false,
             output_changed: false,
             quit: false,
             restart: false,
+            restart_explorer: false,
         }
     }
 }

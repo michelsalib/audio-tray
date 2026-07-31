@@ -31,6 +31,9 @@ pub(super) enum ActionKind {
     Quit,
     /// Relaunch into an update already staged on disk. Only offered while there is one.
     Restart,
+    /// Restart `explorer.exe`, rebuilding the strip with it. Always offered — see
+    /// [`footer_buttons`] for why it cannot be conditional.
+    RestartExplorer,
 }
 
 impl ActionKind {
@@ -43,6 +46,7 @@ impl ActionKind {
             ActionKind::SoundSettings => "Sound settings",
             ActionKind::Quit => "Quit Audio Tray",
             ActionKind::Restart => "Restart to update",
+            ActionKind::RestartExplorer => "Restart Explorer",
         }
     }
     pub(super) fn glyph(self) -> char {
@@ -50,6 +54,23 @@ impl ActionKind {
             ActionKind::SoundSettings => GLYPH_SETTINGS,
             ActionKind::Quit => GLYPH_CANCEL,
             ActionKind::Restart => GLYPH_UPDATE,
+            ActionKind::RestartExplorer => GLYPH_RESTART_SHELL,
+        }
+    }
+
+    /// Whether the button wears a standing accent disc rather than being a bare glyph — i.e.
+    /// whether there is a reason to *notice* it on a panel opened to change the volume.
+    ///
+    /// `Restart` always: it only exists while an update is staged. `RestartExplorer` is always
+    /// present (see [`footer_buttons`]) and so has to earn its accent — from a staged update,
+    /// or from a `strip_up` that is false. Note this only trusts that flag in the direction it
+    /// is reliable: `false` means we know the injection failed or was reverted, while `true` is
+    /// merely optimistic, which is why it no longer decides whether the button appears.
+    pub(super) fn is_cta(self, model: &Model) -> bool {
+        match self {
+            ActionKind::Restart => true,
+            ActionKind::RestartExplorer => !model.strip_up || model.update.is_some(),
+            ActionKind::SoundSettings | ActionKind::Quit => false,
         }
     }
 }
@@ -220,11 +241,26 @@ pub(super) fn grid_px_height(width: i32, scale: f32) -> i32 {
         + (GRID_BOTTOM_PAD * scale).round() as i32
 }
 
-/// The footer's round icon buttons, **rightmost first**: the settings gear always, and a
-/// restart-to-update button to its left while an update is staged on disk (which is where
-/// the old full-width "restart to update to v…" banner went).
+/// The footer's round icon buttons, **rightmost first**: the settings gear, the
+/// restart-Explorer button, and — only while an update is staged — restart-to-update.
+///
+/// `RestartExplorer` is **permanent furniture**, which took a wrong turn to arrive at. It
+/// began as conditional, shown when `strip_up` was false or an update was staged. Both of
+/// those are the situations a fresh Explorer fixes, so the rule looked right; it is not,
+/// because *audio-tray cannot tell whether the strip is actually drawn*. `strip_up` records
+/// that an injection was asked for and accepted, and `taskbar::control_window` only proves the
+/// TAP is receiving XAML callbacks — observed live, both said "up" while the taskbar showed a
+/// bare notification icon and Explorer's own volume slot was still its own. So the button hid
+/// itself in exactly the case it exists for.
+///
+/// Hence: always offered, as a plain "the taskbar controls are wrong, rebuild them" action.
+/// The two conditions survive in [`ActionKind::is_cta`], which decides whether it *draws
+/// attention* — a thing it is safe to be wrong about, unlike whether it exists at all.
+///
+/// Order matters: the always-present buttons keep fixed positions and the transient
+/// `Restart` appears to their left, so a button never moves under the pointer.
 pub(super) fn footer_buttons(model: &Model) -> Vec<ActionKind> {
-    let mut buttons = vec![ActionKind::SoundSettings];
+    let mut buttons = vec![ActionKind::SoundSettings, ActionKind::RestartExplorer];
     if model.update.is_some() {
         buttons.push(ActionKind::Restart);
     }
@@ -344,8 +380,14 @@ mod tests {
         }
     }
 
+    /// A model with the strip up — the ordinary case, and the one where the footer carries
+    /// nothing but the gear. [`model_no_strip`] covers the other side.
     fn model(groups: Vec<Group>, update: Option<&str>) -> Model {
-        Model::new(groups, update.map(str::to_string))
+        Model::new(groups, update.map(str::to_string), true)
+    }
+
+    fn model_no_strip(groups: Vec<Group>, update: Option<&str>) -> Model {
+        Model::new(groups, update.map(str::to_string), false)
     }
 
     fn output_group(devices: Vec<DeviceRow>) -> Group {
@@ -421,32 +463,37 @@ mod tests {
             assert_eq!(footer_hit(&m, width, scale, btn), Some(ActionKind::SoundSettings));
             let item = ((FOOTER_TEXT_X + 2.0) * scale).round() as i32;
             assert_eq!(footer_hit(&m, width, scale, item), Some(ActionKind::LEFT));
-            // The gap between the label and the buttons is inert.
-            let gap = ((footer_item_right(scale) + footer_btn_center_x(width, scale, 0)
-                - FOOTER_BTN * scale / 2.0)
-                / 2.0)
+            // The gap between the label and the buttons is inert. Measured to the *leftmost*
+            // button, since there is always more than one.
+            let leftmost = footer_btn_center_x(width, scale, footer_buttons(&m).len() - 1);
+            let gap = ((footer_item_right(scale) + leftmost - FOOTER_BTN * scale / 2.0) / 2.0)
                 .round() as i32;
             assert_eq!(footer_hit(&m, width, scale, gap), None, "gap at {gap} is clickable");
         }
     }
 
     #[test]
-    fn a_staged_update_adds_a_restart_button_left_of_the_gear() {
+    fn a_staged_update_adds_a_restart_button_left_of_the_others() {
         // The banner row is gone, so this button is the only way to take a staged
-        // update from the panel — and it must not land on top of the gear.
+        // update from the panel — and it must not land on top of its neighbours.
         let scale = 1.5;
         let staged = model(vec![output_group(vec![dev("Speakers", None)])], Some("9.9.9"));
         let plain = model(vec![output_group(vec![dev("Speakers", None)])], None);
-        assert_eq!(footer_buttons(&plain), vec![ActionKind::SoundSettings]);
+        assert_eq!(
+            footer_buttons(&plain),
+            vec![ActionKind::SoundSettings, ActionKind::RestartExplorer]
+        );
+        // `Restart` is transient, so it goes on the *left* end — the permanent buttons must
+        // not shift under the pointer when an update lands.
         assert_eq!(
             footer_buttons(&staged),
-            vec![ActionKind::SoundSettings, ActionKind::Restart]
+            vec![ActionKind::SoundSettings, ActionKind::RestartExplorer, ActionKind::Restart]
         );
 
         let width = content_width(&staged, scale);
-        let gear = footer_btn_center_x(width, scale, 0);
-        let restart = footer_btn_center_x(width, scale, 1);
-        assert!(restart < gear - FOOTER_BTN * scale, "buttons overlap: {restart} vs {gear}");
+        let neighbour = footer_btn_center_x(width, scale, 1);
+        let restart = footer_btn_center_x(width, scale, 2);
+        assert!(restart < neighbour - FOOTER_BTN * scale, "buttons overlap: {restart}");
         assert_eq!(
             footer_hit(&staged, width, scale, restart.round() as i32),
             Some(ActionKind::Restart)
@@ -455,6 +502,62 @@ mod tests {
         assert_eq!(footer_hit(&plain, width, scale, restart.round() as i32), None);
         // …and the panel is wide enough to hold the extra button clear of the label.
         assert!(restart - FOOTER_BTN * scale / 2.0 > footer_item_right(scale));
+    }
+
+    #[test]
+    fn the_restart_explorer_button_is_always_there_and_accents_only_when_needed() {
+        let devs = || vec![output_group(vec![dev("Speakers", None)])];
+        // Present in every state, because nothing here can tell whether the strip is really
+        // drawn — a `strip_up` of true is optimistic, so hiding on it hid the button in the
+        // very case it exists for.
+        for m in [
+            model(devs(), None),
+            model_no_strip(devs(), None),
+            model(devs(), Some("9.9.9")),
+            model_no_strip(devs(), Some("9.9.9")),
+        ] {
+            assert!(footer_buttons(&m).contains(&ActionKind::RestartExplorer));
+            // Offered exactly once, however many reasons apply.
+            assert_eq!(
+                footer_buttons(&m).iter().filter(|k| **k == ActionKind::RestartExplorer).count(),
+                1
+            );
+        }
+        // Quiet when all is well, accented once there is a reason: a known-failed injection…
+        assert!(!ActionKind::RestartExplorer.is_cta(&model(devs(), None)));
+        assert!(ActionKind::RestartExplorer.is_cta(&model_no_strip(devs(), None)));
+        // …or an update whose TAP is stuck behind the DLL Explorer holds open.
+        assert!(ActionKind::RestartExplorer.is_cta(&model(devs(), Some("9.9.9"))));
+        // The gear is furniture and never shouts; `Restart` only exists when it should.
+        assert!(!ActionKind::SoundSettings.is_cta(&model_no_strip(devs(), Some("9.9.9"))));
+        assert!(ActionKind::Restart.is_cta(&model(devs(), Some("9.9.9"))));
+    }
+
+    #[test]
+    fn three_footer_buttons_stay_clear_of_each_other_and_the_label() {
+        // The widest footer there is: gear + restart-to-update + restart-Explorer. The panel
+        // has to grow for it, or the buttons overlap the "Quit Audio Tray" item.
+        for scale in [1.0_f32, 1.5, 2.0] {
+            let m = model_no_strip(vec![output_group(vec![dev("Speakers", None)])], Some("9.9.9"));
+            let buttons = footer_buttons(&m);
+            assert_eq!(buttons.len(), 3);
+            let width = content_width(&m, scale);
+            let mut prev = f32::MAX;
+            for (i, k) in buttons.iter().enumerate() {
+                let cx = footer_btn_center_x(width, scale, i);
+                // Each button hit-tests to itself…
+                assert_eq!(footer_hit(&m, width, scale, cx.round() as i32), Some(*k));
+                // …sits fully left of the one before it…
+                assert!(cx < prev - FOOTER_BTN * scale, "buttons overlap at scale {scale}");
+                prev = cx;
+            }
+            // …and the leftmost still clears the labelled item.
+            let leftmost = footer_btn_center_x(width, scale, buttons.len() - 1);
+            assert!(
+                leftmost - FOOTER_BTN * scale / 2.0 > footer_item_right(scale),
+                "the footer buttons squeeze the label at scale {scale}"
+            );
+        }
     }
 
     #[test]

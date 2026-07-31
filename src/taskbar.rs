@@ -584,3 +584,141 @@ pub fn apply_at_restart(icons: StripIcons) {
         Err(e) => eprintln!("taskbar: Explorer restarted, re-injection failed ({e:#})"),
     }
 }
+
+/// The shell's private "exit Explorer" command — what the hidden Ctrl+Shift+right-click
+/// "Exit Explorer" item on the taskbar posts. Explorer shuts down the orderly way (it saves
+/// its state and closes its windows) *and* the exit counts as deliberate, so Winlogon's
+/// `AutoRestartShell` does not bring it back. That is why [`restart_explorer`] launches the
+/// replacement itself.
+const WM_SHELL_EXIT: u32 = 0x5B4;
+
+/// How long the polite request gets before the process is terminated instead.
+///
+/// Short on purpose. Measured on Win11 26200, both outcomes: with no TAP in Explorer the
+/// graceful exit lands in well under a second, and with our TAP loaded — the normal state,
+/// since the strip is injected on every start — it does not happen at all and the wait is pure
+/// delay before the fallback does the work. So this only has to be long enough for the case
+/// that succeeds quickly, not generous enough for one that never finishes.
+const SHELL_EXIT_WAIT_MS: u32 = 2_500;
+
+/// Restart `explorer.exe`, and with it the strip.
+///
+/// Offered by the flyout's footer in the two cases where only a fresh Explorer will do — no
+/// strip this start, or a staged update whose new TAP is stuck behind the DLL Explorer holds
+/// open (see `flyout::layout::footer_buttons`). Both are conditions the user can otherwise
+/// only clear by signing out or rebooting.
+///
+/// **Blocks for as long as the shell takes to go and come back** (seconds), so callers keep
+/// it off a thread that has to pump messages — see `crate::tray`.
+///
+/// Nothing here puts the strip back, deliberately: a restarted Explorer broadcasts
+/// `TaskbarCreated`, and [`apply_at_restart`] is already wired to it for the Explorer restarts
+/// we do not cause. This path is not special enough to need its own.
+pub fn restart_explorer() -> Result<()> {
+    use windows::Win32::Storage::FileSystem::SYNCHRONIZE;
+    use windows::Win32::System::Threading::{OpenProcess, PROCESS_ACCESS_RIGHTS, PROCESS_TERMINATE};
+
+    let pid = shell_pid()?;
+    // Opened *before* Explorer is asked to leave, and waited on rather than polled for: a
+    // handle goes on identifying this process after it exits, where a pid can be recycled
+    // onto something else entirely in the gap. `SYNCHRONIZE` is bound as a *file* access
+    // right, but the bit is the generic one every waitable handle uses, so it only needs
+    // re-wrapping for a process.
+    let access = PROCESS_ACCESS_RIGHTS(SYNCHRONIZE.0) | PROCESS_TERMINATE;
+    let shell = unsafe { OpenProcess(access, false, pid) }.context("open the shell process")?;
+
+    // The strip dies with the process hosting it, and every path below ends with this
+    // Explorer gone. Cleared up front so a failure part-way cannot leave the tray icon
+    // believing its clicks still belong to a strip that is not there.
+    STRIP_UP.store(false, std::sync::atomic::Ordering::SeqCst);
+
+    let outcome = exit_and_relaunch_shell(shell);
+    let _ = unsafe { windows::Win32::Foundation::CloseHandle(shell) };
+    outcome
+}
+
+/// The body of [`restart_explorer`], split out so the process handle is closed on every path.
+fn exit_and_relaunch_shell(shell: windows::Win32::Foundation::HANDLE) -> Result<()> {
+    use windows::Win32::Foundation::{LPARAM, WAIT_OBJECT_0, WPARAM};
+    use windows::Win32::System::Threading::{TerminateProcess, WaitForSingleObject};
+    use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
+
+    // Ask nicely first, so Explorer saves its state instead of being shot. `window_by_class`
+    // rather than `FindWindow` for the reason given in its own docs.
+    let asked = match window_by_class("Shell_TrayWnd") {
+        Some(tray) => unsafe { PostMessageW(Some(tray), WM_SHELL_EXIT, WPARAM(0), LPARAM(0)) }
+            .inspect_err(|e| eprintln!("taskbar: could not ask Explorer to exit ({e})"))
+            .is_ok(),
+        // No taskbar window at all — there is nothing to ask, so go straight to the fallback.
+        None => {
+            eprintln!("taskbar: no Shell_TrayWnd to ask for an exit");
+            false
+        }
+    };
+
+    let gone = |ms: u32| unsafe { WaitForSingleObject(shell, ms) } == WAIT_OBJECT_0;
+    // Whether the shell had to be shot, which decides how long to wait for a replacement.
+    let mut terminated = false;
+    if !asked || !gone(SHELL_EXIT_WAIT_MS) {
+        // Routine rather than exceptional: measured, an Explorer with our TAP loaded ignores
+        // the request, and that is the state whenever the strip is up. `WM_SHELL_EXIT` is also
+        // undocumented and could stop working on a future build. Either way a button that
+        // silently does nothing would be the worse failure, so fall back to what
+        // `taskkill /f /im explorer.exe` does — the shell is built to be killed, which is what
+        // `AutoRestartShell` exists for.
+        eprintln!("taskbar: Explorer did not exit on request — terminating it instead");
+        unsafe { TerminateProcess(shell, 1) }.context("terminate the shell process")?;
+        terminated = true;
+        if !gone(SHELL_EXIT_WAIT_MS) {
+            bail!("the shell process would not exit");
+        }
+    }
+
+    // The one moment nothing holds `audio_tray_tap.dll`: the old Explorer has released it and
+    // the new one is not started yet. A TAP update that was waiting for a reboot can land
+    // now — and it has to be *here*, because the re-injection that follows `TaskbarCreated`
+    // would otherwise pull the stale DLL straight back into the new process.
+    crate::update::place_staged_tap();
+
+    // Launching explorer.exe while a shell is already up opens a file-browser window rather
+    // than a second shell, so look before leaping: a graceful exit is recorded as deliberate
+    // and nothing restarts the shell for us, but a terminate is the kind of death
+    // `AutoRestartShell` is meant to answer, so allow a little longer for one to appear on its
+    // own. Only a *ceiling* — `wait_for_shell` returns the moment one shows up.
+    //
+    // Kept small because every millisecond of it is a taskbar the user does not have. Measured
+    // on Win11 26200: nothing restarted the shell for us on either path, terminate included,
+    // so in practice this budget is spent in full and then our own launch does the work.
+    let budget = std::time::Duration::from_millis(if terminated { 1_500 } else { 500 });
+    if wait_for_shell(budget) {
+        eprintln!("taskbar: Explorer restarted itself");
+        return Ok(());
+    }
+    // Detached from our streams on purpose. A child inherits them by default, and this child
+    // outlives us by the whole session — so an explorer.exe launched from, say, a dev CLI run
+    // would sit holding that console (or redirected file) open long after audio-tray is gone.
+    // Nothing here wants to read explorer's output either way.
+    std::process::Command::new("explorer.exe")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .context("launch explorer.exe")?;
+    eprintln!("taskbar: Explorer restarted");
+    Ok(())
+}
+
+/// Whether a shell is up, waiting up to `budget` for one to appear.
+fn wait_for_shell(budget: std::time::Duration) -> bool {
+    const POLL: std::time::Duration = std::time::Duration::from_millis(100);
+    let deadline = std::time::Instant::now() + budget;
+    loop {
+        if !unsafe { GetShellWindow() }.0.is_null() {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(POLL);
+    }
+}

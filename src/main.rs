@@ -18,7 +18,9 @@
 //!                         contains <q> (case-insensitive), or whose id equals <q>
 //!   audio-tray --flyout [menu|icons|update]  preview the panel (menu = right-click;
 //!                         icons = the first device's icon-picker screen; update = fake a
-//!                         staged update so the footer's restart button shows)
+//!                         staged update so the footer's restart button shows). No strip is
+//!                         injected in this mode, so the restart-Explorer button always
+//!                         shows — and clicking it really does restart Explorer.
 //!   audio-tray --meter    sample the default output+input peak meters for 4s (diagnostic)
 //!   audio-tray --update   check GitHub releases and self-update now (see update.rs)
 //!   audio-tray --taskbar-click <out|in|panel>
@@ -29,6 +31,9 @@
 //!                         ask an injected TAP to put the taskbar back. Leaves the
 //!                         running tray alone — it will put the strip up again the
 //!                         next time it starts, or when Explorer restarts.
+//!   audio-tray --taskbar-restart
+//!                         restart explorer.exe, as the flyout footer's button does.
+//!                         Frees the TAP DLL, so it also applies a staged update to it.
 
 use anyhow::{bail, Context, Result};
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
@@ -87,9 +92,15 @@ fn main() -> Result<()> {
                 config.save()?;
             }
             println!(
-                "flyout: closed (config_changed={}, quit={}, restart={})",
-                outcome.config_changed, outcome.quit, outcome.restart
+                "flyout: closed (config_changed={}, quit={}, restart={}, restart_explorer={})",
+                outcome.config_changed, outcome.quit, outcome.restart, outcome.restart_explorer
             );
+            // Honoured here, not just reported: clicks on the taskbar cannot be synthesised,
+            // so this preview is the only way to exercise the restart end to end. Synchronous
+            // is fine — unlike the tray, this mode has no message loop to keep alive.
+            if outcome.restart_explorer {
+                taskbar::restart_explorer()?;
+            }
         }
         Some("--list") => list(&backend)?,
         Some("--set") => {
@@ -158,6 +169,15 @@ fn main() -> Result<()> {
             };
             taskbar::post_action(action)?;
             println!("taskbar: posted {action:?} to the running tray.");
+        }
+        Some("--taskbar-restart") => {
+            // Restarts the shell, the same as the flyout footer's button. Here for the same
+            // reason `--taskbar-revert` is: the click that normally triggers it cannot be
+            // synthesised, so this is how the path gets exercised end to end. Leaves the
+            // running tray alone — it puts the strip back on `TaskbarCreated`.
+            println!("taskbar: restarting Explorer...");
+            taskbar::restart_explorer()?;
+            println!("taskbar: done.");
         }
         Some("--taskbar-revert") => {
             // Ask whatever TAP is loaded to put the taskbar back, without touching

@@ -38,6 +38,11 @@ const TAP_DLL: &str = "audio_tray_tap.dll";
 /// binary only takes effect once the process restarts.
 static PENDING: Mutex<Option<String>> = Mutex::new(None);
 
+/// A downloaded TAP that could not be copied into place, as `(fresh, target)` — set when the
+/// replacement had to be handed to the next boot instead (see [`schedule_replace_at_boot`]),
+/// and consumed by [`place_staged_tap`] if the DLL is freed before then.
+static STAGED_TAP: Mutex<Option<(std::path::PathBuf, std::path::PathBuf)>> = Mutex::new(None);
+
 /// The version an applied-but-not-yet-running update will upgrade to, if any.
 pub fn pending_version() -> Option<String> {
     PENDING.lock().ok().and_then(|g| g.clone())
@@ -201,8 +206,47 @@ fn schedule_replace_at_boot(
     }
     .with_context(|| format!("scheduling {TAP_DLL} for replacement at next boot"))?;
 
+    // Remembered so that freeing the DLL before then can still place it: restarting Explorer
+    // does exactly that, and the flyout offers a button for it while an update is staged.
+    if let Ok(mut staged) = STAGED_TAP.lock() {
+        *staged = Some((fresh.to_path_buf(), target.to_path_buf()));
+    }
+
     if verbose {
         println!("{TAP_DLL} is in use by Explorer; it will be replaced on the next restart.");
     }
     Ok(())
+}
+
+/// Place a TAP replacement that is waiting for the next boot, now that its DLL has been
+/// freed. Restarting Explorer is what frees it — see [`crate::taskbar::restart_explorer`],
+/// which calls this in the gap between the old shell exiting and the new one starting.
+///
+/// Returns whether the new DLL is now in place. Best-effort in both directions: usually there
+/// is nothing staged at all (no update, or one whose copy succeeded outright), and a copy that
+/// fails changes nothing — the boot-time rename scheduled alongside it still stands.
+///
+/// Knows only about a staging done by *this* process. A tray restarted since the download has
+/// forgotten where the file is, and that update waits for the boot rename as it would have
+/// anyway — which is why this is an opportunistic improvement rather than the mechanism.
+pub fn place_staged_tap() -> bool {
+    let Some((fresh, target)) = STAGED_TAP.lock().ok().and_then(|staged| staged.clone()) else {
+        return false;
+    };
+    match std::fs::copy(&fresh, &target) {
+        Ok(_) => {
+            println!("audio-tray: placed the pending {TAP_DLL} — no reboot needed.");
+            // The pending boot rename is deliberately left standing rather than cancelled:
+            // it writes the same bytes to the same place, so at worst it is redundant, and it
+            // stays as the fallback if this copy is somehow lost.
+            if let Ok(mut staged) = STAGED_TAP.lock() {
+                *staged = None;
+            }
+            true
+        }
+        Err(e) => {
+            eprintln!("audio-tray: {TAP_DLL} is still held ({e}); it waits for the next boot");
+            false
+        }
+    }
 }

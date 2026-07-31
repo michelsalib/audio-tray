@@ -63,6 +63,10 @@ pub struct Outcome {
     /// The user clicked the "restart to update" entry — the caller should relaunch the
     /// (already-updated on disk) exe and exit.
     pub restart: bool,
+    /// The user clicked "restart Explorer" — the caller should restart the shell (see
+    /// [`crate::taskbar::restart_explorer`]). audio-tray itself keeps running: the strip is
+    /// put back by the `TaskbarCreated` handling that already covers any Explorer restart.
+    pub restart_explorer: bool,
 }
 
 /// Where to open the flyout: horizontally centred on the tray icon (`cx`), sitting just
@@ -175,13 +179,16 @@ unsafe fn show_inner(
 
     let groups = build_groups(backend, config);
     let update = crate::update::pending_version();
+    // Read once, at open: it decides whether the footer's restart-Explorer button is accented,
+    // and the answer cannot change while the panel is modal.
+    let strip_up = crate::taskbar::strip_is_up();
 
     let mut fly = Flyout {
         backend,
         config,
         scale,
         accent,
-        model: Model::new(groups, update),
+        model: Model::new(groups, update, strip_up),
         hit: Interaction::default(),
         surface: Surface::new((8.0 * scale) as i32),
         watches: Vec::new(),
@@ -224,6 +231,7 @@ unsafe fn show_inner(
             config_changed: false,
             output_changed: false,
             restart: false,
+            restart_explorer: false,
         };
     }
 
@@ -340,6 +348,7 @@ unsafe fn show_inner(
         config_changed: fly.model.config_changed,
         output_changed: fly.model.output_changed,
         restart: fly.model.restart,
+        restart_explorer: fly.model.restart_explorer,
     }
 }
 
@@ -619,6 +628,13 @@ impl Flyout<'_> {
                 Some(ActionKind::Restart) => {
                     // The update is already on disk; the caller relaunches the exe and exits.
                     self.model.restart = true;
+                    true
+                }
+                Some(ActionKind::RestartExplorer) => {
+                    // Closes the panel and hands the work to the caller: restarting the shell
+                    // takes seconds and must not happen under our modal mouse capture, with
+                    // the taskbar this flyout is anchored to disappearing underneath it.
+                    self.model.restart_explorer = true;
                     true
                 }
                 None => false,

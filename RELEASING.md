@@ -76,6 +76,16 @@ now the usual outcome: the strip is injected on every start. `--taskbar-revert` 
 not help — the revert deliberately leaves the DLL pinned in `explorer.exe` (see
 `src/taskbar.rs`), so the file stays locked. Restarting Explorer is what frees it.
 
+**Users do not have to wait for that reboot.** The flyout's footer has a *Restart
+Explorer* button (`taskbar::restart_explorer`, also on the CLI as
+`audio-tray --taskbar-restart`), which turns accent-coloured while an update is staged.
+It waits for the old shell to exit and, in that gap
+— the one moment nothing holds the DLL — calls `update::place_staged_tap` to copy the
+new one in before launching the replacement shell. The pending boot rename is left
+standing regardless, so this is an accelerator, not a mechanism you can rely on: it only
+works within the same tray process that did the download, since that is what remembers
+where the staged file is.
+
 Failing to place the DLL is logged and otherwise ignored: the exe has already been
 replaced by then, and turning a good update into a bad one over the DLL would be the
 wrong trade.

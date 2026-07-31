@@ -94,6 +94,12 @@ things worth knowing:
 - **One consumer at a time.** If TranslucentTB, Windhawk or a similar taskbar tool
   is running, the injection may fail — they share the one diagnostics endpoint. You
   keep the plain tray icon.
+- **There is a retry, in the flyout.** If the buttons are missing — or are there but
+  wrong — the flyout's footer has a *Restart Explorer* button (the overlapping-windows
+  glyph, left of the gear). Explorer is injected into as it comes back up, so this is
+  usually all it takes, most often after closing whichever tool was holding the
+  endpoint. It turns accent-coloured when something is known to need it: a failed
+  injection, or a staged update (see [Auto-update](#auto-update)).
 - **Your icon must be on the taskbar, not in the overflow.** Nothing is drawn if it
   is hidden behind the chevron.
 
@@ -106,6 +112,15 @@ Release builds check GitHub Releases on launch and, if a newer version exists,
 download and replace the executable in place (per-user install → no admin
 needed). The update is applied the **next** time the app starts, so the running
 tray is never interrupted. Run `audio-tray --update` to check on demand.
+
+Once one is downloaded, the flyout's footer offers two buttons for taking it:
+
+| Button | What it does |
+|--------|--------------|
+| Restart to update (circular arrow) | Relaunches Audio Tray into the new version |
+| Restart Explorer (overlapping windows) | Applies the new taskbar component, which Explorer holds open — otherwise it waits for your next reboot |
+
+Neither is required; both just bring the update forward.
 
 ## Build from source
 

@@ -428,6 +428,9 @@ fn handle_flyout(
     if outcome.config_changed || outcome.output_changed {
         refresh(backend, tray, config);
     }
+    if outcome.restart_explorer {
+        restart_explorer_off_thread();
+    }
     if outcome.restart {
         restart_app();
     }
@@ -440,6 +443,25 @@ fn handle_flyout(
         unsafe { PostQuitMessage(0) };
     }
     Ok(())
+}
+
+/// Restart the shell on a worker thread, on the footer button's behalf.
+///
+/// [`crate::taskbar::restart_explorer`] blocks for as long as Explorer takes to go and come
+/// back, and this loop has to keep pumping throughout: `TaskbarCreated` is *sent* to our
+/// receiver window rather than posted (see `taskbar::create_receiver`), so it is only
+/// delivered while the thread is in `GetMessage` — and it is what re-registers the tray icon
+/// and re-injects the strip. Waiting inline would mean holding up the very restart we asked
+/// for, and coming back to a taskbar with no icon on it.
+///
+/// Detached on purpose: nothing here reports back, and the work is finished by the
+/// `WM_TASKBAR_RESTARTED` handling in the loop above.
+fn restart_explorer_off_thread() {
+    std::thread::spawn(|| {
+        if let Err(e) = crate::taskbar::restart_explorer() {
+            eprintln!("taskbar: could not restart Explorer ({e:#})");
+        }
+    });
 }
 
 /// Relaunch the (already self-updated on disk) exe as a fresh process, then quit this one so

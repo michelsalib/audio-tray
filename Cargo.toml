@@ -6,7 +6,7 @@ members = ["crates/taskbar-tap"]
 
 [package]
 name = "audio-tray"
-version = "0.8.0"
+version = "0.9.0"
 edition = "2021"
 description = "Windows system-tray app for viewing and switching the default audio output device"
 license = "MIT"

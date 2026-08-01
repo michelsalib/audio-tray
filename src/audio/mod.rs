@@ -4,6 +4,7 @@
 //! friendly name — names collide, localize, and change; the ID is stable (plan §2.5).
 
 pub mod battery;
+pub mod mic;
 pub mod notify;
 pub mod switch;
 pub mod wasapi;

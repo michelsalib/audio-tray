@@ -273,6 +273,11 @@ pub struct StripIcons {
     pub input: char,
     pub output_muted: bool,
     pub input_muted: bool,
+    /// An app is holding the microphone open — the input button carries a red dot
+    /// (see [`crate::audio::mic`]). Independent of `input_muted`: an app that has the
+    /// stream open while you are muted is still recording, and Windows' own indicator
+    /// says so too.
+    pub input_recording: bool,
 }
 
 /// Fallbacks for when the devices cannot be resolved: Volume and Microphone.
@@ -283,6 +288,7 @@ impl Default for StripIcons {
             input: '\u{E720}',
             output_muted: false,
             input_muted: false,
+            input_recording: false,
         }
     }
 }
@@ -336,16 +342,23 @@ const PILL_ALPHA: &str = "80";
 /// quitting: the TAP waits on this process and reverts when it exits. Without it
 /// a `taskkill` would leave a strip behind whose every click is posted to a
 /// process that no longer exists.
+///
+/// `hidevolume` and `hidemic` collapse the two indicators of Windows' own that the strip
+/// now says instead — the volume glyph, and the microphone icon that appears while
+/// something is recording, which our input button carries as a red dot. Both are put back
+/// on revert, and neither is touched until our strip is actually on screen.
 fn init_data(icons: StripIcons) -> String {
     let [r, g, b] = crate::flyout::theme::accent_rgb();
     format!(
         "tooltip={};out={:04X};in={:04X};\
-         outmuted={};inmuted={};accent={r:02X}{g:02X}{b:02X};alpha={PILL_ALPHA};hidevolume=1;pid={}",
+         outmuted={};inmuted={};inrec={};accent={r:02X}{g:02X}{b:02X};alpha={PILL_ALPHA};\
+         hidevolume=1;hidemic=1;pid={}",
         crate::tray::TRAY_MARKER,
         icons.output as u32,
         icons.input as u32,
         u8::from(icons.output_muted),
         u8::from(icons.input_muted),
+        u8::from(icons.input_recording),
         std::process::id()
     )
 }
@@ -361,7 +374,7 @@ const WM_TAP_RESTYLE: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 23
 /// device that is no longer default.
 ///
 /// Both glyphs fit in a message's parameters, so nothing has to be shared: the
-/// codepoint goes in the low bits and the muted flag above it. Best-effort and
+/// codepoint goes in the low bits and the flags above it. Best-effort and
 /// quiet, like [`revert`] — no control window means nothing is injected.
 ///
 /// Returns whether the strip was actually told. The caller remembers what it has
@@ -377,13 +390,18 @@ pub fn restyle(icons: StripIcons) -> bool {
     let Some(control) = control_window() else {
         return false;
     };
-    let pack = |glyph: char, muted: bool| glyph as usize | (usize::from(muted) << 24);
+    // Codepoint in the low 24 bits (Unicode needs 21), then a bit per flag above it: muted
+    // at 24 for either segment, recording at 25 for the input. Must match the unpacking in
+    // the TAP's `lifecycle`.
+    let pack = |glyph: char, muted: bool, recording: bool| {
+        glyph as usize | (usize::from(muted) << 24) | (usize::from(recording) << 25)
+    };
     let posted = unsafe {
         PostMessageW(
             Some(control),
             WM_TAP_RESTYLE,
-            WPARAM(pack(icons.output, icons.output_muted)),
-            LPARAM(pack(icons.input, icons.input_muted) as isize),
+            WPARAM(pack(icons.output, icons.output_muted, false)),
+            LPARAM(pack(icons.input, icons.input_muted, icons.input_recording) as isize),
         )
     };
     if let Err(e) = posted {

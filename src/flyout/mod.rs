@@ -454,6 +454,13 @@ impl Flyout<'_> {
     /// timer. A muted endpoint reads as silent so its fill settles back to the resting glow.
     fn tick_meters(&mut self) {
         let mut changed = false;
+        let mut base_changed = false;
+        // The recording dot rides this same tick. Following it costs an atomic load, not a
+        // registry sweep — [`crate::audio::mic`] keeps the answer current from its own
+        // watcher thread, which is what makes it cheap enough to ask at 30 fps. Unlike the
+        // peaks it is drawn on the mic *glyph*, which lives in the static base layer, so a
+        // flip has to re-render that rather than just recompose.
+        let recording = crate::audio::mic::in_use();
         for group in 0..self.model.groups.len() {
             let raw = if self.model.groups[group].muted {
                 0.0
@@ -466,10 +473,17 @@ impl Flyout<'_> {
                 changed = true;
             }
             g.peak = shown;
+            if g.flow == Flow::Input && g.recording != recording {
+                g.recording = recording;
+                base_changed = true;
+            }
         }
         // Mid-slide the screen belongs to the transition — keep tracking the peaks, but let
         // it paint. The screen it lands on is composed from this same model.
-        if changed && self.anim.is_none() {
+        if (changed || base_changed) && self.anim.is_none() {
+            if base_changed {
+                self.render_base();
+            }
             self.compose();
             self.surface.flush();
         }

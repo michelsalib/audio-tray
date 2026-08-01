@@ -70,7 +70,13 @@ pub(super) fn render_page(ctx: &Ctx, elems: &[LaidElem], out: &mut [u8]) {
                     (Flow::Input, true) => (GLYPH_MIC_OFF, accent),
                 };
                 if let Ok((rgba, gw, gh)) = icons::render_glyph(glyph, icon_px, col) {
-                    cv.blit(d(ICON_X), cy_i - gh as i32 / 2, &rgba, gw, gh, 1.0);
+                    let (gx, gy) = (d(ICON_X), cy_i - gh as i32 / 2);
+                    cv.blit(gx, gy, &rgba, gw, gh, 1.0);
+                    // Something is holding the microphone open: the same dot the taskbar
+                    // strip's input button carries, on the same glyph.
+                    if g.recording {
+                        recording_dot(&mut cv, gx, gy, icon_px);
+                    }
                 }
                 // Track background; the accent fill + thumb + value are drawn in compose.
                 let x0 = TRACK_X0 * scale;

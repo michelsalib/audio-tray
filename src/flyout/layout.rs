@@ -361,6 +361,7 @@ mod tests {
             level: 0.5,
             muted: false,
             peak: 0.0,
+            recording: false,
             devices,
         }
     }

@@ -20,6 +20,9 @@
 //!                         icons = the first device's icon-picker screen; update = fake a
 //!                         staged update so the footer's restart button shows)
 //!   audio-tray --meter    sample the default output+input peak meters for 4s (diagnostic)
+//!   audio-tray --mic [secs]
+//!                         report which apps hold the microphone open, then watch for
+//!                         changes — what the mic icon's red recording dot follows
 //!   audio-tray --vol <up|down|get>
 //!                         nudge (or read) the default output volume, one scroll notch
 //!   audio-tray --osd [out|in] [level%]
@@ -169,6 +172,26 @@ fn main() -> Result<()> {
                 None => None,
             };
             osd::preview(&backend, flow, level)?;
+        }
+        Some("--mic") => {
+            // Dev: what the red recording dot is driven by — which apps hold the
+            // microphone open now, and then every change as it happens. The watcher
+            // itself prints the flips (see `audio::mic`), so this only has to report the
+            // starting state and stay alive to hear them.
+            let seconds = match args.get(1) {
+                Some(value) => value
+                    .parse::<u64>()
+                    .with_context(|| format!("{value:?} is not a number of seconds"))?,
+                None => 20,
+            };
+            let users = audio::mic::users();
+            match users.as_slice() {
+                [] => println!("mic: idle"),
+                users => println!("mic: in use by {}", users.join(", ")),
+            }
+            println!("watching for {seconds}s (start or stop a recording app)...");
+            audio::mic::in_use(); // starts the watcher
+            std::thread::sleep(std::time::Duration::from_secs(seconds));
         }
         Some("--meter") => {
             // Dev: sample the default output + input peak meters (IAudioMeterInformation)

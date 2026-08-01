@@ -32,6 +32,26 @@ const GLYPH_MIC_OFF: char = '\u{EC54}';
 /// Warm tint on a muted segment — a *second* signal; the glyph swap is the first.
 const MUTED_TINT: &str = "#E8836A";
 
+/// The "an app is recording" dot, as fractions of the glyph box: the red disc's radius, the
+/// white ring around it, and the centre both sit on — the top-right corner, which the
+/// microphone glyph's ink leaves free.
+///
+/// Transcribed from `audio_tray::flyout::theme`'s `REC_*`, and they have to stay in step:
+/// the same badge is painted on the same glyph in the flyout and the scroll readout, and
+/// the eye moves between them.
+const REC_R: f64 = 0.15;
+const REC_BORDER: f64 = 0.05;
+const REC_CX: f64 = 0.87;
+const REC_CY: f64 = 0.14;
+
+/// The dot's fill — `audio_tray::flyout::theme::RECORDING`, opaque.
+const RECORDING_FILL: &str = "#FFE81123";
+
+/// The ring around it. White, and *not* the segment's foreground: it is there to separate
+/// the dot from whatever is behind it, and behind it is the accent pill — whose colour is
+/// the user's, so nothing derived from it can be relied on to contrast with red.
+const RECORDING_RING: &str = "#FFFFFFFF";
+
 // Pill geometry, agreed from the mockups ("V2 — shell-matched"): it deliberately
 // mirrors the Control Center button's metrics so the strip reads as a peer of
 // that control rather than as an oversized tray icon.
@@ -152,12 +172,21 @@ pub struct StripState {
     pub input_glyph: char,
     pub output_muted: bool,
     pub input_muted: bool,
+    /// An app is holding the microphone open: the input segment carries a red dot. Set
+    /// independently of `input_muted` — an app that keeps the stream open while the user
+    /// is muted is still recording, which is what Windows' own indicator reports too.
+    pub input_recording: bool,
     /// Accent fill for the pill. `None` draws bare glyphs on the taskbar.
     pub accent: Option<[u8; 3]>,
     /// Alpha applied to `accent`. See [`PILL_ALPHA`].
     pub accent_alpha: u8,
     /// Collapse Explorer's own volume glyph, which our strip duplicates.
     pub hide_system_volume: bool,
+    /// Collapse Explorer's own "microphone in use" indicator, which our input button's
+    /// recording dot says instead. Separate from [`Self::hide_system_volume`] because it is
+    /// a separate icon with a separate failure mode: it only exists while something is
+    /// recording, so it is found — and hidden — mid-session rather than at injection.
+    pub hide_system_mic: bool,
 }
 
 impl Default for StripState {
@@ -167,9 +196,11 @@ impl Default for StripState {
             input_glyph: '\u{E720}',  // Microphone
             output_muted: false,
             input_muted: false,
+            input_recording: false,
             accent: None,
             accent_alpha: PILL_ALPHA,
             hide_system_volume: false,
+            hide_system_mic: false,
         }
     }
 }
@@ -195,12 +226,14 @@ impl StripState {
                 "in" => state.input_glyph = glyph().unwrap_or(state.input_glyph),
                 "outmuted" => state.output_muted = flag(),
                 "inmuted" => state.input_muted = flag(),
+                "inrec" => state.input_recording = flag(),
                 "accent" => state.accent = parse_rgb(value.trim()),
                 "alpha" => {
                     state.accent_alpha =
                         u8::from_str_radix(value.trim(), 16).unwrap_or(state.accent_alpha)
                 }
                 "hidevolume" => state.hide_system_volume = flag(),
+                "hidemic" => state.hide_system_mic = flag(),
                 _ => {}
             }
         }
@@ -352,6 +385,131 @@ fn icon_markup(glyph: char, size: u32, colour: Option<&str>) -> String {
     )
 }
 
+/// Room left around the glyph box, on top of the badge's own overhang, so that rounding at
+/// whatever scale the monitor is running cannot shave the edge of the ring. A whole
+/// effective pixel, because that is the unit the rasteriser can be out by.
+const REC_SLACK: f64 = 1.0;
+
+/// The badge and the wrapper it needs, in effective pixels: the wrapper `Grid`'s side, the
+/// `Ellipse`'s box and stroke, and where that box goes inside the wrapper.
+struct Badge {
+    grid: f64,
+    width: f64,
+    thickness: f64,
+    left: f64,
+    top: f64,
+}
+
+/// Work out that geometry for a `box_px`-square glyph box.
+///
+/// Split out from the markup so the invariant behind the "cropped dot" bug is testable at
+/// every size: the ring, stroke included, has to land inside the wrapper.
+fn badge_geometry(box_px: f64) -> Badge {
+    // A XAML stroke straddles the geometry it outlines — half of `StrokeThickness` falls
+    // outside the ellipse's box and half inside. So the box is the red disc *plus* one
+    // thickness: that puts the visible red at `2 · REC_R` and the ring's outer edge at
+    // `2 · (REC_R + REC_BORDER)`, which is exactly what the rasterised version draws.
+    //
+    // Never thinner than an effective pixel, for the same reason the rasteriser clamps it:
+    // at 100% the fraction comes out under 1 and a ring that faint is the one case the
+    // border exists to prevent.
+    let thickness = (REC_BORDER * box_px).max(1.0);
+    let width = 2.0 * REC_R * box_px + thickness;
+    // Measured off the pixel geometry rather than the fractions, so the clamp above is
+    // accounted for: this is the ring's outer radius, and how far it reaches past the box.
+    let outer = (width + thickness) / 2.0;
+    let (cx, cy) = (REC_CX * box_px, REC_CY * box_px);
+    let pad = (cx + outer - box_px).max(outer - cy).max(0.0) + REC_SLACK;
+    Badge {
+        grid: box_px + 2.0 * pad,
+        width,
+        thickness,
+        // Padding the wrapper equally on all sides leaves the badge exactly where it was
+        // relative to the glyph: both are centred, so the shared centre does not move.
+        left: pad + cx - width / 2.0,
+        top: pad + cy - width / 2.0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The bug this guards: the badge sits at the corner of the glyph box and its ring
+    /// reaches past it, and whatever clips inside the tray's visual tree then cuts the dot
+    /// (observed at 100% scale as a flattened top-right). Every part of the ring has to be
+    /// inside the wrapper — at every size, since the strip's glyph size is a constant today
+    /// but the flyout's is not.
+    #[test]
+    fn the_ring_fits_inside_its_wrapper() {
+        for size in 8..=64 {
+            let b = badge_geometry(f64::from(size));
+            let half = b.thickness / 2.0;
+            let (x0, y0) = (b.left - half, b.top - half);
+            let (x1, y1) = (b.left + b.width + half, b.top + b.width + half);
+            assert!(x0 >= 0.0 && y0 >= 0.0, "size {size}: badge starts at {x0},{y0}");
+            assert!(
+                x1 <= b.grid && y1 <= b.grid,
+                "size {size}: badge reaches {x1},{y1} of a {} wrapper",
+                b.grid
+            );
+        }
+    }
+
+    /// The wrapper is padded *equally*, so growing it cannot shift the glyph — the badge and
+    /// the icon are both centred in it, and the offset between them is what was tuned.
+    #[test]
+    fn the_badge_keeps_its_offset_from_the_glyph_centre() {
+        for size in 8..=64 {
+            let box_px = f64::from(size);
+            let b = badge_geometry(box_px);
+            let centre = b.grid / 2.0;
+            let badge_centre = b.left + b.width / 2.0;
+            let wanted = (REC_CX - 0.5) * box_px;
+            assert!(
+                (badge_centre - centre - wanted).abs() < 1e-9,
+                "size {size}: badge centre {} off the glyph centre, wanted {wanted}",
+                badge_centre - centre
+            );
+        }
+    }
+}
+
+/// The icon, plus the recording dot when something has the microphone open.
+///
+/// The pair is wrapped in a `Grid` centred in the segment, and the *glyph box* inside it —
+/// not the segment — is the coordinate system the dot is placed in. Two reasons: it is the
+/// same box the flyout's rasteriser places its dot in, so one set of fractions describes
+/// both; and the segment's own height is *not* a constant (32 epx inside the pill,
+/// shrink-wrapped to the glyph in the bare-glyph mode), so anything measured from its edges
+/// would move.
+///
+/// The wrapper is deliberately **bigger than the glyph box**: the badge sits at the very
+/// corner and its ring reaches past it, which is what keeps it clear of the microphone's ink
+/// — and a child that overflows gets clipped somewhere in the tray's own visual tree. Seen
+/// at 100% scale as a dot with its top-right flattened. Padding the wrapper by the overhang
+/// (equally on all four sides, so the glyph stays centred) is what gives the ring room to be
+/// drawn in full. The glyph itself still overshoots and still is not clipped, which is the
+/// asymmetry worth knowing: Segoe Fluent ink overhang is *drawn* outside the layout box
+/// (see [`PILL_H`]), an `Ellipse` positioned outside its parent is not.
+fn badged_icon_markup(glyph: char, size: u32, colour: Option<&str>, recording: bool) -> String {
+    let icon = icon_markup(glyph, size, colour);
+    if !recording {
+        return icon;
+    }
+    let Badge { grid, width, thickness, left, top } = badge_geometry(f64::from(size));
+    format!(
+        r##"      <Grid Width="{grid:.2}" Height="{grid:.2}"
+            VerticalAlignment="Center" HorizontalAlignment="Center">
+{icon}
+        <Ellipse Width="{width:.2}" Height="{width:.2}" Fill="{RECORDING_FILL}"
+                 Stroke="{RECORDING_RING}" StrokeThickness="{thickness:.2}"
+                 HorizontalAlignment="Left" VerticalAlignment="Top"
+                 Margin="{left:.2},{top:.2},0,0"/>
+      </Grid>"##
+    )
+}
+
 /// The strip markup: two equal segments, output glyph then input glyph.
 ///
 /// The root needs an explicit `xmlns`: `XamlReader.Load` parses this standalone,
@@ -365,7 +523,13 @@ fn strip_markup(state: StripState) -> String {
     // two: each keeps the pill's radius on its own outer corners and is square
     // where it meets the other, so whichever half lights up the pill still reads
     // as one outline.
-    let segment = |name: &str, glyph: char, size: u32, width: u32, muted: bool, leading: bool| {
+    let segment = |name: &str,
+                   glyph: char,
+                   size: u32,
+                   width: u32,
+                   muted: bool,
+                   recording: bool,
+                   leading: bool| {
         let colour = if muted { Some(MUTED_TINT) } else { base };
         // XAML order for CornerRadius: top-left, top-right, bottom-right,
         // bottom-left.
@@ -387,7 +551,7 @@ fn strip_markup(state: StripState) -> String {
               CornerRadius="{corners}"/>
 {}
     </Grid>"##,
-            icon_markup(glyph, size, colour)
+            badged_icon_markup(glyph, size, colour, recording)
         )
     };
 
@@ -417,8 +581,16 @@ fn strip_markup(state: StripState) -> String {
 {}
 {}
   </StackPanel>"#,
-        segment(SEGMENT_OUT, output, GLYPH_PX, SEGMENT_W, state.output_muted, true),
-        segment(SEGMENT_IN, input, GLYPH_PX, SEGMENT_W, state.input_muted, false),
+        segment(SEGMENT_OUT, output, GLYPH_PX, SEGMENT_W, state.output_muted, false, true),
+        segment(
+            SEGMENT_IN,
+            input,
+            GLYPH_PX,
+            SEGMENT_W,
+            state.input_muted,
+            state.input_recording,
+            false,
+        ),
     );
 
     match state.accent {
@@ -764,6 +936,19 @@ pub const STRIP_NAME: &str = "AudioTrayStrip";
 pub const VOLUME_GLYPHS: &[char] = &[
     '\u{E74F}', '\u{E767}', '\u{E992}', '\u{E993}', '\u{E994}', '\u{E995}',
 ];
+
+/// Codepoints for the shell's *microphone in use* indicator — the icon Windows adds to the
+/// tray while an app is recording, which our input button's red dot now says instead.
+///
+/// Matched the same way as [`VOLUME_GLYPHS`] and it has one extra hazard: our own input
+/// segment draws a microphone too. What keeps them apart is not the codepoint but the
+/// lookup — only a glyph inside a `SystemTray.IconView` is Explorer's (see
+/// `note_system_indicator`); ours lives in the strip we injected.
+///
+/// More than one entry because the shell has been seen using both the plain microphone and
+/// the filled "active" variant, and an unrecognised one costs the whole feature — the log
+/// names any tray glyph it does not know (see `note_unknown_glyph`) if this needs extending.
+pub const MIC_GLYPHS: &[char] = &['\u{E720}', '\u{EC71}', '\u{F12E}', '\u{E1D6}'];
 
 /// Reads a `TextBlock`'s `Text`.
 ///

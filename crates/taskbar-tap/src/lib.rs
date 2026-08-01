@@ -128,9 +128,6 @@ unsafe fn already_decorated(diagnostics: &xamlom::IXamlDiagnostics) -> bool {
     decorate::holds_our_strip(diagnostics, presenter)
 }
 
-/// Set once Explorer's own volume glyph has been collapsed.
-static VOLUME_HIDDEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
 /// Set once the tray sections have been reordered.
 static REORDERED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -138,20 +135,98 @@ static REORDERED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool:
 /// wires the new ones without double-wiring the old.
 static WIRED: Mutex<Vec<u64>> = Mutex::new(Vec::new());
 
-/// The system volume icon and the container holding its slot, once found.
-static VOLUME_SLOT: Mutex<Option<(xamlom::InstanceHandle, xamlom::InstanceHandle)>> =
-    Mutex::new(None);
-
-/// How many times the volume collapse has been re-applied.
+/// One of Explorer's own indicators that our strip says instead, and therefore hides: the
+/// volume glyph, and the "microphone in use" icon.
 ///
-/// There is no clean "it worked" signal to stop on: a collapsed element goes on
-/// reporting its last arranged `ActualWidth` (measured — still 24 long after the
-/// slot has visibly closed), so success cannot be read back off the element. A
-/// bounded retry is the honest way to cover the race instead.
-static VOLUME_RETRIES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// The two are the same problem — find a glyph `TextBlock` in the tray, collapse the icon and
+/// the slot holding it, keep re-applying until layout actually gives the slot up, and
+/// remember enough to put it back — so they are one type with two instances rather than two
+/// copies of the logic.
+struct Indicator {
+    /// For the log.
+    what: &'static str,
+    /// Codepoints that identify it. Names are localised; glyphs are not.
+    glyphs: &'static [char],
+    /// Whether audio-tray asked for this one to be hidden.
+    wanted: fn(&decorate::StripState) -> bool,
+    /// The icon element and the container holding its slot, once found.
+    slot: Mutex<Option<(xamlom::InstanceHandle, xamlom::InstanceHandle)>>,
+    /// How many times the collapse has been re-applied for the *current* slot.
+    ///
+    /// There is no clean "it worked" signal to stop on: a collapsed element goes on
+    /// reporting its last arranged `ActualWidth` (measured — still 24 long after the slot has
+    /// visibly closed), so success cannot be read back off the element. A bounded retry is
+    /// the honest way to cover the race instead.
+    retries: std::sync::atomic::AtomicU32,
+    /// Whether it has been found at all, so the log says so once rather than per sweep.
+    announced: std::sync::atomic::AtomicBool,
+}
+
+impl Indicator {
+    const fn new(
+        what: &'static str,
+        glyphs: &'static [char],
+        wanted: fn(&decorate::StripState) -> bool,
+    ) -> Self {
+        Self {
+            what,
+            glyphs,
+            wanted,
+            slot: Mutex::new(None),
+            retries: std::sync::atomic::AtomicU32::new(0),
+            announced: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    fn recorded(&self) -> Option<(xamlom::InstanceHandle, xamlom::InstanceHandle)> {
+        match self.slot.lock() {
+            Ok(guard) => *guard,
+            Err(poisoned) => *poisoned.into_inner(),
+        }
+    }
+
+    /// Record where it is. A *different* element than last time restarts the retry budget:
+    /// the microphone indicator comes and goes with each recording session, so an appearance
+    /// can be a fresh element to hide, and a spent counter would leave it on screen.
+    ///
+    /// Measured on Win11 26200: the shell in fact *reuses* the same `IconView` for the next
+    /// session, so the first collapse holds and no second announcement arrives — the log
+    /// says "indicator found" once and the icon stays gone. This is for the case where it
+    /// does not, which is not something to bet a visible regression on.
+    fn record(&self, pair: (xamlom::InstanceHandle, xamlom::InstanceHandle)) {
+        let mut held = match self.slot.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if *held != Some(pair) {
+            self.retries.store(0, Ordering::SeqCst);
+        }
+        *held = Some(pair);
+    }
+
+    fn forget(&self) {
+        let mut held = match self.slot.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *held = None;
+        self.retries.store(0, Ordering::SeqCst);
+        self.announced.store(false, Ordering::SeqCst);
+    }
+}
 
 /// Enough to cover the replay burst without re-applying for the process lifetime.
-const VOLUME_MAX_RETRIES: u32 = 24;
+const HIDE_MAX_RETRIES: u32 = 24;
+
+static SYSTEM_VOLUME: Indicator =
+    Indicator::new("volume", decorate::VOLUME_GLYPHS, |s| s.hide_system_volume);
+static SYSTEM_MIC: Indicator =
+    Indicator::new("microphone", decorate::MIC_GLYPHS, |s| s.hide_system_mic);
+
+/// Both, for the sweep and the revert.
+fn indicators() -> [&'static Indicator; 2] {
+    [&SYSTEM_VOLUME, &SYSTEM_MIC]
+}
 
 /// Set once the tray icons' automation names have been logged.
 static PROBED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -494,15 +569,22 @@ impl IVisualTreeServiceCallback_Impl for Tap_Impl {
             // rather than by the recorded tree, since deferring those would
             // otherwise lose the handle.
 
-            // Explorer's own volume indicator, which our strip duplicates. It is a
-            // glyph *TextBlock* inside a SystemTray.IconView, so it is matched on
-            // the codepoint rather than a (translated) name — done in the sweep,
-            // because reading `Text` is itself a XAML call.
+            // Explorer's own volume and "microphone in use" indicators, which our strip
+            // says instead. Each is a glyph *TextBlock* inside a SystemTray.IconView, so it
+            // is matched on the codepoint rather than a (translated) name — done in the
+            // sweep, because reading `Text` is itself a XAML call.
             //
-            // Not one-shot: Explorer rebuilds the tray on DPI and monitor changes,
-            // and the indicator comes back.
+            // Not one-shot: Explorer rebuilds the tray on DPI and monitor changes, and the
+            // indicators come back. The microphone one is not even *born* until an app
+            // starts recording, which is why the sweep is asked to go back to its fast pace
+            // here — at the idle cadence the shell's icon would sit there for up to four
+            // seconds of every call before being collapsed, which is exactly long enough
+            // to be seen.
             if added && name == "InnerTextBlock" {
                 enqueue(&PENDING_GLYPHS, element.handle);
+                if lifecycle::on_tray_thread() {
+                    lifecycle::set_sweep_pace(false);
+                }
             }
 
             // Our own injected segments being announced back to us. XAML reports
@@ -552,16 +634,14 @@ pub(crate) unsafe fn stand_down() {
     if let Ok(mut decorated) = DECORATED.lock() {
         *decorated = None;
     }
-    if let Ok(mut slot) = VOLUME_SLOT.lock() {
-        *slot = None;
+    for indicator in indicators() {
+        indicator.forget();
     }
     if let Ok(mut wired) = WIRED.lock() {
         // Our segments died with the content they lived in; these handles are
         // stale, and keeping them would stop a fresh strip being wired up.
         wired.clear();
     }
-    VOLUME_HIDDEN.store(false, Ordering::SeqCst);
-    VOLUME_RETRIES.store(0, Ordering::SeqCst);
     REORDERED.store(false, Ordering::SeqCst);
     PROBED.store(false, Ordering::SeqCst);
     REPORTED.store(false, Ordering::SeqCst);
@@ -668,22 +748,20 @@ pub(crate) unsafe fn sweep() {
         return;
     };
 
-    // Order matters. Finding the volume slot only records it, and has to happen
+    // Order matters. Finding an indicator's slot only records it, and has to happen
     // whether or not the strip is up yet. Decoration comes next, because
-    // collapsing the volume icon and reordering the tray are both gated on the
+    // collapsing those icons and reordering the tray are both gated on the
     // strip actually being on screen — that gate is what stops us taking Windows'
     // controls away and putting nothing back.
     for text_block in drain(&PENDING_GLYPHS) {
-        note_system_volume(&diagnostics, text_block);
+        note_system_indicator(&diagnostics, text_block);
     }
 
     // "Decorate unless it is already done", so this covers a strip the shell
     // overwrote as well as an icon that arrived with no further event to notice it.
     try_decorate(&diagnostics);
 
-    if VOLUME_RETRIES.load(Ordering::SeqCst) < VOLUME_MAX_RETRIES {
-        enforce_volume_hidden(&diagnostics);
-    }
+    enforce_hidden(&diagnostics);
 
     if strip_placed() && !REORDERED.load(Ordering::SeqCst) && reorder::sections_ready() {
         reorder_now(&diagnostics);
@@ -731,6 +809,7 @@ pub(crate) unsafe fn restyle(
     output_muted: bool,
     input: Option<char>,
     input_muted: bool,
+    input_recording: bool,
 ) {
     {
         let mut strip = match STRIP.lock() {
@@ -743,6 +822,7 @@ pub(crate) unsafe fn restyle(
             input_glyph: input.unwrap_or(state.input_glyph),
             output_muted,
             input_muted,
+            input_recording,
             ..*state
         };
         // A restyle that changes nothing is dropped here, before it costs a
@@ -757,7 +837,7 @@ pub(crate) unsafe fn restyle(
         *state = wanted;
     }
     logf!(
-        "restyle: out={:?} (muted {output_muted}) in={:?} (muted {input_muted})",
+        "restyle: out={:?} (muted {output_muted}) in={:?} (muted {input_muted}, recording {input_recording})",
         output,
         input
     );
@@ -923,103 +1003,119 @@ unsafe fn attach_segment(
     interact::attach(diagnostics, segment, element, plate);
 }
 
-/// Note Explorer's own volume indicator if this text block is it.
+/// Note one of Explorer's own indicators if this text block is it.
 ///
-/// Only *records* the slot — collapsing it is [`enforce_volume_hidden`]'s job,
-/// gated on our strip actually being placed. The two have to be separate because
-/// the volume glyph is announced during the replay, well before our icon has been
-/// decorated; gating the search itself would mean the slot was never found and the
-/// icon never hidden even when the strip does appear.
+/// Only *records* the slot — collapsing it is [`enforce_hidden`]'s job, gated on our strip
+/// actually being placed. The two have to be separate because the volume glyph is announced
+/// during the replay, well before our icon has been decorated; gating the search itself
+/// would mean the slot was never found and the icon never hidden even when the strip does
+/// appear.
 ///
 /// # Safety
 /// XAML UI thread only, and only once the event stream is quiet — see [`sweep`].
-unsafe fn note_system_volume(
+unsafe fn note_system_indicator(
     diagnostics: &xamlom::IXamlDiagnostics,
     text_block: xamlom::InstanceHandle,
 ) {
-    {
-        if !strip_state().is_some_and(|s| s.hide_system_volume) {
-            return;
-        }
-        let Some(text) = decorate::text_of(diagnostics, text_block) else {
-            return;
-        };
-        let Some(glyph) = text.chars().next() else {
-            return;
-        };
-        if !decorate::VOLUME_GLYPHS.contains(&glyph) {
-            return;
-        }
+    let Some(state) = strip_state() else {
+        return;
+    };
+    let Some(text) = decorate::text_of(diagnostics, text_block) else {
+        return;
+    };
+    let Some(glyph) = text.chars().next() else {
+        return;
+    };
+    let found = indicators()
+        .into_iter()
+        .find(|i| (i.wanted)(&state) && i.glyphs.contains(&glyph));
+    let Some(wanted) = found else {
+        note_unknown_glyph(glyph);
+        return;
+    };
 
-        let Some(icon) = ancestor_of_type(text_block, "SystemTray.IconView", 8) else {
-            logf!("volume glyph {:04X} has no SystemTray.IconView ancestor", glyph as u32);
-            return;
-        };
+    // What tells Explorer's microphone glyph from the one in our own input segment: only
+    // the shell's sits in a `SystemTray.IconView`. Ours is inside the strip we injected, so
+    // it falls out here — which is why matching on the codepoint alone is safe.
+    let Some(icon) = ancestor_of_type(text_block, "SystemTray.IconView", 8) else {
+        return;
+    };
 
-        // Collapsing the `IconView` hides the glyph but leaves a hole between
-        // wifi and battery: inside the Quick Settings button each icon sits in
-        // its own generated `ContentPresenter`, and that container keeps its
-        // layout box no matter what happens to its content. Collapse the
-        // container so the `StackPanel` closes the slot up.
-        let slot = tree::parent_of(icon)
-            .filter(|&parent| {
-                tree::type_of(parent).as_deref()
-                    == Some("Windows.UI.Xaml.Controls.ContentPresenter")
-            })
-            .unwrap_or(icon);
+    // Collapsing the `IconView` hides the glyph but leaves a hole between
+    // wifi and battery: inside the Quick Settings button each icon sits in
+    // its own generated `ContentPresenter`, and that container keeps its
+    // layout box no matter what happens to its content. Collapse the
+    // container so the `StackPanel` closes the slot up.
+    let slot = tree::parent_of(icon)
+        .filter(|&parent| {
+            tree::type_of(parent).as_deref() == Some("Windows.UI.Xaml.Controls.ContentPresenter")
+        })
+        .unwrap_or(icon);
 
-        // Log only the first time, so a tray rebuild doesn't spam.
-        if !VOLUME_HIDDEN.swap(true, Ordering::SeqCst) {
-            logf!(
-                "system volume indicator found: glyph {:04X} in IconView 0x{icon:x}, slot 0x{slot:x} (hidden only once our strip is placed)",
-                glyph as u32
-            );
-        }
-        // Remembered so it can be re-applied: a collapse that lands before the
-        // shell has measured this item does not free the slot (observed —
-        // `ActualWidth` still 0 at that point, and the gap survives).
-        {
-            let mut recorded = match VOLUME_SLOT.lock() {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            *recorded = Some((icon, slot));
-        }
-        enforce_volume_hidden(diagnostics);
+    // Log only the first time, so a tray rebuild doesn't spam.
+    if !wanted.announced.swap(true, Ordering::SeqCst) {
+        logf!(
+            "system {} indicator found: glyph {:04X} in IconView 0x{icon:x}, slot 0x{slot:x} (hidden only once our strip is placed)",
+            wanted.what,
+            glyph as u32
+        );
     }
+    // Remembered so it can be re-applied: a collapse that lands before the
+    // shell has measured this item does not free the slot (observed —
+    // `ActualWidth` still 0 at that point, and the gap survives).
+    wanted.record((icon, slot));
+    enforce_hidden(diagnostics);
 }
 
-/// Re-applies the volume collapse until layout actually gives up the slot.
+/// Names a tray glyph we do not recognise, once per codepoint.
 ///
-/// Called on every sweep, so it costs one `ActualWidth` read per tick until it
-/// settles — then nothing.
+/// This is the diagnostic for the one thing [`decorate::MIC_GLYPHS`] cannot be sure of:
+/// which codepoint *this* Windows build uses for "microphone in use". If the indicator is
+/// not being hidden, its glyph is in the log — as long as it was announced, which is the
+/// same condition the hiding itself needs.
+fn note_unknown_glyph(glyph: char) {
+    /// A tray holds a couple of dozen glyphs; past that something is announcing far more
+    /// than we expected and the log is worth more than the completeness.
+    const MAX_SEEN: usize = 48;
+
+    let mut seen = match UNKNOWN_GLYPHS.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if seen.contains(&glyph) || seen.len() >= MAX_SEEN {
+        return;
+    }
+    seen.push(glyph);
+    logf!("tray glyph {:04X} is not one we hide", glyph as u32);
+}
+
+/// Codepoints [`note_unknown_glyph`] has already reported.
+static UNKNOWN_GLYPHS: Mutex<Vec<char>> = Mutex::new(Vec::new());
+
+/// Re-applies each indicator's collapse until layout actually gives up its slot.
+///
+/// Called on every sweep, so it costs one `ActualWidth` read per tick per indicator until
+/// they settle — then nothing.
 ///
 /// # Safety
 /// XAML UI thread only, and only once the event stream is quiet — see [`sweep`].
-unsafe fn enforce_volume_hidden(diagnostics: &xamlom::IXamlDiagnostics) {
-    {
-        // Windows' volume icon stays until ours is actually on the taskbar.
-        if !strip_placed() {
-            return;
+unsafe fn enforce_hidden(diagnostics: &xamlom::IXamlDiagnostics) {
+    // Windows' own icons stay until ours is actually on the taskbar. This is the gate that
+    // stops us taking the shell's controls away and putting nothing back.
+    if !strip_placed() {
+        return;
+    }
+    for indicator in indicators() {
+        if indicator.retries.load(Ordering::SeqCst) >= HIDE_MAX_RETRIES {
+            continue;
         }
-        let attempt = VOLUME_RETRIES.load(Ordering::SeqCst);
-        if attempt >= VOLUME_MAX_RETRIES {
-            return;
-        }
-        let recorded = {
-            let guard = match VOLUME_SLOT.lock() {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            *guard
-        };
-        let Some((icon, slot)) = recorded else {
-            return;
+        let Some((icon, slot)) = indicator.recorded() else {
+            continue;
         };
         // Only worth repeating once layout has actually measured the item — a
         // zero here means it has not run yet, and collapsing then does nothing.
         if decorate::actual_width(diagnostics, slot).is_none_or(|width| width <= 0.0) {
-            return;
+            continue;
         }
         // Before, never after: from the second attempt onwards what we would read
         // back is our own zero width, not Explorer's original.
@@ -1029,8 +1125,11 @@ unsafe fn enforce_volume_hidden(diagnostics: &xamlom::IXamlDiagnostics) {
             restore::remember_layout(diagnostics, slot);
             decorate::collapse(diagnostics, slot);
         }
-        if VOLUME_RETRIES.fetch_add(1, Ordering::SeqCst) + 1 == VOLUME_MAX_RETRIES {
-            logf!("system volume collapse re-applied {VOLUME_MAX_RETRIES}x — stopping");
+        if indicator.retries.fetch_add(1, Ordering::SeqCst) + 1 == HIDE_MAX_RETRIES {
+            logf!(
+                "system {} collapse re-applied {HIDE_MAX_RETRIES}x — stopping",
+                indicator.what
+            );
         }
     }
 }
@@ -1132,9 +1231,10 @@ unsafe fn decorate_icon(
     restore::remember_content(diagnostics, presenter);
     let state = strip_state().unwrap_or_default();
     logf!(
-        "strip state: accent={:?} hidevolume={} out={:04X} in={:04X}",
+        "strip state: accent={:?} hidevolume={} hidemic={} out={:04X} in={:04X}",
         state.accent,
         state.hide_system_volume,
+        state.hide_system_mic,
         state.output_glyph as u32,
         state.input_glyph as u32
     );

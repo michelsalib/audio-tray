@@ -13,8 +13,8 @@ A tiny Windows system-tray app for **controlling your audio without digging thro
 ## Features
 
 - **Taskbar controls** — a pair of buttons drawn into the notification area, one for
-  output and one for input, each showing that device's own icon. Windows' own volume
-  icon is hidden, since the output button duplicates it. See
+  output and one for input, each showing that device's own icon. Windows' own volume and
+  "microphone in use" icons are hidden, since the buttons say the same thing. See
   [taskbar controls](#taskbar-controls).
 - **Left-click** either button to switch that endpoint to the next device;
   **right-click** for a compact acrylic flyout that replaces the native sound flyout:
@@ -25,6 +25,11 @@ A tiny Windows system-tray app for **controlling your audio without digging thro
   volume: the output button for playback, the input button for the microphone. A level
   bar appears next to the buttons while you scroll and fades away three seconds after
   the last change.
+- **A red dot on the mic** whenever an app is recording — on the input button, on the
+  flyout's microphone glyph, and on the level bar. It follows the same record Windows'
+  own "microphone in use" indicator does (which it replaces, see below), so it covers
+  every app and every microphone, and it stays lit while an app holds the stream open
+  even if you are muted.
 - **Falls back to a plain tray icon** if the taskbar controls cannot be drawn — an
   icon reflecting the current output device (speakers, headphones, headset, HDMI…),
   rendered from Segoe Fluent Icons and themed to your taskbar. Either button opens
@@ -81,8 +86,11 @@ Configuration (per-device icon overrides) is stored at
 
 Audio Tray's notification-area presence is two buttons — output and input — drawn
 directly into the taskbar. Left-click either one to cycle that endpoint to the next
-device; right-click opens the flyout. Windows' own volume icon is hidden, because the
-output button duplicates it.
+device; right-click opens the flyout. Two icons of Windows' own are hidden because the
+buttons say the same thing: the volume icon, which the output button duplicates, and the
+"microphone in use" icon, which the input button's red recording dot replaces. Both come
+back when the buttons do not — nothing of Windows' is taken away until the strip is
+actually on screen, and everything is put back on the way out.
 
 It works by loading `audio_tray_tap.dll` into `explorer.exe` through the XAML
 Diagnostics interface — the same mechanism TranslucentTB and Windhawk use. Some

@@ -28,6 +28,10 @@ pub(super) struct Group {
     pub level: f32, // 0.0..=1.0 of the default endpoint
     pub muted: bool,
     pub peak: f32, // smoothed live peak level 0.0..=1.0 of the default endpoint (activity glow)
+    /// An app has the microphone open — the red dot on the mic glyph. Input groups only;
+    /// it is a property of the *capability*, not of this endpoint, so every input group
+    /// carries the same answer (see [`crate::audio::mic`]).
+    pub recording: bool,
     pub devices: Vec<DeviceRow>,
 }
 
@@ -96,7 +100,18 @@ pub(super) fn build_groups(backend: &WasapiBackend, config: &Config) -> Vec<Grou
                 DeviceRow { id: d.id, label: d.friendly_name, icon, selected, battery }
             })
             .collect();
-        groups.push(Group { flow, title, default_id, level, muted, peak: 0.0, devices: rows });
+        // Only the input side can be "recording"; an output group's dot would be nonsense.
+        let recording = flow == Flow::Input && crate::audio::mic::in_use();
+        groups.push(Group {
+            flow,
+            title,
+            default_id,
+            level,
+            muted,
+            peak: 0.0,
+            recording,
+            devices: rows,
+        });
     }
     groups
 }

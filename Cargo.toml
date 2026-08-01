@@ -60,6 +60,8 @@ features = [
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_System_Threading",
+    # CreateEventW / WaitForMultipleObjects, for the microphone-in-use watch.
+    "Win32_Security",
     "Win32_System_Registry",
     # MessageBeep (the volume "ding" on a slider change) lives here, not in UI.
     "Win32_System_Diagnostics_Debug",

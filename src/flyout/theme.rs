@@ -13,6 +13,8 @@ use std::sync::OnceLock;
 use ab_glyph::FontVec;
 use windows::core::w;
 
+use crate::canvas::{Canvas, Rect};
+
 // Layout, in DIPs (scaled by the monitor DPI at show time). Tuned to the native Win11
 // sound flyout: roomy rows, a semibold section header, an accent selection pill.
 pub(super) const CORNER: f32 = 8.0;
@@ -86,12 +88,49 @@ pub(super) const GLYPH_BACK: char = '\u{E72B}'; // Back (leftward arrow) — the
 pub(super) const GLYPH_UPDATE: char = '\u{E72C}'; // Refresh (circular arrow) — restart-to-update button
 
 // Colours (RGB); alpha applied at blend time.
+pub(crate) const RECORDING: [u8; 3] = [0xE8, 0x11, 0x23]; // the "an app is recording" dot
 pub(crate) const TINT: [u8; 3] = [0x2C, 0x2C, 0x2C]; // panel base (semi-transparent, acrylic shows through)
 pub(crate) const TINT_A: f32 = 0.82;
 pub(crate) const TEXT: [u8; 3] = [0xFF, 0xFF, 0xFF]; // primary text + glyphs
 pub(super) const DARK_GLYPH: [u8; 3] = [0x12, 0x16, 0x1C]; // icon colour on a solid accent chip
 pub(super) const HOVER_A: f32 = 0.06; // white overlay for hover
 pub(super) const SEL_A: f32 = 0.09; // white overlay for the selected row
+
+// The recording dot, as fractions of the mic glyph's box: the red disc's radius, the white
+// ring around it, and the centre both sit on. The **top-right corner**, which is where the
+// Segoe microphone's ink does not reach — the capsule runs up the middle, the stand sits
+// under it, and the mute variant's "no" circle is bottom-right.
+//
+// The centre is far enough out that the *ring* clears the capsule too; it is the ring, not
+// the disc, that decides how close the badge can sit.
+const REC_R: f32 = 0.15;
+const REC_BORDER: f32 = 0.05;
+const REC_CX: f32 = 0.87;
+const REC_CY: f32 = 0.14;
+
+/// Stamp the recording dot on a mic glyph drawn at `(x, y)` in a `size`-pixel box.
+///
+/// Lives here, beside the glyphs themselves, because both hand-painted surfaces stamp it —
+/// the flyout's input slider and the scroll readout — and "an app is recording" has to be
+/// the same picture in both. The taskbar strip draws its own (XAML, inside Explorer; see
+/// the TAP's `decorate`), which is why that one is not this.
+pub(crate) fn recording_dot(cv: &mut Canvas, x: i32, y: i32, size: u32) {
+    let box_px = size as f32;
+    let r = box_px * REC_R;
+    let cx = x as f32 + box_px * REC_CX;
+    let cy = y as f32 + box_px * REC_CY;
+    // The white ring first, as a plain disc, with the red one over it — a stroke would have
+    // to be drawn by hand, and this composites identically. Never thinner than a pixel: at
+    // 100% DPI the fraction rounds down to almost nothing, and a ring that faint is the one
+    // case the border exists to prevent.
+    let ring = (box_px * REC_BORDER).max(1.0);
+    let outer = r + ring;
+    let disc = |cv: &mut Canvas, r: f32, col: [u8; 3]| {
+        cv.fill_round_rect(Rect::new(cx - r, cy - r, cx + r, cy + r), r, col, 1.0);
+    };
+    disc(cv, outer, TEXT);
+    disc(cv, r, RECORDING);
+}
 
 pub(crate) fn ui_font() -> Option<&'static FontVec> {
     static FONT: OnceLock<Option<FontVec>> = OnceLock::new();

@@ -96,6 +96,13 @@ static TRAY_TID: AtomicU32 = AtomicU32::new(0);
 pub fn run(backend: WasapiBackend) -> Result<()> {
     let mut config = Config::load();
 
+    // This thread's id, needed before anything is drawn: the endpoint notifications and the
+    // scroll hook below both post here, and so does the microphone watch — which is
+    // registered *first* so that an app starting to record during startup is not missed
+    // between the strip being drawn and the loop being ready to hear about it.
+    let thread_id = unsafe { GetCurrentThreadId() };
+    crate::audio::mic::notify_thread(thread_id);
+
     // Receives clicks from the injected strip. Created before the injection, so a
     // strip that comes up immediately already has somewhere to post to. Also how we
     // learn that Explorer restarted — see `create_receiver`.
@@ -127,7 +134,6 @@ pub fn run(backend: WasapiBackend) -> Result<()> {
     let tray = build_tray(&backend, &config)?;
 
     // Register endpoint-change notifications that wake this thread's message loop.
-    let thread_id = unsafe { GetCurrentThreadId() };
     let _notifications = notify::register(thread_id)?;
 
     // Scroll over the taskbar/tray to change a device's volume.
@@ -171,6 +177,27 @@ pub fn run(backend: WasapiBackend) -> Result<()> {
                 .as_bool()
                 {}
                 refresh(&backend, &tray, &config);
+                continue;
+            }
+            // An app took the microphone, or let it go. Nothing else about the strip has
+            // changed, so amend the dot in place rather than re-reading the devices — see
+            // [`push_mic_state`]. Drained first for the same reason the refresh above is:
+            // the state comes from the watcher's atomic, so only the last message says
+            // anything the ones behind it do not.
+            if msg.message == crate::audio::mic::WM_MIC_CHANGED {
+                let mut extra = MSG::default();
+                while PeekMessageW(
+                    &mut extra,
+                    None,
+                    crate::audio::mic::WM_MIC_CHANGED,
+                    crate::audio::mic::WM_MIC_CHANGED,
+                    PM_REMOVE,
+                )
+                .as_bool()
+                {}
+                if !push_mic_state(crate::audio::mic::in_use()) {
+                    refresh(&backend, &tray, &config);
+                }
                 continue;
             }
             // Scroll over a button (or anywhere on the tray, from the wheel hook) → nudge
@@ -565,6 +592,18 @@ fn handle_flyout(
     if outcome.config_changed || outcome.output_changed {
         refresh(backend, tray, config);
     }
+    // The flyout swallows [`crate::audio::mic::WM_MIC_CHANGED`] the same way, and worse: it
+    // is a *thread* message, so the flyout's pump retrieves it, has no window to dispatch it
+    // to, and drops it. An app that started or stopped recording while the panel was open
+    // would leave the strip's dot wrong until the next thing to touch the strip. Reconciling
+    // here costs an atomic read, and nothing at all if the answer has not moved — including
+    // after the refresh just above, which already read the dot along with everything else.
+    //
+    // Only with a strip up: it is the one surface that has to be *told*. The flyout and the
+    // readout paint from the same atomic every time they are drawn.
+    if crate::taskbar::strip_is_up() && !push_mic_state(crate::audio::mic::in_use()) {
+        refresh(backend, tray, config);
+    }
     if outcome.restart {
         restart_app();
     }
@@ -693,16 +732,24 @@ fn refresh(backend: &WasapiBackend, tray: &TrayIcon, config: &Config) {
 }
 
 /// Tell the strip what to draw, unless it is already drawing exactly that.
-fn push_strip(icons: crate::taskbar::StripIcons) {
+///
+/// Returns whether the strip can be taken to be showing `icons` afterwards — either
+/// because it already was, or because the restyle went out.
+fn push_strip(icons: crate::taskbar::StripIcons) -> bool {
     let mut applied = match STRIP_APPLIED.lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     };
+    if *applied == Some(icons) {
+        return true;
+    }
     // Only recorded when the post actually went out, so a restyle dropped for want
     // of a control window is retried rather than assumed.
-    if *applied != Some(icons) && crate::taskbar::restyle(icons) {
+    if crate::taskbar::restyle(icons) {
         *applied = Some(icons);
+        return true;
     }
+    false
 }
 
 /// Push the current defaults to the strip, for the flyout — which changes devices
@@ -710,6 +757,33 @@ fn push_strip(icons: crate::taskbar::StripIcons) {
 /// cannot do it until the flyout closes.
 pub(crate) fn restyle_strip(backend: &WasapiBackend, config: &Config) {
     push_strip(strip_icons(backend, config));
+}
+
+/// Put the recording dot on the input button, or take it off, without asking the
+/// audio devices anything.
+///
+/// The answer to "is an app recording" arrives on its own schedule (an app opens or
+/// closes a stream — see [`crate::audio::mic`]), and none of the rest of the strip
+/// has changed with it. A full [`refresh`] would re-enumerate both directions and
+/// re-read their mute state for a single bit, on the same critical path a click uses:
+/// measured at 119–383ms. So this amends the state already on screen, exactly as
+/// [`preview_strip`] does for a click.
+///
+/// Returns whether the amendment landed. `false` means there was nothing recorded to
+/// amend, or the restyle never went out, and the caller has to fall back to a full
+/// [`refresh`] — which reads the dot from [`Current::read`] like everything else.
+///
+/// That fallback is not a formality: the strip is normally drawn from the *injection's*
+/// init data, and a restyle posted before the TAP has a control window is deliberately
+/// dropped rather than remembered (see [`crate::taskbar::restyle`]). Nothing minded that
+/// before, because the init data already carried the right glyphs — but recording state
+/// can change after it was read, so this is the one thing that has to get through.
+fn push_mic_state(recording: bool) -> bool {
+    let Some(mut icons) = strip_applied() else {
+        return false;
+    };
+    icons.input_recording = recording;
+    push_strip(icons)
 }
 
 fn strip_applied() -> Option<crate::taskbar::StripIcons> {
@@ -859,6 +933,10 @@ impl Current {
             input: crate::taskbar::strip_glyph(self.input.icon),
             output_muted: self.output.muted,
             input_muted: self.input.muted,
+            // Not part of an `Endpoint`, deliberately: "something is recording" is a
+            // property of the microphone capability rather than of any one endpoint, and
+            // it is answered from a cached atomic rather than by asking COM.
+            input_recording: crate::audio::mic::in_use(),
         }
     }
 }

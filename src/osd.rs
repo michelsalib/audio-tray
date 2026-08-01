@@ -43,8 +43,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use crate::audio::Flow;
 use crate::canvas::{measure, Canvas, Rect};
 use crate::flyout::theme::{
-    accent_rgb, ui_font, GLYPH_MIC, GLYPH_MIC_OFF, GLYPH_MUTE, GLYPH_VOLUME, TEXT, TINT, TINT_A,
-    TRACK_H,
+    accent_rgb, recording_dot, ui_font, GLYPH_MIC, GLYPH_MIC_OFF, GLYPH_MUTE, GLYPH_VOLUME, TEXT,
+    TINT, TINT_A, TRACK_H,
 };
 use crate::icons;
 
@@ -300,7 +300,15 @@ impl Osd {
         let gpx = (GLYPH_PX * scale).round() as u32;
         if let Ok((rgba, gw, gh)) = icons::render_glyph(glyph, gpx, glyph_col) {
             let gx = (GLYPH_CX * scale).round() as i32 - gw as i32 / 2;
-            cv.blit(gx, cy as i32 - gh as i32 / 2, &rgba, gw, gh, 1.0);
+            let gy = cy as i32 - gh as i32 / 2;
+            cv.blit(gx, gy, &rgba, gw, gh, 1.0);
+            // …and if an app is holding the microphone open, the same dot the strip and the
+            // flyout put on that glyph. Read here rather than passed in because it is not
+            // part of the gesture: what the readout reports is the level, and this is the
+            // state of the world at the moment it is drawn.
+            if flow == Flow::Input && crate::audio::mic::in_use() {
+                recording_dot(&mut cv, gx, gy, gpx);
+            }
         }
 
         // Track, then the fill. No thumb, deliberately: this is a readout, and a thumb

@@ -153,6 +153,18 @@ pub fn run(backend: WasapiBackend) -> Result<()> {
     };
     println!("tray: created ({devices} output device(s)); {gestures}.");
 
+    // The YouTube Music half, on a thread of its own. It has to be a thread: every SMTC call blocks
+    // on the async operation it returns, and *this* thread is an STA that owns windows, where that
+    // deadlocks — see `music::on_mta_thread`. `None` means switched off in config, or SMTC would not
+    // open; neither is a reason to take the audio half down.
+    //
+    // Held to the end of `run` on purpose: dropping the handle is what tears the feature down, and the
+    // progress bar it puts on the player's taskbar button would otherwise outlive us.
+    let music = crate::music::spawn(&config.music);
+    if music.is_some() {
+        println!("music: following YouTube Music");
+    }
+
     let tray_rx = TrayIconEvent::receiver();
     // Gestures older than this are the flyout's own opening or dismissing click
     // arriving again — see [`settle_after_flyout`].

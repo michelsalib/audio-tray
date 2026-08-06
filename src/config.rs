@@ -19,6 +19,41 @@ use crate::icons::IconId;
 pub struct Config {
     /// endpoint id string -> chosen built-in icon
     pub icons: HashMap<String, IconId>,
+    /// The YouTube Music half of the app — see [`crate::music`].
+    pub music: Music,
+}
+
+/// Following YouTube Music, and drawing it into the taskbar.
+///
+/// **On by default, which is defensible because it is invisible until it applies.** Nothing here
+/// happens without a YouTube Music media session on the machine: no session, no state to publish, no
+/// progress bar, no tile. A user who never opens the player never sees a difference.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Music {
+    /// Follow the player at all. `false` turns the whole feature off, progress bar included.
+    pub enabled: bool,
+    /// Draw the strip into this app's own taskbar button, matched on its name.
+    ///
+    /// The app's *own* button, so the shell keeps doing the things it already does well: launching
+    /// adds no second icon, minimising goes there, and dragging reorders it. Empty means no strip —
+    /// the feed and the progress bar still work.
+    pub tile: String,
+    /// Pin the SMTC app id instead of guessing it.
+    ///
+    /// Needed only when the built-in matching misses an unusual build: the id is a Chromium
+    /// implementation detail, and `audio-tray --music-probe` prints the real one.
+    pub app_id: Option<String>,
+}
+
+impl Default for Music {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            tile: "YouTube Music".to_string(),
+            app_id: None,
+        }
+    }
 }
 
 impl Config {

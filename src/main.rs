@@ -57,6 +57,7 @@ mod config;
 mod flyout;
 mod icons;
 mod layered;
+mod music;
 mod osd;
 mod taskbar;
 mod tray;
@@ -251,6 +252,20 @@ fn main() -> Result<()> {
             println!("taskbar: restarting Explorer...");
             taskbar::restart_explorer()?;
             println!("taskbar: done.");
+        }
+        // The music half's diagnostics. Both exist because the interesting failures are in *other*
+        // processes: which SMTC session is YouTube Music (Chromium decides the app id), and whether
+        // the player publishes a position at all.
+        Some("--music-probe") => music::probe()?,
+        Some("--music-timeline") => music::report_timeline()?,
+        Some("--music-windows") => {
+            let windows = music::player::player_windows();
+            if windows.is_empty() {
+                println!("no window with 'youtube' in its title");
+            }
+            for line in windows {
+                println!("{line}");
+            }
         }
         Some("--taskbar-revert") => {
             // Ask whatever TAP is loaded to put the taskbar back, without touching

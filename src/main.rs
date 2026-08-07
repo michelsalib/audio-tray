@@ -253,11 +253,25 @@ fn main() -> Result<()> {
             taskbar::restart_explorer()?;
             println!("taskbar: done.");
         }
-        // The music half's diagnostics. Both exist because the interesting failures are in *other*
-        // processes: which SMTC session is YouTube Music (Chromium decides the app id), and whether
-        // the player publishes a position at all.
+        // The music half's diagnostics. They exist because the interesting failures are all in *other*
+        // processes: which SMTC session is YouTube Music (Chromium decides the app id), whether the
+        // player publishes a position at all, and whether the shell still lets us put a progress bar
+        // on somebody else's window.
         Some("--music-probe") => music::probe()?,
         Some("--music-timeline") => music::report_timeline()?,
+        Some("--music-progress") => {
+            let value = args.get(2).map(String::as_str).unwrap_or("off");
+            let fraction = match value {
+                "off" | "none" => None,
+                percent => Some(
+                    percent.parse::<f64>().with_context(|| {
+                        format!("--music-progress wants a percentage or 'off', got {percent:?}")
+                    })? / 100.0,
+                ),
+            };
+            music::player::set_player_progress(fraction, true)?;
+            println!("music: progress -> {fraction:?}");
+        }
         Some("--music-windows") => {
             let windows = music::player::player_windows();
             if windows.is_empty() {

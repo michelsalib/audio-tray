@@ -182,7 +182,13 @@ impl Timeline {
 /// A transport command, as the strip's buttons express it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Command {
+    // The strip only ever toggles — one button, and SMTC own `TryTogglePlayPauseAsync` is what keeps
+    // it honest when the session changed state behind us. These two are kept because this is a
+    // faithful wrapper over the API, and a caller that knows which way it wants should not have to
+    // add them back.
+    #[allow(dead_code)]
     Play,
+    #[allow(dead_code)]
     Pause,
     TogglePlayPause,
     Next,

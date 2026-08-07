@@ -19,6 +19,7 @@ mod interact;
 mod ipc;
 pub mod lifecycle;
 mod log;
+pub mod music;
 mod reorder;
 mod restore;
 mod tree;
@@ -439,6 +440,13 @@ impl Tap_Impl {
                 if let Ok(mut strip) = STRIP.lock() {
                     *strip = Some(decorate::StripState::parse(&data));
                 }
+                // The music tile is opt-in through the same payload: `tile=<app name>` names whose
+                // taskbar button to draw the now-playing strip into, and its absence disables that
+                // half without touching the audio one.
+                music::tile::set_host(value_from(&data, "tile"));
+                if let Some(width) = value_from(&data, "strip").and_then(|w| w.parse().ok()) {
+                    music::layout::set_content_width(width);
+                }
                 // Whoever asked for the strip is also who we put it away for.
                 lifecycle::watch_owner(value_from(&data, "pid"));
             }
@@ -623,7 +631,12 @@ pub(crate) unsafe fn stand_down() {
     GENERATION.fetch_add(1, Ordering::SeqCst);
 
     match diagnostics() {
-        Some(diagnostics) => restore::revert(&diagnostics),
+        Some(diagnostics) => {
+            restore::revert(&diagnostics);
+            // The music tile keeps its own record, because what it has to put back is different in
+            // kind: widths and margins on the *shell own* elements, not content in ours.
+            music::revert(&diagnostics);
+        }
         // Without diagnostics no handle can be resolved, so there is no way to
         // put anything back. Say so rather than reporting a silent success.
         None => logf!("stand down: no IXamlDiagnostics — cannot revert"),
@@ -776,6 +789,13 @@ pub(crate) unsafe fn sweep() {
     }
 
     report_slot_metrics(&diagnostics);
+
+    // The music tile, last: it decorates a *different* element from everything above — an app own
+    // taskbar button rather than our notify icon — so nothing here depends on it and it depends on
+    // nothing here except the two guards at the top of this function, which are the whole reason a
+    // `put_*` against a taskbar element is safe at all.
+    music::sweep(&diagnostics);
+    music::tick::wire(&diagnostics);
 
     // Nothing left to apply — drop to the slow cadence until something comes
     // undone. `strip_placed` going false again (the shell re-binding the

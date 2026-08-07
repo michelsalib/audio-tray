@@ -347,12 +347,19 @@ const PILL_ALPHA: &str = "80";
 /// now says instead — the volume glyph, and the microphone icon that appears while
 /// something is recording, which our input button carries as a red dot. Both are put back
 /// on revert, and neither is touched until our strip is actually on screen.
+/// `tile=` is the music half's share of the payload: whose taskbar button to draw the now-playing
+/// strip into, empty for "do not". It comes from config rather than from an argument because, unlike
+/// the glyphs, it never changes while we run — the button is chosen by the user, not by which device
+/// happens to be default — and because the strip's *content* does not travel this way at all. That
+/// goes through a file the TAP re-reads, since cover art has to reach XAML as an image source.
 fn init_data(icons: StripIcons) -> String {
     let [r, g, b] = crate::flyout::theme::accent_rgb();
+    let music = crate::config::Config::load().music;
+    let tile = if music.enabled { music.tile } else { String::new() };
     format!(
         "tooltip={};out={:04X};in={:04X};\
          outmuted={};inmuted={};inrec={};accent={r:02X}{g:02X}{b:02X};alpha={PILL_ALPHA};\
-         hidevolume=1;hidemic=1;pid={}",
+         hidevolume=1;hidemic=1;tile={tile};pid={}",
         crate::tray::TRAY_MARKER,
         icons.output as u32,
         icons.input as u32,
@@ -421,6 +428,12 @@ pub enum Action {
     CycleOutput,
     CycleInput,
     OpenPanel,
+    /// A transport glyph on the music tile. Codes 10+, deliberately far from the audio ones: the two
+    /// halves of the TAP post to the same window and mean unrelated things, and adjacent codes invite
+    /// an off-by-one that would cycle an audio device on a play click.
+    MusicPrevious,
+    MusicPlayPause,
+    MusicNext,
 }
 
 impl Action {
@@ -431,6 +444,9 @@ impl Action {
             1 => Some(Self::CycleOutput),
             2 => Some(Self::CycleInput),
             3 => Some(Self::OpenPanel),
+            10 => Some(Self::MusicPrevious),
+            11 => Some(Self::MusicPlayPause),
+            12 => Some(Self::MusicNext),
             _ => None,
         }
     }
@@ -441,6 +457,9 @@ impl Action {
             Self::CycleOutput => 1,
             Self::CycleInput => 2,
             Self::OpenPanel => 3,
+            Self::MusicPrevious => 10,
+            Self::MusicPlayPause => 11,
+            Self::MusicNext => 12,
         }
     }
 }

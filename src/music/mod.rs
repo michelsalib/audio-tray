@@ -22,13 +22,6 @@
 //! the only way to hand XAML a bitmap it did not create is a path — so a file is in play regardless,
 //! and one mechanism beats two.
 
-// **Temporary, and it says exactly what is missing.** The feed, the state file and the progress bar
-// are wired into the tray's poll; the *click* half — transport commands and activating the player —
-// has nothing to call it yet, because the clicks arrive from the TAP and the TAP has not been taught
-// to draw this strip. Remove this with that commit; until then every name under it is either live or
-// waiting for one specific caller.
-#![allow(dead_code)]
-
 pub mod feed;
 pub mod player;
 pub mod progress;
@@ -80,7 +73,6 @@ fn enter_mta() {
 /// What the tray thread can ask the music thread to do.
 enum Request {
     Command(smtc::Command),
-    Activate,
     /// Publish and put the progress bar back, then stop. Sent by [`Handle::drop`].
     ShutDown,
 }
@@ -101,11 +93,11 @@ impl Handle {
         let _ = self.requests.send(Request::Command(command));
     }
 
-    /// The strip body's click: bring the player forward, or launch it.
-    pub fn activate(&self) {
-        let _ = self.requests.send(Request::Activate);
-    }
 }
+// There is deliberately no `activate` here. The strip *body* is left to the shell — clicking an app's
+// own taskbar button already means "bring it forward or minimise it", and its press is the
+// drag-to-reorder gesture — so the only place that raises the player is the cold-start fallback in
+// [`Music::command`], where there is no session for a transport click to address.
 
 impl Drop for Handle {
     /// **The teardown has to happen, and this is the only place that can guarantee it.** The state
@@ -227,14 +219,6 @@ impl Music {
         self.poll();
     }
 
-    /// Bring the player forward, or launch it — the strip body's click.
-    pub fn activate(&mut self) {
-        match player::activate_player(self.feed.current_app_id()) {
-            Ok(what) => println!("music: activate -> {what:?}"),
-            Err(err) => eprintln!("music: could not bring the player forward: {err:#}"),
-        }
-    }
-
     /// Hand back everything this feature put somewhere else, before exiting.
     ///
     /// The state file goes so a strip left on screen has nothing to show, and the progress bar goes
@@ -259,7 +243,6 @@ impl Music {
         loop {
             match inbox.recv_timeout(POLL) {
                 Ok(Request::Command(command)) => self.command(command),
-                Ok(Request::Activate) => self.activate(),
                 Ok(Request::ShutDown) => {
                     self.shut_down();
                     return;
@@ -352,13 +335,14 @@ fn report_position(feed: &mut Ytm) -> Result<()> {
         }
         match feed.timeline(&app_id)? {
             Some(timeline) => println!(
-                "t+{}s  position {:.1}s / {}  last updated {}",
+                "t+{}s  position {:.1}s / {}  published {}  last updated {}",
                 sample * 3,
                 timeline.position_seconds(),
                 timeline
                     .duration_seconds()
                     .map(|d| format!("{d:.1}s"))
                     .unwrap_or_else(|| "unknown".into()),
+                timeline.is_published(),
                 timeline.last_updated,
             ),
             None => println!("t+{}s  the session went away", sample * 3),

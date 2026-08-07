@@ -245,7 +245,7 @@ pub fn run(backend: WasapiBackend) -> Result<()> {
                     // away mid-click, and letting one failed gesture out of the
                     // loop would exit the app — the same trap `try_refresh`
                     // documents. A lost click is recoverable; a lost tray is not.
-                    if let Err(e) = handle_taskbar_action(&backend, &mut config, &tray, action) {
+                    if let Err(e) = handle_taskbar_action(&backend, &mut config, &tray, music.as_ref(), action) {
                         eprintln!("taskbar: {action:?} failed ({e:#})");
                         // The strip may be previewing a switch that then failed, and
                         // the refresh that would have corrected it was skipped along
@@ -500,9 +500,11 @@ fn handle_taskbar_action(
     backend: &WasapiBackend,
     config: &mut Config,
     tray: &TrayIcon,
+    music: Option<&crate::music::Handle>,
     action: crate::taskbar::Action,
 ) -> Result<()> {
     use crate::audio::Flow;
+    use crate::music::smtc::Command;
     use crate::taskbar::Action;
 
     let flow = match action {
@@ -511,6 +513,21 @@ fn handle_taskbar_action(
         // No anchor: the strip is not the tray icon, so its rect is not ours to
         // know here. The flyout falls back to its default placement.
         Action::OpenPanel => return handle_flyout(backend, config, tray, None),
+        // A transport glyph on the music tile. Handed to the feed thread and **not** awaited: this is
+        // the STA that owns the tray, and the whole reason the feed lives elsewhere is that a media
+        // session which is slow to answer must not stall it. The strip catches up on the next poll.
+        Action::MusicPrevious | Action::MusicPlayPause | Action::MusicNext => {
+            let Some(music) = music else {
+                println!("taskbar: {action:?} ignored — the music half is not running");
+                return Ok(());
+            };
+            music.command(match action {
+                Action::MusicPrevious => Command::Previous,
+                Action::MusicNext => Command::Next,
+                _ => Command::TogglePlayPause,
+            });
+            return Ok(());
+        }
     };
 
     let devices = backend.enumerate_flow(flow)?;

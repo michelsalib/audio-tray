@@ -43,6 +43,19 @@
 //!   audio-tray --taskbar-restart
 //!                         restart explorer.exe, as the flyout footer's button does.
 //!                         Frees the TAP DLL, so it also applies a staged update to it.
+//!   audio-tray --music-probe
+//!                         list every media session on the machine with its app id, and
+//!                         say which one was matched as YouTube Music — the answer to
+//!                         put in `music.app_id` when the matching misses
+//!   audio-tray --music-timeline
+//!                         sample the matched session's position over a few seconds, which
+//!                         is how the checkpoint-not-a-clock behaviour was measured
+//!   audio-tray --music-progress <percent|off>
+//!                         put a taskbar progress bar on the player's window by hand, to
+//!                         separate "the shell refused it" from "the position was wrong"
+//!   audio-tray --music-windows
+//!                         survey the player's windows (pid, visibility, cloaking, rect),
+//!                         in the process that acts on them — PowerShell cannot do this
 
 use anyhow::{bail, Context, Result};
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};

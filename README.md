@@ -4,7 +4,7 @@
 [![Release](https://github.com/michelsalib/audio-tray/actions/workflows/release.yml/badge.svg)](https://github.com/michelsalib/audio-tray/releases/latest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-A tiny Windows system-tray app for **controlling your audio without digging through Settings** — switch the default output/input device, set volume, and mute, all from one native-feeling flyout.
+A tiny Windows system-tray app for **controlling your audio without digging through Settings** — switch the default output/input device, set volume, and mute, all from one native-feeling flyout. It also turns the YouTube Music PWA's taskbar icon into a now-playing strip.
 
 <p align="center">
   <img src="assets/app.ico" width="96" alt="Audio Tray icon">
@@ -30,6 +30,11 @@ A tiny Windows system-tray app for **controlling your audio without digging thro
   own "microphone in use" indicator does (which it replaces, see below), so it covers
   every app and every microphone, and it stays lit while an app holds the stream open
   even if you are muted.
+- **YouTube Music in its own taskbar button** — the PWA's icon becomes a 240-epx strip
+  showing the track, the artist, and previous/play-pause/next, with the song's position
+  on the progress line Windows already draws under an icon. It is the app's *own* button,
+  so launching adds no second icon, minimising still goes there, and it still drags to
+  reorder. See [the YouTube Music tile](#the-youtube-music-tile).
 - **Falls back to a plain tray icon** if the taskbar controls cannot be drawn — an
   icon reflecting the current output device (speakers, headphones, headset, HDMI…),
   rendered from Segoe Fluent Icons and themed to your taskbar. Either button opens
@@ -77,10 +82,25 @@ audio-tray --set <q>  switch default output to a device by name substring or id
 audio-tray --update   check GitHub Releases and self-update now
 audio-tray --taskbar-revert
                       put the taskbar back, without stopping the running tray
+audio-tray --music-probe
+                      list every media session with its app id, and which one matched
+audio-tray --music-timeline
+                      sample the matched session's position over a few seconds
+audio-tray --music-progress <percent|off>
+                      set the progress bar on the player's window by hand
+audio-tray --music-windows
+                      survey the player's windows (pid, visibility, cloaking, rect)
 ```
 
-Configuration (per-device icon overrides) is stored at
-`%APPDATA%\AudioTray\config\config.toml`.
+Configuration is stored at `%APPDATA%\AudioTray\config\config.toml`: per-device icon
+overrides, and the music tile —
+
+```toml
+[music]
+enabled = true            # false turns the whole music half off, progress bar included
+tile = "YouTube Music"    # the taskbar button to draw into; "" = feed only, no strip
+# app_id = "..."          # pin the SMTC app id, if --music-probe shows a miss
+```
 
 ## Taskbar controls
 
@@ -122,6 +142,39 @@ things worth knowing:
 
 The engineering notes, including the failure modes found along the way, are in
 [crates/taskbar-tap/FINDINGS.md](crates/taskbar-tap/FINDINGS.md).
+
+## The YouTube Music tile
+
+The same injection that draws the audio buttons also replaces the YouTube Music PWA's
+taskbar icon with a now-playing strip: the track title (scrolling when it does not fit),
+the artist under it, and previous / play-pause / next.
+
+| Where | What |
+|-------|------|
+| The strip's body | The shell's own click — activates the player, or minimises it; drag still reorders the icon |
+| The three glyphs | Previous, play/pause, next, sent to the player's media session |
+| Under the icon | The song's position, on the progress line Windows draws for any app — accent while playing, yellow when paused |
+| The running pill | Left where it means something: under the icon, not centred in a 240-epx button |
+
+It follows the media session, not YouTube Music's process, so it needs no extension, no
+API key and no login. Things worth knowing:
+
+- **It is invisible until it applies.** No YouTube Music session on the machine means no
+  state published, no progress bar and no strip — a user who never opens the player sees
+  no difference at all. That is why it is on by default.
+- **The icon must be on the taskbar**, pinned or running, and not in the overflow.
+- **A play click with nothing playing raises the player** instead of synthesising a media
+  key. A Chromium media session does not exist until media has played, and a media key
+  goes to whichever app Windows thinks owns them — which on this machine paused MPC-HC.
+- **The position is interpolated, not polled.** The player publishes a checkpoint with a
+  timestamp rather than a running clock, so the bar advances locally between checkpoints;
+  see FINDINGS.
+- **Nothing of the player's is kept.** Quitting, `--taskbar-revert`, or Explorer
+  restarting all put the button back — width, icon, indicators — and the progress bar is
+  cleared off the player's window on the way out.
+
+Turn it off, or point it at a different app, with the `[music]` section of the config
+above.
 
 ## Auto-update
 

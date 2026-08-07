@@ -28,6 +28,7 @@ pub mod progress;
 pub mod publish;
 pub mod session;
 pub mod smtc;
+pub mod thumbbar;
 
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::time::Duration;
@@ -152,6 +153,8 @@ pub struct Music {
     feed: Ytm,
     publisher: publish::Publisher,
     progress: progress::Progress,
+    /// The transport buttons under the player's hover preview — the shell's own thumbnail toolbar.
+    toolbar: thumbbar::Toolbar,
 }
 
 impl Music {
@@ -161,6 +164,7 @@ impl Music {
             feed: Ytm::new(pinned).context("opening the SMTC session manager")?,
             publisher: publish::Publisher::new(),
             progress: progress::Progress::new(),
+            toolbar: thumbbar::Toolbar::new(),
         })
     }
 
@@ -196,6 +200,10 @@ impl Music {
         if let Err(err) = self.progress.update(timeline, playing) {
             eprintln!("music: could not set the progress bar: {err:#}");
         }
+        // The transport buttons under the hover preview. Driven from the same poll as the bar
+        // because they carry the same one bit of state — whether it is playing, which decides the
+        // play/pause glyph — and an update that costs nothing when it has not changed.
+        self.toolbar.update(playing);
     }
 
     /// Send a transport command, and republish immediately.
@@ -227,6 +235,7 @@ impl Music {
     pub fn shut_down(&mut self) {
         self.publisher.clear();
         self.progress.clear();
+        self.toolbar.clear();
     }
 
     /// The thread body: poll on a timer of our own, and act on what the tray sends.

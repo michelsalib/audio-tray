@@ -16,6 +16,7 @@
 
 pub mod layout;
 pub mod state;
+pub mod thumbbar;
 pub mod tick;
 pub mod ticker;
 pub mod tile;
@@ -47,6 +48,21 @@ pub fn placed_border() -> Option<InstanceHandle> {
     guard.as_ref().map(|placed| placed.border)
 }
 
+// **The hover preview is deliberately left alone.** Replacing its content with a now-playing card
+// was built and abandoned, and the two measurements that killed it are worth keeping:
+//
+// * **There is one `ContentPresenter#HoverFlyoutContent`, shared by every taskbar button** — not one
+//   per flyout, as its animation suggests. The shell shows a different app by *updating* the
+//   `TaskItemThumbnailList` inside it, so replacing the content leaves nothing for it to update and
+//   the card appears on every app's preview.
+// * **Handing it back on the next sweep does not rescue it.** Ownership can only be re-checked when
+//   the timer next runs, so a foreign preview shows our card until it does, and our own shows the
+//   shell's thumbnail until it does — a visible flip-flop either way, with no event to hang the work
+//   on instead (`OnVisualTreeChange` may not mutate XAML; it wedges the shell).
+//
+// The transport controls live on the shell's own thumbnail toolbar instead — `ITaskbarList3::
+// ThumbBarAddButtons`, driven from audio-tray in `music::thumbbar`, which needs no XAML at all.
+
 /// One pass: find the button, put the strip in it, and keep it there.
 ///
 /// # Safety
@@ -62,6 +78,11 @@ pub unsafe fn sweep(diagnostics: &IXamlDiagnostics) {
     let Some(strip) = state::Strip::read() else {
         return;
     };
+
+    // The transport buttons under the hover preview. Drawn by the shell at audio-tray's request and
+    // wired here, because the click the shell raises goes to the player's window rather than to us.
+    // Cheap and quiet when no preview is open: one lookup by type that finds nothing.
+    thumbbar::wire(diagnostics, &host);
 
     let Some(button) = find_button(diagnostics, &host) else {
         return;

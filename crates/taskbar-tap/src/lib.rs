@@ -805,7 +805,17 @@ pub(crate) unsafe fn sweep() {
     // `put_Content` returns rather than during it, so they are always queued for
     // the following tick. Without it the pace dropped first and hover took an idle
     // interval to arrive instead of a fast one.
-    let settled = strip_placed() && REORDERED.load(Ordering::SeqCst) && segments_wired();
+    // **The music tile never settles, and that is deliberate.** The shell rebuilds the hover
+    // preview's thumbnail-toolbar buttons on every hover, so `music::thumbbar::wire` has to catch
+    // them inside that window — at the idle 4s cadence a hover is usually over before a sweep looks,
+    // and the buttons the user is pointing at would still be dead. There is no event to wait on
+    // instead: `OnVisualTreeChange` may not mutate XAML (it wedges the shell), so the timer is the
+    // only place the work can happen and it has to already be running. The cost is a 250ms tick
+    // whose music half, with no preview open, is one lookup by type that finds nothing.
+    let settled = strip_placed()
+        && REORDERED.load(Ordering::SeqCst)
+        && segments_wired()
+        && music::tile::host().is_none();
     lifecycle::set_sweep_pace(settled);
 }
 

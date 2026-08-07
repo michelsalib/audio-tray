@@ -88,9 +88,44 @@ impl Strip {
     }
 
     /// Read the published state, or `None` if the app has not written one yet.
+    ///
+    /// **Cached on the file's modification time.** The sweep that calls this runs up to four times a
+    /// second while there is work outstanding, and re-reading and re-parsing an unchanged file on
+    /// every one of those ticks is work done on the shell's UI thread for an answer that cannot have
+    /// changed. A stat is what is left.
+    ///
+    /// Keyed on mtime *and* length: a state file rewritten within the filesystem's timestamp
+    /// resolution is possible — audio-tray writes on every track change and every play/pause — and
+    /// the two together have never been seen to collide where mtime alone could.
     pub fn read() -> Option<Self> {
-        let text = std::fs::read_to_string(state_path()).ok()?;
-        Some(Self::parse(&text))
+        use std::sync::Mutex;
+        static CACHED: Mutex<Option<(u64, u64, Strip)>> = Mutex::new(None);
+
+        let path = state_path();
+        let stamp = std::fs::metadata(&path).ok().and_then(|meta| {
+            let modified = meta
+                .modified()
+                .ok()?
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()?;
+            Some((modified.as_nanos() as u64, meta.len()))
+        });
+
+        let mut cache = match CACHED.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let (Some((mtime, len)), Some((known_mtime, known_len, strip))) = (stamp, cache.as_ref())
+        {
+            if mtime == *known_mtime && len == *known_len {
+                return Some(strip.clone());
+            }
+        }
+
+        let text = std::fs::read_to_string(&path).ok()?;
+        let strip = Self::parse(&text);
+        *cache = stamp.map(|(mtime, len)| (mtime, len, strip.clone()));
+        Some(strip)
     }
 
     pub fn parse(text: &str) -> Self {

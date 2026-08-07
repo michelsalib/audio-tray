@@ -56,6 +56,10 @@
 //!   audio-tray --music-windows
 //!                         survey the player's windows (pid, visibility, cloaking, rect),
 //!                         in the process that acts on them — PowerShell cannot do this
+//!   audio-tray --music-thumbbar [playing|paused]
+//!                         put prev/play/next on the player's *hover preview* via the shell's
+//!                         own thumbnail toolbar — the measurement for whether that API
+//!                         accepts a window this process does not own
 
 use anyhow::{bail, Context, Result};
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
@@ -284,6 +288,13 @@ fn main() -> Result<()> {
             };
             music::player::set_player_progress(fraction, true)?;
             println!("music: progress -> {fraction:?}");
+        }
+        // The M12 spike: does the shell's own thumbnail toolbar accept a window we do not own?
+        // Nothing documents that case, and the answer decides whether the transport buttons can move
+        // off the strip and under the hover preview at all.
+        Some("--music-thumbbar") => {
+            let playing = !matches!(args.get(2).map(String::as_str), Some("paused"));
+            music::thumbbar::probe(playing)?;
         }
         Some("--music-windows") => {
             let windows = music::player::player_windows();

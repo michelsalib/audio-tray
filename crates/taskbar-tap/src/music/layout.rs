@@ -13,11 +13,16 @@
 
 /// The width the strip lays itself out in.
 ///
-/// 240 affords shell-sized controls while pushing the centred app cluster right by only ~48 epx —
-/// half the growth, which is what the repeater does with the space (measured). 480 was tried and
-/// works completely (46 title characters, all three controls drawn), so the number can be raised; it
-/// is a taskbar-crowding question from here, since a strip that wide starts squeezing the app icons.
-pub const STRIP_WIDTH: u32 = 240;
+/// **162, down from 240, because the transport controls left.** They are on the shell's own
+/// thumbnail toolbar under the hover preview now (`music::thumbbar`, audio-tray side), which frees
+/// the 78 epx three buttons occupied. That width goes back to the taskbar rather than into the text
+/// column: the column keeps the 120 epx it was measured and calibrated at, and the app icons stop
+/// being squeezed toward the shell's compressed layout.
+///
+/// ```text
+/// 2·pad 4  +  cover 28  +  gap 6  +  text 120  +  slack 4  =  162
+/// ```
+pub const STRIP_WIDTH: u32 = 162;
 
 // How much wider than the strip the button has to be asked for is a property of *which* button —
 // 80 epx for the Widgets entry point, 4 for a task button — so it lives on `super::tile::Host` rather
@@ -83,8 +88,6 @@ pub struct Layout {
     /// Between the cover and the text.
     pub gap: u32,
     pub text: u32,
-    /// Each of the three transport buttons.
-    pub button: u32,
     pub title_chars: usize,
     pub artist_chars: usize,
 }
@@ -97,18 +100,21 @@ impl Layout {
     /// Whatever is left goes to the text column, because that is the only part with a graceful
     /// response to being short: the ticker scrolls it.
     pub fn for_width(strip: u32) -> Self {
-        let roomy = strip >= 200;
+        // **Recalibrated when the transport buttons left the strip.** The old threshold was 200 with
+        // three 26-epx buttons in the budget; the same amount of room for the parts that remain is
+        // 200 − 78 = 122. Keeping 200 here would have made the new 162-epx strip take the cramped
+        // branch and shrink a cover that now has more space, not less.
+        let roomy = strip >= 122;
         let pad = if roomy { 2 } else { 1 };
         let cover = if roomy { 28 } else { 26 };
         let gap = if roomy { 6 } else { 3 };
-        let button = if roomy { 26 } else { 19 };
 
         // **The slack is load-bearing, not rounding.** Segoe Fluent glyph ink overshoots its
         // layout box, so without it the trailing bar of the `next` glyph clips — measured twice
-        // at 144. It comes out of the text column for the same reason the text column gets the
-        // remainder.
+        // at 144. It is kept now the glyphs have gone because the same overshoot applies to the
+        // text column's last character against the plate's rounded corner.
         const SLACK: u32 = 4;
-        let fixed = 2 * pad + cover + gap + 3 * button + SLACK;
+        let fixed = 2 * pad + cover + gap + SLACK;
         let text = strip.saturating_sub(fixed);
 
         Self {
@@ -117,7 +123,6 @@ impl Layout {
             cover,
             gap,
             text,
-            button,
             // Rounded, not truncated: the 144 epx column is 7.0 title characters exactly, and
             // integer division would call it 6 and quietly scroll text that used to fit.
             title_chars: ((text * 100 + TITLE_EPX_PER_CHAR / 2) / TITLE_EPX_PER_CHAR) as usize,
@@ -145,13 +150,17 @@ pub fn layout() -> Layout {
     Layout::for_width(CONTENT_WIDTH.load(std::sync::atomic::Ordering::SeqCst))
 }
 
-/// `widen` is the M11 experiment (see [`crate::widen_host`]): the root plate asks for that
-/// many epx instead of [`STRIP_WIDTH`], and paints itself, so a screenshot shows exactly where
-/// the slot cuts it off. **The contents keep their 144 epx budget either way** — that is the
-/// point of putting the experiment in the plate rather than in the layout. A slot that refuses
-/// to grow therefore leaves a working strip instead of a clipped one, which is what made the
-/// last attempt at this ambiguous.
+// Historical, kept because the reasoning still applies to any future width experiment: the M11
+// `widen` probe had the root plate ask for more epx than [`STRIP_WIDTH`] and paint itself, so a
+// screenshot showed exactly where the slot cut it off — with the *contents* keeping their own
+// budget either way. Putting the experiment in the plate rather than in the layout is what made a
+// refused slot leave a working strip instead of a clipped one, which is what had made the previous
+// attempt ambiguous.
 
+/// The strip drawn into the app's taskbar button: cover, title, artist.
+///
+/// The transport controls are on the shell's thumbnail toolbar under the hover preview now — this
+/// surface is 162 epx of taskbar and spends all of it on saying what is playing.
 pub fn now_playing_markup(strip: &super::state::Strip) -> String {
     use super::state::escape;
 
@@ -222,62 +231,33 @@ pub fn now_playing_markup(strip: &super::state::Strip) -> String {
         artist = escape(&super::ticker::window(strip.display_artist(), l.artist_chars, 0)),
     );
 
-    // `glyph_name` lets the play/pause glyph be swapped in place when playback state changes —
-    // the same reason everything else here is named.
-    let button = |name: &str, glyph_name: &str, glyph: &str| {
-        format!(
-            r#"<Grid x:Name="{name}" Width="{button}" Background="Transparent">
-                 <TextBlock x:Name="{glyph_name}" Text="{glyph}" FontFamily="Segoe Fluent Icons"
-                            FontSize="12" HorizontalAlignment="Center" VerticalAlignment="Center"
-                            Foreground="{{ThemeResource SystemControlForegroundBaseHighBrush}}"/>
-               </Grid>"#,
-            button = l.button
-        )
-    };
-
-    // Both namespaces, `Background="Transparent"` on every hit target, and no
-    // `VerticalAlignment="Center"` on the outer panel — see `strip_markup` for why each of
-    // those is load-bearing.
-    // Our own tooltip, carrying the full untruncated title and artist — which is exactly what
-    // the scrolling ticker cannot show at a glance. Declared on our element rather than
-    // written onto the shell's button: a tooltip is resolved from the innermost element under
-    // the pointer, so ours wins without needing `SetValue` on an attached property (which
-    // would mean the whole XamlReader `Style`/`Setter` dance to obtain the
-    // `DependencyProperty`), and without an edit to revert.
-    let tooltip = match (strip.title.trim(), strip.artist.trim()) {
-        ("", "") => "audio-tray".to_string(),
-        (title, "") => title.to_string(),
-        (title, artist) => format!("{title}\n{artist}"),
-    };
-
+    // Both namespaces, and `Background="Transparent"` on the plate — see `strip_markup` for why
+    // each is load-bearing.
+    //
+    // **No `ToolTipService.ToolTip` here, and that is a requirement rather than a taste.** Measured:
+    // a tooltip declared on this element makes XAML's tooltip service own hover for the whole
+    // subtree, and the shell's `Taskbar.FlyoutFrame` preview then never opens at all — the tile was
+    // the one taskbar button with no window preview, and nothing said so. Removing it brings the
+    // preview straight back, which is also where the transport controls now are.
+    //
+    // **No transport glyphs either.** They are on the shell's thumbnail toolbar under that preview,
+    // where they cost no taskbar width. What is left is the thing a taskbar button should be: an
+    // icon and a label saying what is playing.
     format!(
         r#"<Border xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         x:Name="MusicTileStrip" Height="32" Width="{strip_px}" Padding="{pad},0,{pad},0"
-        Background="Transparent" HorizontalAlignment="Left"
-        ToolTipService.ToolTip="{tip}">
+        Background="Transparent" HorizontalAlignment="Left">
   <StackPanel Orientation="Horizontal" HorizontalAlignment="Left">
     {cover}
     {text}
-    {previous}
-    {toggle}
-    {next}
   </StackPanel>
 </Border>"#,
         strip_px = l.strip,
         pad = l.pad,
-        tip = escape(&tooltip),
-        previous = button("MusicTilePrevious", "MusicTilePreviousGlyph", "\u{E892}"),
-        toggle = button(
-            "MusicTilePlayPause",
-            "MusicTileToggleGlyph",
-            strip.playback.toggle_glyph()
-        ),
-        next = button("MusicTileNext", "MusicTileNextGlyph", "\u{E893}"),
     )
 }
 
-/// Point a named `Image` at a file on disk.
 /// Where the shell's running indicator has to sit to be under the strip's app icon: the centre of
 /// the cover square, in epx from the strip's left edge.
 ///
@@ -289,46 +269,59 @@ pub fn icon_centre() -> f64 {
     f64::from(layout.pad) + f64::from(layout.cover) / 2.0
 }
 
-/// The icon's left edge, in epx from the strip's left edge.
-pub fn icon_left() -> f64 {
-    f64::from(layout().pad)
-}
-
-/// The icon's width — what the shell's progress bar is sized to, so the line spans the icon exactly
-/// the way MPC-HC's does instead of stretching across the whole 244-epx button.
+/// The icon's width.
 pub fn icon_width() -> f64 {
     f64::from(layout().cover)
+}
+
+/// The strip's full width — what the shell's progress bar is sized to.
+///
+/// **The whole plate, not the icon.** Sizing the bar to the 28-epx cover was where it started, on the
+/// reasoning that it should sit under the app icon the way MPC-HC's does. On a strip that also
+/// carries the title and artist it reads as a stray underline instead: the bar is about the *track*,
+/// and the track is the whole strip. Spanning the plate makes it a progress bar for the thing the
+/// plate is showing, which is also the only reading at which its length means anything at a glance.
+pub fn strip_width() -> f64 {
+    f64::from(layout().strip)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// The 144 epx layout was tuned by hand and verified on screen before the slot could be
-    /// widened. It is no longer the default, but the *fixed* parts of the formula still have to
-    /// reproduce it exactly.
-    const HAND_TUNED: u32 = 144;
+    /// A width too small for the roomy branch, which still has to lay out rather than underflow.
+    const CRAMPED: u32 = 100;
 
     #[test]
-    fn the_hand_tuned_width_is_reproduced_exactly() {
-        let l = Layout::for_width(HAND_TUNED);
-        assert_eq!((l.pad, l.cover, l.gap, l.button), (1, 26, 3, 19));
-        assert_eq!(l.text, 52);
-        // 8 and 10, not the 7 and 9 this layout was eyeballed at: the character widths were
-        // remeasured off rendered text, and the old ones were 14 % too wide. See
-        // `TITLE_EPX_PER_CHAR`.
-        assert_eq!((l.title_chars, l.artist_chars), (8, 10));
+    fn a_cramped_width_takes_the_smaller_fixed_parts() {
+        let l = Layout::for_width(CRAMPED);
+        assert_eq!((l.pad, l.cover, l.gap), (1, 26, 3));
+        assert_eq!(l.text, 100 - (2 + 26 + 3 + 4));
     }
 
-    /// The shipped width, verified on a real taskbar: 240 of content with the `next` glyph intact
-    /// and both right corners of the plate cleanly rounded.
+    /// **The point of the move.** The transport buttons left for the hover preview, and the width
+    /// they occupied went back to the taskbar rather than into the text — the column keeps exactly
+    /// the 120 epx it was calibrated at, and the strip is 78 epx narrower than it was.
     #[test]
-    fn the_default_width_is_the_measured_one() {
-        assert_eq!(STRIP_WIDTH, 240);
+    fn the_default_width_keeps_the_calibrated_text_column() {
+        assert_eq!(STRIP_WIDTH, 162);
         let l = Layout::for_width(STRIP_WIDTH);
-        assert_eq!((l.pad, l.cover, l.gap, l.button), (2, 28, 6, 26));
-        assert_eq!(l.text, 120);
+        assert_eq!((l.pad, l.cover, l.gap), (2, 28, 6));
+        assert_eq!(l.text, 120, "the text column must survive the narrowing untouched");
         assert_eq!((l.title_chars, l.artist_chars), (18, 23));
+        // For the record: 162 + three 26-epx buttons is the 240 this strip used to be.
+    }
+
+    /// The recalibrated `roomy` threshold has to put the shipped width on the generous branch.
+    /// At the old 200 it would have taken the cramped one and shrunk a cover that gained room.
+    #[test]
+    fn the_shipped_width_is_on_the_roomy_branch() {
+        let shipped = Layout::for_width(STRIP_WIDTH);
+        let generous = Layout::for_width(400);
+        assert_eq!(
+            (shipped.pad, shipped.cover, shipped.gap),
+            (generous.pad, generous.cover, generous.gap)
+        );
     }
 
     /// **The dead space this recalibration exists to remove.** A title window has to come within a
@@ -355,7 +348,7 @@ mod tests {
             "{TITLE_LINE} + {ARTIST_LINE} > {TEXT_HEIGHT}"
         );
         // And the column cannot be taller than the strip, or the button clips it instead.
-        assert!(TEXT_HEIGHT <= 32);
+        const { assert!(TEXT_HEIGHT <= 32) };
     }
 
     /// The running indicator is placed against this, so it has to be the icon's centre and not the
@@ -371,21 +364,55 @@ mod tests {
 
     #[test]
     fn a_wider_slot_spends_it_on_the_text_column() {
-        let narrow = Layout::for_width(HAND_TUNED);
+        let narrow = Layout::for_width(CRAMPED);
         let wide = Layout::for_width(STRIP_WIDTH);
-        assert!(wide.text > narrow.text * 2, "{} vs {}", wide.text, narrow.text);
+        assert!(wide.text > narrow.text, "{} vs {}", wide.text, narrow.text);
         // The fixed parts grow too, but only once there is room for them.
-        assert!(wide.cover > narrow.cover && wide.button > narrow.button);
+        assert!(wide.cover > narrow.cover && wide.gap > narrow.gap);
     }
 
     /// The parts must never sum past the strip, at any width: overflowing is not a cosmetic
-    /// problem but the `next` glyph falling off the end, which is how it presented at 144.
+    /// problem but the last of the text falling outside the plate's rounded corner.
     #[test]
     fn the_parts_always_fit_the_budget() {
-        for width in HAND_TUNED..600 {
+        for width in CRAMPED..600 {
             let l = Layout::for_width(width);
-            let used = 2 * l.pad + l.cover + l.gap + l.text + 3 * l.button;
+            let used = 2 * l.pad + l.cover + l.gap + l.text;
             assert!(used <= width, "{width}: parts use {used}");
         }
+    }
+
+    /// The strip carries no transport glyphs — those are the shell's thumbnail toolbar now — and,
+    /// critically, **no tooltip**.
+    ///
+    /// The tooltip is the one that would fail silently: declaring it makes XAML's tooltip service own
+    /// hover for this subtree, and the shell's window preview then never opens. That cost the tile
+    /// the very surface the controls were moved to, and nothing in any log said so.
+    #[test]
+    fn the_strip_is_just_a_label_now() {
+        let markup = now_playing_markup(&super::super::state::Strip::default());
+        for name in ["MusicTilePrevious", "MusicTilePlayPause", "MusicTileNext"] {
+            assert!(!markup.contains(name), "{name} is still on the strip");
+        }
+        assert!(
+            !markup.contains("ToolTipService"),
+            "a tooltip here suppresses the shell's hover preview entirely"
+        );
+    }
+
+    /// The strip still has to survive the awkward inputs: no cover, and text carrying markup.
+    #[test]
+    fn the_strip_escapes_and_falls_back() {
+        let bare = now_playing_markup(&super::super::state::Strip::default());
+        assert!(bare.contains("Nothing playing"), "{bare}");
+        assert!(!bare.contains("BitmapImage"), "no cover means no image source");
+
+        let awkward = now_playing_markup(&super::super::state::Strip {
+            title: "Sturm & Drang".into(),
+            artist: "<script>".into(),
+            ..Default::default()
+        });
+        assert!(awkward.contains("Sturm &amp; Drang"), "{awkward}");
+        assert!(awkward.contains("&lt;script&gt;"), "{awkward}");
     }
 }

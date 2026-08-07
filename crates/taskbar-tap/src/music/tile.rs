@@ -361,10 +361,10 @@ unsafe fn set_margin(diagnostics: &IXamlDiagnostics, handle: InstanceHandle, mar
 
 /// Move the shell's running indicator and progress bar under the strip's app icon.
 ///
-/// Both are centred in the *button* by the template. Right at 44 epx, wrong at 244: the running pill
-/// lands under the middle of the title and reads as a stray dot, and the progress bar stretches the
-/// full width of the strip. Pinning left and then setting a margin fixes each; the bar additionally
-/// gets the icon's width, which is where MPC-HC's sits.
+/// Both are centred in the *button* by the template, which is right at 44 epx and wrong once it is
+/// the width of a strip. Pinning left and setting a margin fixes each, but they want opposite
+/// things: the running pill is about the *app*, so it goes under the icon, and the progress bar is
+/// about the *track*, so it spans the whole plate.
 ///
 /// The pill's own width is **read** rather than assumed, because the shell grows it when the window is
 /// in the foreground — a hard-coded margin would be off-centre in one of the two states.
@@ -377,11 +377,13 @@ pub unsafe fn place_button_state(diagnostics: &IXamlDiagnostics, button: Instanc
             let name = crate::tree::name_of(child).unwrap_or_default();
             let fixed_width = match name.as_str() {
                 "RunningIndicator" => None,
-                "ProgressIndicator" => Some(layout::icon_width()),
+                // The full plate, not the icon — see [`layout::strip_width`].
+                "ProgressIndicator" => Some(layout::strip_width()),
                 _ => continue,
             };
             let left = match fixed_width {
-                Some(_) => layout::icon_left(),
+                // Flush with the plate's own left edge, so the bar and the strip start together.
+                Some(_) => 0.0,
                 None => {
                     let width = crate::decorate::actual_width(diagnostics, child).unwrap_or(0.0);
                     (layout::icon_centre() - width / 2.0).max(0.0)

@@ -90,6 +90,8 @@ audio-tray --music-progress <percent|off>
                       set the progress bar on the player's window by hand
 audio-tray --music-windows
                       survey the player's windows (pid, visibility, cloaking, rect)
+audio-tray --music-thumbbar [playing|paused]
+                      put the transport buttons on the player's hover preview by hand
 ```
 
 Configuration is stored at `%APPDATA%\AudioTray\config\config.toml`: per-device icon
@@ -146,15 +148,16 @@ The engineering notes, including the failure modes found along the way, are in
 ## The YouTube Music tile
 
 The same injection that draws the audio buttons also replaces the YouTube Music PWA's
-taskbar icon with a now-playing strip: the track title (scrolling when it does not fit),
-the artist under it, and previous / play-pause / next.
+taskbar icon with a now-playing strip: the track title (scrolling when it does not fit)
+and the artist under it, in 162 epx of taskbar. The transport controls are one hover
+away, on the preview's own toolbar.
 
 | Where | What |
 |-------|------|
 | The strip's body | The shell's own click — activates the player, or minimises it; drag still reorders the icon |
-| The three glyphs | Previous, play/pause, next, sent to the player's media session |
-| Under the icon | The song's position, on the progress line Windows draws for any app — accent while playing, yellow when paused |
-| The running pill | Left where it means something: under the icon, not centred in a 240-epx button |
+| Hovering it | Windows' normal window preview, with previous / play-pause / next added underneath |
+| Across the strip | The song's position, on the progress line Windows draws for any app — accent while playing, yellow when paused |
+| The running pill | Left where it means something: under the icon, not centred in a widened button |
 
 It follows the media session, not YouTube Music's process, so it needs no extension, no
 API key and no login. Things worth knowing:
@@ -163,15 +166,27 @@ API key and no login. Things worth knowing:
   state published, no progress bar and no strip — a user who never opens the player sees
   no difference at all. That is why it is on by default.
 - **The icon must be on the taskbar**, pinned or running, and not in the overflow.
+- **The transport buttons are the shell's own.** They are added to the preview with
+  `ITaskbarList3::ThumbBarAddButtons` — the same thumbnail toolbar iTunes and MPC-HC use —
+  so the shell draws, themes and scales them. Windows sends the click to the *player's*
+  window rather than to us, so the TAP takes it from the button element instead; the two
+  halves meet at the button's tooltip text and the 10/11/12 wire codes.
+- **The strip carries no tooltip, deliberately.** Declaring one makes XAML's tooltip
+  service own hover for the tile, and Windows' window preview then never opens — which
+  would take the transport buttons with it.
 - **A play click with nothing playing raises the player** instead of synthesising a media
   key. A Chromium media session does not exist until media has played, and a media key
   goes to whichever app Windows thinks owns them — which on this machine paused MPC-HC.
 - **The position is interpolated, not polled.** The player publishes a checkpoint with a
   timestamp rather than a running clock, so the bar advances locally between checkpoints;
   see FINDINGS.
-- **Nothing of the player's is kept.** Quitting, `--taskbar-revert`, or Explorer
-  restarting all put the button back — width, icon, indicators — and the progress bar is
-  cleared off the player's window on the way out.
+- **The button is handed back on the way out.** Quitting, `--taskbar-revert`, or Explorer
+  restarting all restore its width, icon and indicators, and a clean quit also clears the
+  progress bar off the player's window. Two things do not survive that promise, both by
+  the shell's design rather than by choice: a *killed* audio-tray never runs its teardown,
+  so the progress bar stays until Explorer restarts, and a thumbnail toolbar cannot be
+  removed from a window at all once added — on shutdown its buttons are greyed out
+  instead, which is the honest version of taking them away.
 
 Turn it off, or point it at a different app, with the `[music]` section of the config
 above.

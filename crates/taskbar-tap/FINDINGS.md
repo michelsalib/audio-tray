@@ -1019,13 +1019,83 @@ Two smaller decisions worth recording:
   1/2/3: an off-by-one that cycled an audio device on a play click is exactly the kind of
   bug a shared wire invites.
 
-### Still unverified
+### The transport controls moved to the hover preview — what that cost to learn
 
-The strip has been placed and wired live, and every number above was measured — but on the
-audio-tray side it has not yet been *seen* with a track in it: the session was `Stopped`
-(`"" / ""`) at the time of the run above. What that leaves open is only the last mile —
-the text and the bar on screen with something playing, and the three glyphs clicked by
-hand. The media-tray spike ran all of it; this build has not.
+The three glyphs used to sit on the strip, which worked but spent 78 epx of taskbar on
+controls that are only wanted occasionally. They are now on the preview's **thumbnail
+toolbar**, and the strip is 162 epx instead of 240.
+
+**`ThumbBarAddButtons` works cross-process**, like `SetProgressValue` before it: the shell
+drew our three buttons under YouTube Music's preview, themed and DPI-scaled, from a call
+made in audio-tray against a window Chromium owns. Nothing documents that case.
+
+**But the click does not come back.** `THBN_CLICKED` arrives as a `WM_COMMAND` sent to the
+window the buttons were registered against — the player's — which has never heard of them.
+Measured exactly as predicted: the buttons drew and did nothing. What rescues it is that
+the shell's buttons are ordinary XAML in Explorer, where this DLL already lives:
+
+```text
+Microsoft.UI.Xaml.Controls.ItemsRepeater#ThumbBarRepeater
+  Taskbar.ThumbBarButton#ThumbBarButton
+```
+
+So the shell draws and the TAP listens, with a `Tapped` handler attached exactly as the
+strip's own segments get one. Two traps on the way:
+
+* **The tile's own tooltip suppressed the preview entirely.** `ToolTipService.ToolTip` on
+  the strip made XAML's tooltip service own hover for that subtree, and the shell's
+  `Taskbar.FlyoutFrame` never opened — the tile was the one taskbar button with no window
+  preview, and nothing in any log said so. It presented as "the thumbnail toolbar does not
+  work"; it was the preview never appearing. Remove the tooltip and both come back.
+* **Buttons cannot be identified by position.** Changing the play glyph to a pause glyph
+  means `ThumbBarUpdateButtons`, and the shell rebuilds that button — a new element,
+  announced *after* the other two, with the handler still on the old one. Indexing a
+  sequence-ordered list therefore put previous and next at 0 and 1 and the live play/pause
+  off the end at 3, so the only button whose glyph changes was the only one that went dead
+  after a single press. They are matched on `AutomationProperties.Name` instead, which
+  carries the `szTip` audio-tray set — a contract between the halves, like the wire codes.
+
+### Taking over the hover flyout — built, and abandoned
+
+Drawing our own now-playing card into the preview (cover, title, artist, controls) works and
+looks good, and it is still the wrong answer. Two measurements say why:
+
+**There is exactly one `ContentPresenter#HoverFlyoutContent`, shared by every taskbar
+button.** Its animation suggests one per hover; it is not:
+
+```text
+music: flyout 0x1349c888 ours=true  (1 recorded with that name)   <- our tile
+music: preview card placed on 0x1349c888
+music: flyout 0x1349c888 ours=false (1 recorded with that name)   <- VS Code, same handle
+```
+
+The shell shows a different app by *updating* the `TaskItemThumbnailList` in that presenter.
+Replace the content and there is nothing left for it to update — so the now-playing card
+appeared on **every** app's preview.
+
+**Handing it back on the next sweep does not rescue it.** Ownership can only be re-checked
+when the timer next runs, so a foreign preview shows our card until it does and ours shows
+the shell's thumbnail until it does: a visible flip-flop in both directions. There is no
+event to hang the work on instead, because `OnVisualTreeChange` may not mutate XAML.
+
+A third cost, worth recording because it was the first symptom and looked like something
+else: opening a flyout is a *sustained* burst of tree events, so `QUIET_BEFORE_MUTATING`
+(400 ms) is not reached until the burst ends. That showed up as the shell's own thumbnail
+sitting there for seconds before the card replaced it, and no amount of sweep-pacing fixed
+it — the gate, not the timer, was the wall.
+
+### Seen live
+
+The last mile is done: the strip has been watched through track changes with the title,
+artist, cover and progress line all on screen, the hover preview opens with the three
+transport buttons under it, and they have been clicked by hand and drive the session.
+
+One thing still cannot be driven from a script here, and it is the same limit the audio
+strip has: **synthetic clicks do not reach the taskbar.** Synthetic *movement* does —
+`SendInput` with relative nudges after a `SetCursorPos` opens the preview reliably, which is
+how the flyout was measured at all — but `SetCursorPos` alone does not (a teleport never
+starts the hover-intent timer), and no injected click produces a `Tapped`. So the buttons
+drawing and wiring is verifiable from a script; the buttons *working* is not.
 
 ## The routes that do NOT work — three refused
 

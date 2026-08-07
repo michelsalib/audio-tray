@@ -11,8 +11,9 @@
 //! * **`ITaskbarList3` accepts progress for another process's window.** It is normally an app
 //!   reporting its own, and nothing documents the cross-process case. It works.
 //! * **The `ProgressIndicator` element has to be kept and sized.** The TAP used to collapse it,
-//!   because at a 244-epx button it stretches the full width of the strip. `place_button_state`
-//!   gives it the icon's width instead, which is where MPC-HC's sits.
+//!   because at a widened button it stretches past the strip. `place_button_state` pins it to the
+//!   plate instead — the full width, because the bar is about the track and the track is what the
+//!   whole strip is showing.
 
 use anyhow::Result;
 use windows::Win32::Foundation::HWND;

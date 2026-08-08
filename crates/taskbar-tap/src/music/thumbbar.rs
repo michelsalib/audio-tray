@@ -38,6 +38,11 @@ const BUTTON_TYPE: &str = "Taskbar.ThumbBarButton";
 ///
 /// Handlers are never detached — this DLL outlives every flyout — so the only thing to avoid is
 /// attaching twice to the same element, which would send two commands per click.
+///
+/// **Pruned to what the tree still holds**, because the shell builds three fresh buttons on every
+/// hover and this would otherwise be a list that only grows for the life of the Explorer process,
+/// scanned linearly four times a second. Dropping a handle that XAML has already removed cannot
+/// cause a double-attach: the element it named is gone, so it can never be offered again.
 static WIRED: Mutex<Vec<InstanceHandle>> = Mutex::new(Vec::new());
 
 fn lock<T>(mutex: &'static Mutex<T>) -> std::sync::MutexGuard<'static, T> {
@@ -63,6 +68,13 @@ pub unsafe fn wire(diagnostics: &IXamlDiagnostics, host: &tile::Host) {
     // it fails closed.
     if !flyout_is_ours(diagnostics, host) {
         return;
+    }
+
+    {
+        // Cheap: `buttons` is three handles on a normal hover, and this runs only when a preview is
+        // open at all.
+        let mut wired = lock(&WIRED);
+        wired.retain(|handle| buttons.contains(handle));
     }
 
     for &button in &buttons {

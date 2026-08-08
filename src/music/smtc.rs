@@ -94,6 +94,28 @@ pub struct Snapshot {
     pub cover: Option<Vec<u8>>,
 }
 
+/// What a session is, without asking it what it is playing.
+///
+/// The half of a session that is free to read — see [`Smtc::briefs`]. It carries exactly what
+/// choosing a session needs and nothing that costs a cross-process call, which is what lets the
+/// expensive read happen once per poll instead of once per session.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct Brief {
+    pub app_id: String,
+    pub status: PlaybackStatus,
+    pub capabilities: Capabilities,
+}
+
+/// One poll's answer: the session that won, and where it is in the track.
+///
+/// The two together because they come from the same enumeration — keeping them apart is what used to
+/// cost a second `GetSessions` per poll for the timeline alone.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Reading {
+    pub snapshot: Snapshot,
+    pub timeline: Option<Timeline>,
+}
+
 impl Snapshot {
     /// Whether this looks like a session with something real in it.
     ///
@@ -214,8 +236,10 @@ impl Smtc {
 
     /// Every session Windows currently knows about, newest state each time.
     ///
-    /// Returned as snapshots keyed by app id, because that is all the caller can
-    /// safely keep — see [`Snapshot`].
+    /// **The expensive one, and only `--music-probe` should want it.** Reading a session in full
+    /// means an async round-trip to the owning app plus a decode of its artwork; doing that for every
+    /// session is what [`Smtc::read_current`] exists to avoid. Kept because diagnosis genuinely does
+    /// want every session's title, and pays for it once.
     pub fn sessions(&self) -> Result<Vec<Snapshot>> {
         let sessions = self.manager.GetSessions().context("GetSessions")?;
         let mut out = Vec::new();
@@ -228,6 +252,59 @@ impl Smtc {
             }
         }
         Ok(out)
+    }
+
+    /// What every session *is*, without asking any of them what they are playing.
+    ///
+    /// This is the cheap half of a read, and the distinction is the whole point: an app id and a
+    /// playback status come from `GetPlaybackInfo`, which is local, while a title and its artwork
+    /// come from `TryGetMediaPropertiesAsync`, which is a round-trip into the owning process. Picking
+    /// a session needs only the cheap half.
+    pub fn briefs(&self) -> Result<Vec<Brief>> {
+        let sessions = self.manager.GetSessions().context("GetSessions")?;
+        Ok(sessions.into_iter().map(|s| read_brief(&s)).collect())
+    }
+
+    /// One poll's worth of reading, in a single enumeration.
+    ///
+    /// **The shape exists to stop paying for sessions nobody asked about.** Before this, a poll read
+    /// every session in full — an async properties call and a complete artwork decode *each* — and
+    /// then threw all but one away, then enumerated a second time for the timeline. Per second, on a
+    /// machine with three media sessions, that was two `GetSessions`, three cross-process round trips
+    /// and three image decodes to draw one strip.
+    ///
+    /// Now: one `GetSessions`, a local `GetPlaybackInfo` per session, and then the properties, the
+    /// artwork and the timeline for the **one** session `choose` returns.
+    ///
+    /// `choose` gets the briefs and returns an index into them, so the picking rule stays in
+    /// [`super::session`] where it is tested, and this stays the part that knows about WinRT.
+    pub fn read_current<F>(&self, choose: F) -> Result<Option<Reading>>
+    where
+        F: FnOnce(&[Brief]) -> Option<usize>,
+    {
+        let sessions: Vec<Session> = self
+            .manager
+            .GetSessions()
+            .context("GetSessions")?
+            .into_iter()
+            .collect();
+        let briefs: Vec<Brief> = sessions.iter().map(read_brief).collect();
+        let Some(index) = choose(&briefs) else {
+            return Ok(None);
+        };
+        let session = sessions.get(index).context("chosen session is out of range")?;
+
+        let mut snapshot = Snapshot {
+            app_id: briefs[index].app_id.clone(),
+            status: briefs[index].status,
+            capabilities: briefs[index].capabilities,
+            ..Default::default()
+        };
+        read_properties_into(session, &mut snapshot);
+        Ok(Some(Reading {
+            snapshot,
+            timeline: read_timeline(session),
+        }))
     }
 
     /// The session Windows considers current — what a media key would reach.
@@ -246,25 +323,14 @@ impl Smtc {
 
     /// The timeline of the session owned by `app_id`, if it publishes one.
     ///
-    /// Separate from [`Snapshot`] rather than a field of it, until it is known to be worth drawing:
-    /// `GetTimelineProperties` is a second cross-process read per poll, and a Chromium session that
-    /// publishes nothing but zeroes would make the strip pay for it every 100 ms for no picture.
+    /// **Not on the poll path** — [`Smtc::read_current`] returns the timeline from the enumeration it
+    /// already did, because asking separately meant a second `GetSessions` every second. This is for
+    /// `--music-timeline`, which asks about one session by name and has nothing else in flight.
     pub fn timeline(&self, app_id: &str) -> Result<Option<Timeline>> {
         let Some(session) = self.find(app_id)? else {
             return Ok(None);
         };
-        let properties = session
-            .GetTimelineProperties()
-            .context("GetTimelineProperties")?;
-        Ok(Some(Timeline {
-            start: properties.StartTime().map(|s| s.Duration).unwrap_or(0),
-            end: properties.EndTime().map(|s| s.Duration).unwrap_or(0),
-            position: properties.Position().map(|s| s.Duration).unwrap_or(0),
-            last_updated: properties
-                .LastUpdatedTime()
-                .map(|t| t.UniversalTime)
-                .unwrap_or(0),
-        }))
+        Ok(read_timeline(&session))
     }
 
     /// Send `command` to the session owned by `app_id`.
@@ -312,29 +378,43 @@ fn dispatch(session: &Session, command: Command) -> Result<bool> {
     Ok(accepted)
 }
 
-/// Read one session into a [`Snapshot`].
+/// Read one session into a [`Snapshot`], in full.
 ///
 /// Every field is independently fallible and every failure degrades to a default
 /// rather than failing the whole read: a session mid-track-change routinely has
 /// properties that are briefly unavailable, and losing the strip for a moment
 /// would be worse than showing a blank artist.
 fn read_session(session: &Session) -> Result<Snapshot> {
+    let brief = read_brief(session);
+    let mut snapshot = Snapshot {
+        app_id: brief.app_id,
+        status: brief.status,
+        capabilities: brief.capabilities,
+        ..Default::default()
+    };
+    read_properties_into(session, &mut snapshot);
+    Ok(snapshot)
+}
+
+/// The cheap half: who the session belongs to and what it is doing.
+///
+/// No async call and no artwork, so this costs the same whether the machine has one media session or
+/// six — which is what makes it safe to run over all of them on every poll.
+fn read_brief(session: &Session) -> Brief {
     let app_id = session
         .SourceAppUserModelId()
         .map(|s| s.to_string())
         .unwrap_or_default();
-
-    let mut snapshot = Snapshot {
+    let mut brief = Brief {
         app_id,
         ..Default::default()
     };
-
     if let Ok(info) = session.GetPlaybackInfo() {
         if let Ok(status) = info.PlaybackStatus() {
-            snapshot.status = PlaybackStatus::from_winrt(status);
+            brief.status = PlaybackStatus::from_winrt(status);
         }
         if let Ok(controls) = info.Controls() {
-            snapshot.capabilities = Capabilities {
+            brief.capabilities = Capabilities {
                 can_play: controls.IsPlayEnabled().unwrap_or(false),
                 can_pause: controls.IsPauseEnabled().unwrap_or(false),
                 can_skip_next: controls.IsNextEnabled().unwrap_or(false),
@@ -342,9 +422,14 @@ fn read_session(session: &Session) -> Result<Snapshot> {
             };
         }
     }
+    brief
+}
 
-    // The properties are a single async round-trip to the owning app, so a wedged
-    // player shows up here as a slow read. Treated as "nothing to draw yet".
+/// The expensive half: what is playing, and the picture of it.
+///
+/// The properties are a single async round-trip to the owning app, so a wedged
+/// player shows up here as a slow read. Treated as "nothing to draw yet".
+fn read_properties_into(session: &Session, snapshot: &mut Snapshot) {
     if let Ok(op) = session.TryGetMediaPropertiesAsync() {
         if let Ok(props) = op.get() {
             snapshot.title = props.Title().map(|s| s.to_string()).unwrap_or_default();
@@ -353,8 +438,20 @@ fn read_session(session: &Session) -> Result<Snapshot> {
             snapshot.cover = read_thumbnail(&props);
         }
     }
+}
 
-    Ok(snapshot)
+/// A session's timeline, or `None` when it publishes none.
+fn read_timeline(session: &Session) -> Option<Timeline> {
+    let properties = session.GetTimelineProperties().ok()?;
+    Some(Timeline {
+        start: properties.StartTime().map(|s| s.Duration).unwrap_or(0),
+        end: properties.EndTime().map(|s| s.Duration).unwrap_or(0),
+        position: properties.Position().map(|s| s.Duration).unwrap_or(0),
+        last_updated: properties
+            .LastUpdatedTime()
+            .map(|t| t.UniversalTime)
+            .unwrap_or(0),
+    })
 }
 
 /// Pull the cover art out of a session's properties, or `None`.

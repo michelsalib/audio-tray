@@ -1084,6 +1084,35 @@ else: opening a flyout is a *sustained* burst of tree events, so `QUIET_BEFORE_M
 sitting there for seconds before the card replaced it, and no amount of sweep-pacing fixed
 it — the gate, not the timer, was the wall.
 
+### What an audit of this feature turned up
+
+Four of these were real defects that testing had not reached, and they share a shape worth naming:
+each is a cost or a cleanup that only shows up on a path nobody drives by hand.
+
+* **A killed audio-tray left a progress bar on somebody else's window.** The teardown that clears it
+  runs from the app, so `Stop-Process -Force` skipped it and the bar stayed frozen mid-track until
+  Explorer restarted. The TAP's owner-watch already reverts the strip on that event; it clears the bar
+  now too, which it can do because from inside Explorer `ITaskbarList3` is a local STA call. Verified
+  by killing the app and reading the button back: `music: cleared the progress bar on 0x4068a -> true`.
+* **`--taskbar-revert` put the bar straight back.** It reverts the *TAP*, while the feed carries on
+  polling in the still-running tray — so the next poll redrew a bar on a button with no strip. The
+  tray gates on `strip_is_up()` now.
+* **Every poll read every session's artwork.** `read_session` did the async properties call *and* a
+  full thumbnail decode for every media session on the machine, then threw all but one away, and then
+  enumerated a second time for the timeline. One `GetSessions` now, a local `GetPlaybackInfo` per
+  session to choose with, and the expensive read only for the winner — `session::pick` returns an
+  index rather than a reference precisely so that is possible.
+* **Cover filenames collided across restarts.** The counter that defeats `BitmapImage`'s URI cache
+  restarted at zero every launch, so the first cover after a restart reused a path Explorer still had
+  cached — the exact defect the counter exists to prevent, from the one direction it did not guard.
+  Names carry the pid now, and orphans from killed runs are swept at startup.
+
+One more that was not a bug but was untested-as-shipped: **the progress bar was driven from the feed's
+MTA thread** while every measurement in this document was taken through `--music-progress`, which runs
+on `main`'s STA. `ITaskbarList3` is apartment-threaded, so those are different code paths through COM.
+The fraction is posted to the tray's message loop now (`WM_MUSIC_PROGRESS`) and applied there, which
+is both the tested apartment and the thread that knows whether the controls are up at all.
+
 ### Seen live
 
 The last mile is done: the strip has been watched through track changes with the title,

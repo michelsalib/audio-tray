@@ -6,10 +6,8 @@
 //! appeared. `put_Text` on the same `TextBlock` leaves the tree, and the handlers, alone.
 
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Mutex;
 
-use crate::log::logf;
-use crate::xamlom::{InstanceHandle, IXamlDiagnostics};
+use crate::xamlom::IXamlDiagnostics;
 
 use super::{layout, state, ticker};
 
@@ -44,41 +42,9 @@ pub unsafe fn scroll(diagnostics: &IXamlDiagnostics, strip: &state::Strip) {
     }
 }
 
-/// Segments we have already attached handlers to.
-///
-/// Handlers are never detached — the TAP lives as long as the Explorer process it is pinned in — so
-/// the only thing to avoid is attaching a *second* handler to the same element, which would act on
-/// every click twice.
-static WIRED: Mutex<Vec<InstanceHandle>> = Mutex::new(Vec::new());
-
-/// Attach a click handler to whichever transport glyphs XAML has announced back to us.
-///
-/// Called on a later sweep than the placement, always: our elements are announced *after* `put_Child`
-/// returns, so on the placing sweep they are not in the recorded tree yet.
-///
-/// # Safety
-/// XAML UI thread only.
-pub unsafe fn wire(diagnostics: &IXamlDiagnostics) {
-    for segment in [Segment::Previous, Segment::PlayPause, Segment::Next] {
-        for node in crate::tree::find_by_name(segment.element_name()) {
-            let fresh = {
-                let mut wired = match WIRED.lock() {
-                    Ok(guard) => guard,
-                    Err(poisoned) => poisoned.into_inner(),
-                };
-                if wired.contains(&node) {
-                    false
-                } else {
-                    wired.push(node);
-                    true
-                }
-            };
-            if fresh && crate::interact::attach_music(diagnostics, segment, node) {
-                logf!("music: {} wired on 0x{node:x}", segment.label());
-            }
-        }
-    }
-}
+// The strip's own transport glyphs, and the code that wired them, are gone: the controls live on the
+// hover preview's thumbnail toolbar now, which is the shell's to draw and `super::thumbbar`'s to
+// wire. [`Segment`] stays because both halves still speak in it.
 
 /// Which transport control was hit.
 ///
@@ -93,15 +59,6 @@ pub enum Segment {
 }
 
 impl Segment {
-    /// The `x:Name` in the markup, and how the element is found again once XAML announces it.
-    pub fn element_name(self) -> &'static str {
-        match self {
-            Self::Previous => "MusicTilePrevious",
-            Self::PlayPause => "MusicTilePlayPause",
-            Self::Next => "MusicTileNext",
-        }
-    }
-
     pub fn label(self) -> &'static str {
         match self {
             Self::Previous => "previous",

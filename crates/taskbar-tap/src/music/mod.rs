@@ -152,6 +152,71 @@ pub unsafe fn revert(diagnostics: &IXamlDiagnostics) {
         let cleared = tile::clear_child(diagnostics, placed.border);
         logf!("music: cleared the strip on 0x{:x} -> {cleared}", placed.border);
     }
+    // **The progress bar, which is audio-tray's to set and ours to clean up after.** The one case
+    // that needs this is a *killed* audio-tray: it runs no teardown, so the bar it put on the
+    // player's button would stay frozen mid-track until Explorer restarts. This revert is already
+    // the thing that runs on owner death (`lifecycle::watch_owner`), and from in here the shell's own
+    // `ITaskbarList3` is a local call on an STA.
+    clear_progress_bar();
+}
+
+/// Take the taskbar progress bar off the player's window.
+///
+/// Finds the window the way audio-tray does — a visible top-level window whose title carries the
+/// host's name — because the pid in the init data is audio-tray's, not the player's, and the TAP has
+/// no other handle on it.
+///
+/// Failures are silent: no player window is the ordinary case (the user closed it), and this runs on
+/// a teardown path where there is nobody left to tell anyway.
+fn clear_progress_bar() {
+    use windows::Win32::Foundation::{HWND, LPARAM};
+    use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_ALL};
+    use windows::Win32::UI::Shell::{ITaskbarList3, TaskbarList, TBPF_NOPROGRESS};
+    use windows::Win32::UI::WindowsAndMessaging::{EnumWindows, GetWindowTextW, IsWindowVisible};
+    use windows_core::BOOL;
+
+    let Some(host) = tile::host() else {
+        return;
+    };
+
+    unsafe extern "system" fn visit(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        let search = unsafe { &mut *(lparam.0 as *mut (String, Option<HWND>)) };
+        if !unsafe { IsWindowVisible(hwnd) }.as_bool() {
+            return BOOL(1);
+        }
+        let mut title = [0u16; 512];
+        let len = unsafe { GetWindowTextW(hwnd, &mut title) };
+        if len > 0 {
+            let title = String::from_utf16_lossy(&title[..len as usize]).to_lowercase();
+            if title.contains(&search.0) {
+                search.1 = Some(hwnd);
+                return BOOL(0);
+            }
+        }
+        BOOL(1)
+    }
+
+    let mut search = (host.name.to_lowercase(), None);
+    let _ = unsafe {
+        EnumWindows(
+            Some(visit),
+            LPARAM(&mut search as *mut (String, Option<HWND>) as isize),
+        )
+    };
+    let Some(hwnd) = search.1 else {
+        return;
+    };
+    unsafe {
+        let Ok(taskbar) = CoCreateInstance::<_, ITaskbarList3>(&TaskbarList, None, CLSCTX_ALL)
+        else {
+            return;
+        };
+        if taskbar.HrInit().is_err() {
+            return;
+        }
+        let cleared = taskbar.SetProgressState(hwnd, TBPF_NOPROGRESS).is_ok();
+        logf!("music: cleared the progress bar on {:?} -> {cleared}", hwnd.0);
+    }
 }
 
 /// The app's taskbar button, matched on its accessible name.

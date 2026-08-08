@@ -95,20 +95,24 @@ pub fn classify_with_override(app_id: &str, pinned: Option<&str>) -> Match {
 ///    the strip emptying the moment you pause.
 /// 3. A playing [`Match::Browser`] session, only if nothing certain exists. This is
 ///    the plain-tab case, and it is last because it is a guess.
-pub fn pick<S, F>(snapshots: &[S], app_id: F, playing: impl Fn(&S) -> bool) -> Option<&S>
+///
+/// Returns an **index**, not a reference: the caller reads the chosen session in full afterwards,
+/// and it needs to know *which* of the live session objects to read rather than getting a borrow of
+/// the cheap description it picked from.
+pub fn pick<S, F>(snapshots: &[S], app_id: F, playing: impl Fn(&S) -> bool) -> Option<usize>
 where
     F: Fn(&S) -> &str,
 {
-    let certain = |s: &&S| classify(app_id(s)) == Match::Certain;
+    let certain = |s: &S| classify(app_id(s)) == Match::Certain;
 
     snapshots
         .iter()
-        .find(|s| certain(s) && playing(s))
-        .or_else(|| snapshots.iter().find(certain))
+        .position(|s| certain(s) && playing(s))
+        .or_else(|| snapshots.iter().position(certain))
         .or_else(|| {
             snapshots
                 .iter()
-                .find(|s| classify(app_id(s)) == Match::Browser && playing(s))
+                .position(|s| classify(app_id(s)) == Match::Browser && playing(s))
         })
 }
 
@@ -154,29 +158,47 @@ mod tests {
         assert_eq!(classify_with_override("music.youtube.com", pinned), Match::No);
     }
 
+    /// The index `pick` returns has to address the *same* slice the caller passed, because that is
+    /// what it then reads in full — an off-by-one here would draw one session's art under another's
+    /// title.
+    fn picked(sessions: &[(&'static str, bool)]) -> Option<&'static str> {
+        pick(sessions, |s| s.0, |s| s.1).map(|index| sessions[index].0)
+    }
+
     #[test]
     fn playing_certain_session_beats_paused_one() {
         let sessions = [("MSEdge.music.youtube.com_/.A", false), ("Chrome.music.youtube.com_/.B", true)];
-        let picked = pick(&sessions, |s| s.0, |s| s.1).unwrap();
-        assert_eq!(picked.0, "Chrome.music.youtube.com_/.B");
+        assert_eq!(picked(&sessions), Some("Chrome.music.youtube.com_/.B"));
     }
 
     #[test]
     fn paused_certain_session_still_shows() {
         let sessions = [("MSEdge.music.youtube.com_/.A", false)];
-        assert!(pick(&sessions, |s| s.0, |s| s.1).is_some());
+        assert!(picked(&sessions).is_some());
     }
 
     #[test]
     fn bare_browser_only_wins_when_nothing_certain_exists() {
         let with_certain = [("Chrome", true), ("MSEdge.music.youtube.com_/.A", false)];
-        assert_eq!(pick(&with_certain, |s| s.0, |s| s.1).unwrap().0, "MSEdge.music.youtube.com_/.A");
+        assert_eq!(picked(&with_certain), Some("MSEdge.music.youtube.com_/.A"));
 
         let only_browser = [("Chrome", true)];
-        assert_eq!(pick(&only_browser, |s| s.0, |s| s.1).unwrap().0, "Chrome");
+        assert_eq!(picked(&only_browser), Some("Chrome"));
 
         // A paused bare browser is not enough to guess on.
         let paused_browser = [("Chrome", false)];
-        assert!(pick(&paused_browser, |s| s.0, |s| s.1).is_none());
+        assert_eq!(picked(&paused_browser), None);
+    }
+
+    /// The index is into the slice as given, not into some filtered subsequence — the case that
+    /// would break if `pick` ever grew a `filter` before its `position`.
+    #[test]
+    fn the_index_addresses_the_original_slice() {
+        let sessions = [
+            ("Spotify.exe", true),
+            ("MSEdge.open.spotify.com_/.Default", true),
+            ("Chrome.music.youtube.com_/.B", true),
+        ];
+        assert_eq!(pick(&sessions, |s| s.0, |s| s.1), Some(2));
     }
 }

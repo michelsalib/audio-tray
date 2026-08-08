@@ -279,7 +279,36 @@ pub fn player_window() -> Option<HWND> {
 /// timeline, or nothing playing — clears the bar rather than drawing a zero-length one.
 pub fn set_player_progress(fraction: Option<f64>, playing: bool) -> Result<()> {
     let hwnd = player_window().context("no YouTube Music window to put a progress bar on")?;
-    set_progress(&taskbar_list()?, hwnd, fraction, playing)
+    // **Cached per thread, not rebuilt per call.** `CoCreateInstance` plus `HrInit` is a broker
+    // round-trip, and this is called from a poll; the object is apartment-affine, so a thread-local
+    // is exactly the right lifetime for it — it lives as long as the apartment that may use it.
+    //
+    // A `RefCell` rather than a `OnceCell` because it has to be droppable: this is a **proxy into
+    // explorer.exe**, so an Explorer restart leaves it pointing at a process that no longer exists.
+    // See [`forget_taskbar_list`].
+    TASKBAR.with(|cell| {
+        if cell.borrow().is_none() {
+            *cell.borrow_mut() = Some(taskbar_list()?);
+        }
+        let borrowed = cell.borrow();
+        let taskbar = borrowed.as_ref().context("caching ITaskbarList3")?;
+        set_progress(taskbar, hwnd, fraction, playing)
+    })
+}
+
+thread_local! {
+    static TASKBAR: std::cell::RefCell<Option<windows::Win32::UI::Shell::ITaskbarList3>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Drop the cached `ITaskbarList3` so the next call builds a fresh one.
+///
+/// **An `ITaskbarList3` is a proxy into `explorer.exe`.** When Explorer restarts, every interface
+/// pointer we are holding refers to a dead process — and the calls do not necessarily *fail* in a way
+/// that shows up, they simply stop having any effect. That is the whole reason a progress bar and a
+/// thumbnail toolbar could both come back "successfully" after a restart and neither appear.
+pub fn forget_taskbar_list() {
+    TASKBAR.with(|cell| *cell.borrow_mut() = None);
 }
 
 /// The shell's taskbar list, initialised. Kept by the caller — see [`crate::progress::Progress`].

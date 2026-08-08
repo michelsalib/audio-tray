@@ -74,6 +74,9 @@ fn enter_mta() {
 /// What the tray thread can ask the music thread to do.
 enum Request {
     Command(smtc::Command),
+    /// Explorer restarted, taking the shell-side state with it. Sent by the tray when it sees
+    /// `WM_TASKBAR_RESTARTED`.
+    TaskbarRestarted,
     /// Publish and put the progress bar back, then stop. Sent by [`Handle::drop`].
     ShutDown,
 }
@@ -94,6 +97,15 @@ impl Handle {
         let _ = self.requests.send(Request::Command(command));
     }
 
+    /// Tell the feed that Explorer restarted, so it re-asserts everything the shell was holding.
+    ///
+    /// **Both of this feature's shell-side surfaces are invisible to the feed otherwise.** The
+    /// progress bar and the thumbnail toolbar live in Explorer, against a window that does not change
+    /// when Explorer does — so from the feed's side a restart looks like nothing happening, and both
+    /// caches go on reporting that the shell already has what it needs.
+    pub fn taskbar_restarted(&self) {
+        let _ = self.requests.send(Request::TaskbarRestarted);
+    }
 }
 // There is deliberately no `activate` here. The strip *body* is left to the shell — clicking an app's
 // own taskbar button already means "bring it forward or minimise it", and its press is the
@@ -174,8 +186,8 @@ impl Music {
     /// routine, and the right response to it is to keep showing the last good state — not to take
     /// the strip, or the audio half of the app, down with it.
     pub fn poll(&mut self) {
-        let state = match self.feed.read() {
-            Ok(state) => state,
+        let (state, timeline) = match self.feed.read() {
+            Ok(read) => read,
             Err(err) => {
                 eprintln!("music: could not read the session: {err:#}");
                 return;
@@ -190,16 +202,12 @@ impl Music {
             eprintln!("music: could not publish the strip state: {err:#}");
         }
 
-        let timeline = match self.feed.current_app_id().map(str::to_string) {
-            Some(app_id) => self.feed.timeline(&app_id).unwrap_or(None),
-            None => None,
-        };
+        // The timeline came back with the state, from the same enumeration — asking for it
+        // separately used to cost a second `GetSessions` on every poll.
         let playing = state
             .snapshot()
             .is_some_and(|snapshot| snapshot.status.is_playing());
-        if let Err(err) = self.progress.update(timeline, playing) {
-            eprintln!("music: could not set the progress bar: {err:#}");
-        }
+        self.progress.update(timeline, playing);
         // The transport buttons under the hover preview. Driven from the same poll as the bar
         // because they carry the same one bit of state — whether it is playing, which decides the
         // play/pause glyph — and an update that costs nothing when it has not changed.
@@ -232,9 +240,12 @@ impl Music {
     /// The state file goes so a strip left on screen has nothing to show, and the progress bar goes
     /// because it lives on **another app's** window and would otherwise sit there frozen mid-track
     /// with nobody left to attribute it to.
+    /// **The progress bar is not cleared here, and cannot be.** Clearing it means a message to the
+    /// tray thread, and by the time this runs that thread has left its message loop and is inside
+    /// `Handle::drop` waiting for this one — so the post would sit in a queue nobody reads again.
+    /// `tray::run` clears it directly, on its own thread, before it gets that far.
     pub fn shut_down(&mut self) {
         self.publisher.clear();
-        self.progress.clear();
         self.toolbar.clear();
     }
 
@@ -252,6 +263,14 @@ impl Music {
         loop {
             match inbox.recv_timeout(POLL) {
                 Ok(Request::Command(command)) => self.command(command),
+                Ok(Request::TaskbarRestarted) => {
+                    self.progress.taskbar_restarted();
+                    self.toolbar.taskbar_restarted();
+                    // Straight away rather than up to a second later: the strip is already being
+                    // redrawn by the tray on this same event, and a bar that arrives afterwards is a
+                    // visible flicker on a button that has just come back.
+                    self.poll();
+                }
                 Ok(Request::ShutDown) => {
                     self.shut_down();
                     return;
@@ -304,7 +323,7 @@ fn report_sessions(feed: &mut Ytm) -> Result<()> {
     }
 
     println!("--- what the strip would follow ---");
-    match feed.read()? {
+    match feed.read()?.0 {
         State::Track(snapshot) => println!("  {} — {}", snapshot.title, snapshot.artist),
         State::Absent => println!("  nothing"),
     }
@@ -325,7 +344,7 @@ pub fn report_timeline() -> Result<()> {
 }
 
 fn report_position(feed: &mut Ytm) -> Result<()> {
-    let state = feed.read()?;
+    let (state, _) = feed.read()?;
     let Some(app_id) = feed.current_app_id().map(str::to_string) else {
         println!("no YouTube Music session to ask");
         return Ok(());

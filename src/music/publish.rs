@@ -18,11 +18,17 @@ use crate::music::feed::{PlaybackStatus, State};
 /// Where the state is published. **Must match `state::STATE_FILE` in the TAP.**
 const STATE_FILE: &str = "audio-tray-music.txt";
 
-/// Cover files are written as `audio-tray-cover-<n>.png`.
+/// Cover files are written as `audio-tray-cover-<pid>-<n>.png`.
 ///
 /// A new name per cover, not one reused name: XAML's `BitmapImage` caches by URI, so
 /// rewriting the same path leaves the *previous* cover on screen — the track changes and
 /// the art does not.
+///
+/// **The pid is what makes that true across restarts, and it was missing.** The counter starts at
+/// zero every launch, so restarting audio-tray wrote the next cover to `…-1.png` — a path Explorer
+/// very likely still had cached from the previous run, since Explorer normally outlives us. The
+/// result is the exact defect the counter exists to prevent, reached the one way it was not guarding
+/// against. Names are unique per *process* now, not merely per cover.
 const COVER_PREFIX: &str = "audio-tray-cover-";
 
 pub struct Publisher {
@@ -44,6 +50,7 @@ pub struct Publisher {
 
 impl Publisher {
     pub fn new() -> Self {
+        sweep_orphaned_covers();
         Self {
             last: None,
             cover_generation: 0,
@@ -113,8 +120,11 @@ impl Publisher {
         let path = match cover {
             Some(bytes) => {
                 self.cover_generation += 1;
-                let path = std::env::temp_dir()
-                    .join(format!("{COVER_PREFIX}{}.png", self.cover_generation));
+                let path = std::env::temp_dir().join(format!(
+                    "{COVER_PREFIX}{}-{}.png",
+                    std::process::id(),
+                    self.cover_generation
+                ));
                 write_atomically(&path, bytes).context("writing the cover art")?;
                 let display = path.to_string_lossy().into_owned();
                 self.current_cover = Some(path);
@@ -132,6 +142,29 @@ impl Publisher {
 
 fn state_path() -> std::path::PathBuf {
     std::env::temp_dir().join(STATE_FILE)
+}
+
+/// Delete cover files left behind by earlier runs.
+///
+/// A cover is deleted when the next one replaces it, and the last one when the app shuts down
+/// cleanly — so the only files this finds are from a run that was *killed*, which skips both. Without
+/// this they accumulate in `%TEMP%` forever, one per track played in that session.
+///
+/// Files carrying our own pid are left alone. Reusing a pid is possible in principle; the worst it
+/// could do is delete a cover we are about to rewrite anyway, and the write does not depend on the
+/// file being absent.
+fn sweep_orphaned_covers() {
+    let ours = format!("{COVER_PREFIX}{}-", std::process::id());
+    let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if name.starts_with(COVER_PREFIX) && !name.starts_with(&ours) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
 /// Cheap content fingerprint — length plus a sum, which is ample to notice a different

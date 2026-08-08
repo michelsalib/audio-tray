@@ -409,10 +409,14 @@ pub unsafe fn attach_music(
         logf!("music: 0x{element:x} is not a UIElement — not wiring it up");
         return false;
     };
-    let mut token = 0i64;
+    // A token each. Nothing detaches these — the DLL outlives every element it wires — but one
+    // variable for both registrations quietly discards the first token, so the day something does
+    // want to detach, the press handler is the one that cannot be.
+    let mut press_token = 0i64;
+    let mut tap_token = 0i64;
     let pressed: IPointerEventHandler = MusicPress.into();
-    let press = target.add_PointerPressed(pressed.as_raw(), &mut token);
+    let press = target.add_PointerPressed(pressed.as_raw(), &mut press_token);
     let tapped: ITappedEventHandler = MusicTap(segment).into();
-    let tap = target.add_Tapped(tapped.as_raw(), &mut token);
+    let tap = target.add_Tapped(tapped.as_raw(), &mut tap_token);
     press == S_OK && tap == S_OK
 }

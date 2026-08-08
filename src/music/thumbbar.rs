@@ -131,6 +131,21 @@ impl ThumbBar {
         self.showing_pause = Some(playing);
         Ok(())
     }
+
+    /// Forget that the toolbar was ever installed, without trying to take it down.
+    ///
+    /// For an Explorer restart: the registration lives in the *shell*, so a new Explorer has no
+    /// record of it — but `added` still says otherwise, and every later call would take the
+    /// `ThumbBarUpdateButtons` branch and update a toolbar that no longer exists. That is what left
+    /// the preview with no buttons after a restart, silently, because updating a forgotten toolbar
+    /// does not report an error.
+    ///
+    /// Clearing the flag also disarms [`ThumbBar::drop`]'s grey-them-out step, which is right: there
+    /// is nothing on the new shell to grey.
+    fn forget_registration(&mut self) {
+        self.added = false;
+        self.showing_pause = None;
+    }
 }
 
 impl Drop for ThumbBar {
@@ -361,6 +376,23 @@ impl Toolbar {
     /// There is no way to take a thumbnail toolbar off a window short of destroying the window, so
     /// this is the honest teardown — see [`ThumbBar::drop`].
     pub fn clear(&mut self) {
+        self.bar = None;
+    }
+
+    /// Explorer restarted: the shell's record of our toolbar went with it, so put it back.
+    ///
+    /// The buttons are *shell* state on a window we do not own, which makes an Explorer restart
+    /// exactly as destructive to them as it is to the strip — and unlike the strip, nothing about the
+    /// window changes, so no amount of re-validating the handle notices. Re-adding is the only route,
+    /// and it needs the "already added" flag cleared first.
+    pub fn taskbar_restarted(&mut self) {
+        if let Some(bar) = self.bar.as_mut() {
+            // Before dropping it: this disarms the grey-them-out step in `ThumbBar::drop`, which
+            // would otherwise call into the Explorer that has just gone.
+            bar.forget_registration();
+        }
+        // Dropped rather than reused, because the `ITaskbarList3` inside it is a **proxy into
+        // explorer.exe** — after a restart it addresses a dead process. `update` builds a fresh one.
         self.bar = None;
     }
 }

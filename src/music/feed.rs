@@ -53,35 +53,36 @@ impl Ytm {
         })
     }
 
-    /// Read the current state, remembering which session it came from.
-    pub fn read(&mut self) -> Result<State> {
-        let snapshots = self.smtc.sessions()?;
-
-        let picked = match self.pinned.as_deref() {
+    /// Read the current state and the track position together, remembering which session they came
+    /// from.
+    ///
+    /// **One enumeration, and the artwork is read once.** The picking rule runs against the cheap
+    /// [`smtc::Brief`]s and only the session it returns is read in full — which is the difference
+    /// between one cross-process round-trip per poll and one *per session on the machine*.
+    pub fn read(&mut self) -> Result<(State, Option<smtc::Timeline>)> {
+        let pinned = self.pinned.clone();
+        let reading = self.smtc.read_current(|briefs| match pinned.as_deref() {
             // A pinned id is an exact instruction: use that session or none.
-            Some(pinned) => snapshots
+            Some(pinned) => briefs
                 .iter()
-                .find(|s| s.app_id.eq_ignore_ascii_case(pinned)),
-            None => session::pick(&snapshots, |s| s.app_id.as_str(), |s| s.status.is_playing()),
+                .position(|b| b.app_id.eq_ignore_ascii_case(pinned)),
+            None => session::pick(briefs, |b| b.app_id.as_str(), |b| b.status.is_playing()),
+        })?;
+
+        let Some(reading) = reading else {
+            self.current_app_id = None;
+            return Ok((State::Absent, None));
         };
 
-        match picked {
-            // A session that exists but has no title yet is a track change in
-            // flight. Keeping the previous app id means the buttons stay live
-            // through it.
-            Some(snapshot) if snapshot.has_track() => {
-                self.current_app_id = Some(snapshot.app_id.clone());
-                Ok(State::Track(snapshot.clone()))
-            }
-            Some(snapshot) => {
-                self.current_app_id = Some(snapshot.app_id.clone());
-                Ok(State::Absent)
-            }
-            None => {
-                self.current_app_id = None;
-                Ok(State::Absent)
-            }
-        }
+        self.current_app_id = Some(reading.snapshot.app_id.clone());
+        // A session that exists but has no title yet is a track change in flight. Keeping the
+        // previous app id means the buttons stay live through it.
+        let state = if reading.snapshot.has_track() {
+            State::Track(reading.snapshot)
+        } else {
+            State::Absent
+        };
+        Ok((state, reading.timeline))
     }
 
     /// Send a transport command to the session the last [`Ytm::read`] found.
@@ -131,7 +132,9 @@ impl Ytm {
     /// every caller this could have.
     #[allow(dead_code)] // Kept deliberately, and the doc comment above says why.
     pub fn foreign_session_exists(&self) -> bool {
-        match self.smtc.sessions() {
+        // Briefs, not full snapshots: the question is only about app ids, and reading every
+        // session's artwork to answer it would cost more than the answer is worth.
+        match self.smtc.briefs() {
             Ok(sessions) => sessions
                 .iter()
                 .any(|s| session::classify(&s.app_id) == session::Match::No),

@@ -191,6 +191,28 @@ pub fn run(backend: WasapiBackend) -> Result<()> {
                 refresh(&backend, &tray, &config);
                 continue;
             }
+            // The music feed handing over a progress-bar value. Applied here rather than on the
+            // feed's own thread because this one is an STA and `ITaskbarList3` is an
+            // apartment-threaded shell object — see `taskbar::post_progress`. Drained like the
+            // others: only the newest fraction says anything.
+            if msg.message == crate::taskbar::WM_MUSIC_PROGRESS {
+                let (mut step, mut playing) = (msg.wParam.0, msg.lParam.0 != 0);
+                let mut extra = MSG::default();
+                while PeekMessageW(
+                    &mut extra,
+                    None,
+                    crate::taskbar::WM_MUSIC_PROGRESS,
+                    crate::taskbar::WM_MUSIC_PROGRESS,
+                    PM_REMOVE,
+                )
+                .as_bool()
+                {
+                    step = extra.wParam.0;
+                    playing = extra.lParam.0 != 0;
+                }
+                crate::taskbar::apply_progress(step, playing);
+                continue;
+            }
             // An app took the microphone, or let it go. Nothing else about the strip has
             // changed, so amend the dot in place rather than re-reading the devices — see
             // [`push_mic_state`]. Drained first for the same reason the refresh above is:
@@ -273,6 +295,16 @@ pub fn run(backend: WasapiBackend) -> Result<()> {
                 // — the refresh below has to post again.
                 invalidate_strip();
                 crate::taskbar::apply_at_restart(strip_icons(&backend, &config));
+                // The music half keeps two things in the *shell* — the progress bar and the
+                // thumbnail toolbar — and both died with the old Explorer. Neither is visible from
+                // the feed's side, because the window they hang off is unchanged, so it has to be
+                // told or they stay gone for the rest of the session.
+                if let Some(music) = music.as_ref() {
+                    music.taskbar_restarted();
+                }
+                // And this thread's own cached shell interface, which is a proxy into the Explorer
+                // that just died — see `player::forget_taskbar_list`.
+                crate::music::player::forget_taskbar_list();
                 // The icon `tray-icon` just re-registered carries the defaults it
                 // was built with, so put the current device's icon and tooltip
                 // back on it — and this is also the retry for any refresh that
@@ -334,6 +366,13 @@ pub fn run(backend: WasapiBackend) -> Result<()> {
             }
         }
     }
+
+    // **The progress bar has to come off here**, on this thread, while it still has a message loop's
+    // worth of life left in it. It sits on *another app's* taskbar button, so a bar left at 43 % is a
+    // frozen line under YouTube Music that survives us and that the user cannot attribute to
+    // anything. The music thread cannot do it — see `Music::shut_down` — and dropping `music` below
+    // is what stops the feed putting it back.
+    crate::taskbar::clear_player_progress();
     Ok(())
 }
 

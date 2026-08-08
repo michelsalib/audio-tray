@@ -795,7 +795,6 @@ pub(crate) unsafe fn sweep() {
     // nothing here except the two guards at the top of this function, which are the whole reason a
     // `put_*` against a taskbar element is safe at all.
     music::sweep(&diagnostics);
-    music::tick::wire(&diagnostics);
 
     // Nothing left to apply — drop to the slow cadence until something comes
     // undone. `strip_placed` going false again (the shell re-binding the

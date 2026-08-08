@@ -1113,6 +1113,53 @@ on `main`'s STA. `ITaskbarList3` is apartment-threaded, so those are different c
 The fraction is posted to the tray's message loop now (`WM_MUSIC_PROGRESS`) and applied there, which
 is both the tested apartment and the thread that knows whether the controls are up at all.
 
+### The progress line jumped on every track change — because we were clearing it
+
+**`TBPF_NOPROGRESS` does not blank the bar, it takes `ProgressIndicator` out of the button.** The
+next value builds a *fresh* one from the template — centred, natural width, none of our margin or
+width on it — and the sweep puts those back a tick later. That is the whole of the "centre → left →
+full width" step, and it happened twice a song because a track change was answered with a clear:
+
+```text
+progress bar -> 27% (playing)
+progress bar -> cleared (no timeline)     <- destroys the element
+progress bar -> 1% (playing)              <- rebuilds it, from the template
+```
+
+So the poll never clears now. A gap holds the last fraction; taking the bar away is a *teardown*
+action with its own paths — quit, `--taskbar-revert`, the TAP's owner-watch — each of which means it.
+Measured after: three forced track changes, **zero** clears, 89 % → 0 % straight through.
+
+The obvious narrower guard does not work, and it is worth knowing why before anyone tries it:
+**`current_app_id` drops during a track change too.** Chromium tears the media session down and
+builds a new one, so "only clear when the session is really gone" clears on exactly the gap it was
+meant to protect. There is no instantaneous signal that separates the two; not clearing at all is
+what does.
+
+Three things were tried first, on the theory that this was a race with the shell's layout. Each was a
+real defect and none of them was the cause:
+
+* **Stop rebuilding the strip on a track change.** Real and worth keeping — title and artist are
+  `put_Text` now, and only the cover's own `Border` is reparsed — but it treated a contributor, not
+  the cause.
+* **Take the newest `BackgroundElement`, not the first.** Also a real bug: the recorded tree keeps
+  elements whose removal XAML never announced, so the lookup alternated between a stale and a live
+  one and the placement record missed on alternate sweeps. Fixing it removed a rebuild per track and
+  the jump stayed.
+* **Order the writes width-first**, since an STA pumps while a COM call is outstanding and a frame
+  can land between them. It changes which intermediate is visible, not whether there is one.
+
+**Drawing our own line instead was built, and rejected on sight.** It works — a `Border` in the strip
+fed by a `progress=` key in the state file, moved by one `Width` write, immune to anything the shell
+does — and it is the wrong picture. Windows merges the progress bar *into* the running indicator:
+one underline that fills. A line of ours plus the shell's own pill is two controls saying different
+things about the same app, and that reads worse than the jump it cured. Reverted, and then the actual
+cause turned out to be ours all along.
+
+The lesson worth carrying: three plausible fixes in a row all *reduced* the churn, which kept the
+theory alive long after it should have died. What settled it was reading the log for what we were
+telling the shell to do, rather than reasoning about what the shell does to us.
+
 ### Seen live
 
 The last mile is done: the strip has been watched through track changes with the title,

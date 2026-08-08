@@ -32,7 +32,11 @@ use crate::xamlom::{InstanceHandle, IXamlDiagnostics};
 use super::{tick::Segment, tile};
 
 /// The shell's type for one thumbnail-toolbar button.
-const BUTTON_TYPE: &str = "Taskbar.ThumbBarButton";
+///
+/// Visible to the crate because the visual-tree callback watches for it too: a button being
+/// *announced* is what asks for the wiring below to happen now rather than on the next sweep — see
+/// `crate::wire_transport`.
+pub(crate) const BUTTON_TYPE: &str = "Taskbar.ThumbBarButton";
 
 /// Buttons we have already attached a handler to.
 ///

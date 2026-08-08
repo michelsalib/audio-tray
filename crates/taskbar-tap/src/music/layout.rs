@@ -161,19 +161,26 @@ pub fn layout() -> Layout {
 ///
 /// The transport controls are on the shell's thumbnail toolbar under the hover preview now — this
 /// surface is 162 epx of taskbar and spends all of it on saying what is playing.
-pub fn now_playing_markup(strip: &super::state::Strip) -> String {
+/// `x:Name` of the `Border` holding the cover art, so a track change can swap the art alone.
+pub const COVER_HOST: &str = "MusicTileCoverHost";
+
+/// The cover art and its placeholder — the only part of the strip a track change has to rebuild.
+///
+/// A cover if there is one, otherwise a note glyph on a muted plate: a hole where the art should be
+/// looks like a bug, and plenty of sessions publish no artwork. Both are always present and stacked,
+/// with `Visibility` choosing between them, so the *shape* of this subtree never changes.
+///
+/// **It is a subtree and not a property write because of `Image.Source`.** Title and artist are
+/// `put_Text` on an existing `TextBlock`; pointing an `Image` at a new file needs a fresh
+/// `BitmapImage`, which is a WinRT object this TAP has no binding for — and cannot reuse a path
+/// anyway, since `BitmapImage` caches by URI. Reparsing this much markup is the cheap way to get one.
+pub fn cover_markup(strip: &super::state::Strip, cover_px: u32, gap: u32) -> String {
     use super::state::escape;
 
-    let l = layout();
-
-    // A cover if there is one, otherwise a note glyph on a muted plate — a hole where the
-    // art should be looks like a bug, and plenty of sessions publish no artwork.
-    // Both the art and its placeholder are always present, stacked, with `Visibility`
-    // choosing between them. That is what lets a track change be a handful of property
-    // writes instead of a rebuild — and rebuilding is what made the weather flash through
-    // and what dropped clicks mid-press, because it replaces every element.
-    let cover = format!(
-        r#"<Grid Width="{cover_px}" Height="{cover_px}" Margin="0,0,{gap},0">
+    format!(
+        r#"<Grid xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+                 xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+                 Width="{cover_px}" Height="{cover_px}" Margin="0,0,{gap},0">
              <Border x:Name="MusicTileCoverPlaceholder" CornerRadius="2"
                      Background="{{ThemeResource SystemControlBackgroundBaseLowBrush}}"
                      Visibility="{placeholder}">
@@ -185,8 +192,6 @@ pub fn now_playing_markup(strip: &super::state::Strip) -> String {
                <Image x:Name="MusicTileCover" Stretch="UniformToFill" Visibility="{art}">{source}</Image>
              </Border>
            </Grid>"#,
-        cover_px = l.cover,
-        gap = l.gap,
         art = if strip.cover.is_some() { "Visible" } else { "Collapsed" },
         placeholder = if strip.cover.is_some() {
             "Collapsed"
@@ -200,6 +205,20 @@ pub fn now_playing_markup(strip: &super::state::Strip) -> String {
             ),
             None => String::new(),
         },
+    )
+}
+
+pub fn now_playing_markup(strip: &super::state::Strip) -> String {
+    use super::state::escape;
+
+    let l = layout();
+
+    // Wrapped in a `Border` of its own so a track change can replace **just this** — see
+    // [`COVER_HOST`] and `super::tile::update_cover`. Everything outside it keeps its identity, and
+    // more to the point its size, across a track change.
+    let cover = format!(
+        r#"<Border x:Name="{COVER_HOST}">{}</Border>"#,
+        cover_markup(strip, l.cover, l.gap)
     );
 
     // The text column is a **fixed** width, not a `MaxWidth`, and that is the fix for a real

@@ -359,6 +359,81 @@ unsafe fn set_margin(diagnostics: &IXamlDiagnostics, handle: InstanceHandle, mar
     let _ = framework.put_Margin(margin);
 }
 
+/// Bring a strip already on screen in line with a new track, without replacing it.
+///
+/// Returns whether the strip is now showing `next` — `false` means the elements could not be found,
+/// which is the caller's cue to fall back to a full placement.
+///
+/// Only what differs is touched. Title and artist are `put_Text` on the `TextBlock`s the markup
+/// named; the cover is the one part that has to be reparsed, because pointing an `Image` somewhere
+/// new needs a fresh `BitmapImage` — see [`layout::cover_markup`]. Even that is contained to the
+/// `Border` around it, so the strip's own size never changes and the shell has no reason to re-lay
+/// out the button.
+///
+/// # Safety
+/// XAML UI thread only.
+pub unsafe fn update_in_place(
+    diagnostics: &IXamlDiagnostics,
+    shown: &super::state::Strip,
+    next: &super::state::Strip,
+) -> bool {
+    let l = layout::layout();
+    let mut ok = true;
+    let mut wrote_anything = false;
+
+    for (name, was, now) in [
+        ("MusicTileTitle", shown.display_title(), next.display_title()),
+        (
+            "MusicTileArtist",
+            shown.display_artist(),
+            next.display_artist(),
+        ),
+    ] {
+        if was == now {
+            continue;
+        }
+        // The ticker owns this text from here on, so write the window it would show at step 0
+        // rather than the whole string — otherwise a long title appears unscrolled for a tick.
+        let text = super::ticker::window(now, character_budget(name, &l), 0);
+        let mut wrote = false;
+        for node in crate::tree::find_by_name(name) {
+            wrote |= crate::decorate::set_text(diagnostics, node, &text);
+        }
+        ok &= wrote;
+        wrote_anything |= wrote;
+    }
+
+    if shown.cover != next.cover {
+        let markup = layout::cover_markup(next, l.cover, l.gap);
+        let mut wrote = false;
+        for node in crate::tree::find_by_name(layout::COVER_HOST) {
+            wrote |= set_child(diagnostics, node, &markup);
+        }
+        ok &= wrote;
+        wrote_anything |= wrote;
+    }
+
+    // Only when something actually moved. A play/pause toggle changes `Strip` without changing
+    // anything this function draws — the transport glyphs left for the hover preview — so logging
+    // every call would be a line a second saying nothing happened.
+    if wrote_anything {
+        logf!(
+            "music: strip updated in place — {:?} / {:?}",
+            next.title,
+            next.artist
+        );
+    }
+    ok
+}
+
+fn character_budget(name: &str, l: &layout::Layout) -> usize {
+    if name == "MusicTileTitle" {
+        l.title_chars
+    } else {
+        l.artist_chars
+    }
+}
+
 /// Move the shell's running indicator and progress bar under the strip's app icon.
 ///
 /// Both are centred in the *button* by the template, which is right at 44 epx and wrong once it is
@@ -378,6 +453,12 @@ pub unsafe fn place_button_state(diagnostics: &IXamlDiagnostics, button: Instanc
             let fixed_width = match name.as_str() {
                 "RunningIndicator" => None,
                 // The full plate, not the icon — see [`layout::strip_width`].
+                //
+                // **The shell's own bar, deliberately.** Drawing our own line inside the strip was
+                // tried, to escape the shell re-asserting this element from the button's template;
+                // it works and it is wrong. Windows merges the progress bar *into* the running
+                // indicator — one underline that fills — and a separate line of ours alongside the
+                // shell's pill reads as two controls saying different things about the same app.
                 "ProgressIndicator" => Some(layout::strip_width()),
                 _ => continue,
             };
@@ -389,6 +470,14 @@ pub unsafe fn place_button_state(diagnostics: &IXamlDiagnostics, button: Instanc
                     (layout::icon_centre() - width / 2.0).max(0.0)
                 }
             };
+            // **Width first, then position.** An STA pumps messages while an outgoing COM call is in
+            // flight, so a frame can be rendered *between* these writes — and the order decides what
+            // that frame looks like. Sizing first means the intermediate is a full-width bar still
+            // centred, which slides into place; the other order shows a stub at the left edge that
+            // then grows, which is the more obviously wrong-looking of the two.
+            if let Some(width) = fixed_width {
+                set_width(diagnostics, child, width);
+            }
             pin_left(diagnostics, child);
             set_margin(
                 diagnostics,
@@ -398,9 +487,6 @@ pub unsafe fn place_button_state(diagnostics: &IXamlDiagnostics, button: Instanc
                     ..Default::default()
                 },
             );
-            if let Some(width) = fixed_width {
-                set_width(diagnostics, child, width);
-            }
         }
     }
 }

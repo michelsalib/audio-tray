@@ -163,6 +163,26 @@ pub fn find_by_name(name: &str) -> Vec<u64> {
         .collect()
 }
 
+/// When a handle was announced, as a monotonic sequence number.
+///
+/// **For telling a live element from one XAML never told us it had removed.** The recorder drops a
+/// node on a `Remove`, but those do not always arrive — a rebuilt subtree can leave the old elements
+/// behind, indistinguishable by name or type from the new ones. Between two candidates the newest is
+/// the live one, and this is the only thing recorded that says which that is.
+pub fn seq_of(handle: u64) -> Option<u64> {
+    let tree = lock();
+    tree.nodes.get(&handle).map(|node| node.seq)
+}
+
+/// The most recently announced of `candidates`.
+pub fn newest(candidates: impl IntoIterator<Item = u64>) -> Option<u64> {
+    candidates
+        .into_iter()
+        .filter_map(|handle| Some((seq_of(handle)?, handle)))
+        .max()
+        .map(|(_, handle)| handle)
+}
+
 /// The recorded `x:Name` of a handle.
 pub fn name_of(handle: u64) -> Option<String> {
     let tree = lock();

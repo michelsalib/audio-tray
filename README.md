@@ -30,11 +30,11 @@ A tiny Windows system-tray app for **controlling your audio without digging thro
   own "microphone in use" indicator does (which it replaces, see below), so it covers
   every app and every microphone, and it stays lit while an app holds the stream open
   even if you are muted.
-- **YouTube Music in its own taskbar button** — the PWA's icon becomes a 240-epx strip
-  showing the track, the artist, and previous/play-pause/next, with the song's position
-  on the progress line Windows already draws under an icon. It is the app's *own* button,
-  so launching adds no second icon, minimising still goes there, and it still drags to
-  reorder. See [the YouTube Music tile](#the-youtube-music-tile).
+- **YouTube Music in its own taskbar button** — the PWA's icon becomes a 162-epx strip
+  showing the track, the artist and the song's position, with previous/play-pause/next a
+  hover away on the preview's toolbar. It is the app's *own* button, so launching adds no
+  second icon, minimising still goes there, and it still drags to reorder. See
+  [the YouTube Music tile](#the-youtube-music-tile).
 - **Falls back to a plain tray icon** if the taskbar controls cannot be drawn — an
   icon reflecting the current output device (speakers, headphones, headset, HDMI…),
   rendered from Segoe Fluent Icons and themed to your taskbar. Either button opens
@@ -182,11 +182,10 @@ API key and no login. Things worth knowing:
   see FINDINGS.
 - **The button is handed back on the way out.** Quitting, `--taskbar-revert`, or Explorer
   restarting all restore its width, icon and indicators, and a clean quit also clears the
-  progress bar off the player's window. Two things do not survive that promise, both by
-  the shell's design rather than by choice: a *killed* audio-tray never runs its teardown,
-  so the progress bar stays until Explorer restarts, and a thumbnail toolbar cannot be
-  removed from a window at all once added — on shutdown its buttons are greyed out
-  instead, which is the honest version of taking them away.
+  progress bar off the player's window. One thing does not survive that promise, by the
+  shell's design rather than by choice: a thumbnail toolbar cannot be removed from a window
+  at all once added — on shutdown its buttons are greyed out instead, which is the honest
+  version of taking them away.
 
 Turn it off, or point it at a different app, with the `[music]` section of the config
 above.

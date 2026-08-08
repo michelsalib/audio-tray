@@ -49,6 +49,13 @@ pub const WM_TAP_REVERT: u32 = WM_APP + 21;
 /// Must match `WM_TAP_RESTYLE` on the audio-tray side.
 pub const WM_TAP_RESTYLE: u32 = WM_APP + 23;
 
+/// "Transport buttons have just been built — attach their handlers now."
+///
+/// Never crosses a process boundary, unlike its neighbours, but it shares their numbering because
+/// they all land on windows in this process: audio-tray uses `WM_APP + 20` through `+ 25`, so this
+/// starts after them rather than colliding with one from the other side.
+pub const WM_TAP_WIRE_TRANSPORT: u32 = WM_APP + 26;
+
 /// Timer id for the periodic check that the strip is still there.
 const SWEEP_TIMER: usize = 1;
 
@@ -174,6 +181,16 @@ unsafe extern "system" fn control_proc(
         }
         return LRESULT(0);
     }
+    if msg == WM_TAP_WIRE_TRANSPORT {
+        // Cleared before the work, not after: another set of buttons announced while this one runs
+        // is a real request for another pass, and swallowing it would leave those unwired.
+        WIRE_PENDING.store(false, Ordering::SeqCst);
+        let caught = std::panic::catch_unwind(|| unsafe { crate::wire_transport() });
+        if caught.is_err() {
+            logf!("transport wiring panicked");
+        }
+        return LRESULT(0);
+    }
     if msg == WM_TIMER && wparam.0 == SWEEP_TIMER {
         let caught = std::panic::catch_unwind(|| unsafe { crate::sweep() });
         if caught.is_err() {
@@ -190,6 +207,43 @@ unsafe extern "system" fn control_proc(
 /// act on it.
 pub fn take_pending_revert() -> bool {
     PENDING_REVERT.swap(false, Ordering::SeqCst)
+}
+
+/// Whether a wiring request is already queued, so the three buttons of one rebuild cost one message.
+static WIRE_PENDING: AtomicBool = AtomicBool::new(false);
+
+/// Ask for the hover preview's transport buttons to be wired as soon as the pump is free.
+///
+/// **This is the difference between the first press working and doing nothing.** The shell rebuilds
+/// those buttons on every hover *and* every time audio-tray swaps the play/pause glyph, and until a
+/// handler is attached the click goes where the API sends it — a `WM_COMMAND` to the player's own
+/// window, which has never heard of them. Leaving that to the sweep timer meant a dead button for a
+/// tick plus however long the tree took to fall quiet, which is what "I have to press it twice" was.
+///
+/// Safe to call from anywhere, including from inside the visual-tree stream and off the tray's
+/// thread: `PostMessage` touches no XAML, and the handler runs on the thread that owns the window —
+/// which is the tray's, and the only one that may act.
+pub fn nudge_transport() {
+    let hwnd = WINDOW.load(Ordering::SeqCst);
+    if hwnd == 0 {
+        return;
+    }
+    if WIRE_PENDING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let posted = unsafe {
+        PostMessageW(
+            Some(HWND(hwnd as *mut core::ffi::c_void)),
+            WM_TAP_WIRE_TRANSPORT,
+            WPARAM(0),
+            LPARAM(0),
+        )
+    };
+    if posted.is_err() {
+        // Nothing else clears the flag, and a lost post must not wedge every later request. The
+        // sweep is the fallback either way.
+        WIRE_PENDING.store(false, Ordering::SeqCst);
+    }
 }
 
 /// Creates the control window, once, on the calling thread.

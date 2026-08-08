@@ -48,11 +48,29 @@ impl Progress {
 
     /// Bring the bar in line with a timeline reading.
     ///
-    /// `None` clears it, which is the right answer for "no session" and for "a session that
-    /// publishes no timeline" alike: a bar stuck at some old fraction is worse than no bar.
+    /// **This never clears the bar, and that is the fix for it jumping on every song.**
+    ///
+    /// `TBPF_NOPROGRESS` does not blank the bar, it takes `ProgressIndicator` *out of the button*.
+    /// The next value builds a fresh one from the template — centred, natural width, none of our
+    /// margin or width on it — and the sweep puts those back a tick later. That is exactly the
+    /// "centre → left → full width" step, twice a song. It was never a race with the shell's layout;
+    /// it was us destroying and recreating the element.
+    ///
+    /// A track change goes through a gap where there is no timeline to read, and the obvious guard —
+    /// "only clear when the session is really gone" — does not work: measured, `current_app_id`
+    /// itself drops during the change, because Chromium tears the media session down and builds a
+    /// new one. There is no instantaneous signal that distinguishes the gap from a closed player.
+    ///
+    /// So the poll never clears. A gap holds the last fraction, and the bar stays defined for as long
+    /// as the tile is up. Taking it away is a *teardown* action with its own paths — quit,
+    /// `--taskbar-revert`, the TAP's owner-watch — every one of which knows it means it.
     pub fn update(&mut self, timeline: Option<Timeline>, playing: bool) {
-        let fraction = timeline.and_then(|timeline| timeline.fraction_at(now_ticks(), playing));
-        let step = fraction.map(|fraction| (fraction * STEPS).round() as u64);
+        let measured = timeline.and_then(|timeline| timeline.fraction_at(now_ticks(), playing));
+        let step = Some(match measured {
+            Some(fraction) => (fraction * STEPS).round() as u64,
+            None => self.last.map(|(step, _)| step).unwrap_or(0),
+        });
+        let fraction = step.map(|step| step as f64 / STEPS);
         let next = step.map(|step| (step, playing));
         if self.last == next {
             return;
@@ -67,7 +85,7 @@ impl Progress {
                     fraction * 100.0,
                     if playing { "playing" } else { "paused" }
                 ),
-                None => println!("progress bar -> cleared (no timeline)"),
+                None => println!("progress bar -> cleared (no session)"),
             }
         }
         self.post(step, playing);

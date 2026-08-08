@@ -556,6 +556,18 @@ impl IVisualTreeServiceCallback_Impl for Tap_Impl {
                 return;
             }
 
+            // A transport button in a hover preview, just built. Asking for it to be wired *now*
+            // rather than on the next sweep is the difference between the first press working and
+            // the first press doing nothing — see [`wire_transport`].
+            //
+            // Above the tray-thread gate on purpose: the flyout is not announced on one fixed
+            // thread, and a request that arrives on another island's would be dropped by it. The
+            // post is what moves the work onto the tray's thread, and it is not a XAML call, so it
+            // is allowed from in here.
+            if added && type_name == music::thumbbar::BUTTON_TYPE {
+                lifecycle::nudge_transport();
+            }
+
             // Everything below touches the tray, so it may only run on the thread
             // that owns it. The triggers are element *types* and *names*, which
             // match in every island — "a ContentPresenter was added" fires on the
@@ -739,6 +751,17 @@ pub(crate) unsafe fn sweep() {
     let Some(_busy) = BusyGuard::claim() else {
         return;
     };
+    let Some(diagnostics) = diagnostics() else {
+        return;
+    };
+
+    // **Ahead of the gate below, deliberately** — see [`wire_transport`]. Everything after it waits
+    // for silence because it *writes* to a shell element; attaching a handler does not, and making
+    // it wait cost the user a click on every fresh set of transport buttons.
+    if tree::quiet_for(QUIET_BEFORE_WIRING) {
+        wire_transport_now(&diagnostics);
+    }
+
     // **The fix for the shell freeze.** `put_Content` against a tray element
     // while `AdviseVisualTreeChange` is still streaming does not return: the UI
     // thread is inside a marshalled call, and it wedges there with the whole
@@ -757,9 +780,6 @@ pub(crate) unsafe fn sweep() {
     if !tree::quiet_for(QUIET_BEFORE_MUTATING) {
         return;
     }
-    let Some(diagnostics) = diagnostics() else {
-        return;
-    };
 
     // Order matters. Finding an indicator's slot only records it, and has to happen
     // whether or not the strip is up yet. Decoration comes next, because
@@ -896,6 +916,59 @@ fn segments_wired() -> bool {
         Err(poisoned) => !poisoned.into_inner().is_empty(),
     }
 }
+
+/// Attach handlers to the hover preview's transport buttons, without waiting out the mutation gate.
+///
+/// **Split from [`sweep`] because it is the one job in there that changes nothing.** Everything else
+/// the sweep does writes content, width or margin onto a shell element, and [`QUIET_BEFORE_MUTATING`]
+/// is what makes that safe. This resolves handles and adds event handlers — and paying the same
+/// 400 ms of silence for it, on top of a timer tick, is what made the first press on a button do
+/// nothing at all: the shell rebuilds those buttons on every hover and on every play/pause glyph
+/// change, and an unwired one sends its click to the player's window instead of to us.
+///
+/// A *short* quiet period is still required, because the difference between an `add_Tapped` and a
+/// `put_Content` mid-burst is one nobody here has measured, and the failure mode on the wrong side of
+/// that guess is the whole taskbar wedging. [`QUIET_BEFORE_WIRING`] is the smallest wait that is
+/// still a wait.
+///
+/// # Safety
+/// XAML UI thread only — the tray island's, as for [`sweep`].
+pub(crate) unsafe fn wire_transport() {
+    if !ACTIVE.load(Ordering::SeqCst) {
+        return;
+    }
+    // Same claim as the sweep's, and for the same reason: an STA pumps while a XAML call is
+    // outstanding, so this message can be dispatched from inside one.
+    let Some(_busy) = BusyGuard::claim() else {
+        return;
+    };
+    if !tree::quiet_for(QUIET_BEFORE_WIRING) {
+        // The sweep timer is the fallback — at 250ms with the same short gate, not the long one.
+        return;
+    }
+    let Some(diagnostics) = diagnostics() else {
+        return;
+    };
+    wire_transport_now(&diagnostics);
+}
+
+/// The body of [`wire_transport`], for callers that already hold the diagnostics and the busy claim.
+///
+/// # Safety
+/// XAML UI thread only.
+unsafe fn wire_transport_now(diagnostics: &xamlom::IXamlDiagnostics) {
+    let Some(host) = music::tile::host() else {
+        return;
+    };
+    music::thumbbar::wire(diagnostics, &host);
+}
+
+/// How long the stream must be silent before *attaching a handler*, as against mutating.
+///
+/// Two frames at 60 Hz: past the tight run of events the shell emits while it builds a flyout, and
+/// far short of the time it takes a hand to move from the taskbar button down to the buttons under
+/// it. See [`wire_transport`] for why this is not simply [`QUIET_BEFORE_MUTATING`].
+const QUIET_BEFORE_WIRING: std::time::Duration = std::time::Duration::from_millis(32);
 
 /// How long the visual-tree stream must be silent before we touch XAML.
 ///

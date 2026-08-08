@@ -79,10 +79,10 @@ pub unsafe fn sweep(diagnostics: &IXamlDiagnostics) {
         return;
     };
 
-    // The transport buttons under the hover preview. Drawn by the shell at audio-tray's request and
-    // wired here, because the click the shell raises goes to the player's window rather than to us.
-    // Cheap and quiet when no preview is open: one lookup by type that finds nothing.
-    thumbbar::wire(diagnostics, &host);
+    // The transport buttons under the hover preview are **not** wired from here, though they were:
+    // this runs behind the sweep's mutation gate, and a button is only rebuilt at the moment someone
+    // is pointing at it. `crate::wire_transport` does it ahead of that gate, and off the
+    // announcement, so the first press lands on a live button.
 
     let Some(button) = find_button(diagnostics, &host) else {
         return;
@@ -92,18 +92,50 @@ pub unsafe fn sweep(diagnostics: &IXamlDiagnostics) {
         return;
     };
 
-    let changed = {
+    // **A track change is an update, not a rebuild, and that distinction is visible.** Replacing the
+    // `Border`'s child changes the strip's identity and momentarily its measured size, which makes
+    // the shell re-run the button's layout and re-assert its own `RunningIndicator` and
+    // `ProgressIndicator` from the template. The user sees the progress line snap back to the
+    // shell's centred default and then step through our margin and width writes as they land — a
+    // "centre, left, full width" jump on every song. Keeping the strip's elements in place keeps the
+    // button's layout still, and the indicators with it.
+    let previous = {
         let guard = match PLACED.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        match guard.as_ref() {
-            Some(placed) => placed.border != border || placed.shown != strip,
-            None => true,
+        guard
+            .as_ref()
+            .filter(|placed| placed.border == border)
+            .map(|placed| placed.shown.clone())
+    };
+
+    let applied = match previous {
+        Some(shown) if shown == strip => true,
+        // Same button, different track: patch what differs and leave the tree alone.
+        Some(shown) => tile::update_in_place(diagnostics, &shown, &strip),
+        // A button we have not drawn into — first sweep, or the shell rebuilt it under us.
+        None => {
+            // Says *why* a rebuild is happening. A rebuild per track change is the defect this
+            // branch's neighbours exist to avoid, and the two causes — no record at all, versus a
+            // record against a different `BackgroundElement` — need opposite fixes.
+            if let Some(stale) = placed_border() {
+                logf!("music: border moved 0x{stale:x} -> 0x{border:x}; rebuilding");
+            }
+            let placed = tile::set_child(diagnostics, border, &layout::now_playing_markup(&strip));
+            if placed {
+                logf!(
+                    "music: strip placed on 0x{border:x} — {:?} / {:?} [{:?}]",
+                    strip.title,
+                    strip.artist,
+                    strip.playback
+                );
+            }
+            placed
         }
     };
 
-    if changed && tile::set_child(diagnostics, border, &layout::now_playing_markup(&strip)) {
+    if applied {
         let mut guard = match PLACED.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
@@ -112,12 +144,6 @@ pub unsafe fn sweep(diagnostics: &IXamlDiagnostics) {
             border,
             shown: strip.clone(),
         });
-        logf!(
-            "music: strip placed on 0x{border:x} — {:?} / {:?} [{:?}]",
-            strip.title,
-            strip.artist,
-            strip.playback
-        );
     }
 
     if placed_border() != Some(border) {
@@ -259,16 +285,19 @@ static MISS_LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBoo
 /// **The first `Border` in the panel is not it.** A `TaskListButton` panel holds an unnamed `Border`
 /// before the named one, and putting the strip in that one draws nothing — it sits behind the
 /// background rather than in it.
+/// **The newest match, and that is load-bearing.** The recorded tree keeps elements whose removal
+/// XAML never announced, so a button the shell has rebuilt can offer two `BackgroundElement`s that
+/// are identical by name and parent. Taking the first meant the answer alternated between sweeps —
+/// and since the placement record is keyed on this handle, every alternation looked like "a button we
+/// have not drawn into" and rebuilt the whole strip. That is what made the progress line jump on
+/// every track change: the rebuild, not the track.
 fn find_background_element(
     _diagnostics: &IXamlDiagnostics,
     button: InstanceHandle,
 ) -> Option<InstanceHandle> {
-    for panel in crate::tree::children_of(button) {
-        for child in crate::tree::children_of(panel) {
-            if crate::tree::name_of(child).as_deref() == Some("BackgroundElement") {
-                return Some(child);
-            }
-        }
-    }
-    None
+    let candidates = crate::tree::children_of(button)
+        .into_iter()
+        .flat_map(crate::tree::children_of)
+        .filter(|child| crate::tree::name_of(*child).as_deref() == Some("BackgroundElement"));
+    crate::tree::newest(candidates)
 }

@@ -347,12 +347,19 @@ const PILL_ALPHA: &str = "80";
 /// now says instead — the volume glyph, and the microphone icon that appears while
 /// something is recording, which our input button carries as a red dot. Both are put back
 /// on revert, and neither is touched until our strip is actually on screen.
+/// `tile=` is the music half's share of the payload: whose taskbar button to draw the now-playing
+/// strip into, empty for "do not". It comes from config rather than from an argument because, unlike
+/// the glyphs, it never changes while we run — the button is chosen by the user, not by which device
+/// happens to be default — and because the strip's *content* does not travel this way at all. That
+/// goes through a file the TAP re-reads, since cover art has to reach XAML as an image source.
 fn init_data(icons: StripIcons) -> String {
     let [r, g, b] = crate::flyout::theme::accent_rgb();
+    let music = crate::config::Config::load().music;
+    let tile = if music.enabled { music.tile } else { String::new() };
     format!(
         "tooltip={};out={:04X};in={:04X};\
          outmuted={};inmuted={};inrec={};accent={r:02X}{g:02X}{b:02X};alpha={PILL_ALPHA};\
-         hidevolume=1;hidemic=1;pid={}",
+         hidevolume=1;hidemic=1;tile={tile};pid={}",
         crate::tray::TRAY_MARKER,
         icons.output as u32,
         icons.input as u32,
@@ -421,6 +428,12 @@ pub enum Action {
     CycleOutput,
     CycleInput,
     OpenPanel,
+    /// A transport glyph on the music tile. Codes 10+, deliberately far from the audio ones: the two
+    /// halves of the TAP post to the same window and mean unrelated things, and adjacent codes invite
+    /// an off-by-one that would cycle an audio device on a play click.
+    MusicPrevious,
+    MusicPlayPause,
+    MusicNext,
 }
 
 impl Action {
@@ -431,6 +444,9 @@ impl Action {
             1 => Some(Self::CycleOutput),
             2 => Some(Self::CycleInput),
             3 => Some(Self::OpenPanel),
+            10 => Some(Self::MusicPrevious),
+            11 => Some(Self::MusicPlayPause),
+            12 => Some(Self::MusicNext),
             _ => None,
         }
     }
@@ -441,6 +457,9 @@ impl Action {
             Self::CycleOutput => 1,
             Self::CycleInput => 2,
             Self::OpenPanel => 3,
+            Self::MusicPrevious => 10,
+            Self::MusicPlayPause => 11,
+            Self::MusicNext => 12,
         }
     }
 }
@@ -489,6 +508,77 @@ pub fn post_scroll(flow: crate::audio::Flow, notches: f32) -> Result<()> {
     }
     .context("post the scroll to the tray")
 }
+
+/// Hand the tray thread a progress-bar value for the player's window.
+///
+/// **Posted rather than applied by the caller because of apartments.** The music feed runs on an MTA
+/// (it blocks on `IAsyncOperation`s, which deadlocks an STA), and `ITaskbarList3` is an
+/// apartment-threaded shell object. Driving it from the MTA works, through a marshalling proxy, but
+/// the tray thread is a real STA and is where every measurement of this was actually taken.
+///
+/// `fraction` of `None` clears the bar. Unlike [`post_action`] this is called on a timer, so a
+/// missing receiver is reported to the caller rather than logged here.
+pub fn post_progress(fraction: Option<f64>, playing: bool) -> Result<()> {
+    use windows::Win32::Foundation::{LPARAM, WPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
+
+    let receiver = window_by_class(RECEIVER_CLASS_NAME)
+        .context("no receiver window — audio-tray is not running")?;
+    // `wParam` carries the fraction in `PROGRESS_SCALE`ths, or `PROGRESS_NONE` for "clear it".
+    // A message payload has to be plain integers, and a fraction quantised to a scale the caller
+    // already rounds to loses nothing.
+    let step = match fraction {
+        Some(fraction) => (fraction.clamp(0.0, 1.0) * PROGRESS_SCALE as f64).round() as usize,
+        None => PROGRESS_NONE,
+    };
+    unsafe {
+        PostMessageW(
+            Some(receiver),
+            WM_MUSIC_PROGRESS,
+            WPARAM(step),
+            LPARAM(isize::from(playing)),
+        )
+    }
+    .context("post the progress to the tray")
+}
+
+/// Apply a [`WM_MUSIC_PROGRESS`] payload. Called from the tray's message loop, on its STA.
+///
+/// **Gated on the taskbar controls being up**, which is the other half of a defect this move fixed:
+/// `--taskbar-revert` puts the tile away but leaves the feed running, and without this check the very
+/// next poll drew the bar straight back onto a button that no longer has a strip on it.
+pub fn apply_progress(step: usize, playing: bool) {
+    let fraction = (step != PROGRESS_NONE).then(|| step as f64 / PROGRESS_SCALE as f64);
+    if fraction.is_some() && !strip_is_up() {
+        clear_player_progress();
+        return;
+    }
+    if let Err(err) = crate::music::player::set_player_progress(fraction, playing) {
+        // Routine rather than exceptional: the player's window closes and this is how we find out.
+        // Logged only when there was something to draw, so a closed player is quiet.
+        if fraction.is_some() {
+            eprintln!("music: could not set the progress bar: {err:#}");
+        }
+    }
+}
+
+/// Take the progress bar off the player's window, ignoring the "no player" case.
+pub fn clear_player_progress() {
+    let _ = crate::music::player::set_player_progress(None, false);
+}
+
+/// Denominator for the progress fraction carried in [`WM_MUSIC_PROGRESS`]'s `wParam`.
+const PROGRESS_SCALE: usize = 1000;
+
+/// `wParam` value meaning "clear the bar" — outside the `0..=PROGRESS_SCALE` range a fraction uses.
+const PROGRESS_NONE: usize = usize::MAX;
+
+/// The music feed handing the tray a progress-bar value: `wParam` is the fraction in
+/// [`PROGRESS_SCALE`]ths (or [`PROGRESS_NONE`]), `lParam` is 1 while playing.
+///
+/// Posted **within** the process, feed thread to tray thread, unlike every other message here — the
+/// TAP has no part in it. It exists so the shell call happens on an STA; see [`post_progress`].
+pub const WM_MUSIC_PROGRESS: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 25;
 
 /// Window class of the receiver. Must match `RECEIVER_CLASS` in the TAP's `ipc`
 /// module — the TAP finds this window by class name.

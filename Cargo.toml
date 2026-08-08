@@ -44,6 +44,14 @@ windows-core = "0.61"
 version = "0.61"
 features = [
     "Win32_Foundation",
+    # The music half: GlobalSystemMediaTransportControlsSessionManager and friends are the whole
+    # of the now-playing feed and its transport controls.
+    "Media_Control",
+    # Cover art arrives as an IRandomAccessStreamReference; DataReader turns it into bytes.
+    "Storage_Streams",
+    # IAsyncOperation::get, and the collection the session manager hands back.
+    "Foundation",
+    "Foundation_Collections",
     "Win32_System_Com",
     "Win32_System_Com_StructuredStorage",
     "Win32_System_Variant",

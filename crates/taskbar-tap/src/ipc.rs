@@ -150,3 +150,13 @@ pub fn send_scroll(segment: Segment, delta: i32) {
     };
     post(WM_TASKBAR_SCROLL, flow, delta as isize);
 }
+
+/// Post a raw action code.
+///
+/// For the music tile, whose codes come from `music::tick::Segment` rather than from [`Action`]. Kept
+/// as a separate entry point rather than folding those into `Action`: the two halves of this TAP send
+/// to the same window but mean unrelated things, and one enum spanning both would invite a `match`
+/// that silently treats a media click as an audio one.
+pub fn send_code(code: usize) {
+    post(WM_TASKBAR_ACTION, code, 0);
+}

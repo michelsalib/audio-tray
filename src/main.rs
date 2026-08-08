@@ -43,6 +43,23 @@
 //!   audio-tray --taskbar-restart
 //!                         restart explorer.exe, as the flyout footer's button does.
 //!                         Frees the TAP DLL, so it also applies a staged update to it.
+//!   audio-tray --music-probe
+//!                         list every media session on the machine with its app id, and
+//!                         say which one was matched as YouTube Music — the answer to
+//!                         put in `music.app_id` when the matching misses
+//!   audio-tray --music-timeline
+//!                         sample the matched session's position over a few seconds, which
+//!                         is how the checkpoint-not-a-clock behaviour was measured
+//!   audio-tray --music-progress <percent|off>
+//!                         put a taskbar progress bar on the player's window by hand, to
+//!                         separate "the shell refused it" from "the position was wrong"
+//!   audio-tray --music-windows
+//!                         survey the player's windows (pid, visibility, cloaking, rect),
+//!                         in the process that acts on them — PowerShell cannot do this
+//!   audio-tray --music-thumbbar [playing|paused]
+//!                         put prev/play/next on the player's *hover preview* via the shell's
+//!                         own thumbnail toolbar — the measurement for whether that API
+//!                         accepts a window this process does not own
 
 use anyhow::{bail, Context, Result};
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
@@ -57,6 +74,7 @@ mod config;
 mod flyout;
 mod icons;
 mod layered;
+mod music;
 mod osd;
 mod taskbar;
 mod tray;
@@ -251,6 +269,41 @@ fn main() -> Result<()> {
             println!("taskbar: restarting Explorer...");
             taskbar::restart_explorer()?;
             println!("taskbar: done.");
+        }
+        // The music half's diagnostics. They exist because the interesting failures are all in *other*
+        // processes: which SMTC session is YouTube Music (Chromium decides the app id), whether the
+        // player publishes a position at all, and whether the shell still lets us put a progress bar
+        // on somebody else's window.
+        Some("--music-probe") => music::probe()?,
+        Some("--music-timeline") => music::report_timeline()?,
+        Some("--music-progress") => {
+            let value = args.get(2).map(String::as_str).unwrap_or("off");
+            let fraction = match value {
+                "off" | "none" => None,
+                percent => Some(
+                    percent.parse::<f64>().with_context(|| {
+                        format!("--music-progress wants a percentage or 'off', got {percent:?}")
+                    })? / 100.0,
+                ),
+            };
+            music::player::set_player_progress(fraction, true)?;
+            println!("music: progress -> {fraction:?}");
+        }
+        // The M12 spike: does the shell's own thumbnail toolbar accept a window we do not own?
+        // Nothing documents that case, and the answer decides whether the transport buttons can move
+        // off the strip and under the hover preview at all.
+        Some("--music-thumbbar") => {
+            let playing = !matches!(args.get(2).map(String::as_str), Some("paused"));
+            music::thumbbar::probe(playing)?;
+        }
+        Some("--music-windows") => {
+            let windows = music::player::player_windows();
+            if windows.is_empty() {
+                println!("no window with 'youtube' in its title");
+            }
+            for line in windows {
+                println!("{line}");
+            }
         }
         Some("--taskbar-revert") => {
             // Ask whatever TAP is loaded to put the taskbar back, without touching

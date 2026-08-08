@@ -312,3 +312,111 @@ pub unsafe fn attach(
     }
     ok
 }
+
+/// A click on one of the music tile's transport glyphs.
+///
+/// Separate from [`Tap`] because it means something different and goes somewhere different: the audio
+/// segments cycle a device, these drive a media session in another process. The suppression story
+/// differs too — this one **must** mark the gesture handled, or the shell's own button click activates
+/// YouTube Music on top of the track change the user asked for.
+#[implement(ITappedEventHandler)]
+struct MusicTap(crate::music::tick::Segment);
+
+impl ITappedEventHandler_Impl for MusicTap_Impl {
+    unsafe fn Invoke(&self, _sender: *mut c_void, args: *mut c_void) -> HRESULT {
+        guard("music-tap", || {
+            let suppressed = suppress_tap(args);
+            if already_seen(args) {
+                return;
+            }
+            logf!(
+                "music: tap on {} (Handled set: {suppressed})",
+                self.0.label()
+            );
+            crate::ipc::send_code(self.0.code());
+        })
+    }
+}
+
+/// `PointerPressed` on a transport glyph, marked handled.
+///
+/// **The earliest point at which the chain to the button can be cut**, and it has to be cut here or
+/// pressing play also activates the app. Note this is exactly what is *not* done on the strip body:
+/// there, the press is the shell's drag-to-reorder gesture, and suppressing it made the tile the one
+/// taskbar item the user could not move.
+#[implement(IPointerEventHandler)]
+struct MusicPress;
+
+impl IPointerEventHandler_Impl for MusicPress_Impl {
+    unsafe fn Invoke(&self, _sender: *mut c_void, args: *mut c_void) -> HRESULT {
+        guard("music-press", || {
+            // Deliberately not deduped: suppression has to be applied to every delivery, and marking
+            // an already-handled event handled again is free.
+            suppress_pointer(args);
+        })
+    }
+}
+
+/// Mark a completed tap handled, so it does not continue to the shell's own handler.
+///
+/// # Safety
+/// `args` must be the live args pointer XAML passed to `Invoke`.
+unsafe fn suppress_tap(args: *mut c_void) -> bool {
+    if args.is_null() {
+        return false;
+    }
+    let inspectable = core::mem::transmute::<*mut c_void, IInspectable>(args);
+    let handled = inspectable
+        .cast::<crate::winrt::ITappedRoutedEventArgs>()
+        .ok()
+        .map(|event| event.put_Handled(1) == S_OK)
+        .unwrap_or(false);
+    core::mem::forget(inspectable); // XAML owns the args
+    handled
+}
+
+/// The same, for a pointer press.
+///
+/// # Safety
+/// `args` must be the live args pointer XAML passed to `Invoke`.
+unsafe fn suppress_pointer(args: *mut c_void) -> bool {
+    if args.is_null() {
+        return false;
+    }
+    let inspectable = core::mem::transmute::<*mut c_void, IInspectable>(args);
+    let handled = inspectable
+        .cast::<IPointerRoutedEventArgs>()
+        .ok()
+        .map(|event| event.put_Handled(1) == S_OK)
+        .unwrap_or(false);
+    core::mem::forget(inspectable);
+    handled
+}
+
+/// Wire one of the music tile's transport glyphs.
+///
+/// No hover plate and no wheel handler, unlike [`attach`]: the glyphs sit on the app's own button, so
+/// the shell already lights the whole button on hover, and a scroll there means nothing.
+///
+/// # Safety
+/// XAML UI thread (the visual-tree callback thread) only.
+pub unsafe fn attach_music(
+    diagnostics: &IXamlDiagnostics,
+    segment: crate::music::tick::Segment,
+    element: InstanceHandle,
+) -> bool {
+    let Some(target) = ui_element(diagnostics, element) else {
+        logf!("music: 0x{element:x} is not a UIElement — not wiring it up");
+        return false;
+    };
+    // A token each. Nothing detaches these — the DLL outlives every element it wires — but one
+    // variable for both registrations quietly discards the first token, so the day something does
+    // want to detach, the press handler is the one that cannot be.
+    let mut press_token = 0i64;
+    let mut tap_token = 0i64;
+    let pressed: IPointerEventHandler = MusicPress.into();
+    let press = target.add_PointerPressed(pressed.as_raw(), &mut press_token);
+    let tapped: ITappedEventHandler = MusicTap(segment).into();
+    let tap = target.add_Tapped(tapped.as_raw(), &mut tap_token);
+    press == S_OK && tap == S_OK
+}

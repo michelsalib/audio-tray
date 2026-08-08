@@ -856,6 +856,323 @@ unverified against current code. It was measured once (same sender, same args
 object, same thread, one registration) and coalescing on args identity fixed it;
 whether the underlying double-delivery still happens is unknown.
 
+## The music tile — a second strip, on an app's own button
+
+Grafted in from a separate spike (`media-tray`), which existed to answer whether YouTube
+Music could be drawn into the taskbar at all. It ends up in *this* TAP for one reason,
+which is not tidiness: **XAML Diagnostics takes one consumer per endpoint.** A second
+process injecting into the same Explorer gets `S_OK` and draws nothing — so two taskbar
+features have to be one DLL, or one of them does not work. Verified in a single session,
+one shell, one injection:
+
+```text
+init data = "…;hidevolume=1;hidemic=1;tile=YouTube Music;pid=6436"
+MUTATION SUCCEEDED — chevron content set on 0x14e4e148     <- the audio strip
+music: strip placed on 0xd9c8208 — "" / "" [Stopped]       <- the music tile
+music: previous / play/pause / next wired
+```
+
+The tile lives in [src/music/](src/music/) and shares nothing with the audio strip but the
+plumbing: the tree recorder, the mutation gate, the sweep, and `winrt.rs`.
+
+### A `TaskListButton` is not the notification area, in three ways that each cost a fix
+
+Everything this TAP knew was about `NotifyIconView`, where the slot sizes itself to its
+content and a `ContentPresenter` accepts arbitrary XAML. A task button gives neither:
+
+| | notification area | task button |
+| --- | --- | --- |
+| where content goes | `ContentPresenter.Content` | **`Border#BackgroundElement`.Child** — and *not* the unnamed `Border` before it in the panel, which draws behind the background |
+| width | follows the content | forced: `button → panel → Border`, every level, **re-applied every sweep** because the shell puts `Width=44` back |
+| the shell's own parts | none | `RunningIndicator` and `ProgressIndicator`, centred in a button that is now 244 epx wide |
+
+Slot overhead is **4 epx**, not the 71 measured for the Widgets host and wrongly
+generalised: a button's natural chain is `44 → 44 → 40`, so asking for 80 spent 76 on
+nothing that paints — hover firing before the pointer reached the strip, and taskbar width
+that pushed the shell into its compressed layout early. It cannot be 0 either: a flat
+`240,240,240` puts the plate's rounded right corner on the parent's boundary and it is
+shaved square. 4 is what the corner costs, which is why it is `Host::SLOT_OVERHEAD` per
+host rather than a constant.
+
+**The two indicators are moved, not hidden.** Collapsing `RunningIndicator` costs the only
+cue that the app is open — the strip cannot supply it, since "closed" and "open, nothing
+playing" both read as an empty strip. Centred in 244 epx it sits under the title text and
+reads as a stray dot. Two writes put it where it means something:
+
+```text
+HorizontalAlignment = Left           the template centres it
+Margin.Left = icon_centre - w/2      icon_centre = pad + cover/2 = 16 epx at the 240 strip
+```
+
+`w` is read back (`ActualWidth`, measured 6 epx → margin 13) rather than assumed, because
+the shell grows the pill when the window is in the foreground. `ProgressIndicator` gets the
+same treatment plus the icon's 28 epx width — at a 244-epx button it otherwise stretches
+the whole strip. `Margin` needed two more `IFrameworkElement` placeholders
+(VerticalAlignment g/p sit between it and `HorizontalAlignment`), counted against the SDK
+header like every other slot here.
+
+### The position goes on the shell's own progress bar, on another app's window
+
+`ITaskbarList3::SetProgressState` + `SetProgressValue` **work cross-process**, on a window
+we do not own. Nothing documents that case — it is normally an app reporting itself — so it
+was measured: 40 % from a cold `--music-progress 40`, then against a live session, bar at
+24 % with the session at 66.5 s of 275.7 s (24.1 %). Going through the shell buys the
+colour (accent playing, **yellow paused**), the rounded ends, the track, the animation and
+the user's theme, for no code.
+
+Two things it costs. The fraction is quantised to 200 steps and sent only when the step or
+the play state changes, because this is a cross-process COM call on a 1 s poll — half a
+percent is seven times finer than the 28 epx it paints in. And it **must be cleared on
+quit**, next to the notify-icon removal: a progress bar we put on somebody else's window
+outlives us, and one frozen mid-track is a bug the user cannot attribute to audio-tray.
+
+### The player publishes a checkpoint, not a clock
+
+`GetTimelineProperties` on the YouTube Music session is not empty — worth checking rather
+than assuming, since Chromium historically published nothing there. Measured over 6 s of
+playback, the position moved **1.2 s**: it is republished on play, pause, seek and track
+change, then sits still, and `LastUpdatedTime` is the timestamp of that checkpoint. A
+paused read was correct at 158.3 s while the reads before it had been stale for seconds.
+
+So the bar draws
+
+```text
+shown = position + (now − last_updated)   while Playing, clamped to end
+shown = position                          otherwise
+```
+
+which is local arithmetic on a poll the feed already runs — a smooth bar for one
+`GetTimelineProperties` per poll and no extra cross-process reads.
+
+### Two text defects, both from numbers never read back
+
+`report_widen` now logs our own elements in **both** dimensions, on a later tick (they have
+no measured size on the tick that places them):
+
+```text
+before   Title 103.9 x 18.6      after   Title 119.1 x 17.0
+         Artist 47.5 x 14.6              Artist 47.5 x 14.6
+```
+
+* **Clipped descenders.** 18.6 + 14.6 = 33.2 epx of stacked text in a 30-epx column with a
+  `Clip` to match, so the tails of `p` and `y` went. The button gives no more than 32, so
+  the last 1.6 comes out of the leading: `LineHeight="17"` *with*
+  `LineStackingStrategy="BlockLineHeight"`, without which `LineHeight` is a minimum and
+  nothing moves.
+* **Dead space before the transport glyphs.** The epx-per-character figures were eyeballed
+  at 7.43/5.78 and were 14 % too wide — a 16-character window rendered 103.9 epx of a 120
+  epx column. Measured off rendered text: **6.49 and 5.28**, giving 18 and 23 characters at
+  the 240 strip, filling the column to 119.1 of 120. An average will overflow on unusually
+  wide characters; that is what the `Clip` is for, and overflowing by a character beats dead
+  space on every normal title.
+
+### Three behaviours that only using it could find
+
+* **Suppressing `PointerPressed` costs drag-to-reorder.** The shell's press is where the
+  drag gesture begins, so marking it handled removes reordering entirely — invisible in
+  every log, visible only as a gesture that never starts. On the Widgets host the
+  suppression must stay (an unhandled press opens the board); on an app's own button it
+  protects nothing, because that button's click already *is* what we were reimplementing.
+  `shell_owns_the_button()` gates the body's handlers, and the native path is strictly
+  better: the shell activates or minimises with its own animation, and no foreground rights
+  are needed at all. The three glyphs keep their suppression — pressing play must not also
+  activate the app — so a drag starts on the body, 200 of the 240 epx.
+* **A play click with no session must not synthesise a media key.** Reported from use:
+  pressing play on the YouTube Music strip paused **MPC-HC**. A Chromium session does not
+  exist until media has played, and Windows hands a media key to whichever app owns them.
+  Checking for a foreign session first does not fix it (measured: *no* sessions reported
+  while MPC-HC was running and responding to keys). The fallback raises the player instead
+  — deterministic, always about the right app, and it puts the app's own play button under
+  the cursor.
+* **Raising a window: every call reports success and only one works.** From a process that
+  has not just been interacted with — and we are structurally that process, since the click
+  lands on Explorer's thread and reaches us as a posted message — Windows refuses the
+  foreground change silently. `GetForegroundWindow` afterwards is the only honest test:
+
+  | rung | result, from a process with no rights |
+  | --- | --- |
+  | `ShowWindow(SW_RESTORE)` if minimised | needed, needs no rights, does not foreground |
+  | `SetForegroundWindow` | **refused** (returns success) |
+  | `AttachThreadInput` to the foreground thread, then ask again | **works** |
+  | `SwitchToThisWindow` | not reached; undocumented, increasingly ignored on Win11 |
+
+  Verified end to end with the foreground read back from a *third* process. The proper
+  handoff is done too, on the Explorer side where the click happens: `ipc::send` calls
+  `AllowSetForegroundWindow(pid)` before posting, and **only** for that action — rights
+  handed out that nothing spends are how a click steals focus by surprise.
+
+### The app side: an MTA thread, because the STA deadlocks
+
+Not a design choice. audio-tray's main thread is an STA (it owns windows), and every SMTC
+call returns an `IAsyncOperation` this code blocks on — which on an STA that pumps messages
+deadlocks. The first `--music-probe` hung with no output at all. The feed therefore owns
+its own MTA thread (`music::on_mta_thread`), paces its own poll, and talks to the tray by
+channel, so a wedged session cannot stall the audio half either.
+
+Two smaller decisions worth recording:
+
+* The tile's name comes through the existing init data as `tile=<app name>`, matched as a
+  **substring** of the button's `AutomationProperties.Name` — the shell's name carries a
+  localised suffix (`"YouTube Music épinglé"` here). A miss logs every button it saw, once,
+  because those names are documented nowhere and change with the display language.
+* Transport clicks are wire codes **10/11/12**, deliberately far from the audio strip's
+  1/2/3: an off-by-one that cycled an audio device on a play click is exactly the kind of
+  bug a shared wire invites.
+
+### The transport controls moved to the hover preview — what that cost to learn
+
+The three glyphs used to sit on the strip, which worked but spent 78 epx of taskbar on
+controls that are only wanted occasionally. They are now on the preview's **thumbnail
+toolbar**, and the strip is 162 epx instead of 240.
+
+**`ThumbBarAddButtons` works cross-process**, like `SetProgressValue` before it: the shell
+drew our three buttons under YouTube Music's preview, themed and DPI-scaled, from a call
+made in audio-tray against a window Chromium owns. Nothing documents that case.
+
+**But the click does not come back.** `THBN_CLICKED` arrives as a `WM_COMMAND` sent to the
+window the buttons were registered against — the player's — which has never heard of them.
+Measured exactly as predicted: the buttons drew and did nothing. What rescues it is that
+the shell's buttons are ordinary XAML in Explorer, where this DLL already lives:
+
+```text
+Microsoft.UI.Xaml.Controls.ItemsRepeater#ThumbBarRepeater
+  Taskbar.ThumbBarButton#ThumbBarButton
+```
+
+So the shell draws and the TAP listens, with a `Tapped` handler attached exactly as the
+strip's own segments get one. Two traps on the way:
+
+* **The tile's own tooltip suppressed the preview entirely.** `ToolTipService.ToolTip` on
+  the strip made XAML's tooltip service own hover for that subtree, and the shell's
+  `Taskbar.FlyoutFrame` never opened — the tile was the one taskbar button with no window
+  preview, and nothing in any log said so. It presented as "the thumbnail toolbar does not
+  work"; it was the preview never appearing. Remove the tooltip and both come back.
+* **Buttons cannot be identified by position.** Changing the play glyph to a pause glyph
+  means `ThumbBarUpdateButtons`, and the shell rebuilds that button — a new element,
+  announced *after* the other two, with the handler still on the old one. Indexing a
+  sequence-ordered list therefore put previous and next at 0 and 1 and the live play/pause
+  off the end at 3, so the only button whose glyph changes was the only one that went dead
+  after a single press. They are matched on `AutomationProperties.Name` instead, which
+  carries the `szTip` audio-tray set — a contract between the halves, like the wire codes.
+
+### Taking over the hover flyout — built, and abandoned
+
+Drawing our own now-playing card into the preview (cover, title, artist, controls) works and
+looks good, and it is still the wrong answer. Two measurements say why:
+
+**There is exactly one `ContentPresenter#HoverFlyoutContent`, shared by every taskbar
+button.** Its animation suggests one per hover; it is not:
+
+```text
+music: flyout 0x1349c888 ours=true  (1 recorded with that name)   <- our tile
+music: preview card placed on 0x1349c888
+music: flyout 0x1349c888 ours=false (1 recorded with that name)   <- VS Code, same handle
+```
+
+The shell shows a different app by *updating* the `TaskItemThumbnailList` in that presenter.
+Replace the content and there is nothing left for it to update — so the now-playing card
+appeared on **every** app's preview.
+
+**Handing it back on the next sweep does not rescue it.** Ownership can only be re-checked
+when the timer next runs, so a foreign preview shows our card until it does and ours shows
+the shell's thumbnail until it does: a visible flip-flop in both directions. There is no
+event to hang the work on instead, because `OnVisualTreeChange` may not mutate XAML.
+
+A third cost, worth recording because it was the first symptom and looked like something
+else: opening a flyout is a *sustained* burst of tree events, so `QUIET_BEFORE_MUTATING`
+(400 ms) is not reached until the burst ends. That showed up as the shell's own thumbnail
+sitting there for seconds before the card replaced it, and no amount of sweep-pacing fixed
+it — the gate, not the timer, was the wall.
+
+### What an audit of this feature turned up
+
+Four of these were real defects that testing had not reached, and they share a shape worth naming:
+each is a cost or a cleanup that only shows up on a path nobody drives by hand.
+
+* **A killed audio-tray left a progress bar on somebody else's window.** The teardown that clears it
+  runs from the app, so `Stop-Process -Force` skipped it and the bar stayed frozen mid-track until
+  Explorer restarted. The TAP's owner-watch already reverts the strip on that event; it clears the bar
+  now too, which it can do because from inside Explorer `ITaskbarList3` is a local STA call. Verified
+  by killing the app and reading the button back: `music: cleared the progress bar on 0x4068a -> true`.
+* **`--taskbar-revert` put the bar straight back.** It reverts the *TAP*, while the feed carries on
+  polling in the still-running tray — so the next poll redrew a bar on a button with no strip. The
+  tray gates on `strip_is_up()` now.
+* **Every poll read every session's artwork.** `read_session` did the async properties call *and* a
+  full thumbnail decode for every media session on the machine, then threw all but one away, and then
+  enumerated a second time for the timeline. One `GetSessions` now, a local `GetPlaybackInfo` per
+  session to choose with, and the expensive read only for the winner — `session::pick` returns an
+  index rather than a reference precisely so that is possible.
+* **Cover filenames collided across restarts.** The counter that defeats `BitmapImage`'s URI cache
+  restarted at zero every launch, so the first cover after a restart reused a path Explorer still had
+  cached — the exact defect the counter exists to prevent, from the one direction it did not guard.
+  Names carry the pid now, and orphans from killed runs are swept at startup.
+
+One more that was not a bug but was untested-as-shipped: **the progress bar was driven from the feed's
+MTA thread** while every measurement in this document was taken through `--music-progress`, which runs
+on `main`'s STA. `ITaskbarList3` is apartment-threaded, so those are different code paths through COM.
+The fraction is posted to the tray's message loop now (`WM_MUSIC_PROGRESS`) and applied there, which
+is both the tested apartment and the thread that knows whether the controls are up at all.
+
+### The progress line jumped on every track change — because we were clearing it
+
+**`TBPF_NOPROGRESS` does not blank the bar, it takes `ProgressIndicator` out of the button.** The
+next value builds a *fresh* one from the template — centred, natural width, none of our margin or
+width on it — and the sweep puts those back a tick later. That is the whole of the "centre → left →
+full width" step, and it happened twice a song because a track change was answered with a clear:
+
+```text
+progress bar -> 27% (playing)
+progress bar -> cleared (no timeline)     <- destroys the element
+progress bar -> 1% (playing)              <- rebuilds it, from the template
+```
+
+So the poll never clears now. A gap holds the last fraction; taking the bar away is a *teardown*
+action with its own paths — quit, `--taskbar-revert`, the TAP's owner-watch — each of which means it.
+Measured after: three forced track changes, **zero** clears, 89 % → 0 % straight through.
+
+The obvious narrower guard does not work, and it is worth knowing why before anyone tries it:
+**`current_app_id` drops during a track change too.** Chromium tears the media session down and
+builds a new one, so "only clear when the session is really gone" clears on exactly the gap it was
+meant to protect. There is no instantaneous signal that separates the two; not clearing at all is
+what does.
+
+Three things were tried first, on the theory that this was a race with the shell's layout. Each was a
+real defect and none of them was the cause:
+
+* **Stop rebuilding the strip on a track change.** Real and worth keeping — title and artist are
+  `put_Text` now, and only the cover's own `Border` is reparsed — but it treated a contributor, not
+  the cause.
+* **Take the newest `BackgroundElement`, not the first.** Also a real bug: the recorded tree keeps
+  elements whose removal XAML never announced, so the lookup alternated between a stale and a live
+  one and the placement record missed on alternate sweeps. Fixing it removed a rebuild per track and
+  the jump stayed.
+* **Order the writes width-first**, since an STA pumps while a COM call is outstanding and a frame
+  can land between them. It changes which intermediate is visible, not whether there is one.
+
+**Drawing our own line instead was built, and rejected on sight.** It works — a `Border` in the strip
+fed by a `progress=` key in the state file, moved by one `Width` write, immune to anything the shell
+does — and it is the wrong picture. Windows merges the progress bar *into* the running indicator:
+one underline that fills. A line of ours plus the shell's own pill is two controls saying different
+things about the same app, and that reads worse than the jump it cured. Reverted, and then the actual
+cause turned out to be ours all along.
+
+The lesson worth carrying: three plausible fixes in a row all *reduced* the churn, which kept the
+theory alive long after it should have died. What settled it was reading the log for what we were
+telling the shell to do, rather than reasoning about what the shell does to us.
+
+### Seen live
+
+The last mile is done: the strip has been watched through track changes with the title,
+artist, cover and progress line all on screen, the hover preview opens with the three
+transport buttons under it, and they have been clicked by hand and drive the session.
+
+One thing still cannot be driven from a script here, and it is the same limit the audio
+strip has: **synthetic clicks do not reach the taskbar.** Synthetic *movement* does —
+`SendInput` with relative nudges after a `SetCursorPos` opens the preview reliably, which is
+how the flyout was measured at all — but `SetCursorPos` alone does not (a teleport never
+starts the hover-intent timer), and no injected click produces a `Tapped`. So the buttons
+drawing and wiring is verifiable from a script; the buttons *working* is not.
+
 ## The routes that do NOT work — three refused
 
 Reading the tree is fully solved. **Changing it is not.** Three independent

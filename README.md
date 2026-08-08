@@ -4,7 +4,7 @@
 [![Release](https://github.com/michelsalib/audio-tray/actions/workflows/release.yml/badge.svg)](https://github.com/michelsalib/audio-tray/releases/latest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-A tiny Windows system-tray app for **controlling your audio without digging through Settings** — switch the default output/input device, set volume, and mute, all from one native-feeling flyout.
+A tiny Windows system-tray app for **controlling your audio without digging through Settings** — switch the default output/input device, set volume, and mute, all from one native-feeling flyout. It also turns the YouTube Music PWA's taskbar icon into a now-playing strip.
 
 <p align="center">
   <img src="assets/app.ico" width="96" alt="Audio Tray icon">
@@ -30,6 +30,11 @@ A tiny Windows system-tray app for **controlling your audio without digging thro
   own "microphone in use" indicator does (which it replaces, see below), so it covers
   every app and every microphone, and it stays lit while an app holds the stream open
   even if you are muted.
+- **YouTube Music in its own taskbar button** — the PWA's icon becomes a 162-epx strip
+  showing the track, the artist and the song's position, with previous/play-pause/next a
+  hover away on the preview's toolbar. It is the app's *own* button, so launching adds no
+  second icon, minimising still goes there, and it still drags to reorder. See
+  [the YouTube Music tile](#the-youtube-music-tile).
 - **Falls back to a plain tray icon** if the taskbar controls cannot be drawn — an
   icon reflecting the current output device (speakers, headphones, headset, HDMI…),
   rendered from Segoe Fluent Icons and themed to your taskbar. Either button opens
@@ -77,10 +82,27 @@ audio-tray --set <q>  switch default output to a device by name substring or id
 audio-tray --update   check GitHub Releases and self-update now
 audio-tray --taskbar-revert
                       put the taskbar back, without stopping the running tray
+audio-tray --music-probe
+                      list every media session with its app id, and which one matched
+audio-tray --music-timeline
+                      sample the matched session's position over a few seconds
+audio-tray --music-progress <percent|off>
+                      set the progress bar on the player's window by hand
+audio-tray --music-windows
+                      survey the player's windows (pid, visibility, cloaking, rect)
+audio-tray --music-thumbbar [playing|paused]
+                      put the transport buttons on the player's hover preview by hand
 ```
 
-Configuration (per-device icon overrides) is stored at
-`%APPDATA%\AudioTray\config\config.toml`.
+Configuration is stored at `%APPDATA%\AudioTray\config\config.toml`: per-device icon
+overrides, and the music tile —
+
+```toml
+[music]
+enabled = true            # false turns the whole music half off, progress bar included
+tile = "YouTube Music"    # the taskbar button to draw into; "" = feed only, no strip
+# app_id = "..."          # pin the SMTC app id, if --music-probe shows a miss
+```
 
 ## Taskbar controls
 
@@ -122,6 +144,51 @@ things worth knowing:
 
 The engineering notes, including the failure modes found along the way, are in
 [crates/taskbar-tap/FINDINGS.md](crates/taskbar-tap/FINDINGS.md).
+
+## The YouTube Music tile
+
+The same injection that draws the audio buttons also replaces the YouTube Music PWA's
+taskbar icon with a now-playing strip: the track title (scrolling when it does not fit)
+and the artist under it, in 162 epx of taskbar. The transport controls are one hover
+away, on the preview's own toolbar.
+
+| Where | What |
+|-------|------|
+| The strip's body | The shell's own click — activates the player, or minimises it; drag still reorders the icon |
+| Hovering it | Windows' normal window preview, with previous / play-pause / next added underneath |
+| Across the strip | The song's position, on the progress line Windows draws for any app — accent while playing, yellow when paused |
+| The running pill | Left where it means something: under the icon, not centred in a widened button |
+
+It follows the media session, not YouTube Music's process, so it needs no extension, no
+API key and no login. Things worth knowing:
+
+- **It is invisible until it applies.** No YouTube Music session on the machine means no
+  state published, no progress bar and no strip — a user who never opens the player sees
+  no difference at all. That is why it is on by default.
+- **The icon must be on the taskbar**, pinned or running, and not in the overflow.
+- **The transport buttons are the shell's own.** They are added to the preview with
+  `ITaskbarList3::ThumbBarAddButtons` — the same thumbnail toolbar iTunes and MPC-HC use —
+  so the shell draws, themes and scales them. Windows sends the click to the *player's*
+  window rather than to us, so the TAP takes it from the button element instead; the two
+  halves meet at the button's tooltip text and the 10/11/12 wire codes.
+- **The strip carries no tooltip, deliberately.** Declaring one makes XAML's tooltip
+  service own hover for the tile, and Windows' window preview then never opens — which
+  would take the transport buttons with it.
+- **A play click with nothing playing raises the player** instead of synthesising a media
+  key. A Chromium media session does not exist until media has played, and a media key
+  goes to whichever app Windows thinks owns them — which on this machine paused MPC-HC.
+- **The position is interpolated, not polled.** The player publishes a checkpoint with a
+  timestamp rather than a running clock, so the bar advances locally between checkpoints;
+  see FINDINGS.
+- **The button is handed back on the way out.** Quitting, `--taskbar-revert`, or Explorer
+  restarting all restore its width, icon and indicators, and a clean quit also clears the
+  progress bar off the player's window. One thing does not survive that promise, by the
+  shell's design rather than by choice: a thumbnail toolbar cannot be removed from a window
+  at all once added — on shutdown its buttons are greyed out instead, which is the honest
+  version of taking them away.
+
+Turn it off, or point it at a different app, with the `[music]` section of the config
+above.
 
 ## Auto-update
 

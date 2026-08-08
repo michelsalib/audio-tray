@@ -447,6 +447,23 @@ pub unsafe trait IAutomationPropertiesStatics: IUnknown {
 /// `put_Width` earns its place separately. Collapsing the system volume icon
 /// hides the glyph but does *not* free its slot inside the Quick Settings
 /// button, so the width has to be zeroed explicitly (see `decorate::collapse`).
+///
+/// `HorizontalAlignment` and `Margin` came with the music tile, and each pays for a defect that is
+/// invisible from the code:
+///
+/// * An element left at `Stretch` and then given an explicit `Width` is **centred**, not
+///   left-aligned. That slid the strip 40 epx right — half of `ask − content` — taking the `next`
+///   glyph off the end with it.
+/// * The shell centres its `RunningIndicator` and `ProgressIndicator` in the *button*. Fine at 44
+///   epx; at the 244 the strip needs, the running pill lands under the middle of the title and reads
+///   as a stray dot. Alignment moves them to the button's left edge; the margin places them under the
+///   app icon.
+///
+/// Verified against the SDK header, whose members after `MaxWidth` run **MinHeight g/p, MaxHeight
+/// g/p**, HorizontalAlignment g/p, **VerticalAlignment g/p**, Margin g/p, Name g/p, … — so four
+/// placeholders separate `put_MaxWidth` from `get_HorizontalAlignment`, and two more separate that
+/// from `get_Margin`. Count these against the header, never by eye: one slot out returns `S_OK` and
+/// silently does something else.
 #[interface("a391d09b-4a99-4b7c-9d8d-6fa5d01f6fbf")]
 pub unsafe trait IFrameworkElement: IUnknown {
     pub fn GetIids(&self, count: *mut u32, iids: *mut *mut windows_core::GUID) -> HRESULT;
@@ -469,6 +486,79 @@ pub unsafe trait IFrameworkElement: IUnknown {
     pub fn put_MinWidth(&self, value: f64) -> HRESULT;
     pub fn get_MaxWidth(&self, value: *mut f64) -> HRESULT;
     pub fn put_MaxWidth(&self, value: f64) -> HRESULT;
+    pub fn _reserved_min_height_get(&self) -> HRESULT;
+    pub fn _reserved_min_height_put(&self) -> HRESULT;
+    pub fn _reserved_max_height_get(&self) -> HRESULT;
+    pub fn _reserved_max_height_put(&self) -> HRESULT;
+    pub fn get_HorizontalAlignment(&self, value: *mut i32) -> HRESULT;
+    pub fn put_HorizontalAlignment(&self, value: i32) -> HRESULT;
+    pub fn _reserved_vertical_alignment_get(&self) -> HRESULT;
+    pub fn _reserved_vertical_alignment_put(&self) -> HRESULT;
+    pub fn get_Margin(&self, value: *mut Thickness) -> HRESULT;
+    pub fn put_Margin(&self, value: Thickness) -> HRESULT;
+}
+
+/// `Windows.UI.Xaml.HorizontalAlignment`.
+pub const HORIZONTAL_ALIGNMENT_LEFT: i32 = 0;
+#[allow(dead_code)] // the value everything starts at; kept so the pair reads correctly
+pub const HORIZONTAL_ALIGNMENT_STRETCH: i32 = 3;
+
+/// `Windows.UI.Xaml.Thickness` — four `DOUBLE`s, in XAML's `left,top,right,bottom` order.
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug, PartialEq)]
+pub struct Thickness {
+    pub left: f64,
+    pub top: f64,
+    pub right: f64,
+    pub bottom: f64,
+}
+
+/// `Windows.UI.Xaml.Controls.IBorder`.
+///
+/// **The one property that makes a taskbar *button* usable as a host.** Nothing at that end of the
+/// taskbar is a `ContentControl`, so the notification area's `ContentPresenter.Content` route has no
+/// counterpart there — but every `TaskListButton` template contains a `Border#BackgroundElement`, and
+/// `Border.Child` is a single-value property rather than a `UIElementCollection`, which sidesteps the
+/// `0x800F1000` that blocks `Panel.Children.Append`.
+///
+/// Verified against the SDK header: the interface's own members run BorderBrush g/p, BorderThickness
+/// g/p, Background g/p, CornerRadius g/p, Padding g/p, **Child g/p** — so `put_Child` is the
+/// fourteenth slot, and the ten before it have to be spelled out to reach it. The `Thickness` and
+/// `CornerRadius` ones are declared with `*mut c_void` operands because nothing here calls them; only
+/// their *width in the vtable* matters.
+#[interface("797c4539-45bd-4633-a044-bfb02ef5170f")]
+pub unsafe trait IBorder: IUnknown {
+    pub fn GetIids(&self, count: *mut u32, iids: *mut *mut windows_core::GUID) -> HRESULT;
+    pub fn GetRuntimeClassName(&self, name: *mut *mut c_void) -> HRESULT;
+    pub fn GetTrustLevel(&self, level: *mut i32) -> HRESULT;
+    pub fn get_BorderBrush(&self, value: *mut *mut c_void) -> HRESULT;
+    pub fn put_BorderBrush(&self, value: *mut c_void) -> HRESULT;
+    pub fn get_BorderThickness(&self, value: *mut c_void) -> HRESULT;
+    pub fn put_BorderThickness(&self, value: *mut c_void) -> HRESULT;
+    pub fn get_Background(&self, value: *mut *mut c_void) -> HRESULT;
+    pub fn put_Background(&self, value: *mut c_void) -> HRESULT;
+    pub fn get_CornerRadius(&self, value: *mut c_void) -> HRESULT;
+    pub fn put_CornerRadius(&self, value: *mut c_void) -> HRESULT;
+    pub fn get_Padding(&self, value: *mut c_void) -> HRESULT;
+    pub fn put_Padding(&self, value: *mut c_void) -> HRESULT;
+    pub fn get_Child(&self, value: *mut *mut c_void) -> HRESULT;
+    pub fn put_Child(&self, value: *mut c_void) -> HRESULT;
+}
+
+/// `Windows.UI.Xaml.Controls.IImage`.
+///
+/// Only `put_Source`, and only so cover art can be swapped **in place**. Rebuilding the strip to
+/// change the artwork would replace every element in it — including the ones the click handlers are
+/// attached to — so a track change would silently break the transport buttons.
+///
+/// Verified against the SDK header: `Source` g/p are the interface's first two own members.
+#[interface("495b7402-9af3-4e50-aa90-03388f3086d2")]
+pub unsafe trait IImage: IUnknown {
+    pub fn GetIids(&self, count: *mut u32, iids: *mut *mut windows_core::GUID) -> HRESULT;
+    pub fn GetRuntimeClassName(&self, name: *mut *mut c_void) -> HRESULT;
+    pub fn GetTrustLevel(&self, level: *mut i32) -> HRESULT;
+    pub fn get_Source(&self, value: *mut *mut c_void) -> HRESULT;
+    pub fn put_Source(&self, value: *mut c_void) -> HRESULT;
 }
 
 /// `Windows.UI.Xaml.Controls.IGridStatics`.
@@ -515,3 +605,21 @@ pub const GRID: &str = "Windows.UI.Xaml.Controls.Grid";
 pub const XAML_READER: &str = "Windows.UI.Xaml.Markup.XamlReader";
 pub const AUTOMATION_PROPERTIES: &str = "Windows.UI.Xaml.Automation.AutomationProperties";
 
+
+/// `Windows.UI.Xaml.Input.ITappedRoutedEventArgs`, for the `put_Handled` lever on a completed tap.
+///
+/// The music tile's transport glyphs need it: a tap they act on must not also reach the app button
+/// underneath, or pressing play activates YouTube Music on top of the track change.
+///
+/// Verified against the SDK header: `PointerDeviceType`, `Handled` g/p, `GetPosition` — so `put_Handled`
+/// is the sixth slot after the three `IInspectable` ones.
+#[interface("a099e6be-e624-459a-bb1d-e05c73e2cc66")]
+pub unsafe trait ITappedRoutedEventArgs: IUnknown {
+    pub fn GetIids(&self, count: *mut u32, iids: *mut *mut windows_core::GUID) -> HRESULT;
+    pub fn GetRuntimeClassName(&self, name: *mut *mut c_void) -> HRESULT;
+    pub fn GetTrustLevel(&self, level: *mut i32) -> HRESULT;
+    pub fn get_PointerDeviceType(&self, value: *mut i32) -> HRESULT;
+    pub fn get_Handled(&self, value: *mut u8) -> HRESULT;
+    pub fn put_Handled(&self, value: u8) -> HRESULT;
+    pub fn GetPosition(&self, relative_to: *mut c_void, value: *mut c_void) -> HRESULT;
+}

@@ -19,6 +19,7 @@ mod interact;
 mod ipc;
 pub mod lifecycle;
 mod log;
+pub mod music;
 mod reorder;
 mod restore;
 mod tree;
@@ -439,6 +440,13 @@ impl Tap_Impl {
                 if let Ok(mut strip) = STRIP.lock() {
                     *strip = Some(decorate::StripState::parse(&data));
                 }
+                // The music tile is opt-in through the same payload: `tile=<app name>` names whose
+                // taskbar button to draw the now-playing strip into, and its absence disables that
+                // half without touching the audio one.
+                music::tile::set_host(value_from(&data, "tile"));
+                if let Some(width) = value_from(&data, "strip").and_then(|w| w.parse().ok()) {
+                    music::layout::set_content_width(width);
+                }
                 // Whoever asked for the strip is also who we put it away for.
                 lifecycle::watch_owner(value_from(&data, "pid"));
             }
@@ -548,6 +556,18 @@ impl IVisualTreeServiceCallback_Impl for Tap_Impl {
                 return;
             }
 
+            // A transport button in a hover preview, just built. Asking for it to be wired *now*
+            // rather than on the next sweep is the difference between the first press working and
+            // the first press doing nothing — see [`wire_transport`].
+            //
+            // Above the tray-thread gate on purpose: the flyout is not announced on one fixed
+            // thread, and a request that arrives on another island's would be dropped by it. The
+            // post is what moves the work onto the tray's thread, and it is not a XAML call, so it
+            // is allowed from in here.
+            if added && type_name == music::thumbbar::BUTTON_TYPE {
+                lifecycle::nudge_transport();
+            }
+
             // Everything below touches the tray, so it may only run on the thread
             // that owns it. The triggers are element *types* and *names*, which
             // match in every island — "a ContentPresenter was added" fires on the
@@ -623,7 +643,12 @@ pub(crate) unsafe fn stand_down() {
     GENERATION.fetch_add(1, Ordering::SeqCst);
 
     match diagnostics() {
-        Some(diagnostics) => restore::revert(&diagnostics),
+        Some(diagnostics) => {
+            restore::revert(&diagnostics);
+            // The music tile keeps its own record, because what it has to put back is different in
+            // kind: widths and margins on the *shell own* elements, not content in ours.
+            music::revert(&diagnostics);
+        }
         // Without diagnostics no handle can be resolved, so there is no way to
         // put anything back. Say so rather than reporting a silent success.
         None => logf!("stand down: no IXamlDiagnostics — cannot revert"),
@@ -726,6 +751,17 @@ pub(crate) unsafe fn sweep() {
     let Some(_busy) = BusyGuard::claim() else {
         return;
     };
+    let Some(diagnostics) = diagnostics() else {
+        return;
+    };
+
+    // **Ahead of the gate below, deliberately** — see [`wire_transport`]. Everything after it waits
+    // for silence because it *writes* to a shell element; attaching a handler does not, and making
+    // it wait cost the user a click on every fresh set of transport buttons.
+    if tree::quiet_for(QUIET_BEFORE_WIRING) {
+        wire_transport_now(&diagnostics);
+    }
+
     // **The fix for the shell freeze.** `put_Content` against a tray element
     // while `AdviseVisualTreeChange` is still streaming does not return: the UI
     // thread is inside a marshalled call, and it wedges there with the whole
@@ -744,9 +780,6 @@ pub(crate) unsafe fn sweep() {
     if !tree::quiet_for(QUIET_BEFORE_MUTATING) {
         return;
     }
-    let Some(diagnostics) = diagnostics() else {
-        return;
-    };
 
     // Order matters. Finding an indicator's slot only records it, and has to happen
     // whether or not the strip is up yet. Decoration comes next, because
@@ -777,6 +810,12 @@ pub(crate) unsafe fn sweep() {
 
     report_slot_metrics(&diagnostics);
 
+    // The music tile, last: it decorates a *different* element from everything above — an app own
+    // taskbar button rather than our notify icon — so nothing here depends on it and it depends on
+    // nothing here except the two guards at the top of this function, which are the whole reason a
+    // `put_*` against a taskbar element is safe at all.
+    music::sweep(&diagnostics);
+
     // Nothing left to apply — drop to the slow cadence until something comes
     // undone. `strip_placed` going false again (the shell re-binding the
     // presenter's content) is what brings it back.
@@ -785,7 +824,17 @@ pub(crate) unsafe fn sweep() {
     // `put_Content` returns rather than during it, so they are always queued for
     // the following tick. Without it the pace dropped first and hover took an idle
     // interval to arrive instead of a fast one.
-    let settled = strip_placed() && REORDERED.load(Ordering::SeqCst) && segments_wired();
+    // **The music tile never settles, and that is deliberate.** The shell rebuilds the hover
+    // preview's thumbnail-toolbar buttons on every hover, so `music::thumbbar::wire` has to catch
+    // them inside that window — at the idle 4s cadence a hover is usually over before a sweep looks,
+    // and the buttons the user is pointing at would still be dead. There is no event to wait on
+    // instead: `OnVisualTreeChange` may not mutate XAML (it wedges the shell), so the timer is the
+    // only place the work can happen and it has to already be running. The cost is a 250ms tick
+    // whose music half, with no preview open, is one lookup by type that finds nothing.
+    let settled = strip_placed()
+        && REORDERED.load(Ordering::SeqCst)
+        && segments_wired()
+        && music::tile::host().is_none();
     lifecycle::set_sweep_pace(settled);
 }
 
@@ -867,6 +916,59 @@ fn segments_wired() -> bool {
         Err(poisoned) => !poisoned.into_inner().is_empty(),
     }
 }
+
+/// Attach handlers to the hover preview's transport buttons, without waiting out the mutation gate.
+///
+/// **Split from [`sweep`] because it is the one job in there that changes nothing.** Everything else
+/// the sweep does writes content, width or margin onto a shell element, and [`QUIET_BEFORE_MUTATING`]
+/// is what makes that safe. This resolves handles and adds event handlers — and paying the same
+/// 400 ms of silence for it, on top of a timer tick, is what made the first press on a button do
+/// nothing at all: the shell rebuilds those buttons on every hover and on every play/pause glyph
+/// change, and an unwired one sends its click to the player's window instead of to us.
+///
+/// A *short* quiet period is still required, because the difference between an `add_Tapped` and a
+/// `put_Content` mid-burst is one nobody here has measured, and the failure mode on the wrong side of
+/// that guess is the whole taskbar wedging. [`QUIET_BEFORE_WIRING`] is the smallest wait that is
+/// still a wait.
+///
+/// # Safety
+/// XAML UI thread only — the tray island's, as for [`sweep`].
+pub(crate) unsafe fn wire_transport() {
+    if !ACTIVE.load(Ordering::SeqCst) {
+        return;
+    }
+    // Same claim as the sweep's, and for the same reason: an STA pumps while a XAML call is
+    // outstanding, so this message can be dispatched from inside one.
+    let Some(_busy) = BusyGuard::claim() else {
+        return;
+    };
+    if !tree::quiet_for(QUIET_BEFORE_WIRING) {
+        // The sweep timer is the fallback — at 250ms with the same short gate, not the long one.
+        return;
+    }
+    let Some(diagnostics) = diagnostics() else {
+        return;
+    };
+    wire_transport_now(&diagnostics);
+}
+
+/// The body of [`wire_transport`], for callers that already hold the diagnostics and the busy claim.
+///
+/// # Safety
+/// XAML UI thread only.
+unsafe fn wire_transport_now(diagnostics: &xamlom::IXamlDiagnostics) {
+    let Some(host) = music::tile::host() else {
+        return;
+    };
+    music::thumbbar::wire(diagnostics, &host);
+}
+
+/// How long the stream must be silent before *attaching a handler*, as against mutating.
+///
+/// Two frames at 60 Hz: past the tight run of events the shell emits while it builds a flyout, and
+/// far short of the time it takes a hand to move from the taskbar button down to the buttons under
+/// it. See [`wire_transport`] for why this is not simply [`QUIET_BEFORE_MUTATING`].
+const QUIET_BEFORE_WIRING: std::time::Duration = std::time::Duration::from_millis(32);
 
 /// How long the visual-tree stream must be silent before we touch XAML.
 ///

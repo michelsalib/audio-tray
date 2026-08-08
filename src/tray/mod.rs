@@ -153,6 +153,18 @@ pub fn run(backend: WasapiBackend) -> Result<()> {
     };
     println!("tray: created ({devices} output device(s)); {gestures}.");
 
+    // The YouTube Music half, on a thread of its own. It has to be a thread: every SMTC call blocks
+    // on the async operation it returns, and *this* thread is an STA that owns windows, where that
+    // deadlocks — see `music::on_mta_thread`. `None` means switched off in config, or SMTC would not
+    // open; neither is a reason to take the audio half down.
+    //
+    // Held to the end of `run` on purpose: dropping the handle is what tears the feature down, and the
+    // progress bar it puts on the player's taskbar button would otherwise outlive us.
+    let music = crate::music::spawn(&config.music);
+    if music.is_some() {
+        println!("music: following YouTube Music");
+    }
+
     let tray_rx = TrayIconEvent::receiver();
     // Gestures older than this are the flyout's own opening or dismissing click
     // arriving again — see [`settle_after_flyout`].
@@ -177,6 +189,28 @@ pub fn run(backend: WasapiBackend) -> Result<()> {
                 .as_bool()
                 {}
                 refresh(&backend, &tray, &config);
+                continue;
+            }
+            // The music feed handing over a progress-bar value. Applied here rather than on the
+            // feed's own thread because this one is an STA and `ITaskbarList3` is an
+            // apartment-threaded shell object — see `taskbar::post_progress`. Drained like the
+            // others: only the newest fraction says anything.
+            if msg.message == crate::taskbar::WM_MUSIC_PROGRESS {
+                let (mut step, mut playing) = (msg.wParam.0, msg.lParam.0 != 0);
+                let mut extra = MSG::default();
+                while PeekMessageW(
+                    &mut extra,
+                    None,
+                    crate::taskbar::WM_MUSIC_PROGRESS,
+                    crate::taskbar::WM_MUSIC_PROGRESS,
+                    PM_REMOVE,
+                )
+                .as_bool()
+                {
+                    step = extra.wParam.0;
+                    playing = extra.lParam.0 != 0;
+                }
+                crate::taskbar::apply_progress(step, playing);
                 continue;
             }
             // An app took the microphone, or let it go. Nothing else about the strip has
@@ -233,7 +267,7 @@ pub fn run(backend: WasapiBackend) -> Result<()> {
                     // away mid-click, and letting one failed gesture out of the
                     // loop would exit the app — the same trap `try_refresh`
                     // documents. A lost click is recoverable; a lost tray is not.
-                    if let Err(e) = handle_taskbar_action(&backend, &mut config, &tray, action) {
+                    if let Err(e) = handle_taskbar_action(&backend, &mut config, &tray, music.as_ref(), action) {
                         eprintln!("taskbar: {action:?} failed ({e:#})");
                         // The strip may be previewing a switch that then failed, and
                         // the refresh that would have corrected it was skipped along
@@ -261,6 +295,16 @@ pub fn run(backend: WasapiBackend) -> Result<()> {
                 // — the refresh below has to post again.
                 invalidate_strip();
                 crate::taskbar::apply_at_restart(strip_icons(&backend, &config));
+                // The music half keeps two things in the *shell* — the progress bar and the
+                // thumbnail toolbar — and both died with the old Explorer. Neither is visible from
+                // the feed's side, because the window they hang off is unchanged, so it has to be
+                // told or they stay gone for the rest of the session.
+                if let Some(music) = music.as_ref() {
+                    music.taskbar_restarted();
+                }
+                // And this thread's own cached shell interface, which is a proxy into the Explorer
+                // that just died — see `player::forget_taskbar_list`.
+                crate::music::player::forget_taskbar_list();
                 // The icon `tray-icon` just re-registered carries the defaults it
                 // was built with, so put the current device's icon and tooltip
                 // back on it — and this is also the retry for any refresh that
@@ -322,6 +366,13 @@ pub fn run(backend: WasapiBackend) -> Result<()> {
             }
         }
     }
+
+    // **The progress bar has to come off here**, on this thread, while it still has a message loop's
+    // worth of life left in it. It sits on *another app's* taskbar button, so a bar left at 43 % is a
+    // frozen line under YouTube Music that survives us and that the user cannot attribute to
+    // anything. The music thread cannot do it — see `Music::shut_down` — and dropping `music` below
+    // is what stops the feed putting it back.
+    crate::taskbar::clear_player_progress();
     Ok(())
 }
 
@@ -488,9 +539,11 @@ fn handle_taskbar_action(
     backend: &WasapiBackend,
     config: &mut Config,
     tray: &TrayIcon,
+    music: Option<&crate::music::Handle>,
     action: crate::taskbar::Action,
 ) -> Result<()> {
     use crate::audio::Flow;
+    use crate::music::smtc::Command;
     use crate::taskbar::Action;
 
     let flow = match action {
@@ -499,6 +552,21 @@ fn handle_taskbar_action(
         // No anchor: the strip is not the tray icon, so its rect is not ours to
         // know here. The flyout falls back to its default placement.
         Action::OpenPanel => return handle_flyout(backend, config, tray, None),
+        // A transport glyph on the music tile. Handed to the feed thread and **not** awaited: this is
+        // the STA that owns the tray, and the whole reason the feed lives elsewhere is that a media
+        // session which is slow to answer must not stall it. The strip catches up on the next poll.
+        Action::MusicPrevious | Action::MusicPlayPause | Action::MusicNext => {
+            let Some(music) = music else {
+                println!("taskbar: {action:?} ignored — the music half is not running");
+                return Ok(());
+            };
+            music.command(match action {
+                Action::MusicPrevious => Command::Previous,
+                Action::MusicNext => Command::Next,
+                _ => Command::TogglePlayPause,
+            });
+            return Ok(());
+        }
     };
 
     let devices = backend.enumerate_flow(flow)?;

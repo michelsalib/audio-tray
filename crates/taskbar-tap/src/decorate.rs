@@ -1229,7 +1229,14 @@ pub unsafe fn content_size(
         .then_some((width, height))
 }
 
-unsafe fn object_from_handle(
+/// Turn a recorded handle back into the live XAML object.
+///
+/// `pub(crate)` for the music module, which needs `IBorder` and `IFrameworkElement` pointers of its
+/// own — a taskbar button is not a `ContentPresenter`, so it cannot go through the helpers above.
+///
+/// # Safety
+/// XAML UI thread only.
+pub(crate) unsafe fn object_from_handle(
     diagnostics: &IXamlDiagnostics,
     handle: InstanceHandle,
 ) -> Option<IInspectable> {
@@ -1238,4 +1245,27 @@ unsafe fn object_from_handle(
         return None;
     }
     Some(core::mem::transmute::<*mut c_void, IInspectable>(raw))
+}
+
+/// Set a `TextBlock`'s `Text`.
+///
+/// **This is what makes a scrolling title possible without rebuilding the strip.** That distinction is
+/// load-bearing: rebuilding replaces the elements the click handlers are attached to, so a ticker
+/// driven by re-running `XamlReader.Load` would leave the transport buttons dead within a second of
+/// the strip appearing. Setting a property leaves every element — and every handler — in place.
+///
+/// # Safety
+/// XAML UI thread only.
+pub unsafe fn set_text(diagnostics: &IXamlDiagnostics, handle: InstanceHandle, text: &str) -> bool {
+    let Some(object) = object_from_handle(diagnostics, handle) else {
+        return false;
+    };
+    let Ok(block) = object.cast::<ITextBlock>() else {
+        return false;
+    };
+    let value = HSTRING::from(text);
+    // As in `set_content_raw`: `HSTRING` is repr(transparent) over the handle, so it is transmuted
+    // rather than passed by pointer — `as_ptr` would hand over the UTF-16 buffer instead.
+    let handle = core::mem::transmute_copy::<HSTRING, *mut c_void>(&value);
+    block.put_Text(handle) == S_OK
 }

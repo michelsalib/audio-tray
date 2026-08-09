@@ -227,6 +227,10 @@ fn main() -> Result<()> {
             }
         }
         Some("--update") => update::run_manual()?,
+        // Which TAP is actually on disk. The exe and the DLL ship together but only the
+        // exe is replaced by `self_update`, so they can drift — and answering "did they?"
+        // used to mean comparing file dates by eye.
+        Some("--tap-version") => update::report_tap_version(),
         Some("--taskbar-click") => {
             // Dev: drive the strip's gestures against the running tray. Real clicks
             // on the taskbar cannot be synthesised (see `crates/taskbar-tap/FINDINGS.md`),

@@ -13,6 +13,11 @@
 //! open — the taskbar strip is injected on every start — so the replacement is
 //! usually handed to the OS for the next boot rather than copied into place.
 //!
+//! That second file can therefore fall behind the first, silently — it did, for two releases —
+//! so [`repair_stale_tap`] checks on the way in and re-fetches a DLL that does not match this
+//! exe. It is a separate mechanism from `update_tap` on purpose: `update_tap` runs in the
+//! process being *replaced*, and can only ever be as correct as the build the user is leaving.
+//!
 //! Gated to release builds: `cargo run` / debug builds never self-replace, so
 //! development is never disrupted. Force a check any time with
 //! `audio-tray --update` (works in debug too).
@@ -71,9 +76,145 @@ pub fn spawn_background_check() {
     }
     std::thread::spawn(|| match check_and_apply(false) {
         Ok(self_update::Status::Updated(v)) => set_pending_version(v),
-        Ok(self_update::Status::UpToDate(_)) => {}
+        // **Only with the exe settled.** An update that just landed has already put the *new*
+        // DLL next to it, and this process is still the old version — so a comparison here
+        // would read "stale", and the repair would fetch the version we are about to stop
+        // running. A downgrade, on every launch that takes an update.
+        Ok(self_update::Status::UpToDate(_)) => repair_stale_tap(false),
         Err(e) => eprintln!("audio-tray: background update check failed: {e:#}"),
     });
+}
+
+/// `audio_tray_tap.dll`, beside the running exe.
+fn installed_tap() -> Result<std::path::PathBuf> {
+    let exe = std::env::current_exe().context("locating the running exe")?;
+    let dir = exe.parent().context("exe has no parent directory")?;
+    Ok(dir.join(TAP_DLL))
+}
+
+/// The version stamped into the installed TAP, or `None` if it carries no version resource.
+///
+/// **`None` is a real answer, not just an error**: every DLL built before the stamp existed is
+/// unstamped, and those are exactly the ones a repair is for.
+///
+/// Read from `VS_FIXEDFILEINFO` — the fixed block behind the `\` sub-block — rather than the
+/// `FileVersion` string, which lives in a per-language string table and would mean first asking
+/// `\VarFileInfo\Translation` which language to look under. The numbers are the same numbers and
+/// need no such round trip. See `crates/taskbar-tap/build.rs` for the other end.
+fn installed_tap_version() -> Option<String> {
+    use windows::Win32::Storage::FileSystem::{
+        GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW, VS_FIXEDFILEINFO,
+    };
+    use windows_core::HSTRING;
+
+    let path = HSTRING::from(installed_tap().ok()?.as_os_str());
+    let size = unsafe { GetFileVersionInfoSizeW(&path, None) };
+    if size == 0 {
+        return None;
+    }
+    let mut block = vec![0u8; size as usize];
+    unsafe { GetFileVersionInfoW(&path, None, size, block.as_mut_ptr().cast()) }.ok()?;
+
+    let mut info: *mut core::ffi::c_void = core::ptr::null_mut();
+    let mut len = 0u32;
+    let ok = unsafe {
+        VerQueryValueW(
+            block.as_ptr().cast(),
+            &HSTRING::from("\\"),
+            &mut info,
+            &mut len,
+        )
+    };
+    // The pointer is *into* `block`, which outlives the read below — nothing is freed here.
+    if !ok.as_bool() || info.is_null() || (len as usize) < size_of::<VS_FIXEDFILEINFO>() {
+        return None;
+    }
+    let fixed = unsafe { *info.cast::<VS_FIXEDFILEINFO>() };
+    Some(format!(
+        "{}.{}.{}",
+        fixed.dwFileVersionMS >> 16,
+        fixed.dwFileVersionMS & 0xFFFF,
+        fixed.dwFileVersionLS >> 16
+    ))
+}
+
+/// Fetch the TAP that belongs with this exe, if the one on disk is not it.
+///
+/// **This is the fix for the fix.** `update_tap` runs in the process being replaced, so a bug in it
+/// is only repaired one release *after* the repair ships — and until v0.10.1 it silently downloaded
+/// the asset's JSON metadata instead of the asset, leaving a v0.10.0 exe beside a v0.8.0 DLL. This
+/// side has the opposite property: it runs in the *new* build, so it can clean up after an old one.
+///
+/// Reported at every step and fatal at none. A stale TAP degrades rather than breaks — the
+/// init-data protocol ignores keys it does not know — so this must never be the reason the tray
+/// fails to come up.
+pub fn repair_stale_tap(verbose: bool) {
+    let running = self_update::cargo_crate_version!();
+    match installed_tap_version() {
+        Some(version) if version == running => {
+            if verbose {
+                println!("{TAP_DLL} is v{version} — in step with the exe.");
+            }
+            return;
+        }
+        Some(version) => {
+            eprintln!("audio-tray: {TAP_DLL} is v{version} but the exe is v{running}");
+        }
+        None => eprintln!("audio-tray: {TAP_DLL} carries no version — it predates the stamp"),
+    }
+
+    // Same stance as the background check: a debug build says what it found and touches nothing,
+    // or `--update` in a dev tree would overwrite the TAP you are working on with a release one.
+    if cfg!(debug_assertions) {
+        println!("(debug build — leaving {TAP_DLL} alone)");
+        return;
+    }
+
+    // **Already fetched, and waiting for the shell to let go of the file.** Explorer holds the DLL
+    // for its own lifetime, so the placement usually cannot happen at the moment it is downloaded —
+    // and without this, every launch until that reboot would download the same 2 MB again. Retrying
+    // the *copy* is the cheap half, and it is the half that eventually succeeds.
+    if staging_dir(running).join(TAP_DLL).is_file() {
+        if !place_staged_tap() {
+            println!("audio-tray: the v{running} {TAP_DLL} is staged — it lands on the next Explorer restart or boot.");
+        }
+        return;
+    }
+
+    match update_tap(running, verbose) {
+        Ok(()) => match installed_tap_version() {
+            Some(version) if version == running => println!("audio-tray: {TAP_DLL} is now v{version}."),
+            // Explorer had the file, so the copy was turned into a boot rename. The staged DLL is
+            // what the guard above will find next launch, which is why that path costs no download.
+            _ if staging_dir(running).join(TAP_DLL).is_file() => println!(
+                "audio-tray: the v{running} {TAP_DLL} is staged — it lands on the next Explorer restart or boot."
+            ),
+            // Copied, and *still* not the version we asked for: the release asset itself carries no
+            // stamp. Nothing on this side can fix that, and it would put this check back where it
+            // started on every launch — so it is the one outcome here worth shouting about, which
+            // is the whole lesson of the bug this feature exists for.
+            _ => eprintln!(
+                "audio-tray: fetched the v{running} {TAP_DLL}, but it reports no version — that release's asset is unstamped"
+            ),
+        },
+        Err(e) => eprintln!("audio-tray: could not repair {TAP_DLL} ({e:#})"),
+    }
+}
+
+/// Print what the two halves are, for `--tap-version`.
+///
+/// The diagnostic this feature was missing: the skew it repairs was invisible for two releases, and
+/// answering "which TAP is actually on disk?" meant comparing file dates by eye.
+pub fn report_tap_version() {
+    println!("audio-tray v{}", self_update::cargo_crate_version!());
+    match installed_tap() {
+        Ok(path) => println!("{}", path.display()),
+        Err(e) => println!("(cannot locate {TAP_DLL}: {e:#})"),
+    }
+    match installed_tap_version() {
+        Some(version) => println!("{TAP_DLL} v{version}"),
+        None => println!("{TAP_DLL} carries no version resource — it predates the stamp, or is not there"),
+    }
 }
 
 /// Run an update check synchronously, printing progress. Backs the `--update`
@@ -82,7 +223,12 @@ pub fn run_manual() -> Result<()> {
     println!("audio-tray v{}", self_update::cargo_crate_version!());
     println!("Checking github.com/{REPO_OWNER}/{REPO_NAME} for a newer release...");
     match check_and_apply(true)? {
-        self_update::Status::UpToDate(v) => println!("Already up to date (v{v})."),
+        self_update::Status::UpToDate(v) => {
+            println!("Already up to date (v{v}).");
+            // The exe is settled, so the DLL beside it can be held to the same version — see
+            // [`repair_stale_tap`]. This is also the only way to drive that path by hand.
+            repair_stale_tap(true);
+        }
         self_update::Status::Updated(v) => {
             println!("Updated to v{v}. Restart audio-tray to run the new version.");
         }
@@ -130,9 +276,7 @@ fn check_and_apply(verbose: bool) -> Result<self_update::Status> {
 fn update_tap(version: &str, verbose: bool) -> Result<()> {
     use std::fs;
 
-    let exe = std::env::current_exe().context("locating the running exe")?;
-    let dir = exe.parent().context("exe has no parent directory")?;
-    let target = dir.join(TAP_DLL);
+    let target = installed_tap()?;
 
     // Same asset the exe came from, fetched again — it is two small files, and this
     // only runs on the rare occasion an update was actually applied.
@@ -243,9 +387,8 @@ pub fn place_staged_tap() -> bool {
     if !fresh.is_file() {
         return false;
     }
-    let target = match std::env::current_exe().ok().and_then(|exe| exe.parent().map(|d| d.join(TAP_DLL))) {
-        Some(target) => target,
-        None => return false,
+    let Ok(target) = installed_tap() else {
+        return false;
     };
     match std::fs::copy(&fresh, &target) {
         Ok(_) => {

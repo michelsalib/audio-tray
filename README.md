@@ -80,6 +80,9 @@ audio-tray            run the tray (default)
 audio-tray --list     print the current default + all active output devices
 audio-tray --set <q>  switch default output to a device by name substring or id
 audio-tray --update   check GitHub Releases and self-update now
+audio-tray --tap-version
+                      which taskbar TAP is on disk — the exe and the DLL ship
+                      together, and only the exe is self-updated
 audio-tray --taskbar-revert
                       put the taskbar back, without stopping the running tray
 audio-tray --music-probe

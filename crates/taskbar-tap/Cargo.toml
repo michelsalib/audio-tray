@@ -42,8 +42,21 @@ features = [
     "Win32_System_Diagnostics_ToolHelp", # explorer.exe PID lookup
     "Win32_System_Diagnostics_Debug",    # OutputDebugStringW
     "Win32_System_WinRT",                # RoGetActivationFactory
+    # ITaskbarList3, to take the music tile's progress bar back off the player's
+    # window on teardown (music::clear_progress_bar). Declared here even though the
+    # app already enables it: workspace feature unification was hiding the omission,
+    # and `cargo build -p taskbar-tap` — the command this manifest documents — failed
+    # on it.
+    "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",      # GetShellWindow
     # `RegisterClassW`/`WNDCLASSW` are gated behind Gdi (the struct carries
     # HBRUSH/HICON), and the revert channel needs its own window class.
     "Win32_Graphics_Gdi",
 ]
+
+[build-dependencies]
+# Stamps the *app's* version into the DLL, which is how `update::repair_stale_tap`
+# tells a TAP that shipped with this exe from one left behind by a failed update.
+# See build.rs — the version is read from the root manifest, not from this crate's
+# own `0.0.0`.
+winresource = "0.1.31"

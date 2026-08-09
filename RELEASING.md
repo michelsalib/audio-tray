@@ -101,6 +101,47 @@ possible — the reboot may not have happened yet — and it degrades rather tha
 because unknown `key=value` pairs are ignored and missing ones fall back to defaults.
 Do not add a key the DLL must have.
 
+### When the two halves drift apart
+
+That tolerance cuts both ways: because a stale TAP degrades quietly, a *permanently*
+stale one is invisible. It happened. From v0.9.0 to v0.10.1 `update_tap` asked GitHub
+for the release asset without an `Accept: application/octet-stream` header — and
+`self_update`'s `download_url` is the **api.github.com** url, not the browser one, so
+the endpoint answered with the asset's JSON metadata. 1.7 KB landed on disk named
+`.zip`, extraction failed, and the failure is deliberately non-fatal. Users ran a
+v0.10.0 exe beside a v0.8.0 DLL: no YouTube Music tile, and thumbnail-toolbar transport
+buttons that drew and did nothing.
+
+Two things now guard against a repeat.
+
+**The DLL carries its version.** `crates/taskbar-tap/build.rs` stamps a Windows version
+resource, reading the number from the **root** `Cargo.toml` — the crate's own version is
+`0.0.0`, because `cargo release` skips it (`publish = false`). A resource travels inside
+the file, so the installer and the self-updater both get it right by construction and
+there is no marker file that can land out of step with what it describes.
+
+**The new build repairs what the old one left.** `update::repair_stale_tap` compares
+that stamp against `CARGO_PKG_VERSION` and re-fetches the DLL if they disagree. This is
+the half that matters, because `update_tap` runs *in the process being replaced* — a bug
+in it can only be fixed one release later, by the build that comes after. It runs from
+the background check and from `--update`, and only on `Status::UpToDate`: right after an
+update the new DLL is already on disk against this old process's version, so comparing
+there would "repair" a downgrade.
+
+Debug builds report and change nothing, or `--update` in a dev tree would overwrite the
+TAP you are working on with a release one.
+
+```powershell
+audio-tray --tap-version   # what is actually on disk, next to the exe
+audio-tray --update        # checks, then repairs the DLL if it is out of step
+```
+
+A repair that cannot copy (Explorer has the file) is staged and reported, and the next
+launch retries only the *copy* — it does not download 2 MB again per start. The one
+outcome that logs an error is a release whose own asset is unstamped, which would put the
+check back where it started; `build.rs` panics rather than emit an unstamped DLL, so that
+should not be reachable from CI.
+
 ---
 
 ## 2. How auto-update behaves

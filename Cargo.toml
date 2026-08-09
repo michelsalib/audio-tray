@@ -25,6 +25,11 @@ anyhow = "1"
 # behind audio/switch.rs (plan §9). Must share the same `windows` version as us.
 com-policy-config = "0.6"
 directories = "6.0.0"
+# Only for the `Accept: application/octet-stream` on the TAP download in update.rs.
+# `self_update::Download::set_header` takes `http`'s own header types and re-exports
+# them through a private module, so naming them means depending on `http` directly.
+# Must stay on the major `self_update` uses (1.x) or the types will not unify.
+http = "1"
 # In-app GitHub-releases self-updater (see src/update.rs). Uses the `ureq` client
 # with `native-tls` = Windows SChannel, so no tokio/reqwest, no ring/rustls, and
 # no OpenSSL to build on the MSVC toolchain. archive-zip matches the zipped

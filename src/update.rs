@@ -159,8 +159,16 @@ fn update_tap(version: &str, verbose: bool) -> Result<()> {
 
     let archive = staging.join(&asset.name);
     let mut file = fs::File::create(&archive).context("creating the download file")?;
-    // No `Accept` header needed: `download_url` is the direct browser download.
+    // **`download_url` is the GitHub *API* asset url, not the browser one** — `self_update`'s github
+    // backend reads it from the asset's `url` key. Ask that endpoint for a file and it has to be told
+    // so; without the header it answers with the asset's own JSON *metadata*, and 1.6 KB of
+    // `{"url":…,"id":…}` lands on disk named `.zip`. `self_update` sets exactly this header on the
+    // download it does itself, which is the whole reason the exe updated and the DLL silently did not.
     self_update::Download::from_url(&asset.download_url)
+        .set_header(
+            http::header::ACCEPT,
+            http::HeaderValue::from_static("application/octet-stream"),
+        )
         .show_progress(verbose)
         .download_to(&mut file)
         .context("downloading the release asset")?;

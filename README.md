@@ -104,7 +104,7 @@ overrides, and the music tile —
 [music]
 enabled = true            # false turns the whole music half off, progress bar included
 tile = "YouTube Music"    # the taskbar button to draw into; "" = feed only, no strip
-# app_id = "..."          # pin the SMTC app id, if --music-probe shows a miss
+# app_id = "..."          # pin the SMTC app id: a miss, or YouTube Music as a plain tab
 ```
 
 ## Taskbar controls
@@ -168,6 +168,13 @@ API key and no login. Things worth knowing:
 - **It is invisible until it applies.** No YouTube Music session on the machine means no
   state published, no progress bar and no strip — a user who never opens the player sees
   no difference at all. That is why it is on by default.
+- **It only ever follows a session that names YouTube Music.** An installed PWA carries the
+  origin in its media-session id, so the match is exact. A plain browser tab does not — it
+  reports a bare `MSEdge`/`Chrome` shared with every other tab, and nothing in the session
+  tells a music tab from a video (Windows is told "music" for a YouTube video too). So a
+  bare browser id is never followed on its own, or closing the player would leave whatever
+  video is playing in the strip. If YouTube Music *is* a plain tab for you, pin that id as
+  `app_id` — `--music-probe` prints the line to paste.
 - **The icon must be on the taskbar**, pinned or running, and not in the overflow.
 - **The transport buttons are the shell's own.** They are added to the preview with
   `ITaskbarList3::ThumbBarAddButtons` — the same thumbnail toolbar iTunes and MPC-HC use —

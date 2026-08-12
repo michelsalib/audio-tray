@@ -293,6 +293,10 @@ impl Music {
 /// YouTube Music: it is a Chromium implementation detail, and an installed PWA reports something
 /// quite different from a browser tab. Run this with the player going and the id to pin is the one
 /// marked `Certain`.
+///
+/// A `Browser` verdict means the opposite — an id that could be YouTube Music or could be any
+/// other tab, which is followed only if the user pins it. This says so when it is the only thing
+/// on offer.
 pub fn probe() -> Result<()> {
     on_mta_thread("music-probe", || {
         let mut feed = Ytm::new(None)?;
@@ -314,7 +318,9 @@ fn report_sessions(feed: &mut Ytm) -> Result<()> {
         println!("  verdict  : {:?}", session::classify(&snapshot.app_id));
         println!("  title    : {}", show(&snapshot.title));
         println!("  artist   : {}", show(&snapshot.artist));
+        println!("  album    : {}", show(&snapshot.album));
         println!("  status   : {:?}", snapshot.status);
+        println!("  kind     : {:?}", snapshot.kind);
         match &snapshot.cover {
             Some(bytes) => println!("  cover    : {} bytes", bytes.len()),
             None => println!("  cover    : <none published>"),
@@ -325,7 +331,23 @@ fn report_sessions(feed: &mut Ytm) -> Result<()> {
     println!("--- what the strip would follow ---");
     match feed.read()?.0 {
         State::Track(snapshot) => println!("  {} — {}", snapshot.title, snapshot.artist),
-        State::Absent => println!("  nothing"),
+        State::Absent => {
+            println!("  nothing");
+            // The one case where "nothing" is a decision rather than an absence, and the only
+            // place the user can be told about the config that reverses it.
+            for snapshot in &sessions {
+                if session::classify(&snapshot.app_id) == session::Match::Browser {
+                    println!(
+                        "\n  {} is a bare browser id — it is whatever that browser is playing, so\n  \
+                         it is not followed on its own. If YouTube Music runs as a plain tab there,\n  \
+                         put this in config.toml to follow it anyway:\n\n      \
+                         [music]\n      app_id = \"{}\"",
+                        snapshot.app_id, snapshot.app_id
+                    );
+                    break;
+                }
+            }
+        }
     }
     Ok(())
 }

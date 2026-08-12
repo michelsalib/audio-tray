@@ -28,6 +28,7 @@ use windows::Media::Control::{
     GlobalSystemMediaTransportControlsSessionManager as SessionManager,
     GlobalSystemMediaTransportControlsSessionPlaybackStatus as WinRtPlaybackStatus,
 };
+use windows::Media::MediaPlaybackType;
 use windows::Storage::Streams::DataReader;
 
 /// What a session is doing, reduced to the states a transport control cares about.
@@ -60,6 +61,36 @@ impl PlaybackStatus {
     }
 }
 
+/// What kind of media the session says it is carrying.
+///
+/// Read from `GetPlaybackInfo`, so it costs nothing beyond the status that is already read there.
+///
+/// **Do not use this to tell music from video in a browser — it cannot.** It looks exactly like the
+/// field that would separate a YouTube Music tab from a YouTube video, and it was added to try
+/// that; measured on 26200, a plain YouTube video playing in Edge reports `Music`. Chromium sets
+/// the type once for its whole SMTC integration, because that is what lets it publish title,
+/// artist and album at all. Kept because it is free, `--music-probe` prints it, and the next person
+/// to have this idea should be able to see the answer without wiring it up again.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum MediaKind {
+    #[default]
+    Unknown,
+    Music,
+    Video,
+    Image,
+}
+
+impl MediaKind {
+    fn from_winrt(kind: MediaPlaybackType) -> Self {
+        match kind {
+            MediaPlaybackType::Music => Self::Music,
+            MediaPlaybackType::Video => Self::Video,
+            MediaPlaybackType::Image => Self::Image,
+            _ => Self::Unknown,
+        }
+    }
+}
+
 /// Which transport commands the app says it will honour right now.
 ///
 /// Worth respecting rather than always drawing every button: YouTube Music
@@ -89,6 +120,7 @@ pub struct Snapshot {
     pub album: String,
     pub status: PlaybackStatus,
     pub capabilities: Capabilities,
+    pub kind: MediaKind,
     /// Cover art bytes, as published (PNG or JPEG — read the magic, don't assume).
     /// `None` whenever the app publishes no artwork; see the module note.
     pub cover: Option<Vec<u8>>,
@@ -104,6 +136,7 @@ pub struct Brief {
     pub app_id: String,
     pub status: PlaybackStatus,
     pub capabilities: Capabilities,
+    pub kind: MediaKind,
 }
 
 /// One poll's answer: the session that won, and where it is in the track.
@@ -298,6 +331,7 @@ impl Smtc {
             app_id: briefs[index].app_id.clone(),
             status: briefs[index].status,
             capabilities: briefs[index].capabilities,
+            kind: briefs[index].kind,
             ..Default::default()
         };
         read_properties_into(session, &mut snapshot);
@@ -390,6 +424,7 @@ fn read_session(session: &Session) -> Result<Snapshot> {
         app_id: brief.app_id,
         status: brief.status,
         capabilities: brief.capabilities,
+        kind: brief.kind,
         ..Default::default()
     };
     read_properties_into(session, &mut snapshot);
@@ -420,6 +455,11 @@ fn read_brief(session: &Session) -> Brief {
                 can_skip_next: controls.IsNextEnabled().unwrap_or(false),
                 can_skip_previous: controls.IsPreviousEnabled().unwrap_or(false),
             };
+        }
+        // An `IReference` that is null — the app published no type at all — reads as an error here,
+        // which is the `Unknown` default.
+        if let Ok(kind) = info.PlaybackType().and_then(|t| t.Value()) {
+            brief.kind = MediaKind::from_winrt(kind);
         }
     }
     brief

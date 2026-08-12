@@ -41,8 +41,11 @@ pub struct Music {
     pub tile: String,
     /// Pin the SMTC app id instead of guessing it.
     ///
-    /// Needed only when the built-in matching misses an unusual build: the id is a Chromium
-    /// implementation detail, and `audio-tray --music-probe` prints the real one.
+    /// Needed when the built-in matching misses an unusual build — the id is a Chromium
+    /// implementation detail, and `audio-tray --music-probe` prints the real one — and when
+    /// YouTube Music runs as a **plain browser tab**, which reports a bare `MSEdge`/`Chrome` that
+    /// is indistinguishable from any other tab. That one is never followed unless it is pinned
+    /// here; see [`crate::music::session`].
     pub app_id: Option<String>,
 }
 

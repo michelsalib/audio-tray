@@ -18,6 +18,25 @@
 //! why [`Match::Browser`] exists as a separate, weaker verdict rather than being
 //! folded in with the certain ones.
 //!
+//! **A bare browser id is never followed on its own**, and that is the outcome of trying the
+//! alternative. It used to be a last-resort guess — with no YouTube Music session anywhere, a
+//! playing browser session was taken to be a YouTube Music tab — and what that actually does is
+//! put a YouTube video's title and thumbnail in the strip whenever the player is closed, which is
+//! wrong far more often than it is right.
+//!
+//! Nothing in the session can rescue the guess; measured on 26200 against a plain YouTube video in
+//! Edge, every field that looks like it should separate music from video does not:
+//!
+//! ```text
+//! app id  MSEdge      the same id every other tab in that browser reports
+//! kind    Music       Chromium says Music for a video too — see smtc::MediaKind
+//! album   <empty>     and YouTube Music does not always publish one either
+//! ```
+//!
+//! So the escape hatch is explicit rather than inferred: a user who really does run YouTube Music
+//! as a plain tab pins `MSEdge` (or `Chrome`) as `app_id` in the config, which is the same rule
+//! this used to apply silently — but chosen, and only on the machine that wants it.
+//!
 //! The patterns are matched case-insensitively as substrings. That is deliberately
 //! loose: the exact shape of a PWA's id varies across Chromium versions and
 //! channels, and a missed match means the app shows nothing at all — a far worse
@@ -47,7 +66,8 @@ pub enum Match {
     /// The id names YouTube Music outright, or the user pinned this id in config.
     Certain,
     /// A bare browser id. It *might* be a YouTube Music tab; nothing in SMTC can
-    /// say. Only ever used when no [`Match::Certain`] session exists.
+    /// say. Never followed by [`pick`] — it names an id worth *offering* to pin, and
+    /// `--music-probe` is where that offer is made.
     Browser,
     /// Something else entirely — Spotify, a video, a game.
     No,
@@ -93,8 +113,11 @@ pub fn classify_with_override(app_id: &str, pinned: Option<&str>) -> Match {
 ///    follow.
 /// 2. Any [`Match::Certain`] session — so a paused track still shows, rather than
 ///    the strip emptying the moment you pause.
-/// 3. A playing [`Match::Browser`] session, only if nothing certain exists. This is
-///    the plain-tab case, and it is last because it is a guess.
+///
+/// And nothing else: with no certain session on the machine the answer is **none**, not the
+/// closest thing available. See the module note — the third step this used to have followed any
+/// playing browser session, which is how a YouTube video ends up in the strip with the player
+/// closed.
 ///
 /// Returns an **index**, not a reference: the caller reads the chosen session in full afterwards,
 /// and it needs to know *which* of the live session objects to read rather than getting a borrow of
@@ -109,11 +132,6 @@ where
         .iter()
         .position(|s| certain(s) && playing(s))
         .or_else(|| snapshots.iter().position(certain))
-        .or_else(|| {
-            snapshots
-                .iter()
-                .position(|s| classify(app_id(s)) == Match::Browser && playing(s))
-        })
 }
 
 #[cfg(test)]
@@ -177,17 +195,24 @@ mod tests {
         assert!(picked(&sessions).is_some());
     }
 
+    /// **The bug this rule exists for.** With YouTube Music closed, the only session on the machine
+    /// is whatever else the browser is playing — a video, a stream, an autoplaying page — and it
+    /// reports the same bare `MSEdge` a YouTube Music tab would. Following it puts a video's title
+    /// and thumbnail in the strip; the strip stays empty instead.
     #[test]
-    fn bare_browser_only_wins_when_nothing_certain_exists() {
-        let with_certain = [("Chrome", true), ("MSEdge.music.youtube.com_/.A", false)];
+    fn a_bare_browser_session_is_never_followed() {
+        let only_browser = [("MSEdge", true)];
+        assert_eq!(picked(&only_browser), None);
+
+        let with_certain = [("MSEdge", true), ("MSEdge.music.youtube.com_/.A", false)];
         assert_eq!(picked(&with_certain), Some("MSEdge.music.youtube.com_/.A"));
+    }
 
-        let only_browser = [("Chrome", true)];
-        assert_eq!(picked(&only_browser), Some("Chrome"));
-
-        // A paused bare browser is not enough to guess on.
-        let paused_browser = [("Chrome", false)];
-        assert_eq!(picked(&paused_browser), None);
+    /// The way back for someone who really does run the player as a plain tab: pin the id, and the
+    /// override makes it certain. This is the old fallback, opted into.
+    #[test]
+    fn a_pinned_browser_id_is_how_a_plain_tab_is_followed() {
+        assert_eq!(classify_with_override("MSEdge", Some("MSEdge")), Match::Certain);
     }
 
     /// The index is into the slice as given, not into some filtered subsequence — the case that

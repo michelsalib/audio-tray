@@ -37,6 +37,15 @@
 //! as a plain tab pins `MSEdge` (or `Chrome`) as `app_id` in the config, which is the same rule
 //! this used to apply silently — but chosen, and only on the machine that wants it.
 //!
+//! **The same question is asked of a window**, by [`window_is_player`], and it had to be: the
+//! progress bar and the thumbnail toolbar are put on an HWND, and the HWND used to be found by
+//! title alone. A browser window shows its active tab's title, so a YouTube Music tab makes a plain
+//! Edge window answer to "the YouTube Music window" — and the toolbar, which has no removal call,
+//! then stays under that browser's hover preview long after the tab has moved on. Measured on 26200:
+//! the PWA window and the browser window are the same `msedge.exe`, the same process id and the same
+//! `Chrome_WidgetWin_1` class, and the only field that separates them is the shell's own id for the
+//! window.
+//!
 //! The patterns are matched case-insensitively as substrings. That is deliberately
 //! loose: the exact shape of a PWA's id varies across Chromium versions and
 //! channels, and a missed match means the app shows nothing at all — a far worse
@@ -58,6 +67,9 @@ const CERTAIN: &[&str] = &[
 ];
 
 /// Browsers whose bare id could be a YouTube Music tab, or could be anything else.
+///
+/// Doubles as the executable list [`is_browser_process`] matches on, which is deliberate: the two
+/// questions are the same one asked of a session and of a window.
 const BROWSERS: &[&str] = &["chrome", "msedge", "firefox", "brave", "opera", "vivaldi"];
 
 /// How confident we are that a given app id is YouTube Music.
@@ -102,6 +114,51 @@ pub fn classify_with_override(app_id: &str, pinned: Option<&str>) -> Match {
         };
     }
     classify(app_id)
+}
+
+/// Whether an executable name is a browser's — `msedge.exe`, `chrome.exe`, and the rest.
+///
+/// The fallback half of [`window_is_player`], for a window that publishes no identity of its own.
+pub fn is_browser_process(exe: &str) -> bool {
+    let exe = exe.to_ascii_lowercase();
+    BROWSERS
+        .iter()
+        .any(|browser| exe == format!("{browser}.exe"))
+}
+
+/// Whether a **window** is the player's own, rather than a browser window showing the same title.
+///
+/// **The title cannot answer this, and that is not a subtlety — it is measured.** On 26200 an
+/// installed PWA and a plain tab are windows of the *same* `msedge.exe`, same process id, same
+/// `Chrome_WidgetWin_1` class, and the browser's title reads `YouTube Music …` whenever that tab is
+/// the active one. The one field that separates them is the shell's own identity for the window,
+/// the `PKEY_AppUserModel_ID` its taskbar button is grouped under:
+///
+/// ```text
+/// PWA window      music.youtube.com-5929F88E_vezhnr0wkvrcy!App   Certain
+/// browser window  MSEdge.UserData.Profile1                       No
+/// ```
+///
+/// So a window is the player's when its id is [`Match::Certain`] — the same verdict the session
+/// side follows, on the same string kind — and nothing weaker. Note that a browser window's id is
+/// not even [`Match::Browser`]: the profile suffix makes it fail the bare-id test, which is exactly
+/// what [`classify`] means by "some other origin in the same browser".
+///
+/// `app_id` of `None` means the window publishes no id at all, which is the normal case for a
+/// plain Win32 or Electron player (th-ch/youtube-music, YTMDesktop) — there the title is all there
+/// is, and it has already matched by the time this is asked. The process is the guard on *that*
+/// path: a browser that published nothing must still not be followed, and the identity failing to
+/// read for any other reason must not quietly reopen the hole this closes.
+///
+/// A pinned `music.app_id` deliberately has no say here. It names a *session*, and the session it
+/// names when a user runs the player as a plain tab is a browser's — whose window plays everything
+/// else that browser plays. The strip follows it; the buttons and the progress bar, which land on a
+/// window and cannot be taken off one, do not.
+pub fn window_is_player(app_id: Option<&str>, process: Option<&str>) -> bool {
+    match app_id {
+        Some(app_id) => classify(app_id) == Match::Certain,
+        None => !process.is_some_and(is_browser_process),
+    }
 }
 
 /// Pick the YouTube Music session out of a set of snapshots.
@@ -213,6 +270,40 @@ mod tests {
     #[test]
     fn a_pinned_browser_id_is_how_a_plain_tab_is_followed() {
         assert_eq!(classify_with_override("MSEdge", Some("MSEdge")), Match::Certain);
+    }
+
+    /// **The bug the window rule exists for**, in the two ids measured on 26200 — one `msedge.exe`,
+    /// two windows, and only this string telling them apart. The browser window used to pass on its
+    /// title alone, which is how prev/play/next ended up under Edge's hover preview with the PWA
+    /// closed and the strip showing nothing.
+    #[test]
+    fn a_browser_window_is_not_the_player() {
+        assert!(window_is_player(
+            Some("music.youtube.com-5929F88E_vezhnr0wkvrcy!App"),
+            Some("msedge.exe")
+        ));
+        assert!(!window_is_player(
+            Some("MSEdge.UserData.Profile1"),
+            Some("msedge.exe")
+        ));
+    }
+
+    /// A player that publishes no window identity — an Electron build, or any plain Win32 one — is
+    /// still followed on its title, because that is all such a window offers.
+    #[test]
+    fn a_window_with_no_identity_falls_back_to_the_title() {
+        assert!(window_is_player(None, Some("youtube-music.exe")));
+    }
+
+    /// And the guard on that fallback: a browser whose window published nothing must not slip
+    /// through it. This is also what holds if the identity ever fails to read at all.
+    #[test]
+    fn a_browser_with_no_window_identity_is_still_not_the_player() {
+        assert!(!window_is_player(None, Some("msedge.exe")));
+        assert!(!window_is_player(None, Some("Chrome.exe")));
+        // Neither field readable: nothing says browser, so the title stands — the old behaviour,
+        // kept for the players it was right about.
+        assert!(window_is_player(None, None));
     }
 
     /// The index is into the slice as given, not into some filtered subsequence — the case that

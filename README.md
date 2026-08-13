@@ -175,6 +175,15 @@ API key and no login. Things worth knowing:
   bare browser id is never followed on its own, or closing the player would leave whatever
   video is playing in the strip. If YouTube Music *is* a plain tab for you, pin that id as
   `app_id` — `--music-probe` prints the line to paste.
+- **The same rule decides which *window* gets decorated**, and it has to: the progress bar
+  and the transport buttons land on a window, and a browser window wears its active tab's
+  title, so "the window called YouTube Music" is a browser window whenever that tab is at
+  the front. An installed PWA and a plain tab are windows of the *same* `msedge.exe`; what
+  separates them is the identity the shell groups their taskbar buttons by
+  (`music.youtube.com-…!App` against `MSEdge.UserData.Profile1`), and only the first is
+  taken as the player. Pinning `app_id` does not extend to this: a thumbnail toolbar cannot
+  be removed once added, so buttons put on a browser window outlive the tab that caused
+  them. `--music-windows` prints the identity and the verdict for every candidate window.
 - **The icon must be on the taskbar**, pinned or running, and not in the overflow.
 - **The transport buttons are the shell's own.** They are added to the preview with
   `ITaskbarList3::ThumbBarAddButtons` — the same thumbnail toolbar iTunes and MPC-HC use —

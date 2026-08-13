@@ -9,6 +9,8 @@ use anyhow::{bail, Context, Result};
 use windows::Win32::Foundation::HWND;
 use windows_core::PCWSTR;
 
+use super::session;
+
 fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(core::iter::once(0)).collect()
 }
@@ -152,14 +154,93 @@ fn launch(target: &str) -> Result<()> {
     Ok(())
 }
 
-/// Every top-level window with `youtube` in its title, described — for `--activate`.
+/// The identity the **shell** has for a window: its Application User Model ID.
+///
+/// This is the string the taskbar groups buttons by, which is exactly the question the title
+/// cannot answer — a Chromium PWA window and a plain browser tab live in the *same* `msedge.exe`
+/// and differ only here. An installed YouTube Music PWA publishes an id carrying its origin; a
+/// browser window publishes the browser's own, or none at all.
+///
+/// `None` means the window publishes no id, which is the normal case for a plain Win32 app.
+pub fn window_app_id(hwnd: HWND) -> Option<String> {
+    use windows::Win32::Storage::EnhancedStorage::PKEY_AppUserModel_ID;
+    use windows::Win32::System::Com::CoTaskMemFree;
+    use windows::Win32::System::Com::StructuredStorage::PropVariantToStringAlloc;
+    use windows::Win32::UI::Shell::PropertiesSystem::{IPropertyStore, SHGetPropertyStoreForWindow};
+
+    unsafe {
+        let store: IPropertyStore = SHGetPropertyStoreForWindow(hwnd).ok()?;
+        let value = store.GetValue(&PKEY_AppUserModel_ID).ok()?;
+        // A window with no id set answers with an empty VT_EMPTY variant rather than an error, so
+        // the emptiness — not the call — is what says "this window has no identity of its own".
+        let text = PropVariantToStringAlloc(&value).ok()?;
+        let id = text.to_string().ok();
+        CoTaskMemFree(Some(text.0 as *const core::ffi::c_void));
+        id.filter(|id| !id.trim().is_empty())
+    }
+}
+
+/// The image name of the process owning a window — `msedge.exe`, `chrome.exe`, and so on.
+///
+/// Needed alongside [`window_app_id`] because the two answer different halves of the same
+/// question: the id says *which* app the shell thinks a window is, the image says whether it is a
+/// browser at all. A window that is a browser's and does not carry a YouTube Music id is a tab.
+pub fn window_process(hwnd: HWND) -> Option<String> {
+    use windows::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
+        PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
+    use windows_core::PWSTR;
+
+    unsafe {
+        let mut pid = 0u32;
+        let _ = GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+        let mut buffer = [0u16; 260];
+        let mut len = buffer.len() as u32;
+        let path = QueryFullProcessImageNameW(
+            process,
+            PROCESS_NAME_WIN32,
+            PWSTR(buffer.as_mut_ptr()),
+            &mut len,
+        )
+        .ok()
+        .map(|()| String::from_utf16_lossy(&buffer[..len as usize]));
+        let _ = windows::Win32::Foundation::CloseHandle(process);
+        path.map(|path| {
+            path.rsplit('\\')
+                .next()
+                .unwrap_or(&path)
+                .to_ascii_lowercase()
+        })
+    }
+}
+
+/// Every top-level window with `youtube` in its title, described — for `--music-windows`.
 ///
 /// The point is the *rejected* ones. `player_window` takes the first visible match and
 /// `raise` then reports success, so a window that is visible but cloaked (another virtual desktop,
 /// or Edge holding a PWA window it is not showing) makes the strip claim it brought the player
 /// forward while nothing appears. This is what distinguishes those cases from "no window at all",
 /// which needs the opposite fix.
-pub fn player_windows() -> Vec<String> {
+///
+/// One surveyed window: the verdict, the handle it was reached by, and the line describing it.
+///
+/// The handle is an `isize` rather than an `HWND` so the list can cross a thread — which is the
+/// whole point of [`crate::music::player_verdicts_from_mta`], asking the same windows the same
+/// question from the apartment the toolbar actually runs in.
+pub struct WindowReport {
+    pub hwnd: isize,
+    pub player: bool,
+    pub line: String,
+}
+
+/// `all` drops the title filter, which is how the *other* failure was measured: a plain browser
+/// window whose active tab is YouTube Music passes the title test, and the only fields that say so
+/// are the app id and the process — neither of which is visible without listing windows the title
+/// rule would never have shown.
+pub fn player_windows(all: bool) -> Vec<WindowReport> {
     use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
     use windows::Win32::UI::WindowsAndMessaging::{
         EnumWindows, GetClassNameW, GetWindowLongW, GetWindowRect, GetWindowTextW,
@@ -167,18 +248,27 @@ pub fn player_windows() -> Vec<String> {
     };
     use windows_core::BOOL;
 
+    struct Survey {
+        all: bool,
+        found: Vec<WindowReport>,
+    }
+
     unsafe extern "system" fn visit(
         hwnd: HWND,
         lparam: windows::Win32::Foundation::LPARAM,
     ) -> BOOL {
-        let found = unsafe { &mut *(lparam.0 as *mut Vec<String>) };
+        let survey = unsafe { &mut *(lparam.0 as *mut Survey) };
+        let found = &mut survey.found;
         let mut title = [0u16; 512];
         let len = unsafe { GetWindowTextW(hwnd, &mut title) };
         if len == 0 {
             return BOOL(1);
         }
         let title = String::from_utf16_lossy(&title[..len as usize]);
-        if !title.to_lowercase().contains("youtube") {
+        if !survey.all && !title.to_lowercase().contains("youtube") {
+            return BOOL(1);
+        }
+        if survey.all && !unsafe { IsWindowVisible(hwnd) }.as_bool() {
             return BOOL(1);
         }
         let mut pid = 0u32;
@@ -198,35 +288,70 @@ pub fn player_windows() -> Vec<String> {
         let class_len = unsafe { GetClassNameW(hwnd, &mut class) };
         let class = String::from_utf16_lossy(&class[..class_len.max(0) as usize]);
         let ex_style = unsafe { GetWindowLongW(hwnd, GWL_EXSTYLE) };
-        found.push(format!(
-            "hwnd {:?} pid {pid} vis {} icon {} cloak {cloaked} \
-             rect {},{} {}x{} ex {ex_style:#x} class {class} : {title}",
-            hwnd.0,
-            unsafe { IsWindowVisible(hwnd) }.as_bool(),
-            unsafe { IsIconic(hwnd) }.as_bool(),
-            rect.left,
-            rect.top,
-            rect.right - rect.left,
-            rect.bottom - rect.top,
-        ));
+        // The two fields the title cannot supply, and the reason this survey grew them: the shell's
+        // own identity for the window, and whose process it is.
+        let app_id = window_app_id(hwnd);
+        let process = window_process(hwnd);
+        // The verdict, so this survey answers the question it is run to answer: would this window
+        // be decorated as the player's?
+        let player = session::window_is_player(app_id.as_deref(), process.as_deref());
+        let app_id = app_id.unwrap_or_else(|| "<none>".to_string());
+        let process = process.unwrap_or_else(|| "<unknown>".to_string());
+        found.push(WindowReport {
+            hwnd: hwnd.0 as isize,
+            player,
+            line: format!(
+                "hwnd {:?} pid {pid} {process} vis {} icon {} cloak {cloaked} \
+                 rect {},{} {}x{} ex {ex_style:#x} class {class}\n    aumid {app_id}\n    \
+                 player {player}\n    title {title}",
+                hwnd.0,
+                unsafe { IsWindowVisible(hwnd) }.as_bool(),
+                unsafe { IsIconic(hwnd) }.as_bool(),
+                rect.left,
+                rect.top,
+                rect.right - rect.left,
+                rect.bottom - rect.top,
+            ),
+        });
         BOOL(1)
     }
 
-    let mut found: Vec<String> = Vec::new();
+    let mut survey = Survey {
+        all,
+        found: Vec::new(),
+    };
     let _ = unsafe {
         EnumWindows(
             Some(visit),
-            windows::Win32::Foundation::LPARAM(&mut found as *mut Vec<String> as isize),
+            windows::Win32::Foundation::LPARAM(&mut survey as *mut Survey as isize),
         )
     };
-    found
+    survey.found
+}
+
+/// Whether a window is the player's own — the shell's identity for it, then its process.
+///
+/// The process is only asked for when the identity is missing, which keeps this to a single
+/// cross-process call on the normal path. See [`session::window_is_player`] for what the two
+/// answers mean.
+pub fn is_player_window(hwnd: HWND) -> bool {
+    let app_id = window_app_id(hwnd);
+    let process = match app_id {
+        Some(_) => None,
+        None => window_process(hwnd),
+    };
+    session::window_is_player(app_id.as_deref(), process.as_deref())
 }
 
 /// The YouTube Music window, if it is open.
 ///
-/// Matched on the window title rather than the process, because the PWA runs inside an
-/// `msedge.exe` shared with every other Edge window — the title is what distinguishes it. Only
-/// visible top-level windows are considered, so hidden helper windows never match.
+/// Visible top-level windows only, titled `youtube music`, **and belonging to the player itself**.
+/// The title alone is not enough and was never sufficient: a browser window carries its active
+/// tab's title, so a YouTube Music tab makes a plain Edge window answer to it — and everything
+/// this window feeds (the thumbnail toolbar, the taskbar progress bar, the raise) then lands on
+/// the browser. The toolbar cannot be taken off again, so the buttons outlive the tab that caused
+/// them; that is the bug [`session::window_is_player`] exists to stop, and the title check is now
+/// only the cheap first half of it.
 pub fn player_window() -> Option<HWND> {
     use windows::Win32::UI::WindowsAndMessaging::{EnumWindows, GetWindowTextW, IsWindowVisible};
     use windows_core::BOOL;
@@ -247,7 +372,9 @@ pub fn player_window() -> Option<HWND> {
         let len = unsafe { GetWindowTextW(hwnd, &mut title) };
         if len > 0 {
             let title = String::from_utf16_lossy(&title[..len as usize]).to_lowercase();
-            if title.contains("youtube music") {
+            // The identity is asked for second, and only of a window the title already matched:
+            // it is a cross-process shell call, and this runs on every poll.
+            if title.contains("youtube music") && is_player_window(hwnd) {
                 search.found = hwnd;
                 return BOOL(0);
             }

@@ -70,6 +70,10 @@ features = [
     "Win32_Devices_Properties",
     "Win32_UI_Shell",
     "Win32_UI_Shell_PropertiesSystem",
+    # PKEY_AppUserModel_ID — the shell's identity for a window, which is how the player's own
+    # window is told from a browser tab showing the same title. windows-rs files every canonical
+    # PKEY under EnhancedStorage regardless of what it describes.
+    "Win32_Storage_EnhancedStorage",
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_System_Threading",

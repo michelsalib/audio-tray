@@ -53,9 +53,11 @@
 //!   audio-tray --music-progress <percent|off>
 //!                         put a taskbar progress bar on the player's window by hand, to
 //!                         separate "the shell refused it" from "the position was wrong"
-//!   audio-tray --music-windows
-//!                         survey the player's windows (pid, visibility, cloaking, rect),
-//!                         in the process that acts on them — PowerShell cannot do this
+//!   audio-tray --music-windows [all]
+//!                         survey the player's windows (pid, visibility, cloaking, rect, the
+//!                         shell's app id, and whether it counts as the player), in the process
+//!                         that acts on them — PowerShell cannot do this. `all` drops the title
+//!                         filter, which is how a browser window's id is read next to the PWA's
 //!   audio-tray --music-thumbbar [playing|paused]
 //!                         put prev/play/next on the player's *hover preview* via the shell's
 //!                         own thumbnail toolbar — the measurement for whether that API
@@ -281,7 +283,9 @@ fn main() -> Result<()> {
         Some("--music-probe") => music::probe()?,
         Some("--music-timeline") => music::report_timeline()?,
         Some("--music-progress") => {
-            let value = args.get(2).map(String::as_str).unwrap_or("off");
+            // `args` already has the program name stripped, so the flag is index 0 and its value
+            // is index 1 — this asked for index 2 and so silently read every percentage as "off".
+            let value = args.get(1).map(String::as_str).unwrap_or("off");
             let fraction = match value {
                 "off" | "none" => None,
                 percent => Some(
@@ -297,16 +301,42 @@ fn main() -> Result<()> {
         // Nothing documents that case, and the answer decides whether the transport buttons can move
         // off the strip and under the hover preview at all.
         Some("--music-thumbbar") => {
-            let playing = !matches!(args.get(2).map(String::as_str), Some("paused"));
+            let playing = !matches!(args.get(1).map(String::as_str), Some("paused"));
             music::thumbbar::probe(playing)?;
         }
         Some("--music-windows") => {
-            let windows = music::player::player_windows();
+            // `all` lists every visible titled window, not just the ones the title rule would
+            // match — the view that shows a browser window's app id next to the player's.
+            let all = matches!(args.get(1).map(String::as_str), Some("all"));
+            let windows = music::player::player_windows(all);
             if windows.is_empty() {
                 println!("no window with 'youtube' in its title");
             }
-            for line in windows {
-                println!("{line}");
+            for window in &windows {
+                println!("{}", window.line);
+            }
+            // This process is an STA; the thumbnail toolbar asks the same question from the feed's
+            // MTA. Reporting the comparison rather than a second listing keeps the tool readable
+            // and still says so loudly if the apartment ever changes the answer.
+            let handles: Vec<isize> = windows.iter().map(|window| window.hwnd).collect();
+            match music::player_verdicts_from_mta(handles) {
+                Ok(from_mta) => {
+                    let disagreed: Vec<&music::player::WindowReport> = windows
+                        .iter()
+                        .zip(&from_mta)
+                        .filter(|(window, mta)| window.player != **mta)
+                        .map(|(window, _)| window)
+                        .collect();
+                    if disagreed.is_empty() {
+                        println!("\nsame verdicts from an MTA thread.");
+                    } else {
+                        println!("\nan MTA thread disagrees — the identity does not read there:");
+                        for window in disagreed {
+                            println!("{}", window.line);
+                        }
+                    }
+                }
+                Err(err) => println!("\ncould not ask an MTA thread: {err:#}"),
             }
         }
         Some("--taskbar-revert") => {

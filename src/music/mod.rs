@@ -352,6 +352,31 @@ fn report_sessions(feed: &mut Ytm) -> Result<()> {
     Ok(())
 }
 
+/// Ask an **MTA** thread the same "is this the player's window?" question about the same windows.
+///
+/// Not redundant with the survey that produced them: the two surfaces that act on the player's
+/// window run in *different apartments* — the thumbnail toolbar from the feed's MTA, the progress
+/// bar from the tray's STA — and the window's identity is read with a shell COM call
+/// (`SHGetPropertyStoreForWindow`) in whichever one is asking. An identity that failed to read in
+/// one of them would not error; it would fall through to the process check and quietly stop
+/// decorating the real player. This says the two agree, rather than assuming it.
+///
+/// Takes the handles the survey already found rather than enumerating again, because a second
+/// enumeration answers about a *different set of windows* — one opening or closing in between reads
+/// as a disagreement that is nothing of the sort.
+pub fn player_verdicts_from_mta(windows: Vec<isize>) -> Result<Vec<bool>> {
+    on_mta_thread("music-windows", move || {
+        Ok(windows
+            .into_iter()
+            .map(|hwnd| {
+                player::is_player_window(windows::Win32::Foundation::HWND(
+                    hwnd as *mut core::ffi::c_void,
+                ))
+            })
+            .collect())
+    })
+}
+
 /// Sample the followed session's position three times, three seconds apart.
 ///
 /// **The measurement this exists for:** a player publishes its position as a *checkpoint with a

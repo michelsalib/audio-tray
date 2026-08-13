@@ -13,16 +13,23 @@
 
 /// The width the strip lays itself out in.
 ///
-/// **162, down from 240, because the transport controls left.** They are on the shell's own
-/// thumbnail toolbar under the hover preview now (`music::thumbbar`, audio-tray side), which frees
-/// the 78 epx three buttons occupied. That width goes back to the taskbar rather than into the text
-/// column: the column keeps the 120 epx it was measured and calibrated at, and the app icons stop
-/// being squeezed toward the shell's compressed layout.
+/// **240 → 162 when the transport controls left** for the shell's own thumbnail toolbar under the
+/// hover preview (`music::thumbbar`, audio-tray side), which freed the 78 epx three buttons occupied.
+/// That width went back to the taskbar rather than into the text column, which kept the 120 epx it
+/// had been measured and calibrated at.
+///
+/// **162 → 150 because a column sized for a song title is a hole in the taskbar the rest of the
+/// time.** `Nothing playing` is 100 epx of text in a 120 epx column, and the strip is exactly as wide
+/// as the button we ask the shell for — so the shortfall showed as dead taskbar between the label and
+/// the next app's icon. Narrowing only while idle was tried and is worse: the strip would then be two
+/// sizes, and since YouTube Music publishes no title for a moment between songs it would change size
+/// twice a track, shoving its neighbours about while you aim at them. **One width, and it is this
+/// one.** A title now scrolls a couple of characters sooner, which is what the ticker is for.
 ///
 /// ```text
-/// 2·pad 4  +  cover 28  +  gap 6  +  text 120  +  slack 4  =  162
+/// 2·pad 4  +  cover 28  +  gap 6  +  text 108  +  slack 4  =  150
 /// ```
-pub const STRIP_WIDTH: u32 = 162;
+pub const STRIP_WIDTH: u32 = 150;
 
 // How much wider than the strip the button has to be asked for is a property of *which* button —
 // 80 epx for the Widgets entry point, 4 for a task button — so it lives on `super::tile::Host` rather
@@ -102,8 +109,8 @@ impl Layout {
     pub fn for_width(strip: u32) -> Self {
         // **Recalibrated when the transport buttons left the strip.** The old threshold was 200 with
         // three 26-epx buttons in the budget; the same amount of room for the parts that remain is
-        // 200 − 78 = 122. Keeping 200 here would have made the new 162-epx strip take the cramped
-        // branch and shrink a cover that now has more space, not less.
+        // 200 − 78 = 122. Keeping 200 here would have made the strip take the cramped branch at every
+        // width it has had since — 162, then 150 — and shrink a cover that has more space, not less.
         let roomy = strip >= 122;
         let pad = if roomy { 2 } else { 1 };
         let cover = if roomy { 28 } else { 26 };
@@ -318,17 +325,40 @@ mod tests {
         assert_eq!(l.text, 100 - (2 + 26 + 3 + 4));
     }
 
-    /// **The point of the move.** The transport buttons left for the hover preview, and the width
-    /// they occupied went back to the taskbar rather than into the text — the column keeps exactly
-    /// the 120 epx it was calibrated at, and the strip is 78 epx narrower than it was.
+    /// The shipped width, and what it buys the parts.
+    ///
+    /// 150 rather than the 162 that came out of the transport buttons leaving: that width sized the
+    /// column for a *song title*, and the strip is one size whatever it is showing, so the 12 epx a
+    /// title used but `Nothing playing` did not were dead taskbar the rest of the time.
     #[test]
-    fn the_default_width_keeps_the_calibrated_text_column() {
-        assert_eq!(STRIP_WIDTH, 162);
+    fn the_shipped_width_spends_what_is_left_on_the_column() {
+        assert_eq!(STRIP_WIDTH, 150);
         let l = Layout::for_width(STRIP_WIDTH);
         assert_eq!((l.pad, l.cover, l.gap), (2, 28, 6));
-        assert_eq!(l.text, 120, "the text column must survive the narrowing untouched");
-        assert_eq!((l.title_chars, l.artist_chars), (18, 23));
-        // For the record: 162 + three 26-epx buttons is the 240 this strip used to be.
+        assert_eq!(l.text, 108, "the fixed parts took more than their 42 epx");
+        assert_eq!((l.title_chars, l.artist_chars), (17, 20));
+    }
+
+    /// **The narrowing must not go so far that the idle label scrolls.** A strip permanently ticking
+    /// `Nothing playing` past a clip would be a worse answer to the dead space than the dead space.
+    ///
+    /// Measured through DirectWrite, the two labels come to 99.8 and 73.5 epx at [`TITLE_SIZE`] and
+    /// [`ARTIST_SIZE`] — both inside the 108 epx column, with room for the grid-fitted rendering the
+    /// shell uses to round each glyph's advance up.
+    #[test]
+    fn the_idle_label_still_fits_the_column() {
+        let idle = super::super::state::Strip::default();
+        let l = Layout::for_width(STRIP_WIDTH);
+        for (label, chars) in [
+            (idle.display_title(), l.title_chars),
+            (idle.display_artist(), l.artist_chars),
+        ] {
+            assert!(
+                !super::super::ticker::scrolls(label, chars),
+                "{label:?} does not fit {chars} characters"
+            );
+        }
+        assert!(f64::from(l.text) >= 99.81, "a {} epx column cannot hold the title", l.text);
     }
 
     /// The recalibrated `roomy` threshold has to put the shipped width on the generous branch.

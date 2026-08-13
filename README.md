@@ -30,7 +30,7 @@ A tiny Windows system-tray app for **controlling your audio without digging thro
   own "microphone in use" indicator does (which it replaces, see below), so it covers
   every app and every microphone, and it stays lit while an app holds the stream open
   even if you are muted.
-- **YouTube Music in its own taskbar button** — the PWA's icon becomes a 162-epx strip
+- **YouTube Music in its own taskbar button** — the PWA's icon becomes a 150-epx strip
   showing the track, the artist and the song's position, with previous/play-pause/next a
   hover away on the preview's toolbar. It is the app's *own* button, so launching adds no
   second icon, minimising still goes there, and it still drags to reorder. See
@@ -152,7 +152,7 @@ The engineering notes, including the failure modes found along the way, are in
 
 The same injection that draws the audio buttons also replaces the YouTube Music PWA's
 taskbar icon with a now-playing strip: the track title (scrolling when it does not fit)
-and the artist under it, in 162 epx of taskbar. The transport controls are one hover
+and the artist under it, in 150 epx of taskbar. The transport controls are one hover
 away, on the preview's own toolbar.
 
 | Where | What |

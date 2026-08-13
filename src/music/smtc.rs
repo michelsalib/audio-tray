@@ -91,18 +91,10 @@ impl MediaKind {
     }
 }
 
-/// Which transport commands the app says it will honour right now.
-///
-/// Worth respecting rather than always drawing every button: YouTube Music
-/// disables "previous" at the head of a queue, and a control that visibly does
-/// nothing reads as a broken strip.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-pub struct Capabilities {
-    pub can_play: bool,
-    pub can_pause: bool,
-    pub can_skip_next: bool,
-    pub can_skip_previous: bool,
-}
+// There is deliberately no `Capabilities` here. `GetPlaybackInfo`'s `Controls` says which
+// transport commands the app will honour, and it was read into every snapshot and brief for a
+// strip that was going to grey the buttons out — but the buttons are the shell's thumbnail
+// toolbar now (see `super::thumbbar`), and it draws and enables them itself.
 
 /// Everything worth drawing about one session, read in a single pass.
 ///
@@ -119,7 +111,6 @@ pub struct Snapshot {
     pub artist: String,
     pub album: String,
     pub status: PlaybackStatus,
-    pub capabilities: Capabilities,
     pub kind: MediaKind,
     /// Cover art bytes, as published (PNG or JPEG — read the magic, don't assume).
     /// `None` whenever the app publishes no artwork; see the module note.
@@ -135,7 +126,6 @@ pub struct Snapshot {
 pub struct Brief {
     pub app_id: String,
     pub status: PlaybackStatus,
-    pub capabilities: Capabilities,
     pub kind: MediaKind,
 }
 
@@ -235,16 +225,11 @@ impl Timeline {
 }
 
 /// A transport command, as the strip's buttons express it.
+///
+/// There is no `Play` or `Pause`: the strip has one button for both, and SMTC's own
+/// `TryTogglePlayPauseAsync` is what keeps it honest when the session changed state behind us.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Command {
-    // The strip only ever toggles — one button, and SMTC own `TryTogglePlayPauseAsync` is what keeps
-    // it honest when the session changed state behind us. These two are kept because this is a
-    // faithful wrapper over the API, and a caller that knows which way it wants should not have to
-    // add them back.
-    #[allow(dead_code)]
-    Play,
-    #[allow(dead_code)]
-    Pause,
     TogglePlayPause,
     Next,
     Previous,
@@ -287,17 +272,6 @@ impl Smtc {
         Ok(out)
     }
 
-    /// What every session *is*, without asking any of them what they are playing.
-    ///
-    /// This is the cheap half of a read, and the distinction is the whole point: an app id and a
-    /// playback status come from `GetPlaybackInfo`, which is local, while a title and its artwork
-    /// come from `TryGetMediaPropertiesAsync`, which is a round-trip into the owning process. Picking
-    /// a session needs only the cheap half.
-    pub fn briefs(&self) -> Result<Vec<Brief>> {
-        let sessions = self.manager.GetSessions().context("GetSessions")?;
-        Ok(sessions.into_iter().map(|s| read_brief(&s)).collect())
-    }
-
     /// One poll's worth of reading, in a single enumeration.
     ///
     /// **The shape exists to stop paying for sessions nobody asked about.** Before this, a poll read
@@ -330,7 +304,6 @@ impl Smtc {
         let mut snapshot = Snapshot {
             app_id: briefs[index].app_id.clone(),
             status: briefs[index].status,
-            capabilities: briefs[index].capabilities,
             kind: briefs[index].kind,
             ..Default::default()
         };
@@ -339,20 +312,6 @@ impl Smtc {
             snapshot,
             timeline: read_timeline(session),
         }))
-    }
-
-    /// The session Windows considers current — what a media key would reach.
-    ///
-    /// **Not used as a fallback, deliberately.** Falling back to "whatever is current" is how a
-    /// click on a YouTube Music strip pauses MPC-HC. Kept for `--probe`-style diagnosis, where the
-    /// question *is* which session would win.
-    #[allow(dead_code)]
-    pub fn current(&self) -> Result<Option<Snapshot>> {
-        match self.manager.GetCurrentSession() {
-            Ok(session) => Ok(Some(read_session(&session)?)),
-            // No current session is an error rather than a null on this API.
-            Err(_) => Ok(None),
-        }
     }
 
     /// The timeline of the session owned by `app_id`, if it publishes one.
@@ -403,8 +362,6 @@ impl Smtc {
 /// not to confirm the new state.
 fn dispatch(session: &Session, command: Command) -> Result<bool> {
     let accepted = match command {
-        Command::Play => session.TryPlayAsync()?.get()?,
-        Command::Pause => session.TryPauseAsync()?.get()?,
         Command::TogglePlayPause => session.TryTogglePlayPauseAsync()?.get()?,
         Command::Next => session.TrySkipNextAsync()?.get()?,
         Command::Previous => session.TrySkipPreviousAsync()?.get()?,
@@ -423,7 +380,6 @@ fn read_session(session: &Session) -> Result<Snapshot> {
     let mut snapshot = Snapshot {
         app_id: brief.app_id,
         status: brief.status,
-        capabilities: brief.capabilities,
         kind: brief.kind,
         ..Default::default()
     };
@@ -447,14 +403,6 @@ fn read_brief(session: &Session) -> Brief {
     if let Ok(info) = session.GetPlaybackInfo() {
         if let Ok(status) = info.PlaybackStatus() {
             brief.status = PlaybackStatus::from_winrt(status);
-        }
-        if let Ok(controls) = info.Controls() {
-            brief.capabilities = Capabilities {
-                can_play: controls.IsPlayEnabled().unwrap_or(false),
-                can_pause: controls.IsPauseEnabled().unwrap_or(false),
-                can_skip_next: controls.IsNextEnabled().unwrap_or(false),
-                can_skip_previous: controls.IsPreviousEnabled().unwrap_or(false),
-            };
         }
         // An `IReference` that is null — the app published no type at all — reads as an error here,
         // which is the `Unknown` default.

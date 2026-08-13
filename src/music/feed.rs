@@ -24,7 +24,6 @@ pub enum State {
 }
 
 impl State {
-    #[allow(dead_code)] // The strip reads `State` by matching; this is for callers that do not.
     pub fn snapshot(&self) -> Option<&Snapshot> {
         match self {
             Self::Track(snapshot) => Some(snapshot),
@@ -110,35 +109,11 @@ impl Ytm {
         self.smtc.timeline(app_id)
     }
 
-    /// Every session on the machine, for `--probe`.
+    /// Every session on the machine, for `--music-probe`.
     ///
     /// The point of exposing this is diagnosis: when the built-in matching misses
     /// an unusual YouTube Music build, this is what shows the real app id to pin.
     pub fn all_sessions(&self) -> Result<Vec<Snapshot>> {
         self.smtc.sessions()
-    }
-
-    /// Whether some *other* app holds a media session right now.
-    ///
-    /// Written as a guard for the media-key fallback and then **not used for that**, because it is
-    /// not a sufficient one: a player can register for media keys without publishing an SMTC
-    /// session at all, so "no foreign session" does not mean "the key will reach us". The fallback
-    /// raises the player instead — see the cold-start branch in `main::handle_click`.
-    ///
-    /// Kept because it answers a question worth answering elsewhere: whether the strip is idle
-    /// because nothing is playing, or because something *else* is.
-    ///
-    /// Errors count as "yes, something else is there" — failing closed is the safe direction for
-    /// every caller this could have.
-    #[allow(dead_code)] // Kept deliberately, and the doc comment above says why.
-    pub fn foreign_session_exists(&self) -> bool {
-        // Briefs, not full snapshots: the question is only about app ids, and reading every
-        // session's artwork to answer it would cost more than the answer is worth.
-        match self.smtc.briefs() {
-            Ok(sessions) => sessions
-                .iter()
-                .any(|s| session::classify(&s.app_id) == session::Match::No),
-            Err(_) => true,
-        }
     }
 }

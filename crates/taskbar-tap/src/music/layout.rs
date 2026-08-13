@@ -32,8 +32,8 @@
 pub const STRIP_WIDTH: u32 = 150;
 
 // How much wider than the strip the button has to be asked for is a property of *which* button —
-// 80 epx for the Widgets entry point, 4 for a task button — so it lives on `super::tile::Host` rather
-// than here. See `tile::Host::slot_overhead`.
+// 80 epx for the Widgets entry point, 4 for a task button — so it lives on
+// `super::tile::Host::SLOT_OVERHEAD` rather than here.
 
 /// Font sizes, in effective pixels.
 ///
@@ -157,17 +157,6 @@ pub fn layout() -> Layout {
     Layout::for_width(CONTENT_WIDTH.load(std::sync::atomic::Ordering::SeqCst))
 }
 
-// Historical, kept because the reasoning still applies to any future width experiment: the M11
-// `widen` probe had the root plate ask for more epx than [`STRIP_WIDTH`] and paint itself, so a
-// screenshot showed exactly where the slot cut it off — with the *contents* keeping their own
-// budget either way. Putting the experiment in the plate rather than in the layout is what made a
-// refused slot leave a working strip instead of a clipped one, which is what had made the previous
-// attempt ambiguous.
-
-/// The strip drawn into the app's taskbar button: cover, title, artist.
-///
-/// The transport controls are on the shell's thumbnail toolbar under the hover preview now — this
-/// surface is 162 epx of taskbar and spends all of it on saying what is playing.
 /// `x:Name` of the `Border` holding the cover art, so a track change can swap the art alone.
 pub const COVER_HOST: &str = "MusicTileCoverHost";
 
@@ -293,11 +282,6 @@ pub fn now_playing_markup(strip: &super::state::Strip) -> String {
 pub fn icon_centre() -> f64 {
     let layout = layout();
     f64::from(layout.pad) + f64::from(layout.cover) / 2.0
-}
-
-/// The icon's width.
-pub fn icon_width() -> f64 {
-    f64::from(layout().cover)
 }
 
 /// The strip's full width — what the shell's progress bar is sized to.

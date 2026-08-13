@@ -77,10 +77,10 @@ pub(super) const GRID_BOTTOM_PAD: f32 = 10.0; // gap below the last grid row
 pub(super) const GRID_ICON_RATIO: f32 = 0.55; // glyph size inside a cell
 
 // Fluent glyphs painted directly (not from the built-in IconId set).
-pub(crate) const GLYPH_VOLUME: char = '\u{E767}';
-pub(crate) const GLYPH_MUTE: char = '\u{E74F}';
-pub(crate) const GLYPH_MIC: char = '\u{E720}';
-pub(crate) const GLYPH_MIC_OFF: char = '\u{EC54}';
+const GLYPH_VOLUME: char = '\u{E767}';
+const GLYPH_MUTE: char = '\u{E74F}';
+const GLYPH_MIC: char = '\u{E720}';
+const GLYPH_MIC_OFF: char = '\u{EC54}';
 pub(super) const GLYPH_EDIT: char = '\u{E70F}';
 pub(super) const GLYPH_SETTINGS: char = '\u{E713}';
 pub(super) const GLYPH_CANCEL: char = '\u{E711}';
@@ -130,6 +130,22 @@ pub(crate) fn recording_dot(cv: &mut Canvas, x: i32, y: i32, size: u32) {
     };
     disc(cv, outer, TEXT);
     disc(cv, r, RECORDING);
+}
+
+/// The glyph for one endpoint's state — the picture of "which direction, and is it muted".
+///
+/// Shared by the flyout's slider rows and the scroll readout, because the two are seen a few
+/// pixels apart and a different speaker in each would read as a mismatch. Only the *colour*
+/// differs between them (see [`crate::osd`]'s muted tint), so that stays at the call site.
+pub(crate) fn endpoint_glyph(flow: crate::audio::Flow, muted: bool) -> char {
+    use crate::audio::Flow;
+
+    match (flow, muted) {
+        (Flow::Output, false) => GLYPH_VOLUME,
+        (Flow::Output, true) => GLYPH_MUTE,
+        (Flow::Input, false) => GLYPH_MIC,
+        (Flow::Input, true) => GLYPH_MIC_OFF,
+    }
 }
 
 pub(crate) fn ui_font() -> Option<&'static FontVec> {
@@ -183,23 +199,8 @@ fn accent_palette_light2() -> Option<[u8; 3]> {
 
 /// The user's Windows accent colour from the DWM registry key (stored `AABBGGRR`).
 fn dwm_accent_rgb() -> [u8; 3] {
-    use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
-    let mut v: u32 = 0;
-    let mut size = 4u32;
-    let ok = unsafe {
-        RegGetValueW(
-            HKEY_CURRENT_USER,
-            w!(r"Software\Microsoft\Windows\DWM"),
-            w!("AccentColor"),
-            RRF_RT_REG_DWORD,
-            None,
-            Some(&mut v as *mut u32 as *mut core::ffi::c_void),
-            Some(&mut size),
-        )
-    };
-    if ok.0 == 0 {
-        [(v & 0xFF) as u8, ((v >> 8) & 0xFF) as u8, ((v >> 16) & 0xFF) as u8]
-    } else {
-        [0x60, 0xCD, 0xFF] // fallback Win11 accent
+    match crate::win::hkcu_dword(w!(r"Software\Microsoft\Windows\DWM"), w!("AccentColor")) {
+        Some(v) => [(v & 0xFF) as u8, ((v >> 8) & 0xFF) as u8, ((v >> 16) & 0xFF) as u8],
+        None => [0x60, 0xCD, 0xFF], // fallback Win11 accent
     }
 }

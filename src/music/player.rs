@@ -1,19 +1,14 @@
 //! The player behind the strip: which window it is, how to bring it forward, and its progress bar.
 //!
-//! **There is no menu of ours any more.** A right-click used to open one — a Win32 popup, then an
-//! owner-drawn flyout — and both are gone with the self-updater they mostly existed to offer. On an
-//! app's own taskbar button the right click now falls through to the shell, which answers it with
-//! that app's jump list; that is a better answer than anything we had in there.
+//! Nothing here handles a click on the tile. The strip sits on the app's *own* taskbar button, so
+//! the shell already answers both buttons better than we could — left brings the player forward or
+//! minimises it, right opens its jump list.
 
 use anyhow::{bail, Context, Result};
 use windows::Win32::Foundation::HWND;
 use windows_core::PCWSTR;
 
 use super::session;
-
-fn wide(text: &str) -> Vec<u16> {
-    text.encode_utf16().chain(core::iter::once(0)).collect()
-}
 
 /// Where the player's AUMID is remembered between runs.
 ///
@@ -113,7 +108,7 @@ fn activate_packaged(aumid: &str) -> Result<u32> {
         let manager: IApplicationActivationManager =
             CoCreateInstance(&ApplicationActivationManager, None, CLSCTX_LOCAL_SERVER)
                 .context("CoCreateInstance(ApplicationActivationManager)")?;
-        let aumid_w = wide(aumid);
+        let aumid_w = crate::win::wide(aumid);
         manager
             .ActivateApplication(PCWSTR(aumid_w.as_ptr()), PCWSTR::null(), AO_NONE)
             .with_context(|| format!("ActivateApplication({aumid})"))
@@ -135,8 +130,8 @@ fn launch(target: &str) -> Result<()> {
     use windows::Win32::UI::Shell::ShellExecuteW;
     use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
-    let target_w = wide(target);
-    let verb = wide("open");
+    let target_w = crate::win::wide(target);
+    let verb = crate::win::wide("open");
     let result = unsafe {
         ShellExecuteW(
             None,
@@ -438,7 +433,11 @@ pub fn forget_taskbar_list() {
     TASKBAR.with(|cell| *cell.borrow_mut() = None);
 }
 
-/// The shell's taskbar list, initialised. Kept by the caller — see [`crate::progress::Progress`].
+/// The shell's taskbar list, initialised.
+///
+/// `pub` because the thumbnail toolbar needs one of its own, on the feed's thread — see
+/// [`super::thumbbar::Toolbar`]. Everything on this side goes through [`set_player_progress`],
+/// which caches one per apartment.
 pub fn taskbar_list() -> Result<windows::Win32::UI::Shell::ITaskbarList3> {
     use windows::Win32::System::Com::{
         CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_APARTMENTTHREADED,
@@ -459,7 +458,7 @@ pub fn taskbar_list() -> Result<windows::Win32::UI::Shell::ITaskbarList3> {
 /// The state picks the colour, matching what the taskbar already means by them: green while it runs,
 /// yellow when it is paused — which is why MPC-HC's bar is yellow in the screenshot that prompted
 /// this.
-pub fn set_progress(
+fn set_progress(
     taskbar: &windows::Win32::UI::Shell::ITaskbarList3,
     hwnd: HWND,
     fraction: Option<f64>,

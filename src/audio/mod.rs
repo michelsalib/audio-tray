@@ -47,12 +47,17 @@ pub struct Device {
     pub container_id: Option<String>,
 }
 
-pub trait AudioBackend {
-    /// Active render (output) endpoints only.
-    fn enumerate(&self) -> anyhow::Result<Vec<Device>>;
-    /// Set the default render endpoint across all three roles (plan §2.3).
-    fn set_default(&self, id: &DeviceId) -> anyhow::Result<()>;
-}
-// A `current_default` (render, `eConsole`) used to sit here. Everything now reads the
-// default per direction through `WasapiBackend::default_of`, which answers the same
-// question for either flow.
+/// `PKEY_Device_ContainerId` / `DEVPKEY_Device_ContainerId`, which the `windows` crate binds
+/// under neither name.
+///
+/// Named once because it is read twice, through two different property APIs and as two
+/// different key types: off the audio endpoint's property store ([`wasapi`]) and off the
+/// PnP device node ([`battery`]). The whole point is that the two answers can be compared,
+/// so a typo in either would not fail — it would silently stop matching.
+pub(crate) const CONTAINER_ID_FMTID: u128 = 0x8C7E_D206_3F8A_4827_B3AB_AE9E_1FAE_FC6C;
+pub(crate) const CONTAINER_ID_PID: u32 = 2;
+
+// There is deliberately no `AudioBackend` trait. It had one implementor and two methods,
+// both of which duplicated a `WasapiBackend` inherent method that takes the direction as
+// an argument — so every call site had to import the trait to reach a worse version of a
+// method it already had.

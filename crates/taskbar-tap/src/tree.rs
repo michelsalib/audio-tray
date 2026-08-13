@@ -42,10 +42,7 @@ fn tree() -> &'static Mutex<Tree> {
 }
 
 fn lock() -> std::sync::MutexGuard<'static, Tree> {
-    match tree().lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
-    }
+    crate::lock(tree())
 }
 
 /// How many mutations get logged verbatim, for diagnosing what XAML sends us.
@@ -122,12 +119,9 @@ pub fn quiet_for(period: Duration) -> bool {
     tree.last_event.is_some_and(|at| at.elapsed() >= period)
 }
 
-// Query helpers over the recorded tree. `type_of` / `parent_of` drive the current
-// decoration path; the rest are the vocabulary any richer selector work will need,
-// and are kept rather than re-derived later.
+// Query helpers over the recorded tree.
 
 /// Every recorded element of the given XAML type, in the order they arrived.
-#[allow(dead_code)]
 pub fn find_by_type(type_name: &str) -> Vec<u64> {
     let tree = lock();
     let mut hits: Vec<(u64, u64)> = tree
@@ -199,45 +193,6 @@ pub fn type_of(handle: u64) -> Option<String> {
 pub fn parent_of(handle: u64) -> Option<u64> {
     let tree = lock();
     tree.nodes.get(&handle).map(|node| node.parent)
-}
-
-/// The first descendant of `root` carrying the given `x:Name`.
-#[allow(dead_code)]
-pub fn find_descendant_named(root: u64, name: &str) -> Option<u64> {
-    let tree = lock();
-    // Breadth-first so the shallowest match wins — nested templates reuse names.
-    let mut frontier = vec![root];
-    for _ in 0..MAX_SEARCH_DEPTH {
-        let mut next = Vec::new();
-        for (&handle, node) in &tree.nodes {
-            if !frontier.contains(&node.parent) {
-                continue;
-            }
-            if node.name == name {
-                return Some(handle);
-            }
-            next.push(handle);
-        }
-        if next.is_empty() {
-            return None;
-        }
-        frontier = next;
-    }
-    None
-}
-
-#[allow(dead_code)]
-const MAX_SEARCH_DEPTH: usize = 32;
-
-/// Handles the live feed reported with no parent — the tree roots.
-#[allow(dead_code)]
-pub fn root_handles() -> Vec<u64> {
-    let tree = lock();
-    tree.nodes
-        .iter()
-        .filter(|(_, node)| node.parent == 0)
-        .map(|(&handle, _)| handle)
-        .collect()
 }
 
 /// Starts the dump watchdog exactly once.

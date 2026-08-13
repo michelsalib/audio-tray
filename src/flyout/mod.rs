@@ -8,10 +8,9 @@
 //! corners from DWM. Rows and controls are laid out and hit-tested by hand; the flyout is
 //! modal via mouse capture, like a menu, but stays open while you operate it.
 //!
-//! Either mouse button opens the same panel. What used to be a separate right-click
-//! quick menu is now the footer strip that closes it — Quit on the left, a Sound settings
-//! button on the right, modelled on the Win11 quick-settings footer — so the taskbar strip
-//! can spend its clicks on switching devices rather than on opening menus.
+//! There is one panel, not a panel and a menu: Quit and Sound settings live in the footer
+//! strip that closes it, modelled on the Win11 quick-settings footer. That is what frees the
+//! taskbar strip to spend its clicks on switching devices rather than on opening menus.
 //!
 //! This module is the **controller**: it owns the modal message pump and coordinates the
 //! focused pieces it delegates to — the display [`model`], pure [`layout`], the [`render`]
@@ -52,6 +51,7 @@ use theme::{accent_rgb, TRACK_X0};
 use window::Surface;
 
 /// What the caller must do after the flyout closes.
+#[derive(Default)]
 pub struct Outcome {
     pub quit: bool,
     pub config_changed: bool,
@@ -218,12 +218,7 @@ unsafe fn show_inner(
 
     if let Err(e) = fly.surface.create_window() {
         eprintln!("flyout: create_window failed: {e:?}");
-        return Outcome {
-            quit: false,
-            config_changed: false,
-            output_changed: false,
-            restart: false,
-        };
+        return Outcome::default();
     }
 
     fly.render_base();
@@ -362,19 +357,16 @@ impl Flyout<'_> {
         self.surface.buf = vec![0u8; bytes];
     }
 
-    /// Push the current devices' glyphs to the injected taskbar strip.
+    /// Push the current devices' glyphs to the injected taskbar strip, at the moment of each
+    /// live change.
     ///
-    /// Called at the moment of each live change rather than left to the tray's
-    /// `refresh`, because while this flyout is open it owns the message loop — the
-    /// tray thread is blocked, so an endpoint-change notification is not processed
-    /// until the flyout closes. Waiting for that made the strip visibly lag the
-    /// selection the user had just made.
+    /// The tray's own `refresh` cannot do it: while this flyout is open it owns the message
+    /// loop, so the endpoint-change notification is not processed until it closes — which made
+    /// the strip visibly lag the selection the user had just made.
     ///
-    /// A no-op when there is no strip — an Explorer that refused the injection has
-    /// no window for us to post to — and also when the strip already shows this,
-    /// which is why it goes through the tray rather than straight to `taskbar`: the
-    /// tray owns the record of what has been posted, and a redundant restyle costs
-    /// the TAP a full rebuild.
+    /// Through the tray rather than straight to `taskbar` because the tray owns the record of
+    /// what has been posted, and a restyle the strip is already showing costs the TAP a full
+    /// rebuild.
     fn sync_strip(&self) {
         crate::tray::restyle_strip(self.backend, self.config);
     }
@@ -655,14 +647,7 @@ impl Flyout<'_> {
         let src = self.surface.buf.clone();
         let (elems, _) = layout::build_view(&self.model, self.scale, w, to, h);
         let mut dst = vec![0u8; n];
-        let ctx = render::Ctx {
-            model: &self.model,
-            accent: self.accent,
-            scale: self.scale,
-            width: w,
-            height: h,
-        };
-        render::render_page(&ctx, &elems, &mut dst);
+        render::render_page(&self.ctx(), &elems, &mut dst);
         self.anim = Some(Transition {
             to,
             elems,
@@ -695,7 +680,7 @@ impl Flyout<'_> {
             cv.blit_shift(&anim.src, dx_src);
             cv.blit_shift(&anim.dst, dx_dst);
         }
-        self.surface.present_buf(&anim.frame, w, h, self.surface.x, self.surface.y, 255);
+        self.surface.present(&anim.frame, self.surface.x, self.surface.y, 255);
         if t >= 1.0 {
             self.land(anim);
         } else {
@@ -765,33 +750,23 @@ impl Flyout<'_> {
     /// Render the current view's static layer into the surface's `base` buffer. Slider
     /// fill/thumb/value and hover live in [`Self::compose`].
     fn render_base(&mut self) {
-        let n = (self.surface.width * self.surface.height * 4) as usize;
-        let mut base = vec![0u8; n];
-        // Build the context inline (borrowing only `self.model`) so the disjoint borrows of
-        // the surface's fields stay legal alongside the `&mut base` target.
-        let ctx = render::Ctx {
-            model: &self.model,
-            accent: self.accent,
-            scale: self.scale,
-            width: self.surface.width,
-            height: self.surface.height,
-        };
-        render::render_page(&ctx, &self.surface.elems, &mut base);
+        let mut base = vec![0u8; (self.surface.width * self.surface.height * 4) as usize];
+        render::render_page(&self.ctx(), &self.surface.elems, &mut base);
         self.surface.base = base;
     }
 
     /// Copy the static base, then draw the dynamic overlays (see [`render::compose`]).
     fn compose(&mut self) {
-        // `Ctx` borrows only `self.model`, leaving `self.surface.buf` free to borrow mutably
-        // as the compose target while `elems`/`base` are read (disjoint surface fields).
-        let ctx = render::Ctx {
-            model: &self.model,
-            accent: self.accent,
-            scale: self.scale,
-            width: self.surface.width,
-            height: self.surface.height,
-        };
+        // `Ctx::new` borrows `self.model` alone, which is what leaves `self.surface.buf` free
+        // to borrow mutably as the target while `elems`/`base` are read. `self.ctx()` would
+        // borrow all of `self` and could not.
+        let ctx = render::Ctx::new(&self.model, self.accent, self.scale, self.surface.size());
         render::compose(&ctx, &self.hit, &self.surface.elems, &self.surface.base, &mut self.surface.buf);
+    }
+
+    /// The render context for a pass that is *not* painting into the surface.
+    fn ctx(&self) -> render::Ctx<'_> {
+        render::Ctx::new(&self.model, self.accent, self.scale, self.surface.size())
     }
 }
 

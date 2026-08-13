@@ -73,19 +73,11 @@ impl Host {
 static HOST: Mutex<Option<String>> = Mutex::new(None);
 
 pub fn set_host(name: Option<String>) {
-    let mut guard = match HOST.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    *guard = name.filter(|name| !name.trim().is_empty());
+    *crate::lock(&HOST) = name.filter(|name| !name.trim().is_empty());
 }
 
 pub fn host() -> Option<Host> {
-    let guard = match HOST.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    guard.clone().map(|name| Host { name })
+    crate::lock(&HOST).clone().map(|name| Host { name })
 }
 
 /// The shell's own visuals inside the button that have to go.
@@ -115,10 +107,7 @@ struct Original {
 /// # Safety
 /// XAML UI thread only.
 unsafe fn remember(diagnostics: &IXamlDiagnostics, handle: InstanceHandle) {
-    let mut originals = match ORIGINALS.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
-    };
+    let mut originals = crate::lock(&ORIGINALS);
     if originals.iter().any(|(known, _)| *known == handle) {
         return;
     }
@@ -158,10 +147,7 @@ unsafe fn remember(diagnostics: &IXamlDiagnostics, handle: InstanceHandle) {
 /// # Safety
 /// XAML UI thread only.
 pub unsafe fn restore(diagnostics: &IXamlDiagnostics) {
-    let originals = match ORIGINALS.lock() {
-        Ok(mut guard) => std::mem::take(&mut *guard),
-        Err(poisoned) => std::mem::take(&mut *poisoned.into_inner()),
-    };
+    let originals = std::mem::take(&mut *crate::lock(&ORIGINALS));
     for (handle, original) in originals {
         let Some(object) = object_from_handle(diagnostics, handle) else {
             continue;

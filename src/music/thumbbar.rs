@@ -33,9 +33,7 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::UI::Shell::{
     ITaskbarList3, THBF_ENABLED, THB_FLAGS, THB_ICON, THB_TOOLTIP, THUMBBUTTON,
 };
-use windows::Win32::UI::WindowsAndMessaging::{
-    CreateIconIndirect, DestroyIcon, GetSystemMetrics, HICON, ICONINFO, SM_CXSMICON,
-};
+use windows::Win32::UI::WindowsAndMessaging::{CreateIconIndirect, DestroyIcon, HICON, ICONINFO};
 
 /// The three glyphs, in the order they sit under the preview.
 ///
@@ -91,7 +89,7 @@ impl ThumbBar {
             return Ok(());
         }
 
-        let size = icon_size();
+        let size = crate::win::small_icon_size();
         let previous = icon_from_glyph(PREVIOUS, size)?;
         let toggle = icon_from_glyph(if playing { PAUSE } else { PLAY }, size)?;
         let next = icon_from_glyph(NEXT, size)?;
@@ -155,7 +153,7 @@ impl Drop for ThumbBar {
     /// worse than a visibly greyed one.
     fn drop(&mut self) {
         if self.added {
-            let size = icon_size();
+            let size = crate::win::small_icon_size();
             let dim = |glyph| icon_from_glyph(glyph, size).ok();
             if let (Some(previous), Some(play), Some(next)) =
                 (dim(PREVIOUS), dim(PLAY), dim(NEXT))
@@ -213,20 +211,6 @@ fn tooltip(text: &str) -> [u16; 260] {
 fn destroy(icons: Vec<HICON>) {
     for icon in icons {
         let _ = unsafe { DestroyIcon(icon) };
-    }
-}
-
-/// The size the shell wants these at.
-///
-/// `SM_CXSMICON` rather than a hardcoded 16: the process is per-monitor DPI aware, so on this
-/// 144-DPI machine the small-icon metric is 24 and a 16 px icon would be upscaled and soft — the
-/// same reasoning the tray icon already follows.
-fn icon_size() -> u32 {
-    let size = unsafe { GetSystemMetrics(SM_CXSMICON) };
-    if size > 0 {
-        size as u32
-    } else {
-        16
     }
 }
 

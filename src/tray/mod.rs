@@ -46,10 +46,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::audio::wasapi::WasapiBackend;
-use crate::audio::{notify, AudioBackend, Flow};
+use crate::audio::{notify, Flow};
 use crate::config::Config;
 use crate::flyout;
-use crate::icons::{self, IconId};
+use crate::icons::IconId;
 use crate::osd::Osd;
 use crate::taskbar::WM_TASKBAR_SCROLL;
 
@@ -142,7 +142,7 @@ pub fn run(backend: WasapiBackend) -> Result<()> {
     // first use, so a tray that is never scrolled never makes one.
     let mut osd = Osd::new();
 
-    let devices = backend.enumerate().map(|d| d.len()).unwrap_or(0);
+    let devices = backend.enumerate_flow(Flow::Output).map(|d| d.len()).unwrap_or(0);
     // Which of the two click routings is live, since it depends on whether the
     // injection above took and that is the first thing to know when a gesture
     // does the wrong thing.
@@ -178,16 +178,7 @@ pub fn run(backend: WasapiBackend) -> Result<()> {
             if msg.message == notify::WM_AUDIO_REFRESH {
                 // Coalesce a burst: one set_default fires a callback per role, so drain
                 // any queued refresh messages and refresh only once.
-                let mut extra = MSG::default();
-                while PeekMessageW(
-                    &mut extra,
-                    None,
-                    notify::WM_AUDIO_REFRESH,
-                    notify::WM_AUDIO_REFRESH,
-                    PM_REMOVE,
-                )
-                .as_bool()
-                {}
+                drain_queued(notify::WM_AUDIO_REFRESH);
                 refresh(&backend, &tray, &config);
                 continue;
             }
@@ -196,21 +187,8 @@ pub fn run(backend: WasapiBackend) -> Result<()> {
             // apartment-threaded shell object — see `taskbar::post_progress`. Drained like the
             // others: only the newest fraction says anything.
             if msg.message == crate::taskbar::WM_MUSIC_PROGRESS {
-                let (mut step, mut playing) = (msg.wParam.0, msg.lParam.0 != 0);
-                let mut extra = MSG::default();
-                while PeekMessageW(
-                    &mut extra,
-                    None,
-                    crate::taskbar::WM_MUSIC_PROGRESS,
-                    crate::taskbar::WM_MUSIC_PROGRESS,
-                    PM_REMOVE,
-                )
-                .as_bool()
-                {
-                    step = extra.wParam.0;
-                    playing = extra.lParam.0 != 0;
-                }
-                crate::taskbar::apply_progress(step, playing);
+                let newest = drain_queued(crate::taskbar::WM_MUSIC_PROGRESS).unwrap_or(msg);
+                crate::taskbar::apply_progress(newest.wParam.0, newest.lParam.0 != 0);
                 continue;
             }
             // An app took the microphone, or let it go. Nothing else about the strip has
@@ -219,16 +197,7 @@ pub fn run(backend: WasapiBackend) -> Result<()> {
             // the state comes from the watcher's atomic, so only the last message says
             // anything the ones behind it do not.
             if msg.message == crate::audio::mic::WM_MIC_CHANGED {
-                let mut extra = MSG::default();
-                while PeekMessageW(
-                    &mut extra,
-                    None,
-                    crate::audio::mic::WM_MIC_CHANGED,
-                    crate::audio::mic::WM_MIC_CHANGED,
-                    PM_REMOVE,
-                )
-                .as_bool()
-                {}
+                drain_queued(crate::audio::mic::WM_MIC_CHANGED);
                 if !push_mic_state(crate::audio::mic::in_use()) {
                     refresh(&backend, &tray, &config);
                 }
@@ -349,8 +318,7 @@ pub fn run(backend: WasapiBackend) -> Result<()> {
                             println!("tray: left click on the strip — cycling, not opening");
                             false
                         }
-                        MouseButton::Left => true,
-                        MouseButton::Right => true,
+                        MouseButton::Left | MouseButton::Right => true,
                         _ => false,
                     };
                     if opens_panel {
@@ -374,6 +342,21 @@ pub fn run(backend: WasapiBackend) -> Result<()> {
     // is what stops the feed putting it back.
     crate::taskbar::clear_player_progress();
     Ok(())
+}
+
+/// Take every queued `message` off the loop's queue, returning the last one.
+///
+/// Three of the messages the loop handles are "the world changed, go and look": an endpoint
+/// default (one callback per role, so three per switch), a progress-bar value on a timer, and
+/// a microphone flip. For all of them only the newest says anything the ones behind it do not,
+/// and acting on each in turn costs a full refresh apiece.
+fn drain_queued(message: u32) -> Option<MSG> {
+    let mut newest = None;
+    let mut extra = MSG::default();
+    while unsafe { PeekMessageW(&mut extra, None, message, message, PM_REMOVE) }.as_bool() {
+        newest = Some(extra);
+    }
+    newest
 }
 
 /// Apply a scroll over the taskbar buttons: move that endpoint's volume, and show where it
@@ -442,10 +425,13 @@ fn drain_scrolls(flow: Flow, delta: i32) -> [f32; 2] {
 static ICON_RECT: std::sync::Mutex<Option<RECT>> = std::sync::Mutex::new(None);
 
 fn icon_rect() -> Option<RECT> {
-    match ICON_RECT.lock() {
-        Ok(guard) => *guard,
-        Err(poisoned) => *poisoned.into_inner(),
-    }
+    *lock(&ICON_RECT)
+}
+
+/// Locks one of this module's statics, taking a poisoned lock's contents rather than
+/// panicking: none of them holds anything worth taking the tray down for.
+fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Ask the shell where our notification icon is, remember it for [`flow_at`], and hand it
@@ -465,10 +451,7 @@ fn refresh_icon_rect(tray: &TrayIcon) -> Option<RECT> {
         right: left + rect.size.width as i32,
         bottom: top + rect.size.height as i32,
     };
-    let mut held = match ICON_RECT.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
-    };
+    let mut held = lock(&ICON_RECT);
     // On change only: it decides where the readout appears and how the wheel is routed, and
     // this runs on every refresh — a line per refresh would drown the log it belongs in.
     if *held != Some(slot) {
@@ -542,7 +525,6 @@ fn handle_taskbar_action(
     music: Option<&crate::music::Handle>,
     action: crate::taskbar::Action,
 ) -> Result<()> {
-    use crate::audio::Flow;
     use crate::music::smtc::Command;
     use crate::taskbar::Action;
 
@@ -599,7 +581,7 @@ fn handle_taskbar_action(
     // The strip can say where the click landed before any of the work below, which
     // is what the switch's latency was mostly made of. See [`preview_strip`].
     match next {
-        Some(next) => preview_strip(flow, Some(icon_of(&devices[next], config)), false),
+        Some(next) => preview_strip(flow, Some(config.icon_of(&devices[next])), false),
         None => preview_strip(flow, None, true),
     }
 
@@ -735,7 +717,7 @@ fn build_tray(backend: &WasapiBackend, config: &Config) -> Result<TrayIcon> {
     /// How often to repeat the "still waiting" line, in attempts at `MAX_GAP`.
     const NAG_EVERY: u32 = 12;
 
-    let initial_icon = Endpoint::read(backend, config, crate::audio::Flow::Output).icon;
+    let initial_icon = Endpoint::read(backend, config, Flow::Output).icon;
     let mut gap = FIRST_GAP;
     for attempt in 1.. {
         // Clicks are handled via TrayIconEvent — we deliberately don't hand a
@@ -745,7 +727,7 @@ fn build_tray(backend: &WasapiBackend, config: &Config) -> Result<TrayIcon> {
             .with_icon(icon_image(initial_icon)?)
             .build();
         let failure = match built {
-            Ok(tray) => match try_refresh(backend, &tray, config) {
+            Ok(tray) => match Endpoint::read(backend, config, Flow::Output).apply_to(&tray) {
                 Ok(()) => {
                     if attempt > 1 {
                         println!("tray: registered on attempt {attempt}");
@@ -804,10 +786,7 @@ fn refresh(backend: &WasapiBackend, tray: &TrayIcon, config: &Config) {
 /// Returns whether the strip can be taken to be showing `icons` afterwards — either
 /// because it already was, or because the restyle went out.
 fn push_strip(icons: crate::taskbar::StripIcons) -> bool {
-    let mut applied = match STRIP_APPLIED.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
-    };
+    let mut applied = lock(&STRIP_APPLIED);
     if *applied == Some(icons) {
         return true;
     }
@@ -841,11 +820,9 @@ pub(crate) fn restyle_strip(backend: &WasapiBackend, config: &Config) {
 /// amend, or the restyle never went out, and the caller has to fall back to a full
 /// [`refresh`] — which reads the dot from [`Current::read`] like everything else.
 ///
-/// That fallback is not a formality: the strip is normally drawn from the *injection's*
-/// init data, and a restyle posted before the TAP has a control window is deliberately
-/// dropped rather than remembered (see [`crate::taskbar::restyle`]). Nothing minded that
-/// before, because the init data already carried the right glyphs — but recording state
-/// can change after it was read, so this is the one thing that has to get through.
+/// That fallback is not a formality: a restyle posted before the TAP has a control window is
+/// deliberately dropped rather than remembered (see [`crate::taskbar::restyle`]), and unlike
+/// the glyphs, recording state can change after the injection's init data was read.
 fn push_mic_state(recording: bool) -> bool {
     let Some(mut icons) = strip_applied() else {
         return false;
@@ -855,10 +832,7 @@ fn push_mic_state(recording: bool) -> bool {
 }
 
 fn strip_applied() -> Option<crate::taskbar::StripIcons> {
-    match STRIP_APPLIED.lock() {
-        Ok(guard) => *guard,
-        Err(poisoned) => *poisoned.into_inner(),
-    }
+    *lock(&STRIP_APPLIED)
 }
 
 /// Show the outcome of a click on the strip *before* doing the audio work that
@@ -877,9 +851,7 @@ fn strip_applied() -> Option<crate::taskbar::StripIcons> {
 /// A no-op until a refresh has recorded a state to amend: without one there is
 /// nothing to say about the *other* segment, and the refresh at the end of the
 /// click covers it.
-fn preview_strip(flow: crate::audio::Flow, icon: Option<IconId>, muted: bool) {
-    use crate::audio::Flow;
-
+fn preview_strip(flow: Flow, icon: Option<IconId>, muted: bool) {
     let Some(mut icons) = strip_applied() else {
         return;
     };
@@ -895,14 +867,6 @@ fn preview_strip(flow: crate::audio::Flow, icon: Option<IconId>, muted: bool) {
         }
     }
     push_strip(icons);
-}
-
-/// The icon for a device: a per-device override from the config if there is one,
-/// otherwise the form-factor default.
-fn icon_of(device: &crate::audio::Device, config: &Config) -> IconId {
-    config
-        .icon_for(&device.id.0)
-        .unwrap_or_else(|| icons::default_icon(device.form_factor, &device.friendly_name))
 }
 
 /// The strip state we last asked the TAP for, so an identical restyle can be
@@ -922,14 +886,7 @@ static STRIP_APPLIED: std::sync::Mutex<Option<crate::taskbar::StripIcons>> =
 /// For when the strip is gone rather than wrong: after an Explorer restart the new
 /// TAP starts from the init data, and after a revert there is nothing there at all.
 fn invalidate_strip() {
-    match STRIP_APPLIED.lock() {
-        Ok(mut guard) => *guard = None,
-        Err(poisoned) => *poisoned.into_inner() = None,
-    }
-}
-
-fn try_refresh(backend: &WasapiBackend, tray: &TrayIcon, config: &Config) -> Result<()> {
-    Endpoint::read(backend, config, crate::audio::Flow::Output).apply_to(tray)
+    *lock(&STRIP_APPLIED) = None;
 }
 
 /// The current default of one flow, as both surfaces need it.
@@ -944,7 +901,7 @@ impl Endpoint {
     /// this out per surface cost three enumerations and six `default_of`s for the
     /// same answer (measured at 119–383ms per refresh, on the critical path of
     /// every click).
-    fn read(backend: &WasapiBackend, config: &Config, flow: crate::audio::Flow) -> Self {
+    fn read(backend: &WasapiBackend, config: &Config, flow: Flow) -> Self {
         let default = backend.default_of(flow).ok().flatten();
         let Some(id) = default else {
             return Self { name: "Audio output".to_string(), icon: IconId::Unknown, muted: false };
@@ -956,7 +913,7 @@ impl Endpoint {
             .and_then(|devices| devices.into_iter().find(|d| d.id == id));
         match device {
             Some(d) => Self {
-                icon: icon_of(&d, config),
+                icon: config.icon_of(&d),
                 name: d.friendly_name,
                 muted,
             },
@@ -981,20 +938,15 @@ struct Current {
 
 impl Current {
     fn read(backend: &WasapiBackend, config: &Config) -> Self {
-        use crate::audio::Flow;
+        
         Self {
             output: Endpoint::read(backend, config, Flow::Output),
             input: Endpoint::read(backend, config, Flow::Input),
         }
     }
 
-    /// The glyphs the taskbar strip should draw.
-    ///
-    /// Resolved from the same [`Endpoint`]s the tray icon uses, so all three of
-    /// strip, icon and flyout agree. They did not before: the strip drew fixed
-    /// Volume and Microphone glyphs while the flyout showed the device's own icon,
-    /// so the same speaker appeared as a laptop in one place and a speaker in the
-    /// other.
+    /// The glyphs the taskbar strip should draw, from the same [`Endpoint`]s the tray icon
+    /// uses — see [`crate::taskbar::StripIcons`].
     fn strip_icons(&self) -> crate::taskbar::StripIcons {
         crate::taskbar::StripIcons {
             output: crate::taskbar::strip_glyph(self.output.icon),
@@ -1018,16 +970,8 @@ fn icon_image(id: IconId) -> Result<Icon> {
     // Match the taskbar's monochrome tray icons: white glyph on a dark taskbar,
     // near-black on a light one. Render at the exact small-icon size for crispness.
     let tint = if taskbar_is_light() { [0x20, 0x20, 0x20] } else { [0xff, 0xff, 0xff] };
-    let size = small_icon_size();
-    let (rgba, w, h) = id.render(size, tint)?;
+    let (rgba, w, h) = id.render(crate::win::small_icon_size(), tint)?;
     Ok(Icon::from_rgba(rgba, w, h)?)
-}
-
-/// The DPI-scaled small-icon size Windows wants for the notification area.
-fn small_icon_size() -> u32 {
-    use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSMICON};
-    let px = unsafe { GetSystemMetrics(SM_CXSMICON) };
-    if px <= 0 { 16 } else { px as u32 }
 }
 
 /// A low-level mouse hook that turns wheel-over-taskbar into a volume change. The hook
@@ -1130,22 +1074,12 @@ unsafe fn window_class(hwnd: HWND) -> String {
 }
 
 /// Whether the Windows taskbar uses the light theme (registry `SystemUsesLightTheme`).
+/// Absent means dark, which is the Win11 default.
 fn taskbar_is_light() -> bool {
     use windows::core::w;
-    use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
 
-    let mut data: u32 = 0; // default: dark taskbar
-    let mut size = std::mem::size_of::<u32>() as u32;
-    let status = unsafe {
-        RegGetValueW(
-            HKEY_CURRENT_USER,
-            w!(r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"),
-            w!("SystemUsesLightTheme"),
-            RRF_RT_REG_DWORD,
-            None,
-            Some(&mut data as *mut u32 as *mut core::ffi::c_void),
-            Some(&mut size),
-        )
-    };
-    status.0 == 0 && data == 1
+    crate::win::hkcu_dword(
+        w!(r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"),
+        w!("SystemUsesLightTheme"),
+    ) == Some(1)
 }

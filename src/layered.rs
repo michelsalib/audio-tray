@@ -1,11 +1,11 @@
 //! Putting a hand-painted RGBA buffer on the screen, as a per-pixel-alpha *layered*
 //! window.
 //!
-//! Two surfaces are drawn this way — the control flyout ([`crate::flyout`]) and the
-//! scroll readout ([`crate::osd`]) — and both need the same two things from Win32: an
-//! `UpdateLayeredWindow` blend of a straight-alpha buffer, and the compositor's acrylic
-//! blur behind it. Neither is obvious enough to keep two copies of, so both live here and
-//! the two surfaces bring their own geometry and pixels.
+//! Two surfaces are drawn this way — the control flyout ([`crate::flyout`]) and the scroll
+//! readout ([`crate::osd`]) — and both need the same things from Win32: an
+//! `UpdateLayeredWindow` blend of a straight-alpha buffer, and a dark, rounded, acrylic
+//! frame to blend it into. None of it is obvious enough to keep two copies of, so it lives
+//! here and the two surfaces bring their own geometry and pixels.
 
 use windows::core::{s, w};
 use windows::Win32::Foundation::{COLORREF, HWND, POINT, SIZE};
@@ -89,13 +89,44 @@ pub(crate) fn present(hwnd: HWND, src_buf: &[u8], w: i32, h: i32, x: i32, y: i32
     }
 }
 
+/// Corner radii DWM offers for a panel: `ROUND` for the flyout, `ROUNDSMALL` for the
+/// 32-DIP readout, which the large radius would over-curve.
+pub(crate) const CORNER_ROUND: i32 = 2;
+pub(crate) const CORNER_ROUND_SMALL: i32 = 3;
+
+/// Dress a layered window as one of our panels: dark frame, rounded corners so the
+/// compositor's blur follows what we paint, and the acrylic behind it.
+///
+/// Shared because both surfaces need all three and none of them is one line: DWM takes its
+/// attributes as a void pointer plus a size, so each is four lines of cast at the call site.
+///
+/// # Safety
+/// `hwnd` must be a live window this process owns.
+pub(crate) unsafe fn style_panel(hwnd: HWND, corner: i32) {
+    use windows::Win32::Graphics::Dwm::{
+        DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE,
+    };
+
+    let attribute = |which, value: &i32| {
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            which,
+            value as *const i32 as *const std::ffi::c_void,
+            std::mem::size_of::<i32>() as u32,
+        );
+    };
+    attribute(DWMWA_USE_IMMERSIVE_DARK_MODE, &1);
+    attribute(DWMWA_WINDOW_CORNER_PREFERENCE, &corner);
+    enable_acrylic(hwnd);
+}
+
 /// Enable the acrylic blur-behind via the undocumented (but ubiquitous)
 /// `SetWindowCompositionAttribute`. Best-effort — if it no-ops, the surface is still a
 /// legible semi-transparent dark panel.
 ///
 /// # Safety
 /// `hwnd` must be a live window this process owns.
-pub(crate) unsafe fn enable_acrylic(hwnd: HWND) {
+unsafe fn enable_acrylic(hwnd: HWND) {
     #[repr(C)]
     struct AccentPolicy {
         accent_state: u32,

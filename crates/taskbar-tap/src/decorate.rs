@@ -1,4 +1,4 @@
-//! M3: putting our own visuals into a tray icon.
+//! Putting our own visuals into a tray icon.
 //!
 //! Two routes were measured and rejected first (see `FINDINGS.md`):
 //! `IVisualTreeService::CreateInstance` is `E_NOTIMPL`, and WinRT
@@ -1178,10 +1178,7 @@ pub unsafe fn set_opacity(
 /// # Safety
 /// XAML UI thread only.
 pub unsafe fn actual_width(diagnostics: &IXamlDiagnostics, handle: InstanceHandle) -> Option<f64> {
-    let object = object_from_handle(diagnostics, handle)?;
-    let framework = object.cast::<IFrameworkElement>().ok()?;
-    let mut width = 0.0f64;
-    (framework.get_ActualWidth(&mut width) == S_OK).then_some(width)
+    actual_size(diagnostics, handle).map(|(width, _)| width)
 }
 
 /// Laid-out size of an element, once layout has actually run.

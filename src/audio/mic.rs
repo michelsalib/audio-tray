@@ -118,7 +118,7 @@ fn collect(key: &Key, path: &str, depth: u32, found: &mut Vec<String>) {
             format!(r"{path}\{name}")
         };
         // Bound to a local: a `PCWSTR` into a temporary would dangle before the call.
-        let name_w = wide(&name);
+        let name_w = crate::win::wide(&name);
         if let Some(child) = open(key.0, PCWSTR(name_w.as_ptr()), KEY_READ) {
             collect(&child, &child_path, depth - 1, found);
         }
@@ -272,11 +272,6 @@ fn open(root: HKEY, path: PCWSTR, access: REG_SAM_FLAGS) -> Option<Key> {
     let mut key = HKEY::default();
     let status = unsafe { RegOpenKeyExW(root, path, None, access, &mut key) };
     status.is_ok().then_some(Key(key))
-}
-
-/// A runtime string as the NUL-terminated wide buffer [`open`] needs.
-fn wide(text: &str) -> Vec<u16> {
-    text.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
 /// Names of `key`'s immediate subkeys.

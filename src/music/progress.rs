@@ -66,29 +66,30 @@ impl Progress {
     /// `--taskbar-revert`, the TAP's owner-watch — every one of which knows it means it.
     pub fn update(&mut self, timeline: Option<Timeline>, playing: bool) {
         let measured = timeline.and_then(|timeline| timeline.fraction_at(now_ticks(), playing));
-        let step = Some(match measured {
+        let step = match measured {
             Some(fraction) => (fraction * STEPS).round() as u64,
-            None => self.last.map(|(step, _)| step).unwrap_or(0),
-        });
-        let fraction = step.map(|step| step as f64 / STEPS);
-        let next = step.map(|step| (step, playing));
+            // The gap between tracks: hold the last position rather than clearing.
+            None => self.last.map_or(0, |(step, _)| step),
+        };
+        let next = Some((step, playing));
         if self.last == next {
             return;
         }
         // Logged on a change of *state*, not of value: a step is half a percent, so logging those
-        // would be a line every second or two, while "playing at 71%" or "cleared" is the whole of
-        // what one wants from the log when the bar looks wrong.
+        // would be a line every second or two, while "playing at 71%" is the whole of what one
+        // wants from the log when the bar looks wrong.
         if self.last.map(|(_, was)| was) != Some(playing) {
-            match fraction {
-                Some(fraction) => println!(
-                    "progress bar -> {:.0}% ({})",
-                    fraction * 100.0,
-                    if playing { "playing" } else { "paused" }
-                ),
-                None => println!("progress bar -> cleared (no session)"),
-            }
+            println!(
+                "progress bar -> {:.0}% ({})",
+                step as f64 / STEPS * 100.0,
+                if playing { "playing" } else { "paused" }
+            );
         }
-        self.post(step, playing);
+        // Best-effort by design: a tray that has already gone is the shutdown path, where the bar
+        // is being cleared by [`crate::taskbar::clear_player_progress`] on the way out anyway.
+        if let Err(err) = crate::taskbar::post_progress(Some(step as f64 / STEPS), playing) {
+            eprintln!("music: could not hand the progress bar to the tray: {err:#}");
+        }
         self.last = next;
     }
 
@@ -102,19 +103,8 @@ impl Progress {
         self.last = None;
     }
 
-    // There is no `clear` here any more. Taking the bar off is a *shutdown* action, and this side
-    // cannot perform one: the tray thread has already left its message loop by then, so a posted
-    // clear would sit in a queue nobody reads. `tray::run` does it directly — see the end of that
-    // function, and `Music::shut_down`.
-
-    /// Hand the value to the tray thread.
-    ///
-    /// Best-effort by design: a tray that has already gone is the shutdown path, where the bar is
-    /// being cleared by [`crate::taskbar::clear_player_progress`] on the way out anyway.
-    fn post(&self, step: Option<u64>, playing: bool) {
-        if let Err(err) = crate::taskbar::post_progress(step.map(|step| step as f64 / STEPS), playing)
-        {
-            eprintln!("music: could not hand the progress bar to the tray: {err:#}");
-        }
-    }
+    // There is deliberately no `clear` here. Taking the bar off is a *shutdown* action, and this
+    // side cannot perform one: the tray thread has already left its message loop by then, so a
+    // posted clear would sit in a queue nobody reads. `tray::run` does it directly — see the end
+    // of that function, and `Music::shut_down`.
 }

@@ -1,6 +1,6 @@
-//! `windows`-crate implementation of [`AudioBackend`] read paths: enumerate active
-//! render endpoints, read the current default, and read per-device properties
-//! (friendly name, form factor). Switching lives in [`super::switch`] (plan §6).
+//! The WASAPI backend: enumerate active endpoints, read and set the default of either
+//! direction, and read per-device properties (friendly name, form factor, volume, mute,
+//! peak level). Switching itself lives in [`super::switch`] (plan §6).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -22,7 +22,7 @@ use windows::Win32::System::Com::StructuredStorage::{PropVariantToStringAlloc, P
 use windows::Win32::System::Com::{CoCreateInstance, CoTaskMemFree, CLSCTX_ALL, STGM_READ};
 use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 
-use super::{AudioBackend, Device, DeviceId, Flow, FormFactor};
+use super::{Device, DeviceId, Flow, FormFactor};
 
 /// Posts `msg` to `hwnd` whenever an endpoint's volume or mute changes. The callback fires
 /// on a WASAPI-owned thread, so it does nothing but post — the UI thread re-reads and
@@ -87,7 +87,9 @@ impl Drop for VolumeWatch {
 /// always live, but a capture endpoint's meter only reports while *something* is capturing,
 /// so we hold a silent capture stream open for the duration (see [`CaptureMeter`]).
 pub enum Meter {
-    Render(RenderMeter),
+    /// A render endpoint's own meter, which aggregates every stream on the device — so it
+    /// reflects whatever is playing without us opening a stream of our own.
+    Render(IAudioMeterInformation),
     Capture(CaptureMeter),
 }
 
@@ -95,22 +97,9 @@ impl Meter {
     /// Current peak sample value, 0.0..=1.0 (0 when silent).
     pub fn peak(&self) -> f32 {
         match self {
-            Meter::Render(m) => m.peak(),
-            Meter::Capture(m) => m.peak(),
+            Meter::Render(meter) => unsafe { meter.GetPeakValue() }.unwrap_or(0.0).clamp(0.0, 1.0),
+            Meter::Capture(capture) => capture.peak(),
         }
-    }
-}
-
-/// Peak meter for a render endpoint (activated `IAudioMeterInformation`). The endpoint
-/// meter aggregates every stream on the device, so it reflects whatever is playing without
-/// us opening a stream of our own.
-pub struct RenderMeter {
-    meter: IAudioMeterInformation,
-}
-
-impl RenderMeter {
-    fn peak(&self) -> f32 {
-        unsafe { self.meter.GetPeakValue() }.unwrap_or(0.0).clamp(0.0, 1.0)
     }
 }
 
@@ -244,18 +233,10 @@ impl WasapiBackend {
         }
     }
 
-    /// Master volume of the current default endpoint, 0.0..=1.0.
+    /// Master volume of the current default output endpoint, 0.0..=1.0.
     pub fn master_volume(&self) -> Result<f32> {
-        unsafe {
-            let device = self
-                .enumerator
-                .GetDefaultAudioEndpoint(eRender, eConsole)
-                .context("default endpoint for volume")?;
-            let volume: IAudioEndpointVolume = device
-                .Activate(CLSCTX_ALL, None)
-                .context("activate IAudioEndpointVolume")?;
-            volume.GetMasterVolumeLevelScalar().context("get master volume")
-        }
+        let default = self.default_of(Flow::Output)?.context("no default output")?;
+        self.volume_of(&default)
     }
 
     /// Active endpoints for a direction (output = render, input = capture).
@@ -293,7 +274,7 @@ impl WasapiBackend {
 
     /// Resolve an endpoint by its id string.
     fn device_by_id(&self, id: &DeviceId) -> Result<IMMDevice> {
-        let wide: Vec<u16> = id.0.encode_utf16().chain(std::iter::once(0)).collect();
+        let wide = crate::win::wide(&id.0);
         unsafe { self.enumerator.GetDevice(PCWSTR(wide.as_ptr())) }
             .with_context(|| format!("GetDevice({})", id.0))
     }
@@ -332,11 +313,10 @@ impl WasapiBackend {
     pub fn meter_for(&self, id: &DeviceId, flow: Flow) -> Result<Meter> {
         let device = self.device_by_id(id)?;
         match flow {
-            Flow::Output => {
-                let meter: IAudioMeterInformation = unsafe { device.Activate(CLSCTX_ALL, None) }
-                    .context("activate IAudioMeterInformation")?;
-                Ok(Meter::Render(RenderMeter { meter }))
-            }
+            Flow::Output => Ok(Meter::Render(
+                unsafe { device.Activate(CLSCTX_ALL, None) }
+                    .context("activate IAudioMeterInformation")?,
+            )),
             Flow::Input => Ok(Meter::Capture(CaptureMeter::new(&device)?)),
         }
     }
@@ -369,58 +349,41 @@ impl WasapiBackend {
 
     /// Read the friendly name + form factor of an already-resolved endpoint.
     fn describe(&self, device: &IMMDevice) -> Result<Device> {
+        // Stored as a CLSID property, so it reads back as a `{GUID}` string — which is the
+        // form [`super::battery`] compares against. See [`super::CONTAINER_ID_FMTID`].
+        const CONTAINER_ID: windows::Win32::Foundation::PROPERTYKEY =
+            windows::Win32::Foundation::PROPERTYKEY {
+                fmtid: windows::core::GUID::from_u128(super::CONTAINER_ID_FMTID),
+                pid: super::CONTAINER_ID_PID,
+            };
+
         unsafe {
             let id = DeviceId(take_pwstr(device.GetId().context("GetId")?)?);
             let store = device
                 .OpenPropertyStore(STGM_READ)
                 .context("OpenPropertyStore")?;
-
-            let friendly_name = {
-                let pv = store.GetValue(&PKEY_Device_FriendlyName).context("friendly name")?;
-                let s = PropVariantToStringAlloc(&pv).ok().and_then(|p| {
-                    let out = p.to_string().ok();
-                    CoTaskMemFree(Some(p.0 as *const _));
-                    out
-                });
-                s.unwrap_or_else(|| "(unknown)".to_string())
-            };
-
-            let form_factor = read_form_factor(&store);
-
-            // ContainerId groups all functions of the physical device; used to find its
-            // Bluetooth battery node. Stored as a CLSID property → `{GUID}` string.
-            let container_id = {
-                use windows::Win32::Foundation::PROPERTYKEY;
-                let key = PROPERTYKEY {
-                    fmtid: windows::core::GUID::from_u128(0x8C7E_D206_3F8A_4827_B3AB_AE9E_1FAE_FC6C),
-                    pid: 2,
-                };
-                store
-                    .GetValue(&key)
-                    .ok()
-                    .and_then(|pv| {
-                        PropVariantToStringAlloc(&pv).ok().and_then(|p| {
-                            let out = p.to_string().ok();
-                            CoTaskMemFree(Some(p.0 as *const _));
-                            out
-                        })
-                    })
-                    .filter(|s| !s.is_empty())
-            };
-
-            Ok(Device { id, friendly_name, form_factor, container_id })
+            Ok(Device {
+                id,
+                friendly_name: prop_string(&store, &PKEY_Device_FriendlyName)
+                    .unwrap_or_else(|| "(unknown)".to_string()),
+                form_factor: read_form_factor(&store),
+                container_id: prop_string(&store, &CONTAINER_ID),
+            })
         }
     }
 }
 
-impl AudioBackend for WasapiBackend {
-    fn enumerate(&self) -> Result<Vec<Device>> {
-        self.enumerate_flow(Flow::Output)
-    }
-
-    fn set_default(&self, id: &DeviceId) -> Result<()> {
-        super::switch::set_default(id)
-    }
+/// Read a string property, freeing the COM allocation. `None` for absent, unreadable or
+/// empty — an empty value is no more use to a caller than a missing one.
+unsafe fn prop_string(
+    store: &windows::Win32::UI::Shell::PropertiesSystem::IPropertyStore,
+    key: &windows::Win32::Foundation::PROPERTYKEY,
+) -> Option<String> {
+    let value = store.GetValue(key).ok()?;
+    let allocated = PropVariantToStringAlloc(&value).ok()?;
+    let text = allocated.to_string().ok();
+    CoTaskMemFree(Some(allocated.0 as *const _));
+    text.filter(|text| !text.is_empty())
 }
 
 /// Read `PKEY_AudioEndpoint_FormFactor` and map to our [`FormFactor`]. Any failure or

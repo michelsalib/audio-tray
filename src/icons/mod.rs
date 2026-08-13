@@ -234,7 +234,7 @@ impl Dwrite {
     fn new() -> Option<Dwrite> {
         unsafe {
             let factory: IDWriteFactory2 = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED).ok()?;
-            let path: Vec<u16> = FONT_PATH.encode_utf16().chain(std::iter::once(0)).collect();
+            let path = crate::win::wide(FONT_PATH);
             let file = factory.CreateFontFileReference(PCWSTR(path.as_ptr()), None).ok()?;
             let files = [Some(file)];
             let face = factory

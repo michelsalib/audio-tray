@@ -54,9 +54,9 @@
 
 /// App-id fragments that mean "this is YouTube Music", in confidence order.
 ///
-/// Not a config knob — these are facts about how the players identify themselves.
-/// The user-facing escape hatch is an explicit app id in the config, handled by
-/// [`classify_with_override`].
+/// Not a config knob — these are facts about how the players identify themselves. The
+/// user-facing escape hatch is an explicit `music.app_id`, which [`crate::music::feed::Ytm`]
+/// applies in place of this matching entirely.
 const CERTAIN: &[&str] = &[
     // Chromium PWA or `--app=` window: the origin is in the id.
     "music.youtube.com",
@@ -97,23 +97,6 @@ pub fn classify(app_id: &str) -> Match {
         return Match::Browser;
     }
     Match::No
-}
-
-/// [`classify`], with the config's pinned app id taking precedence.
-///
-/// The override exists because the certain-patterns list cannot be exhaustive: a
-/// PWA id is a Chromium implementation detail, and `audio-tray --music-probe` prints the
-/// real one so it can be pinned when the guess misses.
-#[allow(dead_code)] // `Ytm::read` applies the pin itself; this is the same rule for other callers.
-pub fn classify_with_override(app_id: &str, pinned: Option<&str>) -> Match {
-    if let Some(pinned) = pinned {
-        return if app_id.eq_ignore_ascii_case(pinned) {
-            Match::Certain
-        } else {
-            Match::No
-        };
-    }
-    classify(app_id)
 }
 
 /// Whether an executable name is a browser's — `msedge.exe`, `chrome.exe`, and the rest.
@@ -224,15 +207,6 @@ mod tests {
         assert_eq!(classify("Microsoft.ZuneMusic_8wekyb3d8bbwe!Microsoft.ZuneMusic"), Match::No);
     }
 
-    #[test]
-    fn a_pinned_id_wins_and_excludes_everything_else() {
-        let pinned = Some("Weird.Custom.Build");
-        assert_eq!(classify_with_override("Weird.Custom.Build", pinned), Match::Certain);
-        // Even a normally-certain id loses to an explicit pin — the pin is the
-        // user saying "this one, not whatever you would have guessed".
-        assert_eq!(classify_with_override("music.youtube.com", pinned), Match::No);
-    }
-
     /// The index `pick` returns has to address the *same* slice the caller passed, because that is
     /// what it then reads in full — an off-by-one here would draw one session's art under another's
     /// title.
@@ -263,13 +237,6 @@ mod tests {
 
         let with_certain = [("MSEdge", true), ("MSEdge.music.youtube.com_/.A", false)];
         assert_eq!(picked(&with_certain), Some("MSEdge.music.youtube.com_/.A"));
-    }
-
-    /// The way back for someone who really does run the player as a plain tab: pin the id, and the
-    /// override makes it certain. This is the old fallback, opted into.
-    #[test]
-    fn a_pinned_browser_id_is_how_a_plain_tab_is_followed() {
-        assert_eq!(classify_with_override("MSEdge", Some("MSEdge")), Match::Certain);
     }
 
     /// **The bug the window rule exists for**, in the two ids measured on 26200 — one `msedge.exe`,

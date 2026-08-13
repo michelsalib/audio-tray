@@ -10,11 +10,11 @@
 //!      `AdviseVisualTreeChange`, which replays the whole existing tree to us as
 //!      `Add` mutations and then streams live deltas.
 //!
-//! M1 goal is only to prove that chain works from Rust and to see the tree, so
-//! nothing here mutates anything.
+//! From there the tree is recorded ([`tree`]) and the edits are made from a timer
+//! rather than from the callback — see [`sweep`], which is where every rule about
+//! *when* a XAML call is safe lives.
 
 mod decorate;
-mod dispatch;
 mod interact;
 mod ipc;
 pub mod lifecycle;
@@ -23,14 +23,12 @@ pub mod music;
 mod reorder;
 mod restore;
 mod tree;
-mod walk;
 mod winrt;
 pub mod xamlom;
-mod xamltree;
 
 use core::ffi::c_void;
 use std::sync::atomic::Ordering;
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 use windows::Win32::Foundation::{CLASS_E_CLASSNOTAVAILABLE, E_POINTER, S_FALSE, S_OK};
 use windows::Win32::System::Com::IClassFactory;
 use windows::Win32::System::Com::IClassFactory_Impl;
@@ -57,6 +55,16 @@ pub const XAML_DLL: &str = "Windows.UI.Xaml.dll";
 
 pub fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// Locks a mutex, taking the contents of a poisoned one rather than panicking.
+///
+/// Every lock in this DLL goes through here. A panic inside Explorer's UI thread
+/// would abort the shell, and none of the state guarded by these locks is worth
+/// that: the worst a poisoned lock can hold is a stale handle, which every reader
+/// already re-validates.
+pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 // ---------------------------------------------------------------------------
@@ -97,10 +105,7 @@ static DECORATED: Mutex<Option<(xamlom::InstanceHandle, xamlom::InstanceHandle)>
     Mutex::new(None);
 
 fn decorated_pair() -> Option<(xamlom::InstanceHandle, xamlom::InstanceHandle)> {
-    match DECORATED.lock() {
-        Ok(guard) => *guard,
-        Err(poisoned) => *poisoned.into_inner(),
-    }
+    *lock(&DECORATED)
 }
 
 /// Whether our strip is actually on the taskbar.
@@ -180,10 +185,7 @@ impl Indicator {
     }
 
     fn recorded(&self) -> Option<(xamlom::InstanceHandle, xamlom::InstanceHandle)> {
-        match self.slot.lock() {
-            Ok(guard) => *guard,
-            Err(poisoned) => *poisoned.into_inner(),
-        }
+        *lock(&self.slot)
     }
 
     /// Record where it is. A *different* element than last time restarts the retry budget:
@@ -195,10 +197,7 @@ impl Indicator {
     /// says "indicator found" once and the icon stays gone. This is for the case where it
     /// does not, which is not something to bet a visible regression on.
     fn record(&self, pair: (xamlom::InstanceHandle, xamlom::InstanceHandle)) {
-        let mut held = match self.slot.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
+        let mut held = lock(&self.slot);
         if *held != Some(pair) {
             self.retries.store(0, Ordering::SeqCst);
         }
@@ -206,11 +205,7 @@ impl Indicator {
     }
 
     fn forget(&self) {
-        let mut held = match self.slot.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        *held = None;
+        *lock(&self.slot) = None;
         self.retries.store(0, Ordering::SeqCst);
         self.announced.store(false, Ordering::SeqCst);
     }
@@ -289,17 +284,11 @@ static TARGET_TOOLTIP: Mutex<String> = Mutex::new(String::new());
 static STRIP: Mutex<Option<decorate::StripState>> = Mutex::new(None);
 
 fn target_tooltip() -> String {
-    match TARGET_TOOLTIP.lock() {
-        Ok(guard) => guard.clone(),
-        Err(poisoned) => poisoned.into_inner().clone(),
-    }
+    lock(&TARGET_TOOLTIP).clone()
 }
 
 fn strip_state() -> Option<decorate::StripState> {
-    match STRIP.lock() {
-        Ok(guard) => *guard,
-        Err(poisoned) => *poisoned.into_inner(),
-    }
+    *lock(&STRIP)
 }
 
 /// Pulls one `key=value` out of the `key=value;` initialization payload.
@@ -364,11 +353,8 @@ impl Tap {
 }
 
 impl Tap_Impl {
-    fn state(&self) -> std::sync::MutexGuard<'_, Site> {
-        match self.site.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        }
+    fn state(&self) -> MutexGuard<'_, Site> {
+        lock(&self.site)
     }
 }
 
@@ -434,12 +420,8 @@ impl Tap_Impl {
                 logf!("SetSite: IXamlDiagnostics ok, init data = {data:?}");
                 // The injector passes both which icon to decorate and what to
                 // draw in it, as a `key=value;` payload.
-                if let Ok(mut tooltip) = TARGET_TOOLTIP.lock() {
-                    *tooltip = value_from(&data, "tooltip").unwrap_or_default();
-                }
-                if let Ok(mut strip) = STRIP.lock() {
-                    *strip = Some(decorate::StripState::parse(&data));
-                }
+                *lock(&TARGET_TOOLTIP) = value_from(&data, "tooltip").unwrap_or_default();
+                *lock(&STRIP) = Some(decorate::StripState::parse(&data));
                 // The music tile is opt-in through the same payload: `tile=<app name>` names whose
                 // taskbar button to draw the now-playing strip into, and its absence disables that
                 // half without touching the audio one.
@@ -497,11 +479,7 @@ impl IVisualTreeServiceCallback_Impl for Tap_Impl {
         let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let now = tid();
             if CALLBACK_TID.swap(now, Ordering::SeqCst) != now {
-                // Ground truth for the question this all turns on.
-                let access = self.state().diagnostics.clone().and_then(|d| {
-                    dispatch::dispatcher(&d).and_then(|disp| dispatch::has_thread_access(&disp))
-                });
-                logf!("OnVisualTreeChange on thread {now}; HasThreadAccess = {access:?}");
+                logf!("OnVisualTreeChange on thread {now}");
             }
             let type_name = bstr_to_string(element.type_name);
             let name = bstr_to_string(element.name);
@@ -656,17 +634,13 @@ pub(crate) unsafe fn stand_down() {
 
     // Everything below is "have we done X yet?" state. Clearing it is what lets
     // the feature be switched back on without restarting Explorer.
-    if let Ok(mut decorated) = DECORATED.lock() {
-        *decorated = None;
-    }
+    *lock(&DECORATED) = None;
     for indicator in indicators() {
         indicator.forget();
     }
-    if let Ok(mut wired) = WIRED.lock() {
-        // Our segments died with the content they lived in; these handles are
-        // stale, and keeping them would stop a fresh strip being wired up.
-        wired.clear();
-    }
+    // Our segments died with the content they lived in; these handles are stale,
+    // and keeping them would stop a fresh strip being wired up.
+    lock(&WIRED).clear();
     REORDERED.store(false, Ordering::SeqCst);
     PROBED.store(false, Ordering::SeqCst);
     REPORTED.store(false, Ordering::SeqCst);
@@ -688,19 +662,11 @@ static PENDING_SEGMENTS: Mutex<Vec<(interact::Segment, String, xamlom::InstanceH
 
 /// Takes everything queued, leaving the queue empty.
 fn drain<T>(queue: &Mutex<Vec<T>>) -> Vec<T> {
-    let mut held = match queue.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    std::mem::take(&mut *held)
+    std::mem::take(&mut *lock(queue))
 }
 
 fn enqueue<T>(queue: &Mutex<Vec<T>>, item: T) {
-    let mut held = match queue.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    held.push(item);
+    lock(queue).push(item);
 }
 
 /// Set while we are inside a XAML call, so the sweep timer cannot re-enter.
@@ -824,6 +790,7 @@ pub(crate) unsafe fn sweep() {
     // `put_Content` returns rather than during it, so they are always queued for
     // the following tick. Without it the pace dropped first and hover took an idle
     // interval to arrive instead of a fast one.
+    //
     // **The music tile never settles, and that is deliberate.** The shell rebuilds the hover
     // preview's thumbnail-toolbar buttons on every hover, so `music::thumbbar::wire` has to catch
     // them inside that window — at the idle 4s cadence a hover is usually over before a sweep looks,
@@ -861,10 +828,7 @@ pub(crate) unsafe fn restyle(
     input_recording: bool,
 ) {
     {
-        let mut strip = match STRIP.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
+        let mut strip = lock(&STRIP);
         let state = strip.get_or_insert_with(decorate::StripState::default);
         let wanted = decorate::StripState {
             output_glyph: output.unwrap_or(state.output_glyph),
@@ -893,16 +857,8 @@ pub(crate) unsafe fn restyle(
 
     // Clearing these is what makes the redraw happen and re-wire. The segment
     // elements are replaced wholesale, so their old handles are of no further use.
-    {
-        let mut decorated = match DECORATED.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        *decorated = None;
-    }
-    if let Ok(mut wired) = WIRED.lock() {
-        wired.clear();
-    }
+    *lock(&DECORATED) = None;
+    lock(&WIRED).clear();
     // Fast pace first, so that if the sweep below declines the retry is the short
     // interval and not the idle one.
     lifecycle::set_sweep_pace(false);
@@ -911,10 +867,7 @@ pub(crate) unsafe fn restyle(
 
 /// Whether the strip's segments have had their pointer handlers attached.
 fn segments_wired() -> bool {
-    match WIRED.lock() {
-        Ok(guard) => !guard.is_empty(),
-        Err(poisoned) => !poisoned.into_inner().is_empty(),
-    }
+    !lock(&WIRED).is_empty()
 }
 
 /// Attach handlers to the hover preview's transport buttons, without waiting out the mutation gate.
@@ -1086,10 +1039,7 @@ unsafe fn attach_segment(
     element: xamlom::InstanceHandle,
 ) {
     {
-        let mut wired = match WIRED.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
+        let mut wired = lock(&WIRED);
         if wired.contains(&element) {
             return;
         }
@@ -1180,10 +1130,7 @@ fn note_unknown_glyph(glyph: char) {
     /// than we expected and the log is worth more than the completeness.
     const MAX_SEEN: usize = 48;
 
-    let mut seen = match UNKNOWN_GLYPHS.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
-    };
+    let mut seen = lock(&UNKNOWN_GLYPHS);
     if seen.contains(&glyph) || seen.len() >= MAX_SEEN {
         return;
     }
@@ -1255,7 +1202,7 @@ unsafe fn try_decorate(diagnostics: &xamlom::IXamlDiagnostics) {
     // then hides the reason that actually mattered.
     let why = |reason: &str| {
         static LAST: Mutex<String> = Mutex::new(String::new());
-        let Ok(mut last) = LAST.lock() else { return };
+        let mut last = lock(&LAST);
         if *last != reason {
             logf!("try_decorate: {reason}");
             last.clear();
@@ -1341,11 +1288,7 @@ unsafe fn decorate_icon(
         state.input_glyph as u32
     );
     if decorate::set_chevron_content(diagnostics, presenter, state) {
-        let mut decorated = match DECORATED.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        *decorated = Some((icon, presenter));
+        *lock(&DECORATED) = Some((icon, presenter));
     }
 }
 

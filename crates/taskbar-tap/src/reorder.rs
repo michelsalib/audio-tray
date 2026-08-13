@@ -20,10 +20,9 @@ use crate::log::logf;
 use crate::tree;
 use crate::winrt::{IFrameworkElement, IGridStatics, GRID};
 use crate::xamlom::{IXamlDiagnostics, InstanceHandle};
-use core::ffi::c_void;
 use windows::Win32::Foundation::S_OK;
 use windows::Win32::System::WinRT::RoGetActivationFactory;
-use windows_core::{IInspectable, Interface, HSTRING};
+use windows_core::{Interface, HSTRING};
 
 /// The tray's root grid; its children are the sections we reorder.
 const FRAME_GRID: &str = "SystemTrayFrameGrid";
@@ -65,25 +64,12 @@ pub fn sections_ready() -> bool {
     has_icons && has_cc
 }
 
-unsafe fn object_from_handle(
-    diagnostics: &IXamlDiagnostics,
-    handle: InstanceHandle,
-) -> Option<IInspectable> {
-    let mut raw: *mut c_void = core::ptr::null_mut();
-    let hr = diagnostics.GetIInspectableFromHandle(handle, &mut raw);
-    if hr != S_OK || raw.is_null() {
-        logf!("GetIInspectableFromHandle(0x{handle:x}) -> 0x{:08x}", hr.0);
-        return None;
-    }
-    Some(core::mem::transmute::<*mut c_void, IInspectable>(raw))
-}
-
 /// The element as an `IFrameworkElement`, which is what the `Grid` statics take.
 unsafe fn framework_element(
     diagnostics: &IXamlDiagnostics,
     handle: InstanceHandle,
 ) -> Option<IFrameworkElement> {
-    let object = object_from_handle(diagnostics, handle)?;
+    let object = crate::decorate::object_from_handle(diagnostics, handle)?;
     match object.cast::<IFrameworkElement>() {
         Ok(element) => Some(element),
         Err(err) => {

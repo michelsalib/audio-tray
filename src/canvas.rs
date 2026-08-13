@@ -2,18 +2,15 @@
 //! through here — the control flyout ([`crate::flyout`]) and the scroll readout
 //! ([`crate::osd`]) both paint into one.
 //!
-//! It owns nothing — it borrows a `width`×`height` RGBA byte slice and paints into it —
-//! and knows nothing about Win32, the audio model, or the layout. Every primitive is a
-//! method on [`Canvas`], so callers no longer thread `(buf, w, h)` through every draw call
-//! (which is what forced the old `#[allow(clippy::too_many_arguments)]`s). Because it's
-//! pure, its geometry and blending are unit-testable in isolation.
+//! It owns nothing — it borrows a `width`×`height` RGBA byte slice and paints into it — and
+//! knows nothing about Win32, the audio model, or the layout. Every primitive is a method on
+//! [`Canvas`], so no caller has to thread `(buf, w, h)` through a draw call.
 //!
 //! [`crate::layered`] is the other half: this fills a buffer, that puts it on the screen.
 
 use ab_glyph::{Font, FontVec, PxScale, ScaleFont};
 
-/// An axis-aligned rectangle in pixel space (`x0,y0` top-left → `x1,y1` bottom-right). Lets
-/// [`Canvas::fill_round_rect`] take one geometry argument instead of four loose floats.
+/// An axis-aligned rectangle in pixel space (`x0,y0` top-left → `x1,y1` bottom-right).
 #[derive(Clone, Copy)]
 pub(crate) struct Rect {
     pub x0: f32,
@@ -75,37 +72,22 @@ impl<'a> Canvas<'a> {
     /// Fill a rounded rectangle (SDF-based, anti-aliased at the edge) with a straight-alpha
     /// colour. `r` is clamped to half the smaller side.
     pub(crate) fn fill_round_rect(&mut self, rect: Rect, r: f32, col: [u8; 3], alpha: f32) {
-        let Rect { x0, y0, x1, y1 } = rect;
-        let cx = (x0 + x1) / 2.0;
-        let cy = (y0 + y1) / 2.0;
-        let hx = (x1 - x0) / 2.0;
-        let hy = (y1 - y0) / 2.0;
-        let r = r.min(hx).min(hy);
-        for y in y0.floor() as i32..y1.ceil() as i32 {
-            for x in x0.floor() as i32..x1.ceil() as i32 {
-                let px = x as f32 + 0.5;
-                let py = y as f32 + 0.5;
-                let qx = (px - cx).abs() - (hx - r);
-                let qy = (py - cy).abs() - (hy - r);
-                let outside = qx.max(0.0).hypot(qy.max(0.0));
-                let inside = qx.max(qy).min(0.0);
-                let sd = outside + inside - r;
-                let cov = (0.5 - sd).clamp(0.0, 1.0);
-                if cov > 0.0 {
-                    self.blend(x, y, col, alpha * cov);
-                }
-            }
-        }
+        self.fill_rounded(rect, r, col, alpha, false);
     }
 
     /// Fill a rectangle whose **bottom** corners are rounded and whose top edge is square —
     /// the shape of a strip that closes a rounded panel, so a fill of the panel's last band
     /// follows its corners instead of spilling into them.
-    ///
-    /// Same SDF as [`Self::fill_round_rect`] but with the vertical mirror dropped (only the
-    /// bottom corners curve), intersected (`max`) with the half-plane below the top edge —
-    /// which is what puts the missing top boundary back.
     pub(crate) fn fill_round_rect_bottom(&mut self, rect: Rect, r: f32, col: [u8; 3], alpha: f32) {
+        self.fill_rounded(rect, r, col, alpha, true);
+    }
+
+    /// The rounded-rectangle SDF both fills share.
+    ///
+    /// `bottom_only` drops the vertical mirror, so only the bottom corners curve, and
+    /// intersects (`max`) with the half-plane below the top edge — which is what puts the
+    /// missing top boundary back.
+    fn fill_rounded(&mut self, rect: Rect, r: f32, col: [u8; 3], alpha: f32, bottom_only: bool) {
         let Rect { x0, y0, x1, y1 } = rect;
         let cx = (x0 + x1) / 2.0;
         let cy = (y0 + y1) / 2.0;
@@ -117,10 +99,14 @@ impl<'a> Canvas<'a> {
                 let px = x as f32 + 0.5;
                 let py = y as f32 + 0.5;
                 let qx = (px - cx).abs() - (hx - r);
-                let qy = (py - cy) - (hy - r);
+                let dy = py - cy;
+                let qy = if bottom_only { dy } else { dy.abs() } - (hy - r);
                 let outside = qx.max(0.0).hypot(qy.max(0.0));
                 let inside = qx.max(qy).min(0.0);
-                let sd = (outside + inside - r).max(y0 - py);
+                let mut sd = outside + inside - r;
+                if bottom_only {
+                    sd = sd.max(y0 - py);
+                }
                 let cov = (0.5 - sd).clamp(0.0, 1.0);
                 if cov > 0.0 {
                     self.blend(x, y, col, alpha * cov);

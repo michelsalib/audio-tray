@@ -81,9 +81,10 @@ mod osd;
 mod taskbar;
 mod tray;
 mod update;
+mod win;
 
 use audio::wasapi::WasapiBackend;
-use audio::{AudioBackend, Device, DeviceId, Flow};
+use audio::{Device, DeviceId, Flow};
 use config::Config;
 use icons::IconId;
 
@@ -113,7 +114,7 @@ fn main() -> Result<()> {
             // `--flyout update` fakes a staged update so the footer's restart button shows.
             let mut config = Config::load();
             let outcome = match args.get(1).map(String::as_str) {
-                                Some("icons") => flyout::show_icons_preview(&backend, &mut config, None),
+                Some("icons") => flyout::show_icons_preview(&backend, &mut config, None),
                 Some("update") => {
                     update::set_pending_version("9.9.9");
                     flyout::show(&backend, &mut config, None)
@@ -133,10 +134,10 @@ fn main() -> Result<()> {
             let Some(query) = args.get(1) else {
                 bail!("usage: audio-tray --set <name-substring-or-id>");
             };
-            let devices = backend.enumerate()?;
+            let devices = backend.enumerate_flow(Flow::Output)?;
             let target = find_device(&devices, query)?;
             println!("Switching default to: {} [{}]", target.friendly_name, target.id.0);
-            backend.set_default(&target.id)?;
+            backend.set_default_of(&target.id)?;
             println!("Done. Verify in Windows sound settings.");
         }
         Some("--set-icon") => {
@@ -145,7 +146,7 @@ fn main() -> Result<()> {
             };
             let icon = IconId::parse(icon_str)
                 .with_context(|| format!("unknown icon {icon_str:?}; one of {:?}", IconId::ALL))?;
-            let devices = backend.enumerate()?;
+            let devices = backend.enumerate_flow(Flow::Output)?;
             let target = find_device(&devices, query)?;
             let mut cfg = Config::load();
             cfg.set_icon(target.id.0.clone(), icon);
@@ -283,8 +284,6 @@ fn main() -> Result<()> {
         Some("--music-probe") => music::probe()?,
         Some("--music-timeline") => music::report_timeline()?,
         Some("--music-progress") => {
-            // `args` already has the program name stripped, so the flag is index 0 and its value
-            // is index 1 — this asked for index 2 and so silently read every percentage as "off".
             let value = args.get(1).map(String::as_str).unwrap_or("off");
             let fraction = match value {
                 "off" | "none" => None,
@@ -360,7 +359,7 @@ fn main() -> Result<()> {
 }
 
 fn list(backend: &WasapiBackend) -> Result<()> {
-    let devices = backend.enumerate()?;
+    let devices = backend.enumerate_flow(Flow::Output)?;
     let name_of = |id: &DeviceId| {
         devices
             .iter()

@@ -25,9 +25,6 @@ use std::time::{Duration, Instant};
 
 use windows::core::w;
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
-use windows::Win32::Graphics::Dwm::{
-    DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE,
-};
 use windows::Win32::Graphics::Gdi::{
     GetMonitorInfoW, MonitorFromRect, MONITORINFO, MONITOR_DEFAULTTONEAREST,
 };
@@ -43,8 +40,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use crate::audio::Flow;
 use crate::canvas::{measure, Canvas, Rect};
 use crate::flyout::theme::{
-    accent_rgb, recording_dot, ui_font, GLYPH_MIC, GLYPH_MIC_OFF, GLYPH_MUTE, GLYPH_VOLUME, TEXT,
-    TINT, TINT_A, TRACK_H,
+    accent_rgb, endpoint_glyph, recording_dot, ui_font, TEXT, TINT, TINT_A, TRACK_H,
 };
 use crate::icons;
 
@@ -253,28 +249,9 @@ impl Osd {
             )
         }?;
         self.hwnd = hwnd;
-
-        // Same treatment as the flyout: dark frame, rounded corners so the compositor's
-        // blur follows the panel we paint, and the acrylic behind it.
-        let dark: i32 = 1;
-        let _ = unsafe {
-            DwmSetWindowAttribute(
-                hwnd,
-                DWMWA_USE_IMMERSIVE_DARK_MODE,
-                &dark as *const _ as *const std::ffi::c_void,
-                4,
-            )
-        };
-        let round: i32 = 3; // DWMWCP_ROUNDSMALL — the panel is only 32 DIP tall
-        let _ = unsafe {
-            DwmSetWindowAttribute(
-                hwnd,
-                DWMWA_WINDOW_CORNER_PREFERENCE,
-                &round as *const _ as *const std::ffi::c_void,
-                4,
-            )
-        };
-        unsafe { crate::layered::enable_acrylic(hwnd) };
+        // Same treatment as the flyout, but the smaller corner: the panel is only 32 DIP
+        // tall, and the flyout's radius over-curves it.
+        unsafe { crate::layered::style_panel(hwnd, crate::layered::CORNER_ROUND_SMALL) };
         Ok(())
     }
 
@@ -291,12 +268,8 @@ impl Osd {
         // The same glyphs the flyout's sliders use, so "which endpoint, and is it muted" is
         // the same picture in both places — in the buttons' warm muted tint rather than the
         // flyout's accent, see [`MUTED_GLYPH`].
-        let (glyph, glyph_col) = match (flow, muted) {
-            (Flow::Output, false) => (GLYPH_VOLUME, TEXT),
-            (Flow::Output, true) => (GLYPH_MUTE, MUTED_GLYPH),
-            (Flow::Input, false) => (GLYPH_MIC, TEXT),
-            (Flow::Input, true) => (GLYPH_MIC_OFF, MUTED_GLYPH),
-        };
+        let glyph = endpoint_glyph(flow, muted);
+        let glyph_col = if muted { MUTED_GLYPH } else { TEXT };
         let gpx = (GLYPH_PX * scale).round() as u32;
         if let Ok((rgba, gw, gh)) = icons::render_glyph(glyph, gpx, glyph_col) {
             let gx = (GLYPH_CX * scale).round() as i32 - gw as i32 / 2;

@@ -12,9 +12,6 @@ use std::sync::OnceLock;
 
 use windows::core::w;
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
-use windows::Win32::Graphics::Dwm::{
-    DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE,
-};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, LoadCursorW, PostMessageW, RegisterClassW, IDC_ARROW,
@@ -55,6 +52,11 @@ impl Surface {
             wa: RECT::default(),
             margin,
         }
+    }
+
+    /// The panel's size, which every render pass needs and nothing changes while it is open.
+    pub(super) fn size(&self) -> (i32, i32) {
+        (self.width, self.height)
     }
 
     /// Position the panel: centred on the anchor, sitting above it, clamped to the work
@@ -98,16 +100,7 @@ impl Surface {
             )
         }?;
         self.hwnd = hwnd;
-
-        let dark: i32 = 1;
-        let _ = unsafe {
-            DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark as *const _ as *const std::ffi::c_void, 4)
-        };
-        let round: i32 = 2; // DWMWCP_ROUND
-        let _ = unsafe {
-            DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &round as *const _ as *const std::ffi::c_void, 4)
-        };
-        unsafe { crate::layered::enable_acrylic(hwnd) };
+        unsafe { crate::layered::style_panel(hwnd, crate::layered::CORNER_ROUND) };
         Ok(())
     }
 
@@ -119,27 +112,22 @@ impl Surface {
             let t = i as f32 / frames as f32;
             let ease = 1.0 - (1.0 - t) * (1.0 - t); // ease-out quad
             let yy = self.y + (slide as f32 * (1.0 - ease)) as i32;
-            self.present(self.x, yy, (255.0 * ease) as u8);
+            self.present(&self.buf, self.x, yy, (255.0 * ease) as u8);
             std::thread::sleep(std::time::Duration::from_millis(9));
         }
-        self.present(self.x, self.y, 255);
+        self.flush();
     }
 
     /// Present the current `buf` at the resting position, fully opaque.
     pub(super) fn flush(&self) {
-        self.present(self.x, self.y, 255);
+        self.present(&self.buf, self.x, self.y, 255);
     }
 
-    /// Push `self.buf` (the current screen) to the layered window.
-    pub(super) fn present(&self, x: i32, y: i32, alpha: u8) {
-        self.present_buf(&self.buf, self.width, self.height, x, y, alpha);
-    }
-
-    /// Push a rendered ARGB buffer (`w`×`h`) to the layered window, scaled by a global
-    /// `alpha` (for fade animations) — which also moves and resizes the window to
-    /// `(x, y)`/`(w, h)`. See [`crate::layered::present`].
-    pub(super) fn present_buf(&self, src_buf: &[u8], w: i32, h: i32, x: i32, y: i32, alpha: u8) {
-        crate::layered::present(self.hwnd, src_buf, w, h, x, y, alpha);
+    /// Push a rendered ARGB buffer (always the panel's own size) to the layered window,
+    /// scaled by a global `alpha` for the fade animations. `UpdateLayeredWindow` also moves
+    /// the window to `(x, y)`, so this is how the surface is positioned as well as painted.
+    pub(super) fn present(&self, buf: &[u8], x: i32, y: i32, alpha: u8) {
+        crate::layered::present(self.hwnd, buf, self.width, self.height, x, y, alpha);
     }
 }
 

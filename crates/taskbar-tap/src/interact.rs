@@ -97,10 +97,7 @@ fn already_seen(args: *mut c_void) -> bool {
     const RECYCLE_WINDOW: Duration = Duration::from_millis(500);
 
     static LAST: Mutex<Option<(usize, Instant)>> = Mutex::new(None);
-    let mut last = match LAST.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
-    };
+    let mut last = crate::lock(&LAST);
     let now = Instant::now();
     let duplicate = last
         .map(|(seen, at)| seen == args as usize && now.duration_since(at) < RECYCLE_WINDOW)
@@ -241,12 +238,9 @@ unsafe fn ui_element(
     diagnostics: &IXamlDiagnostics,
     handle: InstanceHandle,
 ) -> Option<IUIElement> {
-    let mut raw: *mut c_void = core::ptr::null_mut();
-    if diagnostics.GetIInspectableFromHandle(handle, &mut raw) != S_OK || raw.is_null() {
-        return None;
-    }
-    let object = core::mem::transmute::<*mut c_void, IInspectable>(raw);
-    object.cast::<IUIElement>().ok()
+    decorate::object_from_handle(diagnostics, handle)?
+        .cast::<IUIElement>()
+        .ok()
 }
 
 /// Wires hover, left click, right click and scroll onto one segment.

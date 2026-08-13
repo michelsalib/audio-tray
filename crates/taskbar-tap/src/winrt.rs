@@ -579,25 +579,11 @@ pub unsafe trait IGridStatics: IUnknown {
     pub fn SetColumn(&self, element: *mut c_void, value: i32) -> HRESULT;
 }
 
-/// `Windows.UI.Core.ICoreDispatcher`, as returned by
-/// `IXamlDiagnostics::GetDispatcher`.
-///
-/// Only `get_HasThreadAccess` is called; `RunAsync` is kept so the vtable layout
-/// stays honest. Marshalling work here is a dead end — see `dispatch.rs`.
-#[interface("60db2fa8-b705-4fde-a7d6-ebbb1891d39e")]
-pub unsafe trait ICoreDispatcher: IUnknown {
-    pub fn GetIids(&self, count: *mut u32, iids: *mut *mut windows_core::GUID) -> HRESULT;
-    pub fn GetRuntimeClassName(&self, name: *mut *mut c_void) -> HRESULT;
-    pub fn GetTrustLevel(&self, level: *mut i32) -> HRESULT;
-    pub fn get_HasThreadAccess(&self, value: *mut u8) -> HRESULT;
-    pub fn ProcessEvents(&self, options: i32) -> HRESULT;
-    pub fn RunAsync(
-        &self,
-        priority: i32,
-        handler: *mut c_void,
-        action: *mut *mut c_void,
-    ) -> HRESULT;
-}
+// There is deliberately no `ICoreDispatcher` binding. Marshalling XAML work through the
+// dispatcher `IXamlDiagnostics::GetDispatcher` hands back is a dead end — it belongs to
+// another of Explorer's XAML islands, and every call against a tray element from there fails
+// `RPC_E_WRONG_THREAD`. See "GetDispatcher is a trap" in FINDINGS.md; the TAP learns the
+// tray's own thread instead (`lifecycle::adopt_tray_thread`) and runs inline on it.
 
 /// The runtime class whose activation factory implements the statics above.
 pub const VISUAL_TREE_HELPER: &str = "Windows.UI.Xaml.Media.VisualTreeHelper";

@@ -41,11 +41,7 @@ struct Placed {
 
 /// Where the strip is, if it is up. Used by the app-facing side to answer "is the tile live".
 pub fn placed_border() -> Option<InstanceHandle> {
-    let guard = match PLACED.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    guard.as_ref().map(|placed| placed.border)
+    crate::lock(&PLACED).as_ref().map(|placed| placed.border)
 }
 
 // **The hover preview is deliberately left alone.** Replacing its content with a now-playing card
@@ -87,7 +83,7 @@ pub unsafe fn sweep(diagnostics: &IXamlDiagnostics) {
     let Some(button) = find_button(diagnostics, &host) else {
         return;
     };
-    let Some(border) = find_background_element(diagnostics, button) else {
+    let Some(border) = find_background_element(button) else {
         logf!("music: {} has no Border#BackgroundElement", host.name);
         return;
     };
@@ -99,16 +95,10 @@ pub unsafe fn sweep(diagnostics: &IXamlDiagnostics) {
     // shell's centred default and then step through our margin and width writes as they land — a
     // "centre, left, full width" jump on every song. Keeping the strip's elements in place keeps the
     // button's layout still, and the indicators with it.
-    let previous = {
-        let guard = match PLACED.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        guard
-            .as_ref()
-            .filter(|placed| placed.border == border)
-            .map(|placed| placed.shown.clone())
-    };
+    let previous = crate::lock(&PLACED)
+        .as_ref()
+        .filter(|placed| placed.border == border)
+        .map(|placed| placed.shown.clone());
 
     let applied = match previous {
         Some(shown) if shown == strip => true,
@@ -136,11 +126,7 @@ pub unsafe fn sweep(diagnostics: &IXamlDiagnostics) {
     };
 
     if applied {
-        let mut guard = match PLACED.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        *guard = Some(Placed {
+        *crate::lock(&PLACED) = Some(Placed {
             border,
             shown: strip.clone(),
         });
@@ -164,13 +150,7 @@ pub unsafe fn sweep(diagnostics: &IXamlDiagnostics) {
 /// # Safety
 /// XAML UI thread only.
 pub unsafe fn revert(diagnostics: &IXamlDiagnostics) {
-    let placed = {
-        let mut guard = match PLACED.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        guard.take()
-    };
+    let placed = crate::lock(&PLACED).take();
     // Order matters: the sizes and margins go back *before* the content comes out, so the button is
     // never briefly its own size with our strip still in it.
     tile::restore(diagnostics);
@@ -285,16 +265,14 @@ static MISS_LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBoo
 /// **The first `Border` in the panel is not it.** A `TaskListButton` panel holds an unnamed `Border`
 /// before the named one, and putting the strip in that one draws nothing — it sits behind the
 /// background rather than in it.
+///
 /// **The newest match, and that is load-bearing.** The recorded tree keeps elements whose removal
 /// XAML never announced, so a button the shell has rebuilt can offer two `BackgroundElement`s that
 /// are identical by name and parent. Taking the first meant the answer alternated between sweeps —
 /// and since the placement record is keyed on this handle, every alternation looked like "a button we
 /// have not drawn into" and rebuilt the whole strip. That is what made the progress line jump on
 /// every track change: the rebuild, not the track.
-fn find_background_element(
-    _diagnostics: &IXamlDiagnostics,
-    button: InstanceHandle,
-) -> Option<InstanceHandle> {
+fn find_background_element(button: InstanceHandle) -> Option<InstanceHandle> {
     let candidates = crate::tree::children_of(button)
         .into_iter()
         .flat_map(crate::tree::children_of)

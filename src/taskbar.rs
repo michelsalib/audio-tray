@@ -57,10 +57,6 @@ type InitializeXamlDiagnosticsEx = unsafe extern "system" fn(
     wsz_initialization_data: PCWSTR,
 ) -> HRESULT;
 
-fn wide(text: &str) -> Vec<u16> {
-    text.encode_utf16().chain(std::iter::once(0)).collect()
-}
-
 /// Path to the TAP, if it shipped with this build.
 fn tap_path() -> Result<PathBuf> {
     let dir = std::env::current_exe()?
@@ -220,16 +216,16 @@ fn shell_pid() -> Result<u32> {
 unsafe fn inject(pid: u32, dll: &std::path::Path, icons: StripIcons) -> Result<()> {
     // `InitializeXamlDiagnosticsEx` is exported from the system XAML runtime, which
     // has no import library — resolve it dynamically.
-    let module = LoadLibraryW(PCWSTR(wide("Windows.UI.Xaml.dll").as_ptr()))
+    let module = LoadLibraryW(PCWSTR(crate::win::wide("Windows.UI.Xaml.dll").as_ptr()))
         .context("load Windows.UI.Xaml.dll")?;
     let symbol = GetProcAddress(module, PCSTR(c"InitializeXamlDiagnosticsEx".as_ptr().cast()))
         .context("Windows.UI.Xaml.dll does not export InitializeXamlDiagnosticsEx")?;
     let initialize: InitializeXamlDiagnosticsEx = std::mem::transmute(symbol);
 
     // Both DLL parameters get the TAP's own path, matching the known-good C++ TAPs.
-    let endpoint = wide(ENDPOINT_NAME);
-    let path = wide(&dll.to_string_lossy());
-    let init_data = wide(&init_data(icons));
+    let endpoint = crate::win::wide(ENDPOINT_NAME);
+    let path = crate::win::wide(&dll.to_string_lossy());
+    let init_data = crate::win::wide(&init_data(icons));
 
     let hr = initialize(
         PCWSTR(endpoint.as_ptr()),
@@ -258,11 +254,9 @@ unsafe fn inject(pid: u32, dll: &std::path::Path, icons: StripIcons) -> Result<(
 
 /// What the strip should draw right now.
 ///
-/// The glyphs are the *current devices'* icons, resolved exactly as the flyout and
-/// the tray icon resolve theirs — a per-device override from the config if there is
-/// one, otherwise the form-factor default. Sending fixed Volume/Microphone glyphs
-/// instead was wrong in a visible way: the flyout showed a laptop, the taskbar
-/// showed a speaker, for the same device.
+/// The glyphs are the *current devices'* icons, resolved through
+/// [`crate::config::Config::icon_of`] like every other surface's — which is what stops the
+/// same device showing as a laptop in the flyout and a speaker on the taskbar.
 ///
 /// One compromise carried over from [`crate::icons`]: the two earbud icons have no
 /// glyph in Segoe Fluent and the tray hand-draws them. The strip can only render a
@@ -327,11 +321,9 @@ const PILL_ALPHA: &str = "80";
 
 /// The `key=value;` payload handed to the TAP as initialization data.
 ///
-/// This is the only chance to configure the strip — it is read once in
-/// `SetSite`. Passing an empty string (as this did before) is not neutral: the
-/// TAP falls back to bare glyphs with no accent pill and leaves Explorer's own
-/// volume icon in place, which is a visibly different control from the one the
-/// design settles on.
+/// This is the only chance to configure the strip — it is read once, in `SetSite`. An empty
+/// payload is not neutral: the TAP then falls back to bare glyphs with no accent pill and
+/// leaves Explorer's own volume icon in place.
 ///
 /// `tooltip` targets *our* tray icon by its accessible name; without it the TAP
 /// decorates whichever notify icon it happens to meet first. It is matched as a

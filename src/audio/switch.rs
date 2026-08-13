@@ -17,8 +17,8 @@ use super::DeviceId;
 /// common bug that leaves some apps (notably communications apps) on the old device
 /// (plan §2.3). COM must already be initialized on the calling thread.
 pub fn set_default(id: &DeviceId) -> Result<()> {
-    // NUL-terminated UTF-16 buffer; must outlive every SetDefaultEndpoint call below.
-    let wide: Vec<u16> = id.0.encode_utf16().chain(std::iter::once(0)).collect();
+    // Bound to a local: the buffer must outlive every SetDefaultEndpoint call below.
+    let wide = crate::win::wide(&id.0);
     let name = PCWSTR(wide.as_ptr());
 
     unsafe {

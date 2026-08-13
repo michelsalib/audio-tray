@@ -8,7 +8,6 @@
 
 use ab_glyph::FontVec;
 
-use crate::audio::Flow;
 use crate::icons::{self, IconId};
 
 use crate::canvas::{fit_label, lerp3, measure, Canvas, Rect};
@@ -28,6 +27,12 @@ pub(super) struct Ctx<'a> {
     pub scale: f32,
     pub width: i32,
     pub height: i32,
+}
+
+impl<'a> Ctx<'a> {
+    pub(super) fn new(model: &'a Model, accent: [u8; 3], scale: f32, size: (i32, i32)) -> Self {
+        Ctx { model, accent, scale, width: size.0, height: size.1 }
+    }
 }
 
 /// Render `elems` (a screen) into `out` (a `width`×`height` RGBA buffer): the panel
@@ -63,12 +68,10 @@ pub(super) fn render_page(ctx: &Ctx, elems: &[LaidElem], out: &mut [u8]) {
                 let g = &groups[group];
                 let cy_i = le.top + le.height / 2;
                 let cy = cy_i as f32;
-                let (glyph, col) = match (g.flow, g.muted) {
-                    (Flow::Output, false) => (GLYPH_VOLUME, TEXT),
-                    (Flow::Output, true) => (GLYPH_MUTE, accent),
-                    (Flow::Input, false) => (GLYPH_MIC, TEXT),
-                    (Flow::Input, true) => (GLYPH_MIC_OFF, accent),
-                };
+                // Muted draws in the accent, which is the flyout's own convention — the
+                // readout beside the taskbar uses a warm tint instead, see [`crate::osd`].
+                let col = if g.muted { accent } else { TEXT };
+                let glyph = endpoint_glyph(g.flow, g.muted);
                 if let Ok((rgba, gw, gh)) = icons::render_glyph(glyph, icon_px, col) {
                     let (gx, gy) = (d(ICON_X), cy_i - gh as i32 / 2);
                     cv.blit(gx, gy, &rgba, gw, gh, 1.0);

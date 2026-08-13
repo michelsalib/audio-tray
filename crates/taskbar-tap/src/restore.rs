@@ -49,10 +49,7 @@ static ORIGINAL: Mutex<Original> = Mutex::new(Original {
 });
 
 fn lock() -> MutexGuard<'static, Original> {
-    match ORIGINAL.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
-    }
+    crate::lock(&ORIGINAL)
 }
 
 /// Records a section's column, the first time we touch it.

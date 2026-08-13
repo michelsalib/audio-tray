@@ -9,7 +9,7 @@
 use crate::audio::wasapi::WasapiBackend;
 use crate::audio::{DeviceId, Flow};
 use crate::config::Config;
-use crate::icons::{self, IconId};
+use crate::icons::IconId;
 
 use super::layout::View;
 
@@ -92,9 +92,7 @@ pub(super) fn build_groups(backend: &WasapiBackend, config: &Config) -> Vec<Grou
         let rows = devices
             .into_iter()
             .map(|d| {
-                let icon = config
-                    .icon_for(&d.id.0)
-                    .unwrap_or_else(|| icons::default_icon(d.form_factor, &d.friendly_name));
+                let icon = config.icon_of(&d);
                 let selected = default_id.as_ref() == Some(&d.id);
                 let battery = battery_of(&d.container_id);
                 DeviceRow { id: d.id, label: d.friendly_name, icon, selected, battery }

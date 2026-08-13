@@ -26,6 +26,7 @@
 
 use std::sync::Mutex;
 
+use crate::lock;
 use crate::log::logf;
 use crate::xamlom::{InstanceHandle, IXamlDiagnostics};
 
@@ -48,13 +49,6 @@ pub(crate) const BUTTON_TYPE: &str = "Taskbar.ThumbBarButton";
 /// scanned linearly four times a second. Dropping a handle that XAML has already removed cannot
 /// cause a double-attach: the element it named is gone, so it can never be offered again.
 static WIRED: Mutex<Vec<InstanceHandle>> = Mutex::new(Vec::new());
-
-fn lock<T>(mutex: &'static Mutex<T>) -> std::sync::MutexGuard<'static, T> {
-    match mutex.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
-    }
-}
 
 /// Attach transport handlers to the thumbnail-toolbar buttons of *our* preview.
 ///

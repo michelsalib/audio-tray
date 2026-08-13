@@ -42,11 +42,10 @@ pub unsafe fn scroll(diagnostics: &IXamlDiagnostics, strip: &state::Strip) {
     }
 }
 
-// The strip's own transport glyphs, and the code that wired them, are gone: the controls live on the
-// hover preview's thumbnail toolbar now, which is the shell's to draw and `super::thumbbar`'s to
-// wire. [`Segment`] stays because both halves still speak in it.
-
 /// Which transport control was hit.
+///
+/// Lives here rather than in [`super::thumbbar`], which is what wires the shell's buttons, because
+/// both halves of the feature speak in it.
 ///
 /// The strip *body* is deliberately not in here. On an app's own button the shell's own click already
 /// means "bring this app forward or minimise it", and its press is where drag-to-reorder begins — so

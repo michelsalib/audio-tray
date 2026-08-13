@@ -33,15 +33,6 @@ impl Playback {
             _ => Self::Stopped,
         }
     }
-
-    /// Segoe Fluent codepoint for the play/pause button: showing what the *click* will do,
-    /// which is the convention every media control follows — a pause glyph while playing.
-    pub fn toggle_glyph(self) -> &'static str {
-        match self {
-            Self::Playing => "\u{E769}", // pause
-            _ => "\u{E768}",             // play
-        }
-    }
 }
 
 /// The strip's contents.
@@ -111,10 +102,7 @@ impl Strip {
             Some((modified.as_nanos() as u64, meta.len()))
         });
 
-        let mut cache = match CACHED.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
+        let mut cache = crate::lock(&CACHED);
         if let (Some((mtime, len)), Some((known_mtime, known_len, strip))) = (stamp, cache.as_ref())
         {
             if mtime == *known_mtime && len == *known_len {
@@ -214,11 +202,5 @@ mod tests {
         assert_eq!(escape("Sturm & Drang"), "Sturm &amp; Drang");
         assert_eq!(escape("<tag>"), "&lt;tag&gt;");
         assert_eq!(escape("say \"hi\""), "say &quot;hi&quot;");
-    }
-
-    #[test]
-    fn the_toggle_glyph_shows_what_the_click_will_do() {
-        assert_eq!(Playback::Playing.toggle_glyph(), "\u{E769}"); // pause
-        assert_eq!(Playback::Paused.toggle_glyph(), "\u{E768}"); // play
     }
 }

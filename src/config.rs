@@ -104,6 +104,18 @@ impl Config {
         self.icons.get(device_id).copied()
     }
 
+    /// The icon to draw for a device: the user's choice if there is one, otherwise the
+    /// form-factor default.
+    ///
+    /// One place, because all three surfaces have to agree — the tray icon, the strip and the
+    /// flyout's device rows. They did not when each resolved it for itself: the same speaker
+    /// appeared as a laptop in one and a speaker in another.
+    pub fn icon_of(&self, device: &crate::audio::Device) -> IconId {
+        self.icon_for(&device.id.0).unwrap_or_else(|| {
+            crate::icons::default_icon(device.form_factor, &device.friendly_name)
+        })
+    }
+
     pub fn set_icon(&mut self, device_id: String, icon: IconId) {
         self.icons.insert(device_id, icon);
     }

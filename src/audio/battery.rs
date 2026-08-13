@@ -36,7 +36,7 @@ unsafe fn collect() -> Option<Vec<(String, u8)>> {
     }
 
     let battery_key = devpkey(0x104E_A319_6EE2_4701_BD47_8DDB_F425_BBE5, 2);
-    let container_key = devpkey(0x8C7E_D206_3F8A_4827_B3AB_AE9E_1FAE_FC6C, 2);
+    let container_key = devpkey(super::CONTAINER_ID_FMTID, super::CONTAINER_ID_PID);
 
     let mut out = Vec::new();
     for id in buf.split(|&c| c == 0).filter(|s| !s.is_empty()) {

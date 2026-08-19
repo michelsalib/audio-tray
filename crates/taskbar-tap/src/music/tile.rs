@@ -46,6 +46,12 @@ pub struct Host {
     pub name: String,
 }
 
+/// The type XAML reports for the repeater that lays the taskbar's buttons out.
+///
+/// The level [`widen`] stops below — and, because every display's taskbar has one of its own, the
+/// identity of a taskbar in [`super::find_buttons`].
+pub const REPEATER_TYPE: &str = "Microsoft.UI.Xaml.Controls.ItemsRepeater";
+
 impl Host {
     pub const TYPE: &'static str = "Taskbar.TaskListButton";
 
@@ -268,9 +274,7 @@ pub unsafe fn widen(diagnostics: &IXamlDiagnostics, border: InstanceHandle, host
         let Some(parent) = crate::tree::parent_of(handle) else {
             return;
         };
-        if crate::tree::type_of(parent).as_deref()
-            == Some("Microsoft.UI.Xaml.Controls.ItemsRepeater")
-        {
+        if crate::tree::type_of(parent).as_deref() == Some(REPEATER_TYPE) {
             return;
         }
         set_width(diagnostics, parent, ask);

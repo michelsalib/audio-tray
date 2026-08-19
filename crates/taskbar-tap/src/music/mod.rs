@@ -26,22 +26,51 @@ use std::sync::Mutex;
 use crate::log::logf;
 use crate::xamlom::{InstanceHandle, IXamlDiagnostics};
 
-/// The `Border#BackgroundElement` we are drawing in, and the strip we last drew.
+/// Every `Border#BackgroundElement` we are drawing in, and the strip each one shows.
 ///
 /// Kept so a sweep can tell "nothing changed" from "the shell rebuilt the button": the strip is only
 /// rebuilt when the *content* changed, because rebuilding replaces every element in it — including
 /// the ones the click handlers are attached to, which is how a track change could silently break the
 /// transport buttons.
-static PLACED: Mutex<Option<Placed>> = Mutex::new(None);
+///
+/// **A list, because there is one button per taskbar.** With the taskbar shown on all displays the
+/// shell builds the app's button once per display, and one record meant every display but one kept
+/// the plain app icon. Keyed on the *button*, so a button the shell rebuilt replaces its own record
+/// rather than leaving one behind per rebuild.
+static PLACED: Mutex<Vec<Placed>> = Mutex::new(Vec::new());
 
 struct Placed {
+    button: InstanceHandle,
     border: InstanceHandle,
     shown: state::Strip,
 }
 
-/// Where the strip is, if it is up. Used by the app-facing side to answer "is the tile live".
-pub fn placed_border() -> Option<InstanceHandle> {
-    crate::lock(&PLACED).as_ref().map(|placed| placed.border)
+/// What the strip in `button`'s `border` is showing, if we put one there.
+fn shown_on(button: InstanceHandle, border: InstanceHandle) -> Option<state::Strip> {
+    crate::lock(&PLACED)
+        .iter()
+        .find(|placed| placed.button == button && placed.border == border)
+        .map(|placed| placed.shown.clone())
+}
+
+/// Which `Border` we last drew `button`'s strip into.
+fn border_of(button: InstanceHandle) -> Option<InstanceHandle> {
+    crate::lock(&PLACED)
+        .iter()
+        .find(|placed| placed.button == button)
+        .map(|placed| placed.border)
+}
+
+/// Note that `button`'s strip is now in `border`, showing `strip`, dropping any earlier record of
+/// that button.
+fn record(button: InstanceHandle, border: InstanceHandle, strip: &state::Strip) {
+    let mut placed = crate::lock(&PLACED);
+    placed.retain(|placed| placed.button != button);
+    placed.push(Placed {
+        button,
+        border,
+        shown: strip.clone(),
+    });
 }
 
 // **The hover preview is deliberately left alone.** Replacing its content with a now-playing card
@@ -59,7 +88,7 @@ pub fn placed_border() -> Option<InstanceHandle> {
 // The transport controls live on the shell's own thumbnail toolbar instead — `ITaskbarList3::
 // ThumbBarAddButtons`, driven from audio-tray in `music::thumbbar`, which needs no XAML at all.
 
-/// One pass: find the button, put the strip in it, and keep it there.
+/// One pass: find the buttons, put a strip in each, and keep them there.
 ///
 /// # Safety
 /// XAML UI thread only, and only with the event stream quiet — the caller's own gating already
@@ -80,68 +109,87 @@ pub unsafe fn sweep(diagnostics: &IXamlDiagnostics) {
     // is pointing at it. `crate::wire_transport` does it ahead of that gate, and off the
     // announcement, so the first press lands on a live button.
 
-    let Some(button) = find_button(diagnostics, &host) else {
-        return;
-    };
-    let Some(border) = find_background_element(button) else {
-        logf!("music: {} has no Border#BackgroundElement", host.name);
-        return;
-    };
+    // A record whose button XAML has removed — a display unplugged, the app closed. Dropping it
+    // cannot lose a strip: the element it named is gone, so there is nothing left to hand back.
+    crate::lock(&PLACED).retain(|placed| crate::tree::type_of(placed.button).is_some());
 
-    // **A track change is an update, not a rebuild, and that distinction is visible.** Replacing the
-    // `Border`'s child changes the strip's identity and momentarily its measured size, which makes
-    // the shell re-run the button's layout and re-assert its own `RunningIndicator` and
-    // `ProgressIndicator` from the template. The user sees the progress line snap back to the
-    // shell's centred default and then step through our margin and width writes as they land — a
-    // "centre, left, full width" jump on every song. Keeping the strip's elements in place keeps the
-    // button's layout still, and the indicators with it.
-    let previous = crate::lock(&PLACED)
-        .as_ref()
-        .filter(|placed| placed.border == border)
-        .map(|placed| placed.shown.clone());
+    // Where a strip now is, and what any out-of-date one is still showing. Both are collected before
+    // a single character is written, because the content writes reach **every** strip at once — they
+    // find their elements by name, and every taskbar's strip names them the same — so they are made
+    // once, below, rather than once per button.
+    let mut drawn: Vec<(InstanceHandle, InstanceHandle)> = Vec::new();
+    let mut stale: Vec<state::Strip> = Vec::new();
 
-    let applied = match previous {
-        Some(shown) if shown == strip => true,
-        // Same button, different track: patch what differs and leave the tree alone.
-        Some(shown) => tile::update_in_place(diagnostics, &shown, &strip),
-        // A button we have not drawn into — first sweep, or the shell rebuilt it under us.
-        None => {
-            // Says *why* a rebuild is happening. A rebuild per track change is the defect this
-            // branch's neighbours exist to avoid, and the two causes — no record at all, versus a
-            // record against a different `BackgroundElement` — need opposite fixes.
-            if let Some(stale) = placed_border() {
-                logf!("music: border moved 0x{stale:x} -> 0x{border:x}; rebuilding");
+    for button in find_buttons(diagnostics, &host) {
+        let Some(border) = find_background_element(button) else {
+            logf!("music: {} has no Border#BackgroundElement", host.name);
+            continue;
+        };
+
+        // **A track change is an update, not a rebuild, and that distinction is visible.** Replacing
+        // the `Border`'s child changes the strip's identity and momentarily its measured size, which
+        // makes the shell re-run the button's layout and re-assert its own `RunningIndicator` and
+        // `ProgressIndicator` from the template. The user sees the progress line snap back to the
+        // shell's centred default and then step through our margin and width writes as they land — a
+        // "centre, left, full width" jump on every song. Keeping the strip's elements in place keeps
+        // the button's layout still, and the indicators with it.
+        match shown_on(button, border) {
+            Some(shown) if shown == strip => drawn.push((button, border)),
+            // Same button, different track: patch what differs and leave the tree alone.
+            Some(shown) => {
+                if !stale.contains(&shown) {
+                    stale.push(shown);
+                }
+                drawn.push((button, border));
             }
-            let placed = tile::set_child(diagnostics, border, &layout::now_playing_markup(&strip));
-            if placed {
-                logf!(
-                    "music: strip placed on 0x{border:x} — {:?} / {:?} [{:?}]",
-                    strip.title,
-                    strip.artist,
-                    strip.playback
-                );
+            // A button we have not drawn into — first sweep, or the shell rebuilt it under us.
+            None => {
+                // Says *why* a rebuild is happening. A rebuild per track change is the defect this
+                // branch's neighbours exist to avoid, and the two causes — no record at all, versus a
+                // record against a different `BackgroundElement` — need opposite fixes.
+                if let Some(previous) = border_of(button) {
+                    logf!("music: border moved 0x{previous:x} -> 0x{border:x}; rebuilding");
+                }
+                if tile::set_child(diagnostics, border, &layout::now_playing_markup(&strip)) {
+                    logf!(
+                        "music: strip placed on 0x{border:x} — {:?} / {:?} [{:?}]",
+                        strip.title,
+                        strip.artist,
+                        strip.playback
+                    );
+                    record(button, border, &strip);
+                    drawn.push((button, border));
+                }
             }
-            placed
         }
-    };
-
-    if applied {
-        *crate::lock(&PLACED) = Some(Placed {
-            border,
-            shown: strip.clone(),
-        });
     }
 
-    if placed_border() != Some(border) {
+    // Once per *distinct* stale value, not once per button: what to write is decided by what differs
+    // from what is up, and the write itself lands on every strip naming those elements.
+    for shown in stale {
+        if !tile::update_in_place(diagnostics, &shown, &strip) {
+            continue;
+        }
+        let mut placed = crate::lock(&PLACED);
+        for record in placed.iter_mut().filter(|record| record.shown == shown) {
+            record.shown = strip.clone();
+        }
+    }
+
+    if drawn.is_empty() {
         return;
     }
 
     // Everything below is re-applied every sweep on purpose: the shell re-asserts the button's own
     // width and rebuilds its indicators, so a single application is undone within a second. Each of
     // these is a no-op when the value is already ours.
-    tile::hide_app_icon(diagnostics, button);
-    tile::widen(diagnostics, border, &host);
-    tile::place_button_state(diagnostics, button);
+    for (button, border) in drawn {
+        tile::hide_app_icon(diagnostics, button);
+        tile::widen(diagnostics, border, &host);
+        tile::place_button_state(diagnostics, button);
+    }
+    // One call for every strip on screen, for the same reason the content writes are: the ticker
+    // writes its window to every `TextBlock` of that name, wherever it is.
     tick::scroll(diagnostics, &strip);
 }
 
@@ -150,11 +198,11 @@ pub unsafe fn sweep(diagnostics: &IXamlDiagnostics) {
 /// # Safety
 /// XAML UI thread only.
 pub unsafe fn revert(diagnostics: &IXamlDiagnostics) {
-    let placed = crate::lock(&PLACED).take();
+    let placed = std::mem::take(&mut *crate::lock(&PLACED));
     // Order matters: the sizes and margins go back *before* the content comes out, so the button is
     // never briefly its own size with our strip still in it.
     tile::restore(diagnostics);
-    if let Some(placed) = placed {
+    for placed in placed {
         let cleared = tile::clear_child(diagnostics, placed.border);
         logf!("music: cleared the strip on 0x{:x} -> {cleared}", placed.border);
     }
@@ -225,36 +273,108 @@ fn clear_progress_bar() {
     }
 }
 
-/// The app's taskbar button, matched on its accessible name.
+/// The app's taskbar button on **every** taskbar, matched on its accessible name.
 ///
 /// A **substring** match, because the shell's name carries a localised suffix — `"YouTube Music
 /// épinglé"` on this machine. A miss logs every button it saw, which is the only way to discover those
 /// names: they are not documented anywhere and they change with the display language.
 ///
+/// **One per taskbar, and that is what puts the strip on a second display.** With the taskbar shown
+/// on all displays the shell builds the app's button once per display — same type, same accessible
+/// name, each in a repeater of its own — and taking the first match left every display but one
+/// showing the plain app icon.
+///
+/// **The newest per taskbar, for the reason [`find_background_element`] takes the newest `Border`:**
+/// the recorded tree keeps elements whose removal XAML never announced, so one taskbar can offer
+/// several buttons that differ only in age. Grouping by the repeater they sit in drops the dead ones
+/// without collapsing several displays into one.
+///
+/// Every candidate's name is read rather than stopping at the first match, and none of them is
+/// cached: the answer is a set now, and the repeater **recycles** buttons — a handle that says
+/// "YouTube Music" on one sweep can be another app's button on the next, and a remembered verdict
+/// would put our strip on that app.
+///
 /// # Safety
 /// XAML UI thread only.
-unsafe fn find_button(diagnostics: &IXamlDiagnostics, host: &tile::Host) -> Option<InstanceHandle> {
+unsafe fn find_buttons(diagnostics: &IXamlDiagnostics, host: &tile::Host) -> Vec<InstanceHandle> {
     let wanted = host.name.to_lowercase();
-    let buttons = crate::tree::find_by_type(tile::Host::TYPE);
-    let mut seen = Vec::new();
-    for button in &buttons {
-        let Some(name) = crate::decorate::automation_name(diagnostics, *button) else {
+    let mut taskbars: Vec<(InstanceHandle, Vec<InstanceHandle>)> = Vec::new();
+    let mut seen: Vec<String> = Vec::new();
+    for button in crate::tree::find_by_type(tile::Host::TYPE) {
+        let Some(name) = crate::decorate::automation_name(diagnostics, button) else {
             continue;
         };
-        if name.to_lowercase().contains(&wanted) {
-            return Some(*button);
+        if !name.to_lowercase().contains(&wanted) {
+            // Deduplicated, because every app is now seen once per taskbar and the point of this list
+            // is the *names* the shell uses.
+            if !seen.contains(&name) {
+                seen.push(name);
+            }
+            continue;
         }
-        seen.push(name);
+        let taskbar = taskbar_of(button);
+        match taskbars.iter_mut().find(|(known, _)| *known == taskbar) {
+            Some((_, buttons)) => buttons.push(button),
+            None => taskbars.push((taskbar, vec![button])),
+        }
     }
-    // Once, not every sweep: this runs four times a second, and the answer does not change until the
-    // user pins something.
-    if !seen.is_empty() && !MISS_LOGGED.swap(true, std::sync::atomic::Ordering::SeqCst) {
-        logf!("music: no button matching {:?} — saw {seen:?}", host.name);
+
+    let buttons: Vec<InstanceHandle> = taskbars
+        .into_iter()
+        .filter_map(|(_, buttons)| crate::tree::newest(buttons))
+        .collect();
+
+    if buttons.is_empty() {
+        // Once, not every sweep: this runs four times a second, and the answer does not change until
+        // the user pins something.
+        if !seen.is_empty() && !MISS_LOGGED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            logf!("music: no button matching {:?} — saw {seen:?}", host.name);
+        }
+        return buttons;
     }
-    None
+    // How many taskbars carry the button, on the way in and whenever it changes. A display plugged in
+    // or unplugged is the whole of what moves it, and it is the first thing a "the strip is missing on
+    // my second screen" report needs.
+    if FOUND.swap(buttons.len(), std::sync::atomic::Ordering::SeqCst) != buttons.len() {
+        logf!(
+            "music: {:?} has a button on {} taskbar(s)",
+            host.name,
+            buttons.len()
+        );
+    }
+    buttons
 }
 
 static MISS_LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// How many buttons the last log line reported, so it is written once per change rather than once per
+/// sweep.
+static FOUND: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Which taskbar a button belongs to, as the handle of the `ItemsRepeater` laying it out.
+///
+/// Each display's taskbar has a repeater of its own, so the repeater **is** the identity of "this
+/// display's copy of the button" — and unlike a screen position it costs no XAML call to read.
+///
+/// Bounded, and it stops at the last *recorded* ancestor: a tree with no repeater above the button
+/// degrades to grouping by that ancestor rather than to an unbounded climb to the root.
+fn taskbar_of(button: InstanceHandle) -> InstanceHandle {
+    let mut handle = button;
+    // The same depth `tile::widen` walks, and for the same reason: that is where the repeater is.
+    for _ in 0..6 {
+        let Some(parent) = crate::tree::parent_of(handle) else {
+            break;
+        };
+        let Some(type_name) = crate::tree::type_of(parent) else {
+            break;
+        };
+        if type_name == tile::REPEATER_TYPE {
+            return parent;
+        }
+        handle = parent;
+    }
+    handle
+}
 
 /// The `Border#BackgroundElement` inside the button's panel.
 ///

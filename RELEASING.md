@@ -124,7 +124,7 @@ there is no marker file that can land out of step with what it describes.
 that stamp against `CARGO_PKG_VERSION` and re-fetches the DLL if they disagree. This is
 the half that matters, because `update_tap` runs *in the process being replaced* — a bug
 in it can only be fixed one release later, by the build that comes after. It runs from
-the background check and from `--update`, and only on `Status::UpToDate`: right after an
+the background check and from `--update`, and only on `VersionStatus::UpToDate`: right after an
 update the new DLL is already on disk against this old process's version, so comparing
 there would "repair" a downgrade.
 

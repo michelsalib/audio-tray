@@ -75,12 +75,13 @@ pub fn spawn_background_check() {
         return;
     }
     std::thread::spawn(|| match check_and_apply(false) {
-        Ok(self_update::Status::Updated(v)) => set_pending_version(v),
+        Ok(self_update::VersionStatus::Updated(v)) => set_pending_version(v),
         // **Only with the exe settled.** An update that just landed has already put the *new*
         // DLL next to it, and this process is still the old version — so a comparison here
         // would read "stale", and the repair would fetch the version we are about to stop
         // running. A downgrade, on every launch that takes an update.
-        Ok(self_update::Status::UpToDate(_)) => repair_stale_tap(false),
+        Ok(self_update::VersionStatus::UpToDate(_)) => repair_stale_tap(false),
+        Ok(_) => {}
         Err(e) => eprintln!("audio-tray: background update check failed: {e:#}"),
     });
 }
@@ -223,20 +224,21 @@ pub fn run_manual() -> Result<()> {
     println!("audio-tray v{}", self_update::cargo_crate_version!());
     println!("Checking github.com/{REPO_OWNER}/{REPO_NAME} for a newer release...");
     match check_and_apply(true)? {
-        self_update::Status::UpToDate(v) => {
+        self_update::VersionStatus::UpToDate(v) => {
             println!("Already up to date (v{v}).");
             // The exe is settled, so the DLL beside it can be held to the same version — see
             // [`repair_stale_tap`]. This is also the only way to drive that path by hand.
             repair_stale_tap(true);
         }
-        self_update::Status::Updated(v) => {
+        self_update::VersionStatus::Updated(v) => {
             println!("Updated to v{v}. Restart audio-tray to run the new version.");
         }
+        status => println!("Update check: {status}."),
     }
     Ok(())
 }
 
-fn check_and_apply(verbose: bool) -> Result<self_update::Status> {
+fn check_and_apply(verbose: bool) -> Result<self_update::VersionStatus> {
     let status = self_update::backends::github::Update::configure()
         .repo_owner(REPO_OWNER)
         .repo_name(REPO_NAME)
@@ -258,7 +260,7 @@ fn check_and_apply(verbose: bool) -> Result<self_update::Status> {
     // replaced successfully by this point, and a stale DLL degrades rather than
     // breaks (the init-data protocol ignores unknown keys and defaults missing
     // ones), so failing here must not turn a good update into a bad one.
-    if let self_update::Status::Updated(version) = &status {
+    if let self_update::VersionStatus::Updated(version) = &status {
         if let Err(e) = update_tap(version, verbose) {
             eprintln!("audio-tray: exe updated but the taskbar TAP did not ({e:#})");
         }
@@ -287,8 +289,9 @@ fn update_tap(version: &str, verbose: bool) -> Result<()> {
         .context("configuring the release lookup")?
         .fetch()
         .context("listing releases")?
+        .into_vec()
         .into_iter()
-        .find(|release| release.version == version)
+        .find(|release| release.version() == version)
         .with_context(|| format!("release v{version} not found"))?;
     let asset = release
         .asset_for(TARGET, None)
@@ -301,19 +304,16 @@ fn update_tap(version: &str, verbose: bool) -> Result<()> {
     let staging = staging_dir(version);
     fs::create_dir_all(&staging).context("creating a staging directory")?;
 
-    let archive = staging.join(&asset.name);
+    let archive = staging.join(asset.name());
     let mut file = fs::File::create(&archive).context("creating the download file")?;
     // **`download_url` is the GitHub *API* asset url, not the browser one** — `self_update`'s github
     // backend reads it from the asset's `url` key. Ask that endpoint for a file and it has to be told
     // so; without the header it answers with the asset's own JSON *metadata*, and 1.6 KB of
     // `{"url":…,"id":…}` lands on disk named `.zip`. `self_update` sets exactly this header on the
     // download it does itself, which is the whole reason the exe updated and the DLL silently did not.
-    self_update::Download::from_url(&asset.download_url)
-        .set_header(
-            http::header::ACCEPT,
-            http::HeaderValue::from_static("application/octet-stream"),
-        )
-        .show_progress(verbose)
+    self_update::Download::from_url(asset.download_url())
+        .request_header(self_update::http::header::ACCEPT, "application/octet-stream")
+        .show_download_progress(verbose)
         .download_to(&mut file)
         .context("downloading the release asset")?;
     drop(file);
@@ -321,7 +321,7 @@ fn update_tap(version: &str, verbose: bool) -> Result<()> {
     self_update::Extract::from_source(&archive)
         .archive(self_update::ArchiveKind::Zip)
         .extract_file(&staging, TAP_DLL)
-        .with_context(|| format!("{TAP_DLL} is not in {}", asset.name))?;
+        .with_context(|| format!("{TAP_DLL} is not in {}", asset.name()))?;
     let fresh = staging.join(TAP_DLL);
     let _ = fs::remove_file(&archive);
 

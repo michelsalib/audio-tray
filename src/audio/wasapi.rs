@@ -212,7 +212,7 @@ impl WasapiBackend {
     /// notch still comes to the same 2% Windows itself uses (see `tray::SCROLL_STEP`).
     ///
     /// Mute is reported, never changed. Muting from the taskbar buttons is a deliberate stop
-    /// in their click cycle (see `tray::handle_taskbar_action`), so a scroll silently
+    /// in their click cycle (see `tray::Tray::taskbar_action`), so a scroll silently
     /// clearing it would fight the gesture the user just made.
     pub fn nudge_volume(&self, flow: Flow, by: f32) -> Result<(f32, bool)> {
         unsafe {

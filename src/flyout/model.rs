@@ -43,7 +43,6 @@ pub(super) struct Model {
     pub update: Option<String>, // staged update's version, if any → the footer's restart button
     // outcome, accumulated while the flyout is open
     pub config_changed: bool,
-    pub output_changed: bool,
     pub quit: bool,
     pub restart: bool,
 }
@@ -55,7 +54,6 @@ impl Model {
             view: View::Main,
             update,
             config_changed: false,
-            output_changed: false,
             quit: false,
             restart: false,
         }

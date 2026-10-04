@@ -82,3 +82,31 @@ pub(crate) fn windows_by_class(class: &str) -> Vec<windows::Win32::Foundation::H
     });
     found
 }
+
+/// Register `class` (re-registering is a harmless no-op) and create a `WS_POPUP` window of it.
+///
+/// One helper for the app's three windows: the tray's hidden message window, the flyout and the
+/// readout. The arrow cursor is set on the class because a captured window gets no `WM_SETCURSOR`.
+pub(crate) fn create_popup(
+    class: PCWSTR,
+    title: PCWSTR,
+    proc: windows::Win32::UI::WindowsAndMessaging::WNDPROC,
+    ex_style: windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE,
+    (x, y, width, height): (i32, i32, i32, i32),
+) -> windows::core::Result<windows::Win32::Foundation::HWND> {
+    use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, LoadCursorW, RegisterClassW, IDC_ARROW, WNDCLASSW, WS_POPUP,
+    };
+
+    let instance = unsafe { GetModuleHandleW(None) }?;
+    let wc = WNDCLASSW {
+        lpfnWndProc: proc,
+        hInstance: instance.into(),
+        hCursor: unsafe { LoadCursorW(None, IDC_ARROW) }.unwrap_or_default(),
+        lpszClassName: class,
+        ..Default::default()
+    };
+    unsafe { RegisterClassW(&wc) };
+    unsafe { CreateWindowExW(ex_style, class, title, WS_POPUP, x, y, width, height, None, None, Some(instance.into()), None) }
+}

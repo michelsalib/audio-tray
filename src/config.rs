@@ -14,7 +14,7 @@ use crate::icons::IconId;
 /// choose between the plain tray icon and the taskbar strip, is the case that
 /// matters today. Rejecting it would throw away the user's icon choices along with
 /// it.
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
     /// endpoint id string -> chosen built-in icon
@@ -28,7 +28,7 @@ pub struct Config {
 /// **On by default, which is defensible because it is invisible until it applies.** Nothing here
 /// happens without a YouTube Music media session on the machine: no session, no state to publish, no
 /// progress bar, no tile. A user who never opens the player never sees a difference.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Music {
     /// Follow the player at all. `false` turns the whole feature off, progress bar included.

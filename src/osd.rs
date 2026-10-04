@@ -17,8 +17,8 @@
 //! app. What it does do is sit *over* whatever is to the right of our buttons (another tray
 //! icon, or the clock) for those three seconds.
 //!
-//! Everything here runs on the tray thread: it owns the window, and its message loop is
-//! what drives [`Osd::tick`].
+//! Everything here runs on the tray thread; the fade timer ticks on the tray's message window
+//! ([`Osd::new`]), which calls [`Osd::tick`].
 
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -52,7 +52,8 @@ const FADE: Duration = Duration::from_millis(400);
 /// Repaint cadence while it is up. Only the fade actually paints; a tick inside [`HOLD`] is
 /// a subtraction, so this costs nothing for most of the readout's life.
 const TICK_MS: u32 = 33;
-const TIMER_ID: usize = 1;
+/// The fade timer's id, on whichever window [`Osd::new`] was told ticks go to.
+pub(crate) const TIMER_ID: usize = 0x05D;
 
 // Geometry, in DIPs, scaled by the display DPI when the window is built.
 //
@@ -88,6 +89,8 @@ const MUTED_GLYPH: [u8; 3] = [0xE8, 0x83, 0x6A];
 /// hidden between appearances, not destroyed, so a scroll never waits for a window.
 pub(crate) struct Osd {
     hwnd: HWND,
+    /// Where the fade timer's `WM_TIMER` goes: the tray's message window, or our own (`None`).
+    ticks_to: Option<HWND>,
     /// Display scale the current geometry and buffer were built for.
     scale: f32,
     width: i32,
@@ -102,9 +105,10 @@ pub(crate) struct Osd {
 }
 
 impl Osd {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(ticks_to: Option<HWND>) -> Self {
         Osd {
             hwnd: HWND(std::ptr::null_mut()),
+            ticks_to,
             scale: 0.0, // no geometry yet; the first `show` builds it
             width: 0,
             height: 0,
@@ -116,10 +120,13 @@ impl Osd {
         }
     }
 
-    /// Whether `hwnd` is this readout's window — how the tray loop tells our `WM_TIMER`
-    /// apart from anyone else's.
-    pub(crate) fn owns(&self, hwnd: HWND) -> bool {
+    /// Whether `hwnd` is this readout's window (for [`preview`]'s own loop).
+    fn owns(&self, hwnd: HWND) -> bool {
         !self.hwnd.0.is_null() && self.hwnd.0 == hwnd.0
+    }
+
+    fn timer_window(&self) -> HWND {
+        self.ticks_to.unwrap_or(self.hwnd)
     }
 
     /// Show the level of one endpoint, or refresh it if it is already up, and restart the
@@ -154,10 +161,10 @@ impl Osd {
         };
         self.changed = Instant::now();
         // Replaces the timer if one is already armed, which is what restarts the countdown.
-        unsafe { SetTimer(Some(self.hwnd), TIMER_ID, TICK_MS, None) };
+        unsafe { SetTimer(Some(self.timer_window()), TIMER_ID, TICK_MS, None) };
     }
 
-    /// One frame of the hold-then-fade, driven by the tray loop's `WM_TIMER`.
+    /// One frame of the hold-then-fade, on each [`TIMER_ID`] tick.
     pub(crate) fn tick(&mut self) {
         if !self.shown {
             return;
@@ -184,15 +191,13 @@ impl Osd {
         );
     }
 
-    /// Take the readout away now. Also what the tray calls before opening the control
-    /// panel: the panel supersedes it, and a frozen bar would otherwise sit there for as
-    /// long as the panel is up (the panel's modal loop is not the one driving [`Self::tick`]).
+    /// Take the readout away now (the tray does before opening the flyout, which covers it).
     pub(crate) fn hide(&mut self) {
         if !self.shown {
             return;
         }
         unsafe {
-            let _ = KillTimer(Some(self.hwnd), TIMER_ID);
+            let _ = KillTimer(Some(self.timer_window()), TIMER_ID);
             let _ = ShowWindow(self.hwnd, SW_HIDE);
         }
         self.shown = false;
@@ -336,7 +341,7 @@ impl Drop for Osd {
             return;
         }
         unsafe {
-            let _ = KillTimer(Some(self.hwnd), TIMER_ID);
+            let _ = KillTimer(Some(self.timer_window()), TIMER_ID);
             let _ = DestroyWindow(self.hwnd);
         }
     }
@@ -368,7 +373,7 @@ pub(crate) fn preview(
     };
     let muted = backend.is_muted(&default).unwrap_or(false);
 
-    let mut osd = Osd::new();
+    let mut osd = Osd::new(None);
     osd.show(flow, level, muted, None);
     println!(
         "osd: {flow:?} at {:.0}%{} — {}x{} at {},{}, holding {}s then fading",
@@ -419,7 +424,7 @@ fn monitor_rect(rect: RECT) -> RECT {
 }
 
 /// A pass-through: the readout has no interaction of its own (it is click-through), and its
-/// `WM_TIMER` is handled by the tray's message loop, which owns the state the fade needs.
+/// `WM_TIMER` goes to the window [`Osd::new`] was given.
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     DefWindowProcW(hwnd, msg, wp, lp)
 }

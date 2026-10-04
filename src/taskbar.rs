@@ -21,7 +21,7 @@
 //! still holds callbacks into.
 //!
 //! Four things have to lead to that revert, and each has its own trigger:
-//!   * audio-tray quits                     → [`revert`], from the tray loop
+//!   * audio-tray quits                     → [`revert`], from the tray
 //!   * audio-tray is killed or crashes      → the TAP waits on our process id,
 //!     passed in [`init_data`], and reverts when it exits
 //!   * Explorer restarts                    → nothing to revert; the DLL died
@@ -568,8 +568,7 @@ pub fn post_progress(fraction: Option<f64>, playing: bool) -> Result<()> {
     use windows::Win32::Foundation::{LPARAM, WPARAM};
     use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 
-    let receiver = window_by_class(RECEIVER_CLASS_NAME)
-        .context("no receiver window — audio-tray is not running")?;
+    let receiver = receiver().context("no receiver window — the tray is not up")?;
     // `wParam` carries the fraction in `PROGRESS_SCALE`ths, or `PROGRESS_NONE` for "clear it".
     // A message payload has to be plain integers, and a fraction quantised to a scale the caller
     // already rounds to loses nothing.
@@ -588,7 +587,7 @@ pub fn post_progress(fraction: Option<f64>, playing: bool) -> Result<()> {
     .context("post the progress to the tray")
 }
 
-/// Apply a [`WM_MUSIC_PROGRESS`] payload. Called from the tray's message loop, on its STA.
+/// Apply a [`WM_MUSIC_PROGRESS`] payload. Called by the tray's message window, on its STA.
 ///
 /// **Gated on the taskbar controls being up**, which is the other half of a defect this move fixed:
 /// `--taskbar-revert` puts the tile away but leaves the feed running, and without this check the very
@@ -642,15 +641,10 @@ pub const WM_TASKBAR_ACTION: u32 =
 /// A scroll over one of the buttons: `wParam` is the direction ([`flow_code`]) and `lParam`
 /// the signed wheel delta, in `WHEEL_DELTA` units.
 ///
-/// Its own message rather than another [`Action`] code, because the tray *coalesces* these —
-/// a precision touchpad produces a stream of sub-notch deltas, and one round of COM per
-/// delta would fall behind the finger. Coalescing means draining every one that is queued,
-/// and draining `WM_TASKBAR_ACTION` would swallow queued clicks with them.
-///
-/// Posted from two places, which is why the payload is this and not a pointer: the TAP, for
-/// a scroll that XAML delivered over a button (the touchpad's only route in — see
-/// [`crate::tray`]), and the tray's own mouse hook, as a thread message. Must match
-/// `WM_TASKBAR_SCROLL` in the TAP's `ipc` module.
+/// Its own message rather than an [`Action`] code because the tray folds a burst of them into
+/// one volume change (a touchpad gesture is tens of sub-notch deltas). Posted by the TAP (the
+/// touchpad's only route in) and by the tray's wheel hook. Must match `WM_TASKBAR_SCROLL` in the
+/// TAP's `ipc` module.
 pub const WM_TASKBAR_SCROLL: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 24;
 
 /// Wire code for a direction in [`WM_TASKBAR_SCROLL`]'s `wParam`. Explicit on both sides, so
@@ -671,13 +665,13 @@ pub fn flow_from_code(code: usize) -> crate::audio::Flow {
     }
 }
 
-/// Explorer restarted — re-inject. Posted to itself by the receiver's window
-/// procedure; see [`create_receiver`] for why it cannot be observed directly.
+/// Explorer restarted — re-inject. The shell *sends* `TaskbarCreated`, so the tray re-posts it as
+/// this rather than injecting inside the shell's broadcast.
 pub const WM_TASKBAR_RESTARTED: u32 =
     windows::Win32::UI::WindowsAndMessaging::WM_APP + 22;
 
 /// The shell's "the taskbar is back" broadcast, registered once.
-fn taskbar_created_message() -> u32 {
+pub fn taskbar_created_message() -> u32 {
     use std::sync::OnceLock;
     static ID: OnceLock<u32> = OnceLock::new();
     *ID.get_or_init(|| unsafe {
@@ -687,76 +681,22 @@ fn taskbar_created_message() -> u32 {
     })
 }
 
-/// Creates the hidden window the TAP posts to.
+/// Creates the hidden window the TAP posts to, with the tray's window procedure.
 ///
-/// Deliberately a *top-level* window rather than a message-only one: message-only
-/// windows are not reachable by `FindWindow`, and searching for them through
-/// `FindWindowEx(HWND_MESSAGE, …)` did not find this window across processes
-/// either. A never-shown, zero-sized tool window is findable by class name and
-/// costs the same. `WS_EX_TOOLWINDOW` keeps it out of the taskbar and Alt-Tab,
-/// and it is never given `SW_SHOW`, so nothing appears on screen.
-///
-/// Created on the tray thread so its messages arrive in the tray's own
-/// `GetMessage` loop — no extra thread, and no locking around the audio state.
-pub fn create_receiver() -> Result<windows::Win32::Foundation::HWND> {
-    use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
-    use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-    use windows::Win32::UI::WindowsAndMessaging::{
-        CreateWindowExW, DefWindowProcW, PostMessageW, RegisterClassW, WNDCLASSW, WS_EX_TOOLWINDOW,
-        WS_POPUP,
-    };
+/// A never-shown, zero-sized *top-level* tool window rather than a message-only one: the TAP finds
+/// it by class with `EnumWindows`, which does not see message-only windows.
+pub fn create_receiver(proc: windows::Win32::UI::WindowsAndMessaging::WNDPROC) -> Result<windows::Win32::Foundation::HWND> {
+    use windows::Win32::UI::WindowsAndMessaging::WS_EX_TOOLWINDOW;
+    let hwnd = crate::win::create_popup(RECEIVER_CLASS, RECEIVER_CLASS, proc, WS_EX_TOOLWINDOW, (0, 0, 0, 0))
+        .context("create the taskbar IPC receiver window")?;
+    RECEIVER.store(hwnd.0 as isize, std::sync::atomic::Ordering::SeqCst);
+    Ok(hwnd)
+}
 
-    // Mostly a pass-through: messages the TAP posts here are picked up by the
-    // tray thread's own `GetMessage` loop, which is where the audio state lives.
-    //
-    // `TaskbarCreated` is the exception, and it has to be handled here. The shell
-    // *sends* that broadcast rather than posting it, so it is delivered straight
-    // to this procedure and never enters the message queue — a `GetMessage` loop
-    // cannot see it at all. Measured: a hand-rolled `PostMessage(HWND_BROADCAST)`
-    // showed up in the loop immediately, while three real Explorer restarts
-    // produced nothing, even after 30 seconds. Re-posting it to ourselves is what
-    // gets it into the queue, where the loop can act on it with the config in
-    // scope.
-    unsafe extern "system" fn proc(
-        hwnd: HWND,
-        msg: u32,
-        wparam: WPARAM,
-        lparam: LPARAM,
-    ) -> LRESULT {
-        if msg == taskbar_created_message() {
-            let _ = unsafe { PostMessageW(Some(hwnd), WM_TASKBAR_RESTARTED, WPARAM(0), LPARAM(0)) };
-        }
-        unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
-    }
-
-    unsafe {
-        let instance = GetModuleHandleW(None).context("GetModuleHandle")?;
-        // Registering twice is harmless; the second attempt just fails.
-        let class = WNDCLASSW {
-            lpfnWndProc: Some(proc),
-            hInstance: instance.into(),
-            lpszClassName: RECEIVER_CLASS,
-            ..Default::default()
-        };
-        RegisterClassW(&class);
-
-        CreateWindowExW(
-            WS_EX_TOOLWINDOW,
-            RECEIVER_CLASS,
-            RECEIVER_CLASS,
-            WS_POPUP,
-            0,
-            0,
-            0,
-            0,
-            None,
-            None,
-            Some(instance.into()),
-            None,
-        )
-        .context("create the taskbar IPC receiver window")
-        .inspect(|hwnd| RECEIVER.store(hwnd.0 as isize, std::sync::atomic::Ordering::SeqCst))
-    }
+/// This process's receiver window, once [`create_receiver`] has run.
+pub fn receiver() -> Option<windows::Win32::Foundation::HWND> {
+    let raw = RECEIVER.load(std::sync::atomic::Ordering::SeqCst);
+    (raw != 0).then_some(windows::Win32::Foundation::HWND(raw as *mut core::ffi::c_void))
 }
 
 /// Whether this process has already restarted Explorer to repair the strip.

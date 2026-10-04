@@ -13,8 +13,8 @@
 //! `NonPackaged` — and `HKLM` the system and service side.
 //!
 //! A watcher thread blocks in `RegNotifyChangeKeyValue` on both roots and recomputes when
-//! the store changes, then posts [`WM_MIC_CHANGED`] to whichever thread asked to hear about
-//! it (the tray's loop, which owns the taskbar strip). Everyone else reads the answer from
+//! the store changes, then posts [`WM_MIC_CHANGED`] to the tray's message window (which owns
+//! the taskbar strip). Everyone else reads the answer from
 //! [`in_use`] — a cached atomic, so the flyout can sample it on every frame for nothing.
 //! The wait carries a [`RECHECK_MS`] ceiling as a safety net; the notification is what
 //! makes it prompt, not what makes it correct.
@@ -23,20 +23,19 @@
 //! recording from some other microphone is still an app recording, and hiding that would
 //! make the dot disagree with the system indicator sitting a few pixels away.
 
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use windows::core::{w, PCWSTR, PWSTR};
-use windows::Win32::Foundation::{CloseHandle, HANDLE, LPARAM, WPARAM};
+use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::System::Registry::{
     RegCloseKey, RegEnumKeyExW, RegGetValueW, RegNotifyChangeKeyValue, RegOpenKeyExW, HKEY,
     HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_NOTIFY, KEY_READ, REG_NOTIFY_CHANGE_LAST_SET,
     REG_NOTIFY_CHANGE_NAME, REG_SAM_FLAGS, RRF_RT_REG_QWORD,
 };
 use windows::Win32::System::Threading::{CreateEventW, WaitForMultipleObjects};
-use windows::Win32::UI::WindowsAndMessaging::{PostThreadMessageW, WM_APP};
+use windows::Win32::UI::WindowsAndMessaging::WM_APP;
 
-/// Posted to the thread registered with [`notify_thread`] when the answer to [`in_use`]
-/// changes. A thread message with no window, like [`super::notify::WM_AUDIO_REFRESH`].
+/// Posted (coalesced) to the tray's message window when the answer to [`in_use`] changes.
 pub const WM_MIC_CHANGED: u32 = WM_APP + 3;
 
 /// The consent store's microphone branch, under both `HKCU` and `HKLM`.
@@ -58,18 +57,6 @@ static IN_USE: AtomicBool = AtomicBool::new(false);
 
 /// Whether the watcher has been started, so [`in_use`] starts exactly one.
 static WATCHING: AtomicBool = AtomicBool::new(false);
-
-/// Thread to wake on a change; 0 until someone asks (the `--flyout` previews never do).
-static NOTIFY_TID: AtomicU32 = AtomicU32::new(0);
-
-/// Wake `thread_id` with [`WM_MIC_CHANGED`] whenever the answer changes.
-///
-/// Separate from [`in_use`] because the two have different owners: anything that paints
-/// asks the question, while only the tray thread — the one holding the strip and the
-/// notification icon — has a message loop to be told about it.
-pub fn notify_thread(thread_id: u32) {
-    NOTIFY_TID.store(thread_id, Ordering::SeqCst);
-}
 
 /// Whether any app has the microphone open right now.
 ///
@@ -228,16 +215,9 @@ fn arm(key: &Key, event: &Event) -> bool {
     status.is_ok()
 }
 
-/// Tell the registered thread the answer changed. Best-effort: no registered thread (the
-/// dev previews) or a queue that has gone away both mean there is nobody to tell.
+/// Tell the tray the answer changed. A no-op without one (the dev previews).
 fn announce() {
-    let thread_id = NOTIFY_TID.load(Ordering::SeqCst);
-    if thread_id == 0 {
-        return;
-    }
-    unsafe {
-        let _ = PostThreadMessageW(thread_id, WM_MIC_CHANGED, WPARAM(0), LPARAM(0));
-    }
+    crate::tray::MIC_CHANGED.post();
 }
 
 /// An open registry key, closed on drop.

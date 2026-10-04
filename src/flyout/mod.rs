@@ -55,10 +55,6 @@ use window::Surface;
 pub struct Outcome {
     pub quit: bool,
     pub config_changed: bool,
-    /// The default *output* device was switched while the flyout was open. The
-    /// endpoint-change notifications that would refresh the tray icon are consumed by our
-    /// own modal message loop, so the caller must refresh explicitly.
-    pub output_changed: bool,
     /// The user clicked the "restart to update" entry — the caller should relaunch the
     /// (already-updated on disk) exe and exit.
     pub restart: bool,
@@ -310,8 +306,9 @@ unsafe fn show_inner(
                 fly.scroll_volume(sy - fly.surface.y, delta);
             }
             WM_VOL_CHANGED => fly.refresh_volumes(),
-            WM_TIMER if msg.wParam.0 == ANIM_TIMER_ID => fly.tick_transition(),
-            WM_TIMER => fly.tick_meters(),
+            // Only our own timers: the tray's message window has timers too, and they must be dispatched.
+            WM_TIMER if msg.hwnd == fly.surface.hwnd && msg.wParam.0 == ANIM_TIMER_ID => fly.tick_transition(),
+            WM_TIMER if msg.hwnd == fly.surface.hwnd => fly.tick_meters(),
             WM_KEYDOWN if msg.wParam.0 as u16 == VK_ESCAPE.0 => break 'pump,
             WM_FLYOUT_CLOSE => break 'pump, // lost capture (Start menu, Alt-Tab, …)
             _ => {
@@ -332,7 +329,6 @@ unsafe fn show_inner(
     Outcome {
         quit: fly.model.quit,
         config_changed: fly.model.config_changed,
-        output_changed: fly.model.output_changed,
         restart: fly.model.restart,
     }
 }
@@ -567,9 +563,6 @@ impl Flyout<'_> {
                     if self.model.groups[group].default_id.as_ref() != Some(&id) {
                         if let Err(e) = self.backend.set_default_of(&id) {
                             eprintln!("switch failed: {e:#}");
-                        }
-                        if self.model.groups[group].flow == Flow::Output {
-                            self.model.output_changed = true;
                         }
                         for row in &mut self.model.groups[group].devices {
                             row.selected = row.id == id;

@@ -472,7 +472,11 @@ fn set_progress(
     unsafe {
         match fraction {
             Some(fraction) => {
-                let completed = (fraction.clamp(0.0, 1.0) * TOTAL as f64).round() as u64;
+                // **Never 0.** The shell treats a zero value as no progress: the bar collapses into the
+                // running dot, and the next non-zero value builds a fresh `ProgressIndicator` from the
+                // template — centred, natural width — until the TAP's sweep re-pins it. That was the
+                // jump on every track change. One thousandth is invisible and keeps the element alive.
+                let completed = ((fraction.clamp(0.0, 1.0) * TOTAL as f64).round() as u64).max(1);
                 taskbar
                     .SetProgressState(hwnd, if playing { TBPF_NORMAL } else { TBPF_PAUSED })
                     .context("SetProgressState")?;

@@ -47,10 +47,10 @@
 //!                         list every media session on the machine with its app id, and
 //!                         say which one was matched as YouTube Music — the answer to
 //!                         put in `music.app_id` when the matching misses
-//!   audio-tray --music-timeline
-//!                         sample the matched session's position over a few seconds, which
-//!                         is how the checkpoint-not-a-clock behaviour was measured
-//!   audio-tray --music-progress <percent|off>
+//!   audio-tray --music-timeline [next|prev|toggle] [secs]
+//!                         trace the followed session every 100 ms (default 9s), optionally
+//!                         sending a transport command 2s in, to watch a track change
+//!   audio-tray --music-progress <percent|off> [paused]
 //!                         put a taskbar progress bar on the player's window by hand, to
 //!                         separate "the shell refused it" from "the position was wrong"
 //!   audio-tray --music-windows [all]
@@ -282,7 +282,16 @@ fn main() -> Result<()> {
         // player publishes a position at all, and whether the shell still lets us put a progress bar
         // on somebody else's window.
         Some("--music-probe") => music::probe()?,
-        Some("--music-timeline") => music::report_timeline()?,
+        Some("--music-timeline") => {
+            let skip = match args.get(1).map(String::as_str) {
+                Some("next") => Some(music::smtc::Command::Next),
+                Some("prev") => Some(music::smtc::Command::Previous),
+                Some("toggle") => Some(music::smtc::Command::TogglePlayPause),
+                _ => None,
+            };
+            let seconds = args.iter().skip(1).find_map(|a| a.parse().ok()).unwrap_or(9);
+            music::report_timeline(seconds, skip)?
+        }
         Some("--music-progress") => {
             let value = args.get(1).map(String::as_str).unwrap_or("off");
             let fraction = match value {
@@ -293,7 +302,7 @@ fn main() -> Result<()> {
                     })? / 100.0,
                 ),
             };
-            music::player::set_player_progress(fraction, true)?;
+            music::player::set_player_progress(fraction, args.get(2).map(String::as_str) != Some("paused"))?;
             println!("music: progress -> {fraction:?}");
         }
         // The M12 spike: does the shell's own thumbnail toolbar accept a window we do not own?

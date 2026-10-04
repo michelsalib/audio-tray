@@ -377,51 +377,46 @@ pub fn player_verdicts_from_mta(windows: Vec<isize>) -> Result<Vec<bool>> {
     })
 }
 
-/// Sample the followed session's position three times, three seconds apart.
+/// Trace what the feed reads every 100 ms for `seconds`, optionally sending `skip` two seconds in.
 ///
-/// **The measurement this exists for:** a player publishes its position as a *checkpoint with a
-/// timestamp*, not as a running clock — measured, it moved 1.2 s over 6 s of playback — so a progress
-/// bar has to interpolate from `last updated` while the status is playing. If a future Chromium stops
-/// publishing a timeline at all, this is what says so.
-pub fn report_timeline() -> Result<()> {
-    on_mta_thread("music-timeline", || {
+/// Shows the position as a checkpoint plus its age (a player republishes it only when something
+/// happens) and what a track change looks like from here: the session vanishes for about a second.
+pub fn report_timeline(seconds: u64, skip: Option<smtc::Command>) -> Result<()> {
+    on_mta_thread("music-timeline", move || {
         let mut feed = Ytm::new(None)?;
-        report_position(&mut feed)
+        report_position(&mut feed, seconds, skip)
     })
 }
 
-fn report_position(feed: &mut Ytm) -> Result<()> {
-    let (state, _) = feed.read()?;
-    let Some(app_id) = feed.current_app_id().map(str::to_string) else {
-        println!("no YouTube Music session to ask");
-        return Ok(());
-    };
-    println!(
-        "following {app_id} — {}",
-        if state.snapshot().is_some_and(|s| s.status.is_playing()) {
-            "playing"
-        } else {
-            "not playing"
+fn report_position(feed: &mut Ytm, seconds: u64, skip: Option<smtc::Command>) -> Result<()> {
+    let started = std::time::Instant::now();
+    let mut skipped = false;
+    while started.elapsed().as_secs() < seconds {
+        let at = started.elapsed().as_secs_f64();
+        if !skipped && at >= 2.0_f64.min(seconds as f64 / 2.0) {
+            if let Some(command) = skip {
+                println!("{at:6.2}s  >>> {command:?}: {:?}", feed.send(command));
+            }
+            skipped = true;
         }
-    );
-    for sample in 0..3 {
-        if sample > 0 {
-            std::thread::sleep(std::time::Duration::from_secs(3));
-        }
-        match feed.timeline(&app_id)? {
-            Some(timeline) => println!(
-                "t+{}s  position {:.1}s / {}  published {}  last updated {}",
-                sample * 3,
-                timeline.position_seconds(),
-                timeline
-                    .duration_seconds()
-                    .map(|d| format!("{d:.1}s"))
-                    .unwrap_or_else(|| "unknown".into()),
-                timeline.is_published(),
-                timeline.last_updated,
+        let (state, timeline) = feed.read()?;
+        let (status, title) = match state.snapshot() {
+            Some(s) => (format!("{:?}", s.status), s.title.clone()),
+            None => ("-".into(), "<absent>".into()),
+        };
+        let playing = state.snapshot().is_some_and(|s| s.status.is_playing());
+        let line = match timeline {
+            Some(t) => format!(
+                "pos {:6.1}s / {:>7}  updated {:+7.2}s ago  -> {}",
+                t.position_seconds(),
+                t.duration_seconds().map(|d| format!("{d:.1}s")).unwrap_or_else(|| "?".into()),
+                (smtc::now_ticks() - t.last_updated) as f64 / 1e7,
+                t.fraction_at(smtc::now_ticks(), playing).map(|f| format!("{:5.1}%", f * 100.0)).unwrap_or_else(|| "none".into()),
             ),
-            None => println!("t+{}s  the session went away", sample * 3),
-        }
+            None => "no timeline".into(),
+        };
+        println!("{at:6.2}s  {:<8} {:<10} {line}  {title}", feed.current_app_id().map_or("-", |_| "app"), status);
+        std::thread::sleep(std::time::Duration::from_millis(100));
     }
     Ok(())
 }

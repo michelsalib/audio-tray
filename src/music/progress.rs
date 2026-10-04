@@ -65,12 +65,12 @@ impl Progress {
     /// as the tile is up. Taking it away is a *teardown* action with its own paths — quit,
     /// `--taskbar-revert`, the TAP's owner-watch — every one of which knows it means it.
     pub fn update(&mut self, timeline: Option<Timeline>, playing: bool) {
-        let measured = timeline.and_then(|timeline| timeline.fraction_at(now_ticks(), playing));
-        let step = match measured {
-            Some(fraction) => (fraction * STEPS).round() as u64,
-            // The gap between tracks: hold the last position rather than clearing.
-            None => self.last.map_or(0, |(step, _)| step),
+        // The gap between tracks: hold the last reading, colour included. The session is gone for
+        // about a second, so `playing` reads false there and would flash the bar yellow.
+        let Some(fraction) = timeline.and_then(|timeline| timeline.fraction_at(now_ticks(), playing)) else {
+            return;
         };
+        let step = (fraction * STEPS).round() as u64;
         let next = Some((step, playing));
         if self.last == next {
             return;

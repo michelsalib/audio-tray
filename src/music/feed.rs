@@ -104,11 +104,6 @@ impl Ytm {
         self.current_app_id.as_deref()
     }
 
-    /// Where the followed session says it is in the track, if it says anything.
-    pub fn timeline(&self, app_id: &str) -> Result<Option<smtc::Timeline>> {
-        self.smtc.timeline(app_id)
-    }
-
     /// Every session on the machine, for `--music-probe`.
     ///
     /// The point of exposing this is diagnosis: when the built-in matching misses

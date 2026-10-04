@@ -214,16 +214,6 @@ pub fn now_ticks() -> i64 {
     UNIX_EPOCH_IN_TICKS + (since_unix.as_nanos() / 100) as i64
 }
 
-impl Timeline {
-    /// Whether there is anything here worth drawing.
-    ///
-    /// A session that publishes no timeline at all reads as all zeroes, which is the case this
-    /// exists to distinguish — see `--timeline`.
-    pub fn is_published(self) -> bool {
-        self.end > self.start || self.position > 0
-    }
-}
-
 /// A transport command, as the strip's buttons express it.
 ///
 /// There is no `Play` or `Pause`: the strip has one button for both, and SMTC's own
@@ -312,18 +302,6 @@ impl Smtc {
             snapshot,
             timeline: read_timeline(session),
         }))
-    }
-
-    /// The timeline of the session owned by `app_id`, if it publishes one.
-    ///
-    /// **Not on the poll path** — [`Smtc::read_current`] returns the timeline from the enumeration it
-    /// already did, because asking separately meant a second `GetSessions` every second. This is for
-    /// `--music-timeline`, which asks about one session by name and has nothing else in flight.
-    pub fn timeline(&self, app_id: &str) -> Result<Option<Timeline>> {
-        let Some(session) = self.find(app_id)? else {
-            return Ok(None);
-        };
-        Ok(read_timeline(&session))
     }
 
     /// Send `command` to the session owned by `app_id`.
@@ -522,12 +500,11 @@ mod tests {
     }
 
     /// A session with no timeline at all reads as zeroes, and a zero-length track has no fraction to
-    /// draw — the caller clears the bar rather than showing an empty one.
+    /// draw — the progress bar holds its last reading rather than showing an empty one.
     #[test]
     fn no_timeline_means_no_bar() {
         let empty = Timeline::default();
         assert_eq!(empty.fraction_at(now_ticks(), true), None);
-        assert!(!empty.is_published());
     }
 
     /// The epoch has to match SMTC's, or every interpolation is out by 369 years.

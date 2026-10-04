@@ -383,6 +383,11 @@ fn schedule_replace_at_boot(
 /// is nothing staged at all (no update, or one whose copy succeeded outright), and a copy that
 /// fails changes nothing, since the boot-time rename scheduled alongside it still stands.
 pub fn place_staged_tap() -> bool {
+    // Like `repair_stale_tap`: a debug build must not drop a release TAP (staged by the installed
+    // tray, same version) over the one being developed in target\debug.
+    if cfg!(debug_assertions) {
+        return false;
+    }
     let fresh = staging_dir(self_update::cargo_crate_version!()).join(TAP_DLL);
     if !fresh.is_file() {
         return false;

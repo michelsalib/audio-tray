@@ -88,6 +88,8 @@ enum Request {
 pub struct Handle {
     requests: Sender<Request>,
     thread: Option<std::thread::JoinHandle<()>>,
+    /// Disconnects when the thread has finished (its sender is dropped on the way out, panic included).
+    finished: Receiver<()>,
 }
 
 impl Handle {
@@ -112,15 +114,30 @@ impl Handle {
 // drag-to-reorder gesture — so the only place that raises the player is the cold-start fallback in
 // [`Music::command`], where there is no session for a transport click to address.
 
+/// How long Quit waits for the feed thread to tidy up.
+const SHUTDOWN_WAIT: Duration = Duration::from_secs(2);
+
 impl Drop for Handle {
     /// **The teardown has to happen, and this is the only place that can guarantee it.** The state
     /// file and — more importantly — a progress bar on *another app's* taskbar button both outlive
     /// this process, so an exit that skips them leaves a strip with nothing driving it and a bar
     /// frozen mid-track that the user cannot attribute to anything.
+    ///
+    /// Bounded, because the thread can be stuck in an un-timed WinRT `.get()` against a wedged
+    /// player and Quit must not hang on it: after [`SHUTDOWN_WAIT`] it is detached, and the state
+    /// file is removed from here so the TAP stops drawing the strip.
     fn drop(&mut self) {
         let _ = self.requests.send(Request::ShutDown);
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
+        match self.finished.recv_timeout(SHUTDOWN_WAIT) {
+            Err(RecvTimeoutError::Timeout) => {
+                eprintln!("music: the feed did not stop within {SHUTDOWN_WAIT:?}; leaving it behind");
+                publish::remove_published();
+            }
+            _ => {
+                if let Some(thread) = self.thread.take() {
+                    let _ = thread.join();
+                }
+            }
         }
     }
 }
@@ -135,9 +152,11 @@ pub fn spawn(settings: &crate::config::Music) -> Option<Handle> {
     }
     let pinned = settings.app_id.clone();
     let (requests, inbox) = std::sync::mpsc::channel();
+    let (finished_tx, finished) = std::sync::mpsc::channel::<()>();
     let thread = std::thread::Builder::new()
         .name("music".to_string())
         .spawn(move || {
+            let _finished = finished_tx;
             enter_mta();
             match Music::new(pinned) {
                 Ok(mut music) => music.serve(inbox),
@@ -148,6 +167,7 @@ pub fn spawn(settings: &crate::config::Music) -> Option<Handle> {
         Ok(thread) => Some(Handle {
             requests,
             thread: Some(thread),
+            finished,
         }),
         Err(e) => {
             eprintln!("music: could not start the feed thread ({e:#})");

@@ -110,3 +110,22 @@ pub(crate) fn create_popup(
     unsafe { RegisterClassW(&wc) };
     unsafe { CreateWindowExW(ex_style, class, title, WS_POPUP, x, y, width, height, None, None, Some(instance.into()), None) }
 }
+
+/// The display scale (DPI / 96, at least 1) and work area of the monitor nearest `point`.
+///
+/// Per monitor rather than `GetDpiForSystem`: the process is per-monitor-DPI aware, and a panel
+/// shown on a secondary display at another scaling must be sized for that display.
+pub(crate) fn monitor_at(point: windows::Win32::Foundation::POINT) -> (f32, windows::Win32::Foundation::RECT) {
+    use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONEAREST};
+    use windows::Win32::UI::HiDpi::{GetDpiForMonitor, GetDpiForSystem, MDT_EFFECTIVE_DPI};
+
+    let monitor = unsafe { MonitorFromPoint(point, MONITOR_DEFAULTTONEAREST) };
+    let (mut dpi_x, mut dpi_y) = (0u32, 0u32);
+    let dpi = match unsafe { GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y) } {
+        Ok(()) if dpi_x > 0 => dpi_x,
+        _ => unsafe { GetDpiForSystem() },
+    };
+    let mut info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+    let work = if unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() { info.rcWork } else { Default::default() };
+    ((dpi as f32 / 96.0).max(1.0), work)
+}

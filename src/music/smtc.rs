@@ -231,6 +231,7 @@ pub enum Command {
 /// once and reused rather than per poll.
 pub struct Smtc {
     manager: SessionManager,
+    covers: std::cell::RefCell<CoverCache>,
 }
 
 impl Smtc {
@@ -239,7 +240,7 @@ impl Smtc {
             .context("SMTC RequestAsync")?
             .get()
             .context("awaiting the SMTC session manager")?;
-        Ok(Self { manager })
+        Ok(Self { manager, covers: Default::default() })
     }
 
     /// Every session Windows currently knows about, newest state each time.
@@ -297,7 +298,7 @@ impl Smtc {
             kind: briefs[index].kind,
             ..Default::default()
         };
-        read_properties_into(session, &mut snapshot);
+        read_properties_into(session, &mut snapshot, Some(&mut self.covers.borrow_mut()));
         Ok(Some(Reading {
             snapshot,
             timeline: read_timeline(session),
@@ -361,7 +362,7 @@ fn read_session(session: &Session) -> Result<Snapshot> {
         kind: brief.kind,
         ..Default::default()
     };
-    read_properties_into(session, &mut snapshot);
+    read_properties_into(session, &mut snapshot, None);
     Ok(snapshot)
 }
 
@@ -395,14 +396,58 @@ fn read_brief(session: &Session) -> Brief {
 ///
 /// The properties are a single async round-trip to the owning app, so a wedged
 /// player shows up here as a slow read. Treated as "nothing to draw yet".
-fn read_properties_into(session: &Session, snapshot: &mut Snapshot) {
+fn read_properties_into(session: &Session, snapshot: &mut Snapshot, covers: Option<&mut CoverCache>) {
     if let Ok(op) = session.TryGetMediaPropertiesAsync() {
         if let Ok(props) = op.get() {
             snapshot.title = props.Title().map(|s| s.to_string()).unwrap_or_default();
             snapshot.artist = props.Artist().map(|s| s.to_string()).unwrap_or_default();
             snapshot.album = props.AlbumTitle().map(|s| s.to_string()).unwrap_or_default();
-            snapshot.cover = read_thumbnail(&props);
+            snapshot.cover = match covers {
+                Some(covers) => covers.cover(CoverKey::of(snapshot), || read_thumbnail(&props)),
+                None => read_thumbnail(&props),
+            };
         }
+    }
+}
+
+/// Which track a cover belongs to.
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct CoverKey {
+    app_id: String,
+    title: String,
+    artist: String,
+}
+
+impl CoverKey {
+    fn of(snapshot: &Snapshot) -> Self {
+        Self { app_id: snapshot.app_id.clone(), title: snapshot.title.clone(), artist: snapshot.artist.clone() }
+    }
+}
+
+/// The current track's cover, so a poll does not reopen and decode the thumbnail stream.
+///
+/// Re-read for the first [`CoverCache::SETTLE_POLLS`] polls of a track (players can publish the new
+/// title before its art) and while there is none; reused after that.
+#[derive(Default)]
+struct CoverCache {
+    key: Option<CoverKey>,
+    polls: u32,
+    bytes: Option<Vec<u8>>,
+}
+
+impl CoverCache {
+    const SETTLE_POLLS: u32 = 3;
+
+    fn cover(&mut self, key: CoverKey, read: impl FnOnce() -> Option<Vec<u8>>) -> Option<Vec<u8>> {
+        if self.key.as_ref() != Some(&key) {
+            self.key = Some(key);
+            self.polls = 0;
+        }
+        self.polls = self.polls.saturating_add(1);
+        if self.polls <= Self::SETTLE_POLLS || self.bytes.is_none() {
+            self.bytes = read();
+        }
+        self.bytes.clone()
     }
 }
 
@@ -516,5 +561,45 @@ mod tests {
         let now = now_ticks();
         let years = (now - measured).abs() as f64 / (SECOND as f64 * 86_400.0 * 365.0);
         assert!(years < 5.0, "now_ticks is {years} years from a real reading");
+    }
+
+    fn key(title: &str) -> CoverKey {
+        CoverKey { app_id: "YTM!App".into(), title: title.into(), artist: "Artist".into() }
+    }
+
+    #[test]
+    fn a_settled_cover_is_not_read_again() {
+        let mut cache = CoverCache::default();
+        let mut reads = 0;
+        for _ in 0..10 {
+            let got = cache.cover(key("A"), || {
+                reads += 1;
+                Some(vec![1, 2, 3])
+            });
+            assert_eq!(got, Some(vec![1, 2, 3]));
+        }
+        assert_eq!(reads, CoverCache::SETTLE_POLLS, "read while settling, reused after");
+    }
+
+    #[test]
+    fn a_new_track_reads_its_cover_again() {
+        let mut cache = CoverCache::default();
+        for _ in 0..5 {
+            cache.cover(key("A"), || Some(vec![1]));
+        }
+        // The new title arrives with the old art first; the settle window picks up the new one.
+        assert_eq!(cache.cover(key("B"), || Some(vec![1])), Some(vec![1]));
+        assert_eq!(cache.cover(key("B"), || Some(vec![2])), Some(vec![2]));
+        assert_eq!(cache.cover(key("B"), || Some(vec![9])), Some(vec![9]));
+        assert_eq!(cache.cover(key("B"), || panic!("settled")), Some(vec![9]));
+    }
+
+    #[test]
+    fn no_cover_keeps_asking() {
+        let mut cache = CoverCache::default();
+        for _ in 0..5 {
+            assert_eq!(cache.cover(key("A"), || None), None);
+        }
+        assert_eq!(cache.cover(key("A"), || Some(vec![7])), Some(vec![7]));
     }
 }

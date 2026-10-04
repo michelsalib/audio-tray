@@ -67,11 +67,11 @@ impl Config {
         Ok(dirs.config_dir().join("config.toml"))
     }
 
-    /// Load config, falling back to defaults if it's missing or unreadable — a bad
-    /// config file must never prevent the tray from starting.
+    /// Load config, falling back to defaults if it is missing or unreadable — a bad config file
+    /// must never prevent the tray from starting.
     pub fn load() -> Self {
-        match Self::try_load() {
-            Ok(cfg) => cfg,
+        match Self::path() {
+            Ok(path) => Self::load_from(&path),
             Err(e) => {
                 eprintln!("config: using defaults ({e:#})");
                 Self::default()
@@ -79,13 +79,28 @@ impl Config {
         }
     }
 
-    fn try_load() -> Result<Self> {
-        let path = Self::path()?;
-        if !path.exists() {
-            return Ok(Self::default());
+    /// A file that does not parse is renamed to `config.toml.bad` (replacing an older one) rather
+    /// than left for the next [`Config::save`] to overwrite: the user's icon choices are in it.
+    fn load_from(path: &std::path::Path) -> Self {
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Self::default(),
+            Err(e) => {
+                eprintln!("config: could not read {} ({e}); using defaults", path.display());
+                return Self::default();
+            }
+        };
+        match toml::from_str(&text) {
+            Ok(config) => config,
+            Err(e) => {
+                let bad = path.with_extension("toml.bad");
+                match std::fs::rename(path, &bad) {
+                    Ok(()) => eprintln!("config: {} is invalid ({e}); kept it as {} and using defaults", path.display(), bad.display()),
+                    Err(err) => eprintln!("config: {} is invalid ({e}) and could not be set aside ({err}); using defaults", path.display()),
+                }
+                Self::default()
+            }
         }
-        let text = std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-        toml::from_str(&text).context("parse config.toml")
     }
 
     pub fn save(&self) -> Result<()> {
@@ -137,6 +152,24 @@ mod tests {
         let back: Config = toml::from_str(&text).expect("deserialize");
 
         assert_eq!(back.icon_for("{0.0.0.00000000}.{abc}"), Some(IconId::Speakers));
+    }
+
+    #[test]
+    fn a_corrupt_config_is_set_aside_not_overwritten() {
+        let dir = std::env::temp_dir().join(format!("audio-tray-config-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "[icons
+this is not toml").unwrap();
+
+        let cfg = Config::load_from(&path);
+        assert!(cfg.icons.is_empty(), "defaults");
+        assert!(!path.exists(), "the bad file is moved out of the way");
+        let bad = std::fs::read_to_string(dir.join("config.toml.bad")).unwrap();
+        assert!(bad.contains("not toml"), "and kept intact");
+        // Missing is plain defaults, with nothing renamed.
+        assert!(Config::load_from(&path).icons.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Every config written while the taskbar strip was an opt-in still has a

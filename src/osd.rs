@@ -29,7 +29,6 @@ use windows::Win32::Graphics::Gdi::{
     GetMonitorInfoW, MonitorFromRect, MONITORINFO, MONITOR_DEFAULTTONEAREST,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::HiDpi::GetDpiForSystem;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetCursorPos, GetSystemMetrics, KillTimer,
     RegisterClassW, SetTimer, SetWindowPos, ShowWindow, HWND_TOPMOST, SM_CXSCREEN, SM_CYSCREEN,
@@ -134,7 +133,15 @@ impl Osd {
     /// without one it falls back to the pointer, which is over the buttons anyway — that is
     /// how the scroll got here.
     pub(crate) fn show(&mut self, flow: Flow, level: f32, muted: bool, anchor: Option<RECT>) {
-        if let Err(e) = self.ensure_window() {
+        let at = match anchor {
+            Some(slot) => POINT { x: (slot.left + slot.right) / 2, y: (slot.top + slot.bottom) / 2 },
+            None => {
+                let mut cursor = POINT::default();
+                let _ = unsafe { GetCursorPos(&mut cursor) };
+                cursor
+            }
+        };
+        if let Err(e) = self.ensure_window(crate::win::monitor_at(at).0) {
             eprintln!("osd: could not create the readout window ({e})");
             return;
         }
@@ -203,11 +210,9 @@ impl Osd {
         self.shown = false;
     }
 
-    /// Size the geometry to the current DPI and create the window if it does not exist yet.
-    fn ensure_window(&mut self) -> windows::core::Result<()> {
-        // Re-read every time: a monitor or scaling change while the tray runs would
-        // otherwise leave the readout sized for the old DPI for the life of the process.
-        let scale = (unsafe { GetDpiForSystem() } as f32 / 96.0).max(1.0);
+    /// Size the geometry for `scale` (the DPI of the monitor it is about to appear on, re-read per
+    /// appearance) and create the window if it does not exist yet.
+    fn ensure_window(&mut self, scale: f32) -> windows::core::Result<()> {
         if (scale - self.scale).abs() > 0.01 {
             self.scale = scale;
             self.width = (PANEL_W * scale).round() as i32;

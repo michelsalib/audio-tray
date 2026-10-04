@@ -121,6 +121,9 @@ pub unsafe fn sweep(diagnostics: &IXamlDiagnostics) {
     let mut stale: Vec<state::Strip> = Vec::new();
 
     for button in find_buttons(diagnostics, &host) {
+        if !crate::live() {
+            return;
+        }
         let Some(border) = find_background_element(button) else {
             logf!("music: {} has no Border#BackgroundElement", host.name);
             continue;
@@ -184,6 +187,9 @@ pub unsafe fn sweep(diagnostics: &IXamlDiagnostics) {
     // width and rebuilds its indicators, so a single application is undone within a second. Each of
     // these is a no-op when the value is already ours.
     for (button, border) in drawn {
+        if !crate::live() {
+            return;
+        }
         tile::hide_app_icon(diagnostics, button);
         tile::widen(diagnostics, border, &host);
         tile::place_button_state(diagnostics, button);
@@ -234,6 +240,11 @@ fn clear_progress_bar() {
     };
 
     unsafe extern "system" fn visit(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        // A panic must not unwind into user32: treat it as "stop".
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { visit_inner(hwnd, lparam) })).unwrap_or(BOOL(0))
+    }
+
+    unsafe fn visit_inner(hwnd: HWND, lparam: LPARAM) -> BOOL {
         let search = unsafe { &mut *(lparam.0 as *mut (String, Option<HWND>)) };
         if !unsafe { IsWindowVisible(hwnd) }.as_bool() {
             return BOOL(1);

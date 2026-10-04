@@ -57,6 +57,14 @@ pub fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
+/// Runs a COM method body, turning a panic into `E_UNEXPECTED`: nothing may unwind into Explorer.
+fn guarded<T>(what: &str, body: impl FnOnce() -> Result<T>) -> Result<T> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)).unwrap_or_else(|_| {
+        logf!("{what} panicked");
+        Err(windows::Win32::Foundation::E_UNEXPECTED.into())
+    })
+}
+
 /// Locks a mutex, taking the contents of a poisoned one rather than panicking.
 ///
 /// Every lock in this DLL goes through here. A panic inside Explorer's UI thread
@@ -254,12 +262,10 @@ pub(crate) fn diagnostics() -> Option<xamlom::IXamlDiagnostics> {
     if raw == 0 {
         return None;
     }
-    let stored = unsafe {
+    let stored = core::mem::ManuallyDrop::new(unsafe {
         core::mem::transmute::<*mut c_void, xamlom::IXamlDiagnostics>(raw as *mut c_void)
-    };
-    let borrowed = stored.clone();
-    core::mem::forget(stored);
-    Some(borrowed)
+    });
+    Some((*stored).clone())
 }
 
 /// The live `IXamlDiagnostics`, as a raw pointer so other threads can reach it.
@@ -355,6 +361,8 @@ pub(crate) fn hand_over(data: &str) -> isize {
     }
     let before = strip_state();
     configure(data);
+    // A revert still pending from the old owner is superseded: the new owner wants the strip.
+    STAND_DOWN_PENDING.store(false, Ordering::SeqCst);
     let was_active = ACTIVE.swap(true, Ordering::SeqCst);
     CURRENT.store(GENERATION.load(Ordering::SeqCst), Ordering::SeqCst);
     if was_active && strip_state() != before {
@@ -429,22 +437,20 @@ impl IObjectWithSite_Impl for Tap_Impl {
     fn SetSite(&self, punksite: Ref<'_, windows_core::IUnknown>) -> Result<()> {
         // A panic unwinding out of here would cross the COM boundary and abort
         // explorer.exe, so the whole body runs inside a catch.
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.set_site(punksite)))
-            .unwrap_or_else(|_| {
-                logf!("SetSite panicked");
-                Err(E_POINTER.into())
-            })
+        guarded("SetSite", || self.set_site(punksite))
     }
 
     fn GetSite(&self, riid: *const GUID, ppvsite: *mut *mut c_void) -> Result<()> {
-        if ppvsite.is_null() {
-            return Err(E_POINTER.into());
-        }
-        unsafe { *ppvsite = core::ptr::null_mut() };
-        match self.state().site.as_ref() {
-            Some(site) => unsafe { site.query(riid, ppvsite).ok() },
-            None => Err(E_POINTER.into()),
-        }
+        guarded("GetSite", || {
+            if ppvsite.is_null() {
+                return Err(E_POINTER.into());
+            }
+            unsafe { *ppvsite = core::ptr::null_mut() };
+            match self.state().site.as_ref() {
+                Some(site) => unsafe { site.query(riid, ppvsite).ok() },
+                None => Err(E_POINTER.into()),
+            }
+        })
     }
 }
 
@@ -478,7 +484,10 @@ impl Tap_Impl {
                 let mut raw: *mut u16 = core::ptr::null_mut();
                 let hr = unsafe { diagnostics.GetInitializationData(&mut raw) };
                 let data = if hr == S_OK {
-                    unsafe { bstr_to_string(raw) }
+                    let text = unsafe { bstr_to_string(raw) };
+                    // The out-BSTR is ours to free.
+                    drop(unsafe { windows_core::BSTR::from_raw(raw) });
+                    text
                 } else {
                     String::new()
                 };
@@ -570,10 +579,9 @@ impl IVisualTreeServiceCallback_Impl for Tap_Impl {
                 // here is the whole reason it was deferred: this is the thread
                 // that may touch the tray.
                 if let Some(pid) = lifecycle::take_pending_revert() {
-                    if lifecycle::revert_is_current(pid) {
-                        logf!("running the deferred revert");
-                        stand_down();
-                    }
+                    // Posted, not run: no XAML from inside this callback.
+                    logf!("posting the deferred revert");
+                    lifecycle::request_revert(pid);
                 }
             }
 
@@ -675,6 +683,7 @@ pub(crate) unsafe fn stand_down() {
     // nor the periodic sweep.
     ACTIVE.store(false, Ordering::SeqCst);
     CURRENT.store(0, Ordering::SeqCst);
+    STAND_DOWN_PENDING.store(false, Ordering::SeqCst);
 
     match diagnostics() {
         Some(diagnostics) => {
@@ -765,14 +774,50 @@ impl Drop for BusyGuard {
 /// # Safety
 /// XAML UI thread only — it is called from the control window's timer.
 pub(crate) unsafe fn sweep() {
-    if !ACTIVE.load(Ordering::SeqCst) {
-        return;
-    }
     // Dropped if a visual-tree callback — or another sweep — is already inside a
-    // XAML call on this thread. Skipping is always safe: the next tick is 3s away.
+    // XAML call on this thread. Skipping is always safe: the next tick is at most 4 s away.
     let Some(_busy) = BusyGuard::claim() else {
         return;
     };
+    sweep_claimed();
+    // A revert that arrived mid-sweep (see [`revert`]) runs now, still under the claim.
+    if STAND_DOWN_PENDING.swap(false, Ordering::SeqCst) {
+        stand_down();
+    }
+}
+
+/// Whether the strip is still wanted. Checked between the sweep's phases: a revert pumped in
+/// during one of its XAML calls clears it, and nothing may be written after that.
+pub(crate) fn live() -> bool {
+    ACTIVE.load(Ordering::SeqCst)
+}
+
+/// A revert that could not run because a XAML call was in flight; the sweep finishes it.
+static STAND_DOWN_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Answer a revert request: stand down now, or — if a XAML call further up this stack is in
+/// flight (an STA pumps during outgoing COM calls) — stop all writing at once and leave the
+/// restore to the sweep, which runs it under the busy claim as soon as that call returns.
+///
+/// # Safety
+/// Tray thread only.
+pub(crate) unsafe fn revert() {
+    let Some(_busy) = BusyGuard::claim() else {
+        ACTIVE.store(false, Ordering::SeqCst);
+        CURRENT.store(0, Ordering::SeqCst);
+        STAND_DOWN_PENDING.store(true, Ordering::SeqCst);
+        unsafe { lifecycle::set_sweep_pace(false) };
+        logf!("revert deferred — a XAML call is in flight");
+        return;
+    };
+    stand_down();
+}
+
+/// The body of [`sweep`], under its busy claim.
+unsafe fn sweep_claimed() {
+    if !live() {
+        return;
+    }
     let Some(diagnostics) = diagnostics() else {
         return;
     };
@@ -815,8 +860,14 @@ pub(crate) unsafe fn sweep() {
     // "Decorate unless it is already done", so this covers a strip the shell
     // overwrote as well as an icon that arrived with no further event to notice it.
     try_decorate(&diagnostics);
+    if !live() {
+        return;
+    }
 
     enforce_hidden(&diagnostics);
+    if !live() {
+        return;
+    }
 
     if strip_placed() && !REORDERED.load(Ordering::SeqCst) && reorder::sections_ready() {
         reorder_now(&diagnostics);
@@ -831,12 +882,18 @@ pub(crate) unsafe fn sweep() {
     }
 
     report_slot_metrics(&diagnostics);
+    if !live() {
+        return;
+    }
 
     // The music tile, last: it decorates a *different* element from everything above — an app own
     // taskbar button rather than our notify icon — so nothing here depends on it and it depends on
     // nothing here except the two guards at the top of this function, which are the whole reason a
     // `put_*` against a taskbar element is safe at all.
     music::sweep(&diagnostics);
+    if !live() {
+        return;
+    }
 
     // Nothing left to apply — drop to the slow cadence until something comes
     // undone. `strip_placed` going false again (the shell re-binding the
@@ -1379,16 +1436,18 @@ impl IClassFactory_Impl for Factory_Impl {
         riid: *const GUID,
         ppvobject: *mut *mut c_void,
     ) -> Result<()> {
-        if ppvobject.is_null() {
-            return Err(E_POINTER.into());
-        }
-        unsafe { *ppvobject = core::ptr::null_mut() };
-        if !punkouter.is_null() {
-            return Err(windows::Win32::Foundation::CLASS_E_NOAGGREGATION.into());
-        }
-        logf!("Factory::CreateInstance");
-        let tap: IObjectWithSite = Tap::new().into();
-        unsafe { tap.query(riid, ppvobject).ok() }
+        guarded("CreateInstance", || {
+            if ppvobject.is_null() {
+                return Err(E_POINTER.into());
+            }
+            unsafe { *ppvobject = core::ptr::null_mut() };
+            if !punkouter.is_null() {
+                return Err(windows::Win32::Foundation::CLASS_E_NOAGGREGATION.into());
+            }
+            logf!("Factory::CreateInstance");
+            let tap: IObjectWithSite = Tap::new().into();
+            unsafe { tap.query(riid, ppvobject).ok() }
+        })
     }
 
     fn LockServer(&self, _flock: windows_core::BOOL) -> Result<()> {

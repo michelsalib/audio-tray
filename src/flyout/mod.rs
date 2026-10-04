@@ -28,13 +28,12 @@ use std::time::Instant;
 
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{LPARAM, POINT};
-use windows::Win32::UI::HiDpi::GetDpiForSystem;
 use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, VK_ESCAPE};
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
     DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW, KillTimer, LoadCursorW, SetCursor,
-    SetForegroundWindow, SetTimer, ShowWindow, SystemParametersInfoW, TranslateMessage, IDC_ARROW,
-    MSG, SPI_GETWORKAREA, SW_SHOWNA, SW_SHOWNORMAL, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WHEEL_DELTA,
+    SetForegroundWindow, SetTimer, ShowWindow, TranslateMessage, IDC_ARROW,
+    MSG, SW_SHOWNA, SW_SHOWNORMAL, WHEEL_DELTA,
     WM_APP, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN,
     WM_TIMER,
 };
@@ -165,7 +164,17 @@ unsafe fn show_inner(
     anchor: Option<Anchor>,
     start_icons: bool,
 ) -> Outcome {
-    let scale = (GetDpiForSystem() as f32 / 96.0).max(1.0);
+    // Where it opens: centred above the tray icon, else at the cursor. Its monitor decides the scale
+    // and the work area it is clamped to.
+    let (cx, bottom) = match anchor {
+        Some(a) => (a.cx, a.bottom),
+        None => {
+            let mut cur = POINT::default();
+            let _ = GetCursorPos(&mut cur);
+            (cur.x, cur.y)
+        }
+    };
+    let (scale, work_area) = crate::win::monitor_at(POINT { x: cx, y: bottom });
     let accent = accent_rgb();
 
     let groups = build_groups(backend, config);
@@ -185,22 +194,9 @@ unsafe fn show_inner(
         anim: None,
     };
 
-    // Resolve the anchor: bottom-right above the tray icon, else the cursor.
-    let _ = SystemParametersInfoW(
-        SPI_GETWORKAREA,
-        0,
-        Some(&mut fly.surface.wa as *mut _ as *mut std::ffi::c_void),
-        SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
-    );
+    fly.surface.wa = work_area;
     let gap = (8.0 * scale) as i32;
-    let (cx, bottom) = match anchor {
-        Some(a) => (a.cx, a.bottom - gap),
-        None => {
-            let mut cur = POINT::default();
-            let _ = GetCursorPos(&mut cur);
-            (cur.x, cur.y)
-        }
-    };
+    let bottom = if anchor.is_some() { bottom - gap } else { bottom };
     fly.surface.base_cx = cx;
     fly.surface.base_bottom = bottom.min(fly.surface.wa.bottom - fly.surface.margin);
 
@@ -594,10 +590,7 @@ impl Flyout<'_> {
                     let id = self.model.groups[group].devices[dev].id.0.clone();
                     self.model.groups[group].devices[dev].icon = icon;
                     self.config.set_icon(id, icon);
-                    self.model.config_changed = true;
-                    if let Err(e) = self.config.save() {
-                        eprintln!("save config failed: {e:#}");
-                    }
+                    self.model.config_changed = true; // saved by the caller, once, on close
                     self.sync_strip();
                     self.navigate(View::Main, false);
                 }

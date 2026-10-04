@@ -66,11 +66,15 @@ impl Action {
 /// actually finds it.
 fn find_receiver() -> Option<HWND> {
     unsafe extern "system" fn visit(hwnd: HWND, lparam: LPARAM) -> BOOL {
-        if unsafe { class_of(hwnd) } == RECEIVER_CLASS_NAME {
-            unsafe { *(lparam.0 as *mut HWND) = hwnd };
-            return BOOL(0); // found — stop enumerating
-        }
-        BOOL(1)
+        // A panic must not unwind into user32 (and through it, Explorer): treat it as "stop".
+        std::panic::catch_unwind(|| {
+            if unsafe { class_of(hwnd) } == RECEIVER_CLASS_NAME {
+                unsafe { *(lparam.0 as *mut HWND) = hwnd };
+                return BOOL(0); // found — stop enumerating
+            }
+            BOOL(1)
+        })
+        .unwrap_or(BOOL(0))
     }
 
     let mut found = HWND(core::ptr::null_mut());

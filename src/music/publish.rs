@@ -115,9 +115,11 @@ impl Publisher {
     }
 
     /// Write new cover bytes to a fresh filename and drop the previous one.
+    ///
+    /// On a failed write the previous cover stays current (and on disk), so nothing is leaked and
+    /// the next poll retries.
     fn write_cover(&mut self, cover: Option<&[u8]>) -> Result<Option<String>> {
-        let previous = self.current_cover.take();
-        let path = match cover {
+        let next = match cover {
             Some(bytes) => {
                 self.cover_generation += 1;
                 let path = std::env::temp_dir().join(format!(
@@ -126,17 +128,16 @@ impl Publisher {
                     self.cover_generation
                 ));
                 write_atomically(&path, bytes).context("writing the cover art")?;
-                let display = path.to_string_lossy().into_owned();
-                self.current_cover = Some(path);
-                Some(display)
+                Some(path)
             }
             None => None,
         };
+        let display = next.as_ref().map(|path| path.to_string_lossy().into_owned());
         // Only after the new one is in place: the TAP may still be rendering the old path.
-        if let Some(previous) = previous {
+        if let Some(previous) = std::mem::replace(&mut self.current_cover, next) {
             let _ = std::fs::remove_file(previous);
         }
-        Ok(path)
+        Ok(display)
     }
 }
 
@@ -184,13 +185,24 @@ fn sanitise(text: &str) -> String {
 /// Write via a temp file and rename, so a reader never sees a partial file.
 fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
     let temp = path.with_extension("tmp");
-    {
-        let mut file = std::fs::File::create(&temp)?;
+    let written = std::fs::File::create(&temp).and_then(|mut file| {
         file.write_all(bytes)?;
-        file.flush()?;
+        file.flush()
+    });
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&temp);
+        return Err(e.into());
     }
     // `rename` over an existing file fails on Windows; `fs::rename` maps to MoveFileEx
     // with replace semantics in std, so this is safe.
-    std::fs::rename(&temp, path)?;
+    std::fs::rename(&temp, path).inspect_err(|_| {
+        let _ = std::fs::remove_file(&temp);
+    })?;
     Ok(())
+}
+
+/// Remove the published state file, from any thread — the fallback when the feed thread cannot
+/// run its own [`Publisher::clear`]. The cover file is left for the next start's sweep.
+pub fn remove_published() {
+    let _ = std::fs::remove_file(state_path());
 }

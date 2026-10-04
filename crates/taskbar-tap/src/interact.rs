@@ -359,14 +359,13 @@ unsafe fn suppress_tap(args: *mut c_void) -> bool {
     if args.is_null() {
         return false;
     }
-    let inspectable = core::mem::transmute::<*mut c_void, IInspectable>(args);
-    let handled = inspectable
+    // Borrowed: XAML owns the args. ManuallyDrop means a panic below cannot release them.
+    let inspectable = ManuallyDrop::new(core::mem::transmute::<*mut c_void, IInspectable>(args));
+    inspectable
         .cast::<crate::winrt::ITappedRoutedEventArgs>()
         .ok()
         .map(|event| event.put_Handled(1) == S_OK)
-        .unwrap_or(false);
-    core::mem::forget(inspectable); // XAML owns the args
-    handled
+        .unwrap_or(false)
 }
 
 /// The same, for a pointer press.
@@ -377,14 +376,12 @@ unsafe fn suppress_pointer(args: *mut c_void) -> bool {
     if args.is_null() {
         return false;
     }
-    let inspectable = core::mem::transmute::<*mut c_void, IInspectable>(args);
-    let handled = inspectable
+    let inspectable = ManuallyDrop::new(core::mem::transmute::<*mut c_void, IInspectable>(args));
+    inspectable
         .cast::<IPointerRoutedEventArgs>()
         .ok()
         .map(|event| event.put_Handled(1) == S_OK)
-        .unwrap_or(false);
-    core::mem::forget(inspectable);
-    handled
+        .unwrap_or(false)
 }
 
 /// Wire one of the music tile's transport glyphs.

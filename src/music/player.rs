@@ -30,8 +30,13 @@ pub fn remember_player(app_id: &str) {
     if !app_id.contains('!') {
         return;
     }
+    let mut known = REMEMBERED.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if known.as_deref() == Some(app_id) {
+        return;
+    }
     let Some(path) = remembered_path() else { return };
-    if remembered_player().as_deref() == Some(app_id) {
+    *known = Some(app_id.to_string());
+    if std::fs::read_to_string(&path).is_ok_and(|on_disk| on_disk.trim() == app_id) {
         return;
     }
     if let Some(parent) = path.parent() {
@@ -39,6 +44,9 @@ pub fn remember_player(app_id: &str) {
     }
     let _ = std::fs::write(path, app_id);
 }
+
+/// What [`remember_player`] last wrote or confirmed, so a poll costs no file read.
+static REMEMBERED: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
 /// The last packaged player identity we saw.
 pub fn remembered_player() -> Option<String> {

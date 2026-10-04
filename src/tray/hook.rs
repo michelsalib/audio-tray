@@ -99,13 +99,7 @@ fn flow_at(pt: POINT) -> Flow {
         return Flow::Output;
     }
     match icon_rect() {
-        Some(slot) if pt.x >= slot.left && pt.x < slot.right && pt.y >= slot.top && pt.y < slot.bottom => {
-            if pt.x < (slot.left + slot.right) / 2 {
-                Flow::Output
-            } else {
-                Flow::Input
-            }
-        }
+        Some(slot) if in_slot(pt) && pt.x >= (slot.left + slot.right) / 2 => Flow::Input,
         _ => Flow::Output,
     }
 }
@@ -117,12 +111,33 @@ unsafe fn point_over_tray(pt: POINT) -> bool {
         return false;
     }
     let root: HWND = unsafe { GetAncestor(hwnd, GA_ROOT) };
-    matches!(
-        crate::win::class_name(root).as_str(),
-        "Shell_TrayWnd"
-            | "Shell_SecondaryTrayWnd"
-            | "NotifyIconOverflowWindow"
-            | "TopLevelWindowForOverflowXamlIsland"
-            | "Xaml_WindowedPopupClass"
-    )
+    wheel_belongs_to_tray(&crate::win::class_name(root), crate::taskbar::strip_is_up(), in_slot(pt))
+}
+
+/// Whether a wheel over a window of `class` is ours. A `Xaml_WindowedPopupClass` is any XAML
+/// popup in any app; it only counts over our own strip (whose hover tooltip is one).
+fn wheel_belongs_to_tray(class: &str, strip_up: bool, over_slot: bool) -> bool {
+    match class {
+        "Shell_TrayWnd" | "Shell_SecondaryTrayWnd" | "NotifyIconOverflowWindow" | "TopLevelWindowForOverflowXamlIsland" => true,
+        "Xaml_WindowedPopupClass" => strip_up && over_slot,
+        _ => false,
+    }
+}
+
+fn in_slot(pt: POINT) -> bool {
+    icon_rect().is_some_and(|slot| pt.x >= slot.left && pt.x < slot.right && pt.y >= slot.top && pt.y < slot.bottom)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::wheel_belongs_to_tray;
+
+    #[test]
+    fn only_our_strip_claims_a_xaml_popup() {
+        assert!(wheel_belongs_to_tray("Shell_TrayWnd", false, false));
+        assert!(wheel_belongs_to_tray("Xaml_WindowedPopupClass", true, true));
+        assert!(!wheel_belongs_to_tray("Xaml_WindowedPopupClass", true, false), "another app's popup");
+        assert!(!wheel_belongs_to_tray("Xaml_WindowedPopupClass", false, true), "no strip up");
+        assert!(!wheel_belongs_to_tray("Chrome_WidgetWin_1", true, true));
+    }
 }

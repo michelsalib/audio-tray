@@ -160,7 +160,7 @@ unsafe extern "system" fn control_proc(
                 return;
             }
             logf!("revert requested — on thread {}", crate::tid());
-            unsafe { crate::stand_down() };
+            unsafe { crate::revert() };
         });
         if caught.is_err() {
             logf!("revert handler panicked");

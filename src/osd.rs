@@ -20,20 +20,18 @@
 //! Everything here runs on the tray thread; the fade timer ticks on the tray's message window
 //! ([`Osd::new`]), which calls [`Osd::tick`].
 
-use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use windows::core::w;
-use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     GetMonitorInfoW, MonitorFromRect, MONITORINFO, MONITOR_DEFAULTTONEAREST,
 };
-use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, GetCursorPos, GetSystemMetrics, KillTimer,
-    RegisterClassW, SetTimer, SetWindowPos, ShowWindow, HWND_TOPMOST, SM_CXSCREEN, SM_CYSCREEN,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE, SW_SHOWNA, WNDCLASSW, WS_EX_LAYERED,
-    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+    DefWindowProcW, DestroyWindow, GetCursorPos, GetSystemMetrics, KillTimer, SetTimer, SetWindowPos,
+    ShowWindow, HWND_TOPMOST, SM_CXSCREEN, SM_CYSCREEN, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+    SW_HIDE, SW_SHOWNA, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    WS_EX_TRANSPARENT,
 };
 
 use crate::audio::Flow;
@@ -224,41 +222,15 @@ impl Osd {
             return Ok(());
         }
 
-        static REGISTERED: OnceLock<()> = OnceLock::new();
-        let hinstance = HINSTANCE(unsafe { GetModuleHandleW(None) }?.0);
-        REGISTERED.get_or_init(|| {
-            let wc = WNDCLASSW {
-                lpfnWndProc: Some(wndproc),
-                hInstance: hinstance,
-                lpszClassName: w!("AudioTrayVolumeOsd"),
-                ..Default::default()
-            };
-            unsafe { RegisterClassW(&wc) };
-        });
-
         // `WS_EX_TRANSPARENT` + `WS_EX_NOACTIVATE` make it a pure readout: clicks fall
-        // straight through to the taskbar underneath, so covering the clock for three
-        // seconds never costs the user a click.
-        let hwnd = unsafe {
-            CreateWindowExW(
-                WS_EX_LAYERED
-                    | WS_EX_TOOLWINDOW
-                    | WS_EX_TOPMOST
-                    | WS_EX_NOACTIVATE
-                    | WS_EX_TRANSPARENT,
-                w!("AudioTrayVolumeOsd"),
-                w!("Audio volume"),
-                WS_POPUP,
-                0,
-                0,
-                self.width,
-                self.height,
-                None,
-                None,
-                Some(hinstance),
-                None,
-            )
-        }?;
+        // straight through to the taskbar underneath.
+        let hwnd = crate::win::create_popup(
+            w!("AudioTrayVolumeOsd"),
+            w!("Audio volume"),
+            Some(wndproc),
+            WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT,
+            (0, 0, self.width, self.height),
+        )?;
         self.hwnd = hwnd;
         // Same treatment as the flyout, but the smaller corner: the panel is only 32 DIP
         // tall, and the flyout's radius over-curves it.

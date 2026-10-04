@@ -23,13 +23,12 @@
 use std::sync::Mutex;
 
 use windows::Win32::Foundation::S_OK;
-use windows_core::{IInspectable, Interface, HSTRING};
+use windows_core::{IInspectable, Interface};
 
-use crate::decorate::object_from_handle;
+use crate::decorate::{element, object_from_handle};
 use crate::log::logf;
 use crate::winrt::{
-    IBorder, IFrameworkElement, IXamlReaderStatics, Thickness, HORIZONTAL_ALIGNMENT_LEFT,
-    XAML_READER,
+    IBorder, IFrameworkElement, Thickness, HORIZONTAL_ALIGNMENT_LEFT,
 };
 use crate::xamlom::{InstanceHandle, IXamlDiagnostics};
 
@@ -117,10 +116,7 @@ unsafe fn remember(diagnostics: &IXamlDiagnostics, handle: InstanceHandle) {
     if originals.iter().any(|(known, _)| *known == handle) {
         return;
     }
-    let Some(object) = object_from_handle(diagnostics, handle) else {
-        return;
-    };
-    let Ok(framework) = object.cast::<IFrameworkElement>() else {
+    let Some(framework) = element::<IFrameworkElement>(diagnostics, handle) else {
         return;
     };
     // `NaN` for a width that was never set, which is what `put_Width` itself treats as unset. Writing
@@ -155,10 +151,7 @@ unsafe fn remember(diagnostics: &IXamlDiagnostics, handle: InstanceHandle) {
 pub unsafe fn restore(diagnostics: &IXamlDiagnostics) {
     let originals = std::mem::take(&mut *crate::lock(&ORIGINALS));
     for (handle, original) in originals {
-        let Some(object) = object_from_handle(diagnostics, handle) else {
-            continue;
-        };
-        let Ok(framework) = object.cast::<IFrameworkElement>() else {
+        let Some(framework) = element::<IFrameworkElement>(diagnostics, handle) else {
             continue;
         };
         // Position before size: putting the margin and alignment back first means the element is
@@ -207,35 +200,14 @@ pub unsafe fn set_child(
 /// # Safety
 /// XAML UI thread only.
 pub unsafe fn clear_child(diagnostics: &IXamlDiagnostics, handle: InstanceHandle) -> bool {
-    let Some(target) = object_from_handle(diagnostics, handle) else {
-        return false;
-    };
-    let Ok(border) = target.cast::<IBorder>() else {
+    let Some(border) = element::<IBorder>(diagnostics, handle) else {
         return false;
     };
     border.put_Child(core::ptr::null_mut()) == S_OK
 }
 
-/// Build a live element from markup.
-///
-/// `XamlReader.Load`, because `IVisualTreeService::CreateInstance` is `E_NOTIMPL` inside Explorer —
-/// the same reason audio-tray's own strip is built this way.
-///
-/// # Safety
-/// XAML UI thread only.
 unsafe fn load_markup(markup: &str) -> Option<IInspectable> {
-    let reader: IXamlReaderStatics = crate::decorate::factory(XAML_READER)?;
-    let markup = HSTRING::from(markup);
-    // `HSTRING` is repr(transparent) over the handle; `as_ptr` would hand over the UTF-16 buffer
-    // instead, which the callee would misread as a handle.
-    let handle = core::mem::transmute_copy::<HSTRING, *mut core::ffi::c_void>(&markup);
-    let mut created: *mut core::ffi::c_void = core::ptr::null_mut();
-    let hr = reader.Load(handle, &mut created);
-    if hr != S_OK || created.is_null() {
-        logf!("music: XamlReader.Load rejected the strip markup: 0x{:08x}", hr.0);
-        return None;
-    }
-    Some(core::mem::transmute::<*mut core::ffi::c_void, IInspectable>(created))
+    crate::decorate::load_xaml(markup)
 }
 
 /// Widen the host `Border` **and every ancestor up to the `ItemsRepeater`**.
@@ -283,10 +255,7 @@ pub unsafe fn widen(diagnostics: &IXamlDiagnostics, border: InstanceHandle, host
 /// # Safety
 /// XAML UI thread only.
 unsafe fn set_width(diagnostics: &IXamlDiagnostics, handle: InstanceHandle, width: f64) {
-    let Some(object) = object_from_handle(diagnostics, handle) else {
-        return;
-    };
-    let Ok(framework) = object.cast::<IFrameworkElement>() else {
+    let Some(framework) = element::<IFrameworkElement>(diagnostics, handle) else {
         return;
     };
     // Already ours: writing the same value four times a second buys nothing, and skipping is also the
@@ -309,10 +278,7 @@ unsafe fn set_width(diagnostics: &IXamlDiagnostics, handle: InstanceHandle, widt
 /// # Safety
 /// XAML UI thread only.
 unsafe fn pin_left(diagnostics: &IXamlDiagnostics, handle: InstanceHandle) {
-    let Some(object) = object_from_handle(diagnostics, handle) else {
-        return;
-    };
-    let Ok(framework) = object.cast::<IFrameworkElement>() else {
+    let Some(framework) = element::<IFrameworkElement>(diagnostics, handle) else {
         return;
     };
     let mut alignment = 0i32;
@@ -330,10 +296,7 @@ unsafe fn pin_left(diagnostics: &IXamlDiagnostics, handle: InstanceHandle) {
 /// # Safety
 /// XAML UI thread only.
 unsafe fn set_margin_left(diagnostics: &IXamlDiagnostics, handle: InstanceHandle, left: f64) {
-    let Some(object) = object_from_handle(diagnostics, handle) else {
-        return;
-    };
-    let Ok(framework) = object.cast::<IFrameworkElement>() else {
+    let Some(framework) = element::<IFrameworkElement>(diagnostics, handle) else {
         return;
     };
     let mut live = Thickness::default();

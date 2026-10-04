@@ -129,3 +129,11 @@ pub(crate) fn monitor_at(point: windows::Win32::Foundation::POINT) -> (f32, wind
     let work = if unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() { info.rcWork } else { Default::default() };
     ((dpi as f32 / 96.0).max(1.0), work)
 }
+
+/// A window's title, empty when it has none.
+pub(crate) fn window_title(hwnd: windows::Win32::Foundation::HWND) -> String {
+    use windows::Win32::UI::WindowsAndMessaging::GetWindowTextW;
+    let mut buf = [0u16; 512];
+    let len = unsafe { GetWindowTextW(hwnd, &mut buf) };
+    String::from_utf16_lossy(&buf[..len.max(0) as usize])
+}

@@ -8,14 +8,10 @@
 //! drawing itself (the controller fills the buffers via [`super::render`] and hands them
 //! here to present), or the layered blend, which is [`crate::layered`]'s.
 
-use std::sync::OnceLock;
-
 use windows::core::w;
-use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
-use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, LoadCursorW, PostMessageW, RegisterClassW, IDC_ARROW,
-    WM_CAPTURECHANGED, WNDCLASSW, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    DefWindowProcW, PostMessageW, WM_CAPTURECHANGED, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
 };
 
 use super::layout::LaidElem;
@@ -69,36 +65,13 @@ impl Surface {
     }
 
     pub(super) fn create_window(&mut self) -> windows::core::Result<()> {
-        static REGISTERED: OnceLock<()> = OnceLock::new();
-        let hinstance = HINSTANCE(unsafe { GetModuleHandleW(None) }?.0);
-        REGISTERED.get_or_init(|| {
-            let cursor = unsafe { LoadCursorW(None, IDC_ARROW) }.unwrap_or_default();
-            let wc = WNDCLASSW {
-                lpfnWndProc: Some(wndproc),
-                hInstance: hinstance,
-                hCursor: cursor,
-                lpszClassName: w!("AudioTrayFlyout"),
-                ..Default::default()
-            };
-            unsafe { RegisterClassW(&wc) };
-        });
-
-        let hwnd = unsafe {
-            CreateWindowExW(
-                WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
-                w!("AudioTrayFlyout"),
-                w!("Audio"),
-                WS_POPUP,
-                self.x,
-                self.y,
-                self.width,
-                self.height,
-                None,
-                None,
-                Some(hinstance),
-                None,
-            )
-        }?;
+        let hwnd = crate::win::create_popup(
+            w!("AudioTrayFlyout"),
+            w!("Audio"),
+            Some(wndproc),
+            WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
+            (self.x, self.y, self.width, self.height),
+        )?;
         self.hwnd = hwnd;
         unsafe { crate::layered::style_panel(hwnd, crate::layered::CORNER_ROUND) };
         Ok(())

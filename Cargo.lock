@@ -78,6 +78,7 @@ dependencies = [
  "directories",
  "self_update",
  "serde",
+ "tap-proto",
  "toml 1.1.6+spec-1.1.0",
  "tray-icon",
  "windows",
@@ -2080,6 +2081,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "tap-proto"
+version = "0.0.0"
+
+[[package]]
 name = "target-lexicon"
 version = "0.12.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2089,6 +2094,7 @@ checksum = "61c41af27dd6d1e27b1b16b489db798443478cef1f06a660c96db617ba5de3b1"
 name = "taskbar-tap"
 version = "0.0.0"
 dependencies = [
+ "tap-proto",
  "windows",
  "windows-core",
  "winresource",

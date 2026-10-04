@@ -26,6 +26,7 @@ name = "xaml-tap-inject"
 path = "src/main.rs"
 
 [dependencies]
+tap-proto = { path = "../tap-proto" }
 # Shares the main crate's pin — same workspace now, so a skew on GUID/HRESULT/BSTR
 # types is impossible rather than merely discouraged.
 windows-core = "0.61"

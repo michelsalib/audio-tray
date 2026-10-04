@@ -2,7 +2,7 @@
 # The TAP DLL that draws our controls into the taskbar. A member so CI, clippy and
 # cargo-release cover it; `cargo build` here still builds only audio-tray, since
 # the DLL cannot be relinked while Explorer holds it loaded.
-members = ["crates/taskbar-tap"]
+members = ["crates/taskbar-tap", "crates/tap-proto"]
 
 [package]
 name = "audio-tray"
@@ -23,6 +23,8 @@ publish = false
 dev = []
 
 [dependencies]
+# Constants shared with the TAP (window classes, message ids, codes).
+tap-proto = { path = "crates/tap-proto" }
 ab_glyph = "0.2.32"
 anyhow = "1"
 # Undocumented IPolicyConfig binding for switching the default endpoint. Isolated

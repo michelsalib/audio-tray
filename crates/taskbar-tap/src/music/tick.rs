@@ -71,12 +71,12 @@ impl Segment {
         }
     }
 
-    /// Wire code for the message posted to audio-tray. **Must match `taskbar::Action` there.**
+    /// Wire code for the message posted to audio-tray (`tap_proto::ACTION_*`).
     pub fn code(self) -> usize {
         match self {
-            Self::Previous => 10,
-            Self::PlayPause => 11,
-            Self::Next => 12,
+            Self::Previous => tap_proto::ACTION_MUSIC_PREVIOUS,
+            Self::PlayPause => tap_proto::ACTION_MUSIC_PLAY_PAUSE,
+            Self::Next => tap_proto::ACTION_MUSIC_NEXT,
         }
     }
 }

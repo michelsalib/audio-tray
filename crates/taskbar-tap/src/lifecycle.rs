@@ -27,39 +27,21 @@ use windows::Win32::System::Threading::{
 };
 use windows::Win32::System::DataExchange::COPYDATASTRUCT;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, KillTimer, PostMessageW, RegisterClassW, SetTimer, HMENU, WM_APP,
+    CreateWindowExW, DefWindowProcW, KillTimer, PostMessageW, RegisterClassW, SetTimer, HMENU,
     WM_COPYDATA, WM_TIMER, WNDCLASSW, WS_EX_TOOLWINDOW, WS_POPUP,
 };
 
 use crate::log::logf;
 
-/// Class name audio-tray looks for. Must match `TAP_CONTROL_CLASS` on the
-/// audio-tray side.
-pub const CONTROL_CLASS: &str = "AudioTrayTapControl";
+pub use tap_proto::CONTROL_CLASS;
 
-/// "Undo everything and stand down." Sent when the user turns the feature off,
-/// and when audio-tray exits.
-pub const WM_TAP_REVERT: u32 = WM_APP + 21;
+pub use tap_proto::WM_TAP_REVERT;
 
-/// "The devices changed — redraw with these glyphs."
-///
-/// The init data is read once in `SetSite`, so it cannot carry a device switch.
-/// Both glyphs fit in the message parameters, so nothing has to be shared: `wParam`
-/// carries the output codepoint with its muted flag at bit 24, `lParam` the input —
-/// which carries one flag more, "an app is recording", at bit 25.
-/// Must match `WM_TAP_RESTYLE` on the audio-tray side.
-pub const WM_TAP_RESTYLE: u32 = WM_APP + 23;
+pub use tap_proto::WM_TAP_RESTYLE;
 
-/// "Transport buttons have just been built — attach their handlers now."
-///
-/// Never crosses a process boundary, unlike its neighbours, but it shares their numbering because
-/// they all land on windows in this process: audio-tray uses `WM_APP + 20` through `+ 25`, so this
-/// starts after them rather than colliding with one from the other side.
-pub const WM_TAP_WIRE_TRANSPORT: u32 = WM_APP + 26;
+pub use tap_proto::WM_TAP_WIRE_TRANSPORT;
 
-/// "A tracked button's `ProgressIndicator`/`RunningIndicator` was just rebuilt — re-pin it." In-process,
-/// like [`WM_TAP_WIRE_TRANSPORT`]; posted from the visual-tree callback, handled here.
-pub const WM_TAP_REPIN: u32 = WM_APP + 27;
+pub use tap_proto::WM_TAP_REPIN;
 
 /// Retries a re-pin that met a busy thread or a stream that was not yet quiet.
 const REPIN_TIMER: usize = 2;
@@ -184,9 +166,9 @@ unsafe extern "system" fn control_proc(
             // alone — "an app is recording" at bit 25.
             let glyph = |packed: usize| {
                 (
-                    char::from_u32((packed & 0x00FF_FFFF) as u32),
-                    packed & (1 << 24) != 0,
-                    packed & (1 << 25) != 0,
+                    char::from_u32((packed & tap_proto::RESTYLE_GLYPH_MASK) as u32),
+                    packed & tap_proto::RESTYLE_MUTED != 0,
+                    packed & tap_proto::RESTYLE_RECORDING != 0,
                 )
             };
             let (out, out_muted, _) = glyph(wparam.0);
@@ -497,8 +479,7 @@ pub fn request_revert(pid: u32) {
 /// Owner pids with a watcher thread running.
 static WATCHED: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
 
-/// `COPYDATASTRUCT::dwData` tagging a handover payload ("ATH1"). Must match `taskbar.rs`.
-pub const HANDOVER_MAGIC: usize = 0x4154_4831;
+pub use tap_proto::HANDOVER_MAGIC;
 
 /// Full path of this DLL, to tell our own copy from another build's.
 pub fn own_module_path() -> Option<String> {

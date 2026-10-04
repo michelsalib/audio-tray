@@ -9,8 +9,7 @@
 //! Written atomically by the app (temp file then rename), so a half-written state is never
 //! read. Both sides must agree on [`STATE_FILE`] and on the key names.
 
-/// Where the app publishes the state. **Must match `music::publish::STATE_FILE` in audio-tray.**
-pub const STATE_FILE: &str = "audio-tray-music.txt";
+pub use tap_proto::MUSIC_STATE_FILE as STATE_FILE;
 
 pub fn state_path() -> std::path::PathBuf {
     std::env::temp_dir().join(STATE_FILE)

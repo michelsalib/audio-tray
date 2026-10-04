@@ -40,13 +40,9 @@ use windows::Win32::UI::WindowsAndMessaging::{GetShellWindow, GetWindowThreadPro
 use windows_core::{GUID, HRESULT, PCSTR, PCWSTR};
 
 /// The TAP's class id, matched by the DLL's `DllGetClassObject`.
-const CLSID_TAP: GUID = GUID::from_u128(0xb3e9_2816_117d_476f_936e_06ed_52b2_e55d);
+const CLSID_TAP: GUID = GUID::from_u128(tap_proto::CLSID_TAP);
 
-/// Shared XAML Diagnostics endpoint name — the single-consumer bottleneck.
-const ENDPOINT_NAME: &str = "VisualDiagConnection1";
-
-/// Ships next to `audio-tray.exe`.
-const TAP_DLL: &str = "audio_tray_tap.dll";
+use tap_proto::{ENDPOINT_NAME, TAP_DLL};
 
 type InitializeXamlDiagnosticsEx = unsafe extern "system" fn(
     end_point_name: PCWSTR,
@@ -126,13 +122,9 @@ fn just_injected(pid: u32) -> bool {
         .is_some_and(|(was, at)| was == pid && at.elapsed() < WINDOW)
 }
 
-/// Window class of the TAP's control window, inside `explorer.exe`. Must match
-/// `CONTROL_CLASS` in the TAP's `lifecycle` module.
-const TAP_CONTROL_CLASS: &str = "AudioTrayTapControl";
+use tap_proto::CONTROL_CLASS as TAP_CONTROL_CLASS;
 
-/// "Put the taskbar back." Must match `WM_TAP_REVERT` in the TAP's `lifecycle`
-/// module.
-const WM_TAP_REVERT: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 21;
+use tap_proto::WM_TAP_REVERT;
 
 /// Ask the injected TAP to undo its changes.
 ///
@@ -272,17 +264,7 @@ impl Default for StripIcons {
     }
 }
 
-/// Codepoints standing in for the two icons Segoe Fluent has no glyph for.
-///
-/// **Plane 15 private use, not the BMP private-use area.** Segoe Fluent Icons
-/// itself occupies much of the latter (roughly U+E700..U+F8B3), so a BMP PUA
-/// codepoint could collide with a real glyph. These two are guaranteed not to.
-///
-/// The TAP recognises them and draws the shapes as XAML vectors rather than looking
-/// for a glyph. Must match `EARBUDS_WIRELESS` / `EARBUDS_ROUND` in the TAP's
-/// `decorate` module.
-const GLYPH_WIRELESS_EARBUDS: char = '\u{F0001}';
-const GLYPH_ROUND_EARBUDS: char = '\u{F0002}';
+use tap_proto::{GLYPH_ROUND_EARBUDS, GLYPH_WIRELESS_EARBUDS};
 
 /// The codepoint the strip should carry for an icon.
 ///
@@ -355,11 +337,7 @@ fn init_data(icons: StripIcons, owner_pid: u32) -> String {
 /// Our receiver window, for the `hwnd=` key. Set by [`create_receiver`].
 static RECEIVER: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
 
-/// `COPYDATASTRUCT::dwData` tagging a handover. Must match `HANDOVER_MAGIC` in the TAP's
-/// `lifecycle` module, as must the two result codes below (its `HANDOVER_*`).
-const HANDOVER_MAGIC: usize = 0x4154_4831;
-const HANDOVER_ACCEPTED: usize = 1;
-const HANDOVER_DECLINED: usize = 2;
+use tap_proto::{HANDOVER_ACCEPTED, HANDOVER_DECLINED, HANDOVER_MAGIC};
 
 /// Hand every TAP already loaded in Explorer a fresh init payload naming `owner_pid` as its owner.
 ///
@@ -394,7 +372,7 @@ fn offer_handover(icons: StripIcons, owner_pid: u32) -> Result<()> {
                 Some(&mut result),
             )
         };
-        match (sent.0, result) {
+        match (sent.0, result as isize) {
             (0, _) => why.push("did not answer".to_string()),
             (_, HANDOVER_ACCEPTED) => return Ok(()),
             (_, HANDOVER_DECLINED) => why.push("is from another build".to_string()),
@@ -416,9 +394,7 @@ pub fn transfer_owner(child_pid: u32, icons: StripIcons) {
     }
 }
 
-/// "Redraw the strip with these glyphs." Must match `WM_TAP_RESTYLE` in the TAP's
-/// `lifecycle` module.
-const WM_TAP_RESTYLE: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 23;
+use tap_proto::WM_TAP_RESTYLE;
 
 /// Tell an injected TAP that the devices changed, so the strip follows them.
 ///
@@ -443,11 +419,9 @@ pub fn restyle(icons: StripIcons) -> bool {
     let Some(control) = control_window() else {
         return false;
     };
-    // Codepoint in the low 24 bits (Unicode needs 21), then a bit per flag above it: muted
-    // at 24 for either segment, recording at 25 for the input. Must match the unpacking in
-    // the TAP's `lifecycle`.
+    // The codepoint plus a flag bit each; recording is only ever set for the input.
     let pack = |glyph: char, muted: bool, recording: bool| {
-        glyph as usize | (usize::from(muted) << 24) | (usize::from(recording) << 25)
+        glyph as usize | if muted { tap_proto::RESTYLE_MUTED } else { 0 } | if recording { tap_proto::RESTYLE_RECORDING } else { 0 }
     };
     let posted = unsafe {
         PostMessageW(
@@ -487,12 +461,12 @@ impl Action {
     /// separately without silently disagreeing about enum ordering.
     pub fn from_code(code: usize) -> Option<Self> {
         match code {
-            1 => Some(Self::CycleOutput),
-            2 => Some(Self::CycleInput),
-            3 => Some(Self::OpenPanel),
-            10 => Some(Self::MusicPrevious),
-            11 => Some(Self::MusicPlayPause),
-            12 => Some(Self::MusicNext),
+            tap_proto::ACTION_CYCLE_OUTPUT => Some(Self::CycleOutput),
+            tap_proto::ACTION_CYCLE_INPUT => Some(Self::CycleInput),
+            tap_proto::ACTION_OPEN_PANEL => Some(Self::OpenPanel),
+            tap_proto::ACTION_MUSIC_PREVIOUS => Some(Self::MusicPrevious),
+            tap_proto::ACTION_MUSIC_PLAY_PAUSE => Some(Self::MusicPlayPause),
+            tap_proto::ACTION_MUSIC_NEXT => Some(Self::MusicNext),
             _ => None,
         }
     }
@@ -501,12 +475,12 @@ impl Action {
     #[cfg(feature = "dev")]
     fn code(self) -> usize {
         match self {
-            Self::CycleOutput => 1,
-            Self::CycleInput => 2,
-            Self::OpenPanel => 3,
-            Self::MusicPrevious => 10,
-            Self::MusicPlayPause => 11,
-            Self::MusicNext => 12,
+            Self::CycleOutput => tap_proto::ACTION_CYCLE_OUTPUT,
+            Self::CycleInput => tap_proto::ACTION_CYCLE_INPUT,
+            Self::OpenPanel => tap_proto::ACTION_OPEN_PANEL,
+            Self::MusicPrevious => tap_proto::ACTION_MUSIC_PREVIOUS,
+            Self::MusicPlayPause => tap_proto::ACTION_MUSIC_PLAY_PAUSE,
+            Self::MusicNext => tap_proto::ACTION_MUSIC_NEXT,
         }
     }
 }
@@ -621,42 +595,21 @@ const PROGRESS_SCALE: usize = 1000;
 /// `wParam` value meaning "clear the bar" — outside the `0..=PROGRESS_SCALE` range a fraction uses.
 const PROGRESS_NONE: usize = usize::MAX;
 
-/// The music feed handing the tray a progress-bar value: `wParam` is the fraction in
-/// [`PROGRESS_SCALE`]ths (or [`PROGRESS_NONE`]), `lParam` is 1 while playing.
-///
-/// Posted **within** the process, feed thread to tray thread, unlike every other message here — the
-/// TAP has no part in it. It exists so the shell call happens on an STA; see [`post_progress`].
-pub const WM_MUSIC_PROGRESS: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 25;
+pub use tap_proto::WM_MUSIC_PROGRESS;
 
-/// Window class of the receiver. Must match `RECEIVER_CLASS` in the TAP's `ipc`
-/// module — the TAP finds this window by class name.
 #[cfg(feature = "dev")]
-const RECEIVER_CLASS_NAME: &str = "AudioTrayTaskbarIpc";
+use tap_proto::RECEIVER_CLASS as RECEIVER_CLASS_NAME;
 
-/// The same name, wide and NUL-terminated, for `RegisterClassW`. `w!` takes a
-/// literal and there is no const way back from it to a `&str`, so the two are
-/// spelled out separately — keep them identical.
-const RECEIVER_CLASS: PCWSTR = windows::core::w!("AudioTrayTaskbarIpc");
+pub use tap_proto::WM_TASKBAR_ACTION;
 
-/// Message the TAP posts; `wParam` carries the [`Action`] code.
-pub const WM_TASKBAR_ACTION: u32 =
-    windows::Win32::UI::WindowsAndMessaging::WM_APP + 20;
-
-/// A scroll over one of the buttons: `wParam` is the direction ([`flow_code`]) and `lParam`
-/// the signed wheel delta, in `WHEEL_DELTA` units.
-///
-/// Its own message rather than an [`Action`] code because the tray folds a burst of them into
-/// one volume change (a touchpad gesture is tens of sub-notch deltas). Posted by the TAP (the
-/// touchpad's only route in) and by the tray's wheel hook. Must match `WM_TASKBAR_SCROLL` in the
-/// TAP's `ipc` module.
-pub const WM_TASKBAR_SCROLL: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 24;
+pub use tap_proto::WM_TASKBAR_SCROLL;
 
 /// Wire code for a direction in [`WM_TASKBAR_SCROLL`]'s `wParam`. Explicit on both sides, so
 /// the exe and the DLL can be built separately without agreeing by accident.
 pub fn flow_code(flow: crate::audio::Flow) -> usize {
     match flow {
-        crate::audio::Flow::Output => 0,
-        crate::audio::Flow::Input => 1,
+        crate::audio::Flow::Output => tap_proto::FLOW_OUTPUT,
+        crate::audio::Flow::Input => tap_proto::FLOW_INPUT,
     }
 }
 
@@ -664,15 +617,12 @@ pub fn flow_code(flow: crate::audio::Flow) -> usize {
 /// direction the wheel has always adjusted.
 pub fn flow_from_code(code: usize) -> crate::audio::Flow {
     match code {
-        1 => crate::audio::Flow::Input,
+        tap_proto::FLOW_INPUT => crate::audio::Flow::Input,
         _ => crate::audio::Flow::Output,
     }
 }
 
-/// Explorer restarted — re-inject. The shell *sends* `TaskbarCreated`, so the tray re-posts it as
-/// this rather than injecting inside the shell's broadcast.
-pub const WM_TASKBAR_RESTARTED: u32 =
-    windows::Win32::UI::WindowsAndMessaging::WM_APP + 22;
+pub use tap_proto::WM_TASKBAR_RESTARTED;
 
 /// The shell's "the taskbar is back" broadcast, registered once.
 pub fn taskbar_created_message() -> u32 {
@@ -691,7 +641,9 @@ pub fn taskbar_created_message() -> u32 {
 /// it by class with `EnumWindows`, which does not see message-only windows.
 pub fn create_receiver(proc: windows::Win32::UI::WindowsAndMessaging::WNDPROC) -> Result<windows::Win32::Foundation::HWND> {
     use windows::Win32::UI::WindowsAndMessaging::WS_EX_TOOLWINDOW;
-    let hwnd = crate::win::create_popup(RECEIVER_CLASS, RECEIVER_CLASS, proc, WS_EX_TOOLWINDOW, (0, 0, 0, 0))
+    let class = windows_core::HSTRING::from(tap_proto::RECEIVER_CLASS);
+    let class = PCWSTR(class.as_ptr());
+    let hwnd = crate::win::create_popup(class, class, proc, WS_EX_TOOLWINDOW, (0, 0, 0, 0))
         .context("create the taskbar IPC receiver window")?;
     RECEIVER.store(hwnd.0 as isize, std::sync::atomic::Ordering::SeqCst);
     Ok(hwnd)

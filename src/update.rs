@@ -34,9 +34,7 @@ const REPO_NAME: &str = "audio-tray";
 const BIN_NAME: &str = "audio-tray";
 /// Must match the asset name suffix produced by the release workflow.
 const TARGET: &str = "x86_64-pc-windows-msvc";
-/// The taskbar TAP, which travels with the exe. Must match `TAP_DLL` in
-/// [`crate::taskbar`] and the name the release workflow puts in the zip.
-const TAP_DLL: &str = "audio_tray_tap.dll";
+use tap_proto::TAP_DLL;
 
 /// Set to the new version string once a background update has been downloaded and applied
 /// to the on-disk exe. The flyout reads this to offer a "restart to update" entry; the new

@@ -17,24 +17,14 @@ use crate::log::logf;
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows_core::BOOL;
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetClassNameW, PostMessageW, WM_APP,
+    EnumWindows, GetClassNameW, PostMessageW,
 };
 
-/// Window class of audio-tray's receiver. Must match `RECEIVER_CLASS` on the
-/// audio-tray side.
-const RECEIVER_CLASS_NAME: &str = "AudioTrayTaskbarIpc";
+use tap_proto::RECEIVER_CLASS as RECEIVER_CLASS_NAME;
 
-/// The message audio-tray listens for. `wParam` carries the [`Action`] code.
-const WM_TASKBAR_ACTION: u32 = WM_APP + 20;
+use tap_proto::WM_TASKBAR_ACTION;
 
-/// A scroll over one of the segments: `wParam` is the direction (0 = output, 1 = input) and
-/// `lParam` the signed wheel delta, in `WHEEL_DELTA` units.
-///
-/// Its own message rather than another [`Action`] code, because it carries a delta and
-/// because audio-tray coalesces these — a touchpad gesture is tens of them, and draining
-/// them from its queue must not swallow queued clicks. Must match `WM_TASKBAR_SCROLL` on the
-/// audio-tray side.
-const WM_TASKBAR_SCROLL: u32 = WM_APP + 24;
+use tap_proto::WM_TASKBAR_SCROLL;
 
 /// What the user did on the strip.
 #[derive(Clone, Copy)]
@@ -50,9 +40,9 @@ impl Action {
     /// and audio-tray can be rebuilt independently without silently disagreeing.
     fn code(self) -> usize {
         match self {
-            Self::Cycle(Segment::Output) => 1,
-            Self::Cycle(Segment::Input) => 2,
-            Self::OpenPanel => 3,
+            Self::Cycle(Segment::Output) => tap_proto::ACTION_CYCLE_OUTPUT,
+            Self::Cycle(Segment::Input) => tap_proto::ACTION_CYCLE_INPUT,
+            Self::OpenPanel => tap_proto::ACTION_OPEN_PANEL,
         }
     }
 }
@@ -157,8 +147,8 @@ pub fn send(action: Action) {
 /// with the ones behind it — is audio-tray's to decide, like every other gesture here.
 pub fn send_scroll(segment: Segment, delta: i32) {
     let flow = match segment {
-        Segment::Output => 0,
-        Segment::Input => 1,
+        Segment::Output => tap_proto::FLOW_OUTPUT,
+        Segment::Input => tap_proto::FLOW_INPUT,
     };
     post(WM_TASKBAR_SCROLL, flow, delta as isize);
 }

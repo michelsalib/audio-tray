@@ -248,57 +248,29 @@ pub struct WindowReport {
 pub fn player_windows(all: bool) -> Vec<WindowReport> {
     use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
     use windows::Win32::UI::WindowsAndMessaging::{
-        EnumWindows, GetClassNameW, GetWindowLongW, GetWindowRect, GetWindowTextW,
-        GetWindowThreadProcessId, IsIconic, IsWindowVisible, GWL_EXSTYLE,
+        GetWindowLongW, GetWindowRect, GetWindowThreadProcessId, IsIconic, IsWindowVisible, GWL_EXSTYLE,
     };
-    use windows_core::BOOL;
 
-    struct Survey {
-        all: bool,
-        found: Vec<WindowReport>,
-    }
-
-    unsafe extern "system" fn visit(
-        hwnd: HWND,
-        lparam: windows::Win32::Foundation::LPARAM,
-    ) -> BOOL {
-        let survey = unsafe { &mut *(lparam.0 as *mut Survey) };
-        let found = &mut survey.found;
-        let mut title = [0u16; 512];
-        let len = unsafe { GetWindowTextW(hwnd, &mut title) };
-        if len == 0 {
-            return BOOL(1);
-        }
-        let title = String::from_utf16_lossy(&title[..len as usize]);
-        if !survey.all && !title.to_lowercase().contains("youtube") {
-            return BOOL(1);
-        }
-        if survey.all && !unsafe { IsWindowVisible(hwnd) }.as_bool() {
-            return BOOL(1);
+    let mut found = Vec::new();
+    crate::win::enum_windows(|hwnd| {
+        let title = crate::win::window_title(hwnd);
+        let visible = unsafe { IsWindowVisible(hwnd) }.as_bool();
+        if title.is_empty() || (!all && !title.to_lowercase().contains("youtube")) || (all && !visible) {
+            return true;
         }
         let mut pid = 0u32;
         let _ = unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
         let mut cloaked = 0u32;
         let _ = unsafe {
-            DwmGetWindowAttribute(
-                hwnd,
-                DWMWA_CLOAKED,
-                &mut cloaked as *mut u32 as *mut core::ffi::c_void,
-                size_of::<u32>() as u32,
-            )
+            DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &mut cloaked as *mut u32 as *mut core::ffi::c_void, size_of::<u32>() as u32)
         };
         let mut rect = windows::Win32::Foundation::RECT::default();
         let _ = unsafe { GetWindowRect(hwnd, &mut rect) };
-        let mut class = [0u16; 128];
-        let class_len = unsafe { GetClassNameW(hwnd, &mut class) };
-        let class = String::from_utf16_lossy(&class[..class_len.max(0) as usize]);
+        let class = crate::win::class_name(hwnd);
         let ex_style = unsafe { GetWindowLongW(hwnd, GWL_EXSTYLE) };
-        // The two fields the title cannot supply, and the reason this survey grew them: the shell's
-        // own identity for the window, and whose process it is.
+        // The shell's identity for the window and its process: the two fields the title cannot supply.
         let app_id = window_app_id(hwnd);
         let process = window_process(hwnd);
-        // The verdict, so this survey answers the question it is run to answer: would this window
-        // be decorated as the player's?
         let player = session::window_is_player(app_id.as_deref(), process.as_deref());
         let app_id = app_id.unwrap_or_else(|| "<none>".to_string());
         let process = process.unwrap_or_else(|| "<unknown>".to_string());
@@ -306,11 +278,10 @@ pub fn player_windows(all: bool) -> Vec<WindowReport> {
             hwnd: hwnd.0 as isize,
             player,
             line: format!(
-                "hwnd {:?} pid {pid} {process} vis {} icon {} cloak {cloaked} \
+                "hwnd {:?} pid {pid} {process} vis {visible} icon {} cloak {cloaked} \
                  rect {},{} {}x{} ex {ex_style:#x} class {class}\n    aumid {app_id}\n    \
                  player {player}\n    title {title}",
                 hwnd.0,
-                unsafe { IsWindowVisible(hwnd) }.as_bool(),
                 unsafe { IsIconic(hwnd) }.as_bool(),
                 rect.left,
                 rect.top,
@@ -318,20 +289,9 @@ pub fn player_windows(all: bool) -> Vec<WindowReport> {
                 rect.bottom - rect.top,
             ),
         });
-        BOOL(1)
-    }
-
-    let mut survey = Survey {
-        all,
-        found: Vec::new(),
-    };
-    let _ = unsafe {
-        EnumWindows(
-            Some(visit),
-            windows::Win32::Foundation::LPARAM(&mut survey as *mut Survey as isize),
-        )
-    };
-    survey.found
+        true
+    });
+    found
 }
 
 /// Whether a window is the player's own — the shell's identity for it, then its process.
@@ -358,45 +318,21 @@ pub fn is_player_window(hwnd: HWND) -> bool {
 /// them; that is the bug [`session::window_is_player`] exists to stop, and the title check is now
 /// only the cheap first half of it.
 pub fn player_window() -> Option<HWND> {
-    use windows::Win32::UI::WindowsAndMessaging::{EnumWindows, GetWindowTextW, IsWindowVisible};
-    use windows_core::BOOL;
+    use windows::Win32::UI::WindowsAndMessaging::IsWindowVisible;
 
-    struct Search {
-        found: HWND,
-    }
-
-    unsafe extern "system" fn visit(
-        hwnd: HWND,
-        lparam: windows::Win32::Foundation::LPARAM,
-    ) -> BOOL {
-        let search = unsafe { &mut *(lparam.0 as *mut Search) };
+    let mut found = None;
+    crate::win::enum_windows(|hwnd| {
         if !unsafe { IsWindowVisible(hwnd) }.as_bool() {
-            return BOOL(1);
+            return true;
         }
-        let mut title = [0u16; 512];
-        let len = unsafe { GetWindowTextW(hwnd, &mut title) };
-        if len > 0 {
-            let title = String::from_utf16_lossy(&title[..len as usize]).to_lowercase();
-            // The identity is asked for second, and only of a window the title already matched:
-            // it is a cross-process shell call, and this runs on every poll.
-            if title.contains("youtube music") && is_player_window(hwnd) {
-                search.found = hwnd;
-                return BOOL(0);
-            }
+        // The identity is asked second, and only of a title match: it is a cross-process shell
+        // call, and this runs on every poll.
+        if crate::win::window_title(hwnd).to_lowercase().contains("youtube music") && is_player_window(hwnd) {
+            found = Some(hwnd);
         }
-        BOOL(1)
-    }
-
-    let mut search = Search {
-        found: HWND(std::ptr::null_mut()),
-    };
-    let _ = unsafe {
-        EnumWindows(
-            Some(visit),
-            windows::Win32::Foundation::LPARAM(&mut search as *mut Search as isize),
-        )
-    };
-    (!search.found.0.is_null()).then_some(search.found)
+        found.is_none()
+    });
+    found
 }
 
 /// Set the taskbar progress bar on the player's window — the line MPC-HC draws under its icon.

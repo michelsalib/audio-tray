@@ -1,0 +1,10 @@
+# The wire protocol between audio-tray and its TAP: window classes, message ids, codes and keys
+# both sides must agree on. Plain constants and no dependencies, so either side can use it.
+[package]
+name = "tap-proto"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+path = "src/lib.rs"

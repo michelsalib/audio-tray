@@ -15,8 +15,7 @@ use anyhow::{Context, Result};
 
 use crate::music::feed::{PlaybackStatus, State};
 
-/// Where the state is published. **Must match `state::STATE_FILE` in the TAP.**
-const STATE_FILE: &str = "audio-tray-music.txt";
+use tap_proto::MUSIC_STATE_FILE as STATE_FILE;
 
 /// Cover files are written as `audio-tray-cover-<pid>-<n>.png`.
 ///

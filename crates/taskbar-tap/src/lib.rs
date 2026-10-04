@@ -43,12 +43,9 @@ use xamlom::{
 
 /// Our TAP's class id. Never registered anywhere — `InitializeXamlDiagnosticsEx`
 /// passes it straight to our own `DllGetClassObject`.
-pub const CLSID_TAP: GUID = GUID::from_u128(0xb3e9_2816_117d_476f_936e_06ed_52b2_e55d);
+pub const CLSID_TAP: GUID = GUID::from_u128(tap_proto::CLSID_TAP);
 
-/// The XAML diagnostics endpoint. This name is the reason the mechanism is
-/// effectively single-consumer: TranslucentTB and Windhawk's Taskbar Styler use
-/// the very same one.
-pub const ENDPOINT_NAME: &str = "VisualDiagConnection1";
+pub use tap_proto::ENDPOINT_NAME;
 
 /// The DLL that exports `InitializeXamlDiagnosticsEx`.
 pub const XAML_DLL: &str = "Windows.UI.Xaml.dll";
@@ -329,10 +326,7 @@ fn configure(data: &str) {
 /// The app version this DLL shipped with (stamped by build.rs from the root manifest).
 pub const APP_VERSION: &str = env!("AUDIO_TRAY_VERSION");
 
-/// Outcome codes of a handover, returned from the control window's `WM_COPYDATA`. 0 is what an
-/// older TAP without the handler answers (`DefWindowProc`). Must match `taskbar.rs`.
-pub const HANDOVER_ACCEPTED: isize = 1;
-pub const HANDOVER_DECLINED: isize = 2;
+pub use tap_proto::{HANDOVER_ACCEPTED, HANDOVER_DECLINED};
 
 /// Whether a new audio-tray may adopt this already-loaded TAP: the same app version, and the
 /// same DLL file it would have injected. Anything else needs a fresh Explorer.

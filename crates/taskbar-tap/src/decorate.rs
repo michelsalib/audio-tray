@@ -241,14 +241,7 @@ impl StripState {
     }
 }
 
-/// Markers audio-tray sends for the two icons Segoe Fluent has no glyph for.
-///
-/// Plane 15 private use rather than the BMP private-use area, because Segoe Fluent
-/// occupies much of the latter itself (roughly U+E700..U+F8B3) and a BMP codepoint
-/// could collide with a real glyph. Must match `GLYPH_WIRELESS_EARBUDS` /
-/// `GLYPH_ROUND_EARBUDS` on the audio-tray side.
-const EARBUDS_WIRELESS: char = '\u{F0001}';
-const EARBUDS_ROUND: char = '\u{F0002}';
+use tap_proto::{GLYPH_ROUND_EARBUDS as EARBUDS_ROUND, GLYPH_WIRELESS_EARBUDS as EARBUDS_WIRELESS};
 
 /// Stroke width of the hand-drawn icons, as a fraction of the icon box.
 ///
@@ -707,9 +700,7 @@ pub unsafe fn automation_name(
     handle: InstanceHandle,
 ) -> Option<String> {
     let statics: IAutomationPropertiesStatics = factory(AUTOMATION_PROPERTIES)?;
-    let element = object_from_handle(diagnostics, handle)?
-        .cast::<IDependencyObject>()
-        .ok()?;
+    let element = element::<IDependencyObject>(diagnostics, handle)?;
     let mut raw: *mut c_void = core::ptr::null_mut();
     if statics.GetName(element.as_raw(), &mut raw) != S_OK || raw.is_null() {
         return None;
@@ -762,21 +753,9 @@ pub unsafe fn set_chevron_content(
     presenter: InstanceHandle,
     state: StripState,
 ) -> bool {
-    let Some(reader) = factory::<IXamlReaderStatics>(XAML_READER) else {
+    let Some(content) = load_xaml(&strip_markup(state)) else {
         return false;
     };
-
-    let markup = HSTRING::from(strip_markup(state));
-    let mut created: *mut c_void = core::ptr::null_mut();
-    // `HSTRING` is repr(transparent) over the handle; `as_ptr` would hand over the
-    // UTF-16 buffer instead, which the callee would misread as a handle.
-    let markup_handle = core::mem::transmute_copy::<HSTRING, *mut c_void>(&markup);
-    let hr = reader.Load(markup_handle, &mut created);
-    if hr != S_OK || created.is_null() {
-        logf!("XamlReader.Load failed: 0x{:08x}", hr.0);
-        return false;
-    }
-    let content = core::mem::transmute::<*mut c_void, IInspectable>(created);
     logf!(
         "XamlReader.Load ok -> {}",
         content.GetRuntimeClassName().map(|n| n.to_string()).unwrap_or_default()
@@ -852,9 +831,7 @@ pub unsafe fn descendant_of_class(
     let statics: IVisualTreeHelperStatics = factory(VISUAL_TREE_HELPER)?;
     // `VisualTreeHelper` deals in `DependencyObject`; handing it the plain
     // `IInspectable` would call through the wrong vtable.
-    let root = object_from_handle(diagnostics, icon)?
-        .cast::<IDependencyObject>()
-        .ok()?;
+    let root = element::<IDependencyObject>(diagnostics, icon)?;
 
     let mut frontier = vec![root];
     let mut visited = 0usize;
@@ -913,10 +890,7 @@ pub unsafe fn holds_our_strip(
     diagnostics: &IXamlDiagnostics,
     presenter: InstanceHandle,
 ) -> bool {
-    let Some(object) = object_from_handle(diagnostics, presenter) else {
-        return false;
-    };
-    let Ok(iface) = object.cast::<IContentPresenter>() else {
+    let Some(iface) = element::<IContentPresenter>(diagnostics, presenter) else {
         return false;
     };
     let mut raw: *mut c_void = core::ptr::null_mut();
@@ -969,8 +943,7 @@ pub const MIC_GLYPHS: &[char] = &['\u{E720}', '\u{EC71}', '\u{F12E}', '\u{E1D6}'
 /// # Safety
 /// XAML UI thread only.
 pub unsafe fn text_of(diagnostics: &IXamlDiagnostics, handle: InstanceHandle) -> Option<String> {
-    let object = object_from_handle(diagnostics, handle)?;
-    let text_block = object.cast::<ITextBlock>().ok()?;
+    let text_block = element::<ITextBlock>(diagnostics, handle)?;
     let mut raw: *mut c_void = core::ptr::null_mut();
     if text_block.get_Text(&mut raw) != S_OK || raw.is_null() {
         return None;
@@ -1041,8 +1014,7 @@ pub struct Layout {
 /// # Safety
 /// XAML UI thread only.
 pub unsafe fn layout_of(diagnostics: &IXamlDiagnostics, handle: InstanceHandle) -> Option<Layout> {
-    let object = object_from_handle(diagnostics, handle)?;
-    let element = object.cast::<IUIElement>().ok()?;
+    let element = element::<IUIElement>(diagnostics, handle)?;
     let mut visibility = 0i32;
     if element.get_Visibility(&mut visibility) != S_OK {
         return None;
@@ -1050,7 +1022,7 @@ pub unsafe fn layout_of(diagnostics: &IXamlDiagnostics, handle: InstanceHandle) 
     // Not every UIElement is a FrameworkElement; those simply have no width to
     // put back, and `NaN` is the value `put_Width` treats as "unset" anyway.
     let (mut width, mut min_width) = (f64::NAN, f64::NAN);
-    if let Ok(framework) = object.cast::<IFrameworkElement>() {
+    if let Ok(framework) = element.cast::<IFrameworkElement>() {
         if framework.get_Width(&mut width) != S_OK {
             width = f64::NAN;
         }
@@ -1130,8 +1102,7 @@ pub unsafe fn content_of(
     diagnostics: &IXamlDiagnostics,
     presenter: InstanceHandle,
 ) -> Option<*mut c_void> {
-    let object = object_from_handle(diagnostics, presenter)?;
-    let iface = object.cast::<IContentPresenter>().ok()?;
+    let iface = element::<IContentPresenter>(diagnostics, presenter)?;
     let mut raw: *mut c_void = core::ptr::null_mut();
     (iface.get_Content(&mut raw) == S_OK).then_some(raw)
 }
@@ -1170,10 +1141,7 @@ pub unsafe fn set_opacity(
     handle: InstanceHandle,
     opacity: f64,
 ) -> bool {
-    let Some(object) = object_from_handle(diagnostics, handle) else {
-        return false;
-    };
-    let Ok(element) = object.cast::<IUIElement>() else {
+    let Some(element) = element::<IUIElement>(diagnostics, handle) else {
         return false;
     };
     let hr = element.put_Opacity(opacity);
@@ -1203,8 +1171,7 @@ pub unsafe fn actual_size(
     diagnostics: &IXamlDiagnostics,
     handle: InstanceHandle,
 ) -> Option<(f64, f64)> {
-    let object = object_from_handle(diagnostics, handle)?;
-    let framework = object.cast::<IFrameworkElement>().ok()?;
+    let framework = element::<IFrameworkElement>(diagnostics, handle)?;
     let mut width = 0.0f64;
     let mut height = 0.0f64;
     (framework.get_ActualWidth(&mut width) == S_OK && framework.get_ActualHeight(&mut height) == S_OK)
@@ -1224,8 +1191,7 @@ pub unsafe fn content_size(
     diagnostics: &IXamlDiagnostics,
     presenter: InstanceHandle,
 ) -> Option<(f64, f64)> {
-    let target = object_from_handle(diagnostics, presenter)?;
-    let iface = target.cast::<IContentPresenter>().ok()?;
+    let iface = element::<IContentPresenter>(diagnostics, presenter)?;
     let mut raw: *mut c_void = core::ptr::null_mut();
     if iface.get_Content(&mut raw) != S_OK || raw.is_null() {
         return None;
@@ -1258,6 +1224,37 @@ pub(crate) unsafe fn object_from_handle(
     Some(core::mem::transmute::<*mut c_void, IInspectable>(raw))
 }
 
+/// The live object behind `handle`, as interface `I`.
+///
+/// # Safety
+/// XAML UI thread only.
+pub(crate) unsafe fn element<I: Interface>(diagnostics: &IXamlDiagnostics, handle: InstanceHandle) -> Option<I> {
+    object_from_handle(diagnostics, handle)?.cast().ok()
+}
+
+/// An `HSTRING` as the raw handle our hand-rolled vtables take. `HSTRING` is repr(transparent) over
+/// the handle; `as_ptr` would hand over the UTF-16 buffer instead. `value` must outlive the call.
+pub(crate) fn hstring_abi(value: &HSTRING) -> *mut c_void {
+    unsafe { core::mem::transmute_copy::<HSTRING, *mut c_void>(value) }
+}
+
+/// `XamlReader.Load`: a live element built from markup (`IVisualTreeService::CreateInstance` is
+/// `E_NOTIMPL` inside Explorer).
+///
+/// # Safety
+/// XAML UI thread only.
+pub(crate) unsafe fn load_xaml(markup: &str) -> Option<IInspectable> {
+    let reader: IXamlReaderStatics = factory(XAML_READER)?;
+    let markup = HSTRING::from(markup);
+    let mut created: *mut c_void = core::ptr::null_mut();
+    let hr = reader.Load(hstring_abi(&markup), &mut created);
+    if hr != S_OK || created.is_null() {
+        logf!("XamlReader.Load failed: 0x{:08x}", hr.0);
+        return None;
+    }
+    Some(core::mem::transmute::<*mut c_void, IInspectable>(created))
+}
+
 /// Set a `TextBlock`'s `Text`.
 ///
 /// **This is what makes a scrolling title possible without rebuilding the strip.** That distinction is
@@ -1268,15 +1265,9 @@ pub(crate) unsafe fn object_from_handle(
 /// # Safety
 /// XAML UI thread only.
 pub unsafe fn set_text(diagnostics: &IXamlDiagnostics, handle: InstanceHandle, text: &str) -> bool {
-    let Some(object) = object_from_handle(diagnostics, handle) else {
-        return false;
-    };
-    let Ok(block) = object.cast::<ITextBlock>() else {
+    let Some(block) = element::<ITextBlock>(diagnostics, handle) else {
         return false;
     };
     let value = HSTRING::from(text);
-    // As in `set_content_raw`: `HSTRING` is repr(transparent) over the handle, so it is transmuted
-    // rather than passed by pointer — `as_ptr` would hand over the UTF-16 buffer instead.
-    let handle = core::mem::transmute_copy::<HSTRING, *mut c_void>(&value);
-    block.put_Text(handle) == S_OK
+    block.put_Text(hstring_abi(&value)) == S_OK
 }

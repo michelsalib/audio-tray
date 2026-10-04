@@ -1,26 +1,9 @@
 //! YouTube Music in the taskbar: the feed, and the tile it draws into.
 //!
-//! **Why this lives in audio-tray at all.** Both features need the same scarce resource — XAML
-//! Diagnostics takes *one* consumer per endpoint, so a separate app drawing into the taskbar cannot
-//! run alongside this one. Sharing the TAP is not a convenience, it is the only arrangement in which
-//! both can exist on the same machine. It was developed as its own project (media-tray) precisely to
-//! avoid disturbing this one until it worked, and this is the merge.
-//!
-//! The split inside:
-//!
-//! ```text
-//! feed      which SMTC session is YouTube Music, and what it is playing
-//! smtc      the thin skin over Windows.Media.Control
-//! session   the app-id matching that decides "this is YouTube Music"
-//! publish   hands the state to the TAP, as a file it re-reads
-//! player    the player's window: raising it, activating it, its progress bar
-//! progress  the position, drawn as the shell's own taskbar progress bar
-//! ```
-//!
-//! Nothing here draws the strip; that is the TAP's half. The one thing to know about the seam is
-//! that it is a **file**, not a message: the cover art has to reach XAML as an image *source*, and
-//! the only way to hand XAML a bitmap it did not create is a path — so a file is in play regardless,
-//! and one mechanism beats two.
+//! It shares audio-tray's TAP because XAML Diagnostics takes one consumer per endpoint. All SMTC
+//! work runs on its own MTA thread ([`spawn`]); the tray thread holds only a channel. Nothing here
+//! draws the strip: [`publish`] hands state to the TAP as a file, while [`progress`] and
+//! [`thumbbar`] drive the shell's own progress bar and thumbnail toolbar on the player's window.
 
 pub mod feed;
 pub mod player;
@@ -39,17 +22,8 @@ pub use feed::Ytm;
 #[cfg(feature = "dev")]
 use feed::State;
 
-/// **This feature cannot run on audio-tray's own thread, and that is not a style choice.**
-///
-/// Every SMTC call here blocks on the `IAsyncOperation` it returns, and audio-tray's main thread is
-/// an **STA** because it owns windows — the tray icon, the flyout, the readout. Blocking on an
-/// apartment-threaded call without pumping messages deadlocks, and it does: measured, the very first
-/// `--music-probe` hung before printing a line, with no output and no error. media-tray never met
-/// this because it had no UI and could take an MTA for the whole process.
-///
-/// So the feed lives on a thread of its own that initialises **MTA**, paces its own poll, and takes
-/// requests by channel. The tray thread never touches WinRT media APIs at all, which also means a
-/// slow or wedged session can never stall the audio half.
+/// Run `body` on a fresh MTA thread and wait for it. SMTC calls block on `IAsyncOperation`, which
+/// deadlocks on the main STA (FINDINGS.md, 'The app side: an MTA thread').
 #[cfg(feature = "dev")]
 fn on_mta_thread<T, F>(what: &'static str, body: F) -> Result<T>
 where
@@ -69,25 +43,20 @@ where
 
 fn enter_mta() {
     use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
-    // Already-initialised is not a failure; a *different* apartment on this thread would be, and
-    // cannot happen — the thread is created here and does nothing else.
+    // Only called on threads created for this, so no other apartment can already be set.
     let _ = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
 }
 
 /// What the tray thread can ask the music thread to do.
 enum Request {
     Command(smtc::Command),
-    /// Explorer restarted, taking the shell-side state with it. Sent by the tray when it sees
-    /// `WM_TASKBAR_RESTARTED`.
+    /// Explorer restarted (tray saw `WM_TASKBAR_RESTARTED`): shell-side state is gone.
     TaskbarRestarted,
-    /// Publish and put the progress bar back, then stop. Sent by [`Handle::drop`].
+    /// Clear the published state and toolbar, then stop. Sent by [`Handle::drop`].
     ShutDown,
 }
 
-/// The tray thread's end of the music feature.
-///
-/// Holds no WinRT at all — just a channel — so it is safe to keep in an STA and cheap to poke from a
-/// click handler.
+/// The tray thread's end of the music feature: just a channel, no WinRT, so safe in an STA.
 pub struct Handle {
     requests: Sender<Request>,
     thread: Option<std::thread::JoinHandle<()>>,
@@ -96,39 +65,26 @@ pub struct Handle {
 }
 
 impl Handle {
-    /// A transport command from the strip. Best-effort: a dead music thread means the feature is
-    /// gone, which is not worth taking the tray down for.
+    /// A transport command from the strip. Best-effort if the music thread is dead.
     pub fn command(&self, command: smtc::Command) {
         let _ = self.requests.send(Request::Command(command));
     }
 
-    /// Tell the feed that Explorer restarted, so it re-asserts everything the shell was holding.
-    ///
-    /// **Both of this feature's shell-side surfaces are invisible to the feed otherwise.** The
-    /// progress bar and the thumbnail toolbar live in Explorer, against a window that does not change
-    /// when Explorer does — so from the feed's side a restart looks like nothing happening, and both
-    /// caches go on reporting that the shell already has what it needs.
+    /// Tell the feed Explorer restarted, so it re-asserts the progress bar and toolbar (their caches
+    /// cannot see a restart: the player's window is unchanged).
     pub fn taskbar_restarted(&self) {
         let _ = self.requests.send(Request::TaskbarRestarted);
     }
 }
-// There is deliberately no `activate` here. The strip *body* is left to the shell — clicking an app's
-// own taskbar button already means "bring it forward or minimise it", and its press is the
-// drag-to-reorder gesture — so the only place that raises the player is the cold-start fallback in
-// [`Music::command`], where there is no session for a transport click to address.
+// No `activate` on purpose: body clicks belong to the shell (activate/minimise, drag-to-reorder);
+// only the no-session fallback in [`Music::command`] raises the player.
 
 /// How long Quit waits for the feed thread to tidy up.
 const SHUTDOWN_WAIT: Duration = Duration::from_secs(2);
 
 impl Drop for Handle {
-    /// **The teardown has to happen, and this is the only place that can guarantee it.** The state
-    /// file and — more importantly — a progress bar on *another app's* taskbar button both outlive
-    /// this process, so an exit that skips them leaves a strip with nothing driving it and a bar
-    /// frozen mid-track that the user cannot attribute to anything.
-    ///
-    /// Bounded, because the thread can be stuck in an un-timed WinRT `.get()` against a wedged
-    /// player and Quit must not hang on it: after [`SHUTDOWN_WAIT`] it is detached, and the state
-    /// file is removed from here so the TAP stops drawing the strip.
+    /// Guarantees the teardown (state file, toolbar). Bounded: a thread stuck in a WinRT `.get()`
+    /// is detached after [`SHUTDOWN_WAIT`] and the state file is removed from here instead.
     fn drop(&mut self) {
         let _ = self.requests.send(Request::ShutDown);
         match self.finished.recv_timeout(SHUTDOWN_WAIT) {
@@ -145,10 +101,8 @@ impl Drop for Handle {
     }
 }
 
-/// Start following YouTube Music on a thread of its own.
-///
-/// Returns `None` when the feature is switched off. An SMTC that will not open is reported and also
-/// yields `None`: the audio half must come up either way.
+/// Start following YouTube Music on its own MTA thread. `None` when switched off or the thread
+/// cannot start; the audio half must come up either way.
 pub fn spawn(settings: &crate::config::Music) -> Option<Handle> {
     if !settings.enabled {
         return None;
@@ -179,16 +133,12 @@ pub fn spawn(settings: &crate::config::Music) -> Option<Handle> {
     }
 }
 
-/// Everything the taskbar half of this feature needs, held together.
-///
-/// One struct rather than three locals in the message loop, because the three have to move
-/// together: a poll reads the feed, writes the state file, and updates the progress bar, and any of
-/// those happening without the others shows the user a strip that disagrees with itself.
+/// The feed and its outputs, which a poll always updates together.
 pub struct Music {
     feed: Ytm,
     publisher: publish::Publisher,
     progress: progress::Progress,
-    /// The transport buttons under the player's hover preview — the shell's own thumbnail toolbar.
+    /// The transport buttons on the shell's thumbnail toolbar under the player's preview.
     toolbar: thumbbar::Toolbar,
 }
 
@@ -203,11 +153,8 @@ impl Music {
         })
     }
 
-    /// One poll: read the session, publish it for the TAP, and move the progress bar.
-    ///
-    /// Errors are reported and swallowed rather than returned. A session dying mid-enumeration is
-    /// routine, and the right response to it is to keep showing the last good state — not to take
-    /// the strip, or the audio half of the app, down with it.
+    /// One poll: read the session, publish it, move the bar and toolbar. Errors are logged and the
+    /// last good state kept (a session dying mid-enumeration is routine).
     pub fn poll(&mut self) {
         let (state, timeline) = match self.feed.read() {
             Ok(read) => read,
@@ -216,8 +163,7 @@ impl Music {
                 return;
             }
         };
-        // Remember who the player is while we can see it: the session disappears when YouTube Music
-        // closes, and this is what lets a later click still launch the app rather than the website.
+        // Remember the player while visible, so a click after it closes launches the app.
         if let Some(app_id) = self.feed.current_app_id() {
             player::remember_player(app_id);
         }
@@ -225,27 +171,15 @@ impl Music {
             eprintln!("music: could not publish the strip state: {err:#}");
         }
 
-        // The timeline came back with the state, from the same enumeration — asking for it
-        // separately used to cost a second `GetSessions` on every poll.
         let playing = state
             .snapshot()
             .is_some_and(|snapshot| snapshot.status.is_playing());
         self.progress.update(timeline, playing);
-        // The transport buttons under the hover preview. Driven from the same poll as the bar
-        // because they carry the same one bit of state — whether it is playing, which decides the
-        // play/pause glyph — and an update that costs nothing when it has not changed.
         self.toolbar.update(playing);
     }
 
-    /// Send a transport command, and republish immediately.
-    ///
-    /// Republished rather than waiting for the next poll: a play/pause that takes a second to change
-    /// the glyph reads as a control that did not work.
-    ///
-    /// With no session to address — YouTube Music open but never played, or closed — the player is
-    /// brought forward instead. **Not a synthesised media key**: the key is global, so with no
-    /// session of our own it reaches YouTube Music only by winning a race against every other
-    /// player, and it was measured pausing MPC-HC instead.
+    /// Send a transport command and republish immediately. With no session the player is raised
+    /// instead; never synthesise a media key (it reaches whichever player owns them).
     pub fn command(&mut self, command: smtc::Command) {
         match self.feed.send(command) {
             Ok(true) => {}
@@ -258,28 +192,15 @@ impl Music {
         self.poll();
     }
 
-    /// Hand back everything this feature put somewhere else, before exiting.
-    ///
-    /// The state file goes so a strip left on screen has nothing to show, and the progress bar goes
-    /// because it lives on **another app's** window and would otherwise sit there frozen mid-track
-    /// with nobody left to attribute it to.
-    /// **The progress bar is not cleared here, and cannot be.** Clearing it means a message to the
-    /// tray thread, and by the time this runs that thread has left its message loop and is inside
-    /// `Handle::drop` waiting for this one — so the post would sit in a queue nobody reads again.
-    /// `tray::run` clears it directly, on its own thread, before it gets that far.
+    /// Remove the state file and toolbar before exiting. The progress bar is not cleared here: the
+    /// tray loop has already exited, so `tray::run` clears it directly.
     pub fn shut_down(&mut self) {
         self.publisher.clear();
         self.toolbar.clear();
     }
 
-    /// The thread body: poll on a timer of our own, and act on what the tray sends.
-    ///
-    /// `recv_timeout` rather than a sleep plus a `try_recv`, so a click is acted on the moment it
-    /// arrives instead of waiting out the rest of the poll interval — a play/pause that takes up to a
-    /// second to respond reads as a control that did not work.
-    ///
-    /// One second between polls is well inside "feels live" for a track change, and it is the
-    /// position — which SMTC does *not* raise events for — that makes polling unavoidable at all.
+    /// The thread body: poll every second (SMTC raises no position events) and act on requests the
+    /// moment they arrive.
     fn serve(&mut self, inbox: Receiver<Request>) {
         const POLL: Duration = Duration::from_secs(1);
         self.poll();
@@ -289,9 +210,7 @@ impl Music {
                 Ok(Request::TaskbarRestarted) => {
                     self.progress.taskbar_restarted();
                     self.toolbar.taskbar_restarted();
-                    // Straight away rather than up to a second later: the strip is already being
-                    // redrawn by the tray on this same event, and a bar that arrives afterwards is a
-                    // visible flicker on a button that has just come back.
+                    // Now, alongside the strip's redraw, rather than flicker in a second later.
                     self.poll();
                 }
                 Ok(Request::ShutDown) => {
@@ -299,8 +218,7 @@ impl Music {
                     return;
                 }
                 Err(RecvTimeoutError::Timeout) => self.poll(),
-                // The tray dropped its handle without a shutdown — it is going away, so do the
-                // teardown anyway rather than leaving state on other people's windows.
+                // Handle dropped without a shutdown: tear down anyway.
                 Err(RecvTimeoutError::Disconnected) => {
                     self.shut_down();
                     return;
@@ -310,16 +228,8 @@ impl Music {
     }
 }
 
-/// List every SMTC session on the machine, with the YouTube Music verdict on each.
-///
-/// The one thing the built-in matching cannot be sure of is the exact app id of *this* machine's
-/// YouTube Music: it is a Chromium implementation detail, and an installed PWA reports something
-/// quite different from a browser tab. Run this with the player going and the id to pin is the one
-/// marked `Certain`.
-///
-/// A `Browser` verdict means the opposite — an id that could be YouTube Music or could be any
-/// other tab, which is followed only if the user pins it. This says so when it is the only thing
-/// on offer.
+/// List every SMTC session with its YouTube Music verdict, and offer the `app_id` line to pin when
+/// only a bare browser session is on offer.
 #[cfg(feature = "dev")]
 pub fn probe() -> Result<()> {
     on_mta_thread("music-probe", || {
@@ -356,8 +266,6 @@ fn report_sessions(feed: &mut Ytm) -> Result<()> {
         State::Track(snapshot) => println!("  {} — {}", snapshot.title, snapshot.artist),
         State::Absent => {
             println!("  nothing");
-            // The one case where "nothing" is a decision rather than an absence, and the only
-            // place the user can be told about the config that reverses it.
             for snapshot in &sessions {
                 if session::classify(&snapshot.app_id) == session::Match::Browser {
                     println!(
@@ -375,18 +283,8 @@ fn report_sessions(feed: &mut Ytm) -> Result<()> {
     Ok(())
 }
 
-/// Ask an **MTA** thread the same "is this the player's window?" question about the same windows.
-///
-/// Not redundant with the survey that produced them: the two surfaces that act on the player's
-/// window run in *different apartments* — the thumbnail toolbar from the feed's MTA, the progress
-/// bar from the tray's STA — and the window's identity is read with a shell COM call
-/// (`SHGetPropertyStoreForWindow`) in whichever one is asking. An identity that failed to read in
-/// one of them would not error; it would fall through to the process check and quietly stop
-/// decorating the real player. This says the two agree, rather than assuming it.
-///
-/// Takes the handles the survey already found rather than enumerating again, because a second
-/// enumeration answers about a *different set of windows* — one opening or closing in between reads
-/// as a disagreement that is nothing of the sort.
+/// Re-ask "is this the player's window?" from an MTA for the given handles, to check it agrees
+/// with the STA answer (toolbar and progress bar read the window identity in different apartments).
 #[cfg(feature = "dev")]
 pub fn player_verdicts_from_mta(windows: Vec<isize>) -> Result<Vec<bool>> {
     on_mta_thread("music-windows", move || {
@@ -403,8 +301,7 @@ pub fn player_verdicts_from_mta(windows: Vec<isize>) -> Result<Vec<bool>> {
 
 /// Trace what the feed reads every 100 ms for `seconds`, optionally sending `skip` two seconds in.
 ///
-/// Shows the position as a checkpoint plus its age (a player republishes it only when something
-/// happens) and what a track change looks like from here: the session vanishes for about a second.
+/// Shows the position checkpoint and its age, and the ~1 s session gap around a track change.
 #[cfg(feature = "dev")]
 pub fn report_timeline(seconds: u64, skip: Option<smtc::Command>) -> Result<()> {
     on_mta_thread("music-timeline", move || {

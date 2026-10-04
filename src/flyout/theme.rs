@@ -1,12 +1,5 @@
-//! Design tokens for the flyout: the layout dimensions (in DIPs, scaled by the monitor
-//! DPI at show time), the colour palette, the Segoe Fluent control glyphs, the UI fonts,
-//! and the user's Windows accent colour. Everything visual and tunable lives here, so the
-//! rest of the flyout reads as structure rather than magic numbers.
-//!
-//! The palette, the endpoint glyphs, the track height and the UI font are `pub(crate)`
-//! rather than private to the flyout: [`crate::osd`] is a second surface in the same design
-//! language (a volume readout beside the taskbar), and it has to *be* the same dark tint,
-//! the same white, the same speaker/microphone glyphs. Only its geometry is its own.
+//! Design tokens for the flyout: layout dimensions (DIPs), palette, Fluent glyphs, UI fonts
+//! and the accent colour. The `pub(crate)` ones are shared with [`crate::osd`].
 
 use std::sync::OnceLock;
 
@@ -43,8 +36,7 @@ pub(super) const TRACK_X0: f32 = 52.0; // track left edge
 pub(super) const VALUE_W: f32 = 46.0; // reserved right area for the percentage
 pub(crate) const TRACK_H: f32 = 4.0;
 pub(super) const THUMB_R: f32 = 7.0;
-// footer bar (the panel's last row, modelled on the Win11 quick-settings footer): a
-// hairline across the full width, a labelled action on the left, a round icon button right
+// footer bar: hairline, a labelled action on the left, round icon buttons on the right
 pub(super) const FOOTER_TOP_GAP: f32 = 6.0; // standoff above the hairline (the panel's old closing pad)
 pub(super) const FOOTER_H: f32 = 52.0; // the strip itself: hairline down to the panel's bottom edge
 pub(super) const FOOTER_ICON_X: f32 = 16.0; // left inset of the footer item's glyph
@@ -96,33 +88,21 @@ pub(super) const DARK_GLYPH: [u8; 3] = [0x12, 0x16, 0x1C]; // icon colour on a s
 pub(super) const HOVER_A: f32 = 0.06; // white overlay for hover
 pub(super) const SEL_A: f32 = 0.09; // white overlay for the selected row
 
-// The recording dot, as fractions of the mic glyph's box: the red disc's radius, the white
-// ring around it, and the centre both sit on. The **top-right corner**, which is where the
-// Segoe microphone's ink does not reach — the capsule runs up the middle, the stand sits
-// under it, and the mute variant's "no" circle is bottom-right.
-//
-// The centre is far enough out that the *ring* clears the capsule too; it is the ring, not
-// the disc, that decides how close the badge can sit.
+// The recording dot, as fractions of the mic glyph's box: disc radius, white ring, centre.
+// Top-right is the one corner the mic glyph (and its mute variant) leaves free; the ring must clear it.
 const REC_R: f32 = 0.15;
 const REC_BORDER: f32 = 0.05;
 const REC_CX: f32 = 0.87;
 const REC_CY: f32 = 0.14;
 
-/// Stamp the recording dot on a mic glyph drawn at `(x, y)` in a `size`-pixel box.
-///
-/// Lives here, beside the glyphs themselves, because both hand-painted surfaces stamp it —
-/// the flyout's input slider and the scroll readout — and "an app is recording" has to be
-/// the same picture in both. The taskbar strip draws its own (XAML, inside Explorer; see
-/// the TAP's `decorate`), which is why that one is not this.
+/// Stamp the recording dot on a mic glyph drawn at `(x, y)` in a `size`-pixel box. Shared by
+/// the flyout and the OSD; the taskbar strip draws its own in the TAP.
 pub(crate) fn recording_dot(cv: &mut Canvas, x: i32, y: i32, size: u32) {
     let box_px = size as f32;
     let r = box_px * REC_R;
     let cx = x as f32 + box_px * REC_CX;
     let cy = y as f32 + box_px * REC_CY;
-    // The white ring first, as a plain disc, with the red one over it — a stroke would have
-    // to be drawn by hand, and this composites identically. Never thinner than a pixel: at
-    // 100% DPI the fraction rounds down to almost nothing, and a ring that faint is the one
-    // case the border exists to prevent.
+    // The ring is a white disc under the red one, at least 1px so it survives 100% DPI.
     let ring = (box_px * REC_BORDER).max(1.0);
     let outer = r + ring;
     let disc = |cv: &mut Canvas, r: f32, col: [u8; 3]| {
@@ -132,11 +112,8 @@ pub(crate) fn recording_dot(cv: &mut Canvas, x: i32, y: i32, size: u32) {
     disc(cv, r, RECORDING);
 }
 
-/// The glyph for one endpoint's state — the picture of "which direction, and is it muted".
-///
-/// Shared by the flyout's slider rows and the scroll readout, because the two are seen a few
-/// pixels apart and a different speaker in each would read as a mismatch. Only the *colour*
-/// differs between them (see [`crate::osd`]'s muted tint), so that stays at the call site.
+/// The glyph for an endpoint's direction and mute state, shared by the flyout and the OSD
+/// (colour stays at the call site).
 pub(crate) fn endpoint_glyph(flow: crate::audio::Flow, muted: bool) -> char {
     use crate::audio::Flow;
 
@@ -168,10 +145,8 @@ pub(super) fn ui_font_semibold() -> Option<&'static FontVec> {
     .as_ref()
 }
 
-/// The accent colour to paint (selection pill, slider fill/thumb). On our dark surface
-/// Windows uses the *Light2* shade of the accent palette rather than the base accent —
-/// matching that keeps us in step with the native flyout. Falls back to the DWM base
-/// accent, then the Win11 default.
+/// The accent colour to paint: the palette's Light2 shade (what Windows uses on dark
+/// surfaces), else the DWM accent, else the Win11 default.
 pub(crate) fn accent_rgb() -> [u8; 3] {
     accent_palette_light2().unwrap_or_else(dwm_accent_rgb)
 }

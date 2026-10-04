@@ -1,11 +1,5 @@
-//! Putting a hand-painted RGBA buffer on the screen, as a per-pixel-alpha *layered*
-//! window.
-//!
-//! Two surfaces are drawn this way — the control flyout ([`crate::flyout`]) and the scroll
-//! readout ([`crate::osd`]) — and both need the same things from Win32: an
-//! `UpdateLayeredWindow` blend of a straight-alpha buffer, and a dark, rounded, acrylic
-//! frame to blend it into. None of it is obvious enough to keep two copies of, so it lives
-//! here and the two surfaces bring their own geometry and pixels.
+//! Putting a hand-painted RGBA buffer on screen as a per-pixel-alpha layered window, in a
+//! dark, rounded, acrylic frame. Shared by the flyout and the OSD.
 
 use windows::core::{s, w};
 use windows::Win32::Foundation::{COLORREF, HWND, POINT, SIZE};
@@ -17,10 +11,8 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 use windows::Win32::UI::WindowsAndMessaging::{UpdateLayeredWindow, ULW_ALPHA};
 
-/// Push a rendered straight-alpha RGBA buffer (`w`×`h`) to a layered window as
-/// premultiplied BGRA, scaled by a global `alpha` (for fade animations).
-/// `UpdateLayeredWindow` also moves + resizes the window to `(x, y)` and `(w, h)`, so this
-/// is how a layered surface is positioned as well as painted.
+/// Push a straight-alpha RGBA buffer (`w`×`h`) to a layered window at `(x, y)`, scaled by a
+/// global `alpha`. This also moves and resizes the window.
 pub(crate) fn present(hwnd: HWND, src_buf: &[u8], w: i32, h: i32, x: i32, y: i32, alpha: u8) {
     unsafe {
         let screen = GetDC(None);
@@ -94,11 +86,8 @@ pub(crate) fn present(hwnd: HWND, src_buf: &[u8], w: i32, h: i32, x: i32, y: i32
 pub(crate) const CORNER_ROUND: i32 = 2;
 pub(crate) const CORNER_ROUND_SMALL: i32 = 3;
 
-/// Dress a layered window as one of our panels: dark frame, rounded corners so the
-/// compositor's blur follows what we paint, and the acrylic behind it.
-///
-/// Shared because both surfaces need all three and none of them is one line: DWM takes its
-/// attributes as a void pointer plus a size, so each is four lines of cast at the call site.
+/// Dress a layered window as one of our panels: dark frame, rounded corners (so the blur
+/// follows what we paint) and acrylic.
 ///
 /// # Safety
 /// `hwnd` must be a live window this process owns.
@@ -120,9 +109,7 @@ pub(crate) unsafe fn style_panel(hwnd: HWND, corner: i32) {
     enable_acrylic(hwnd);
 }
 
-/// Enable the acrylic blur-behind via the undocumented (but ubiquitous)
-/// `SetWindowCompositionAttribute`. Best-effort — if it no-ops, the surface is still a
-/// legible semi-transparent dark panel.
+/// Enable acrylic blur-behind via the undocumented `SetWindowCompositionAttribute`; best-effort.
 ///
 /// # Safety
 /// `hwnd` must be a live window this process owns.

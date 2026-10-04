@@ -1,36 +1,16 @@
 //! Explorer integration: the pair of controls drawn inside the taskbar itself.
 //!
-//! This is how audio-tray presents itself in the notification area, and it is
-//! attempted on every start. It is still not a *requirement*: the plain
-//! `Shell_NotifyIcon` tray entry is registered unconditionally by `crate::tray`
-//! and the strip decorates it, so an injection that is unavailable or fails leaves
-//! the app behaving exactly as it did before the strip existed. Callers treat
-//! every error here as "the plain icon carries on alone", never as fatal.
+//! `InitializeXamlDiagnosticsEx` loads `audio_tray_tap.dll` into `explorer.exe`, where it decorates
+//! our `Shell_NotifyIcon` entry (registered unconditionally by `crate::tray`). Optional by contract:
+//! every error here means "the plain icon carries on alone", never fatal. See
+//! `crates/taskbar-tap/FINDINGS.md`.
 //!
-//! Mechanism (see `crates/taskbar-tap/FINDINGS.md` for the measurements behind it):
-//! `InitializeXamlDiagnosticsEx` loads `audio_tray_tap.dll` into `explorer.exe`,
-//! where it implements `IVisualTreeServiceCallback2`, watches the XAML tree for
-//! our `SystemTray.NotifyIconView`, and restyles it.
-//!
-//! Taking the strip back down is a revert, not an unload. The TAP pins itself in
-//! `explorer.exe` and stays there, but everything it changed — the tray icon's
-//! content, the tray sections' columns, Explorer's own volume slot — is an
-//! ordinary property edit that it recorded before making and can undo in place.
-//! [`revert`] asks for that; the DLL then sits inert until the next injection.
-//! Unloading it instead would gain a page of memory and risk freeing code Explorer
-//! still holds callbacks into.
-//!
-//! Four things have to lead to that revert, and each has its own trigger:
-//!   * audio-tray quits                     → [`revert`], from the tray
-//!   * audio-tray is killed or crashes      → the TAP waits on our process id,
-//!     passed in [`init_data`], and reverts when it exits
-//!   * Explorer restarts                    → nothing to revert; the DLL died
-//!     with it, and [`apply_at_restart`] injects into the new one
-//!   * the user asks for the taskbar back   → [`revert`], via
-//!     `audio-tray --taskbar-revert`, which leaves the running tray untouched
-//!
-//! Remaining caveat: XAML Diagnostics is effectively single-consumer — TranslucentTB
-//! and Windhawk's Taskbar Styler use the same `VisualDiagConnection1` endpoint.
+//! Taking the strip down is a revert in place, never an unload; the DLL stays loaded and inert.
+//! Revert triggers: quit → [`revert`]; killed → the TAP's watch on the `pid=` owner; Explorer
+//! restart → nothing to revert, [`apply_at_restart`] re-injects; `--taskbar-revert` → [`revert`].
+//! A relaunch hands the loaded TAP the new owner ([`offer_handover`]); Explorer is restarted only
+//! for a TAP from another build or one that does not answer. XAML Diagnostics is single-consumer
+//! (TranslucentTB, Windhawk use the same endpoint).
 
 use std::path::PathBuf;
 
@@ -66,29 +46,16 @@ fn tap_path() -> Result<PathBuf> {
     Ok(dll)
 }
 
-/// Shell process and time of the last successful injection.
-///
-/// Only used to suppress an immediate duplicate; see [`apply_at_restart`].
+/// Shell process and time of the last successful injection, to suppress a duplicate.
 static LAST_INJECTED: std::sync::Mutex<Option<(u32, std::time::Instant)>> =
     std::sync::Mutex::new(None);
 
-/// Whether a strip of ours is currently up, as far as we know.
-///
-/// This decides what a click on the plain notification icon means, so it is not
-/// merely informational — see [`strip_is_up`].
+/// Whether a strip of ours is currently up, as far as we know. See [`strip_is_up`].
 static STRIP_UP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Whether the strip is up, and so owns the gestures over our tray icon.
-///
-/// The shell goes on invoking the notification icon *underneath* the strip, so a
-/// click on a segment is also delivered as an ordinary tray-icon click. The two
-/// deliveries are one gesture and must not both act on it: the strip's own
-/// handlers are the ones that know which segment was hit.
-///
-/// Tracks our own injections and reverts, which is all it claims — a strip that
-/// injected but never managed to draw still reads as up. That is why the icon's
-/// *right* click stays live either way: it keeps the panel, and Quit, reachable
-/// even if this is optimistic.
+/// Whether the strip is up and so owns left clicks on our tray icon (the shell also delivers a
+/// segment click as a tray-icon click). Optimistic — it tracks our injections and reverts only —
+/// so the icon's right click stays live regardless.
 pub fn strip_is_up() -> bool {
     STRIP_UP.load(std::sync::atomic::Ordering::SeqCst)
 }
@@ -96,8 +63,7 @@ pub fn strip_is_up() -> bool {
 /// Inject the TAP into the shell's Explorer. Best-effort by contract: every error
 /// means "no strip this time", and the message says why.
 fn enable(icons: StripIcons) -> Result<()> {
-    // Cleared up front so that any failure below leaves it false; only the
-    // success path at the end sets it.
+    // Cleared first so any failure leaves it false.
     STRIP_UP.store(false, std::sync::atomic::Ordering::SeqCst);
     let dll = tap_path()?;
     let pid = shell_pid()?;
@@ -111,8 +77,7 @@ fn enable(icons: StripIcons) -> Result<()> {
 
 /// Whether we injected into this same Explorer a moment ago.
 fn just_injected(pid: u32) -> bool {
-    /// Long enough to cover "audio-tray started as the shell came up", short enough
-    /// that a deliberate revert and re-inject is never mistaken for a duplicate.
+    /// Covers "started as the shell came up"; short enough not to block a deliberate re-inject.
     const WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
 
     LAST_INJECTED
@@ -126,27 +91,15 @@ use tap_proto::CONTROL_CLASS as TAP_CONTROL_CLASS;
 
 use tap_proto::WM_TAP_REVERT;
 
-/// Ask the injected TAP to undo its changes.
-///
-/// The DLL stays loaded — it cannot do this work on the way out (`DllMain`'s
-/// detach runs under the loader lock, on a thread that may not touch XAML) and it
-/// does not need to, because the changes are ordinary property edits and are
-/// reversible in place. What the TAP unloading would buy us is a page of memory;
-/// what it would risk is freeing code Explorer still holds callbacks into.
-///
-/// Best-effort and quiet: a missing control window means nothing is injected, so
-/// there is nothing to put back.
+/// Ask the injected TAP to undo its changes in place (it stays loaded). `owner_pid` 0 is
+/// unconditional; otherwise the TAP ignores it once another process owns the strip. Best-effort.
 pub fn revert(owner_pid: u32) {
     use windows::Win32::Foundation::{LPARAM, WPARAM};
     use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 
-    // Before the post, and unconditionally: from here on the plain icon is the
-    // whole of the UI again, so its clicks have to go back to being the ones that
-    // matter. Nothing about a failed post would make a strip reappear.
+    // Unconditionally: the plain icon's clicks matter again from here on.
     STRIP_UP.store(false, std::sync::atomic::Ordering::SeqCst);
-    // Posted, not sent: this must never block on Explorer's UI thread, and there
-    // is nothing to learn from the answer. `owner_pid` 0 is unconditional; otherwise the TAP
-    // ignores it once another process owns the strip.
+    // Posted, not sent: never block on Explorer's UI thread.
     for control in crate::win::windows_by_class(TAP_CONTROL_CLASS) {
         if let Err(e) = unsafe { PostMessageW(Some(control), WM_TAP_REVERT, WPARAM(owner_pid as usize), LPARAM(0)) } {
             eprintln!("taskbar: could not ask for a revert ({e})");
@@ -159,11 +112,8 @@ fn control_window() -> Option<windows::Win32::Foundation::HWND> {
     window_by_class(TAP_CONTROL_CLASS)
 }
 
-/// A top-level window with this exact class name, in any process.
-///
-/// `EnumWindows` rather than `FindWindow`, which does not locate these windows
-/// across processes — measured in both directions, for us finding the TAP's
-/// control window and for the TAP finding our receiver.
+/// A top-level window with this exact class name, in any process. `EnumWindows`, because
+/// `FindWindow` does not find these windows across processes.
 fn window_by_class(class_name: &str) -> Option<windows::Win32::Foundation::HWND> {
     let mut found = None;
     crate::win::enum_windows(|hwnd| {
@@ -175,8 +125,7 @@ fn window_by_class(class_name: &str) -> Option<windows::Win32::Foundation::HWND>
     found
 }
 
-/// The process owning the desktop window — the Explorer that hosts the taskbar,
-/// not a file-browser window that happens to share the name.
+/// The process owning the desktop window: the Explorer hosting the taskbar.
 fn shell_pid() -> Result<u32> {
     let hwnd = unsafe { GetShellWindow() };
     if hwnd.0.is_null() {
@@ -191,8 +140,7 @@ fn shell_pid() -> Result<u32> {
 }
 
 unsafe fn inject(pid: u32, dll: &std::path::Path, icons: StripIcons) -> Result<()> {
-    // `InitializeXamlDiagnosticsEx` is exported from the system XAML runtime, which
-    // has no import library — resolve it dynamically.
+    // No import library for the system XAML runtime: resolve dynamically.
     let module = LoadLibraryW(PCWSTR(crate::win::wide("Windows.UI.Xaml.dll").as_ptr()))
         .context("load Windows.UI.Xaml.dll")?;
     let symbol = GetProcAddress(module, PCSTR(c"InitializeXamlDiagnosticsEx".as_ptr().cast()))
@@ -213,10 +161,7 @@ unsafe fn inject(pid: u32, dll: &std::path::Path, icons: StripIcons) -> Result<(
         PCWSTR(init_data.as_ptr()),
     );
     if hr.is_err() {
-        // XAML Diagnostics is effectively single-consumer: TranslucentTB and
-        // Windhawk's Taskbar Styler connect to this same `VisualDiagConnection1`
-        // endpoint. A bare HRESULT sends people hunting for a bug in our code, so
-        // name the likeliest cause alongside it.
+        // Name the likeliest cause: another consumer holds the endpoint.
         bail!(
             "InitializeXamlDiagnosticsEx failed: 0x{:08x} ({}). \
              The {ENDPOINT_NAME} endpoint takes one consumer at a time — if \
@@ -229,25 +174,16 @@ unsafe fn inject(pid: u32, dll: &std::path::Path, icons: StripIcons) -> Result<(
     Ok(())
 }
 
-/// What the strip should draw right now.
-///
-/// The glyphs are the *current devices'* icons, resolved through
-/// [`crate::config::Config::icon_of`] like every other surface's — which is what stops the
-/// same device showing as a laptop in the flyout and a speaker on the taskbar.
-///
-/// One compromise carried over from [`crate::icons`]: the two earbud icons have no
-/// glyph in Segoe Fluent and the tray hand-draws them. The strip can only render a
-/// font glyph, so those fall back to the headphone glyph.
+/// What the strip should draw right now: the current devices' icons, resolved through
+/// [`crate::config::Config::icon_of`] like every other surface's (earbuds via [`strip_glyph`]).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct StripIcons {
     pub output: char,
     pub input: char,
     pub output_muted: bool,
     pub input_muted: bool,
-    /// An app is holding the microphone open — the input button carries a red dot
-    /// (see [`crate::audio::mic`]). Independent of `input_muted`: an app that has the
-    /// stream open while you are muted is still recording, and Windows' own indicator
-    /// says so too.
+    /// An app holds the microphone open (red dot; see [`crate::audio::mic`]). Independent of
+    /// `input_muted`, as Windows' own indicator is.
     pub input_recording: bool,
 }
 
@@ -266,12 +202,8 @@ impl Default for StripIcons {
 
 use tap_proto::{GLYPH_ROUND_EARBUDS, GLYPH_WIRELESS_EARBUDS};
 
-/// The codepoint the strip should carry for an icon.
-///
-/// Mostly `IconId::glyph`, but the two earbud variants are hand-drawn rather than
-/// font glyphs — `glyph` returns the headphone codepoint for them as a deliberate
-/// fallback, which in the strip would silently show the wrong icon. This maps them
-/// to the markers above instead, so the TAP can draw the real shape.
+/// The codepoint the strip should carry for an icon: `IconId::glyph`, except the hand-drawn earbuds
+/// map to marker codepoints so the TAP draws the real shape instead of the headphone fallback.
 pub fn strip_glyph(icon: crate::icons::IconId) -> char {
     use crate::icons::IconId;
     match icon {
@@ -281,39 +213,14 @@ pub fn strip_glyph(icon: crate::icons::IconId) -> char {
     }
 }
 
-/// Alpha applied to the accent fill, as hex. A fully opaque accent block is
-/// brighter than anything Windows puts in a taskbar; at half alpha the pill
-/// carries the same visual weight as the Control Center button beside it.
+/// Alpha applied to the accent fill, as hex: half, to match the weight of the shell's own buttons.
 const PILL_ALPHA: &str = "80";
 
-/// The `key=value;` payload handed to the TAP as initialization data.
-///
-/// This is the only chance to configure the strip — it is read once, in `SetSite`. An empty
-/// payload is not neutral: the TAP then falls back to bare glyphs with no accent pill and
-/// leaves Explorer's own volume icon in place.
-///
-/// `tooltip` targets *our* tray icon by its accessible name; without it the TAP
-/// decorates whichever notify icon it happens to meet first. It is matched as a
-/// **substring**, because the tooltip is mostly the current device's name — only
-/// [`crate::tray::TRAY_MARKER`] is stable across device switches and locales.
-///
-/// `pid` is how the strip gets cleaned up when we are killed or crash rather than
-/// quitting: the TAP waits on this process and reverts when it exits. Without it
-/// a `taskkill` would leave a strip behind whose every click is posted to a
-/// process that no longer exists.
-///
-/// `hidevolume` and `hidemic` collapse the two indicators of Windows' own that the strip
-/// now says instead — the volume glyph, and the microphone icon that appears while
-/// something is recording, which our input button carries as a red dot. Both are put back
-/// on revert, and neither is touched until our strip is actually on screen.
-/// `tile=` is the music half's share of the payload: whose taskbar button to draw the now-playing
-/// strip into, empty for "do not". It comes from config rather than from an argument because, unlike
-/// the glyphs, it never changes while we run — the button is chosen by the user, not by which device
-/// happens to be default — and because the strip's *content* does not travel this way at all. That
-/// goes through a file the TAP re-reads, since cover art has to reach XAML as an image source.
-///
-/// `ver=`, `tap=` and `hwnd=` serve the handover ([`offer_handover`]): which exe version and DLL
-/// file this payload belongs to, and which receiver window to post to. Older TAPs ignore them.
+/// The `key=value;` init payload for the TAP, read once in `SetSite` (or on a handover).
+/// `tooltip` is matched as a substring of our icon's accessible name ([`crate::tray::TRAY_MARKER`]
+/// is the stable part); `pid` is the owner the TAP watches and reverts on exit; `hidevolume`/`hidemic`
+/// collapse Windows' own indicators; `tile` names the app button for the music tile (empty = off);
+/// `ver`/`tap`/`hwnd` identify the build and receiver for [`offer_handover`].
 fn init_data(icons: StripIcons, owner_pid: u32) -> String {
     let [r, g, b] = crate::flyout::theme::accent_rgb();
     let music = crate::config::Config::load().music;
@@ -339,12 +246,8 @@ static RECEIVER: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize
 
 use tap_proto::{HANDOVER_ACCEPTED, HANDOVER_DECLINED, HANDOVER_MAGIC};
 
-/// Hand every TAP already loaded in Explorer a fresh init payload naming `owner_pid` as its owner.
-///
-/// A TAP from this exact build adopts it — re-binds owner watch and receiver, and re-applies the
-/// strip — which is what lets a relaunch skip the Explorer restart. `Err` says why none did: a
-/// different version or DLL (declined), a TAP that predates the handover, or one that did not
-/// answer within the timeout.
+/// Hand every TAP loaded in Explorer a fresh init payload naming `owner_pid` as owner. A TAP from
+/// this exact build adopts it (no Explorer restart needed); `Err` says why none did.
 fn offer_handover(icons: StripIcons, owner_pid: u32) -> Result<()> {
     use windows::Win32::Foundation::{LPARAM, WPARAM};
     use windows::Win32::System::DataExchange::COPYDATASTRUCT;
@@ -359,8 +262,7 @@ fn offer_handover(icons: StripIcons, owner_pid: u32) -> Result<()> {
     let mut why = Vec::new();
     for control in crate::win::windows_by_class(TAP_CONTROL_CLASS) {
         let mut result = 0usize;
-        // Sent, not posted: `WM_COPYDATA` only carries its payload synchronously. Bounded so a
-        // wedged shell cannot hang the tray; the TAP's handler only flips state, so it is quick.
+        // `WM_COPYDATA` must be sent; bounded so a wedged shell cannot hang the tray.
         let sent = unsafe {
             SendMessageTimeoutW(
                 control,
@@ -396,21 +298,9 @@ pub fn transfer_owner(child_pid: u32, icons: StripIcons) {
 
 use tap_proto::WM_TAP_RESTYLE;
 
-/// Tell an injected TAP that the devices changed, so the strip follows them.
-///
-/// The init data is read once, in `SetSite`, so it cannot carry this — switching
-/// devices after injection would otherwise leave the strip showing the icon of a
-/// device that is no longer default.
-///
-/// Both glyphs fit in a message's parameters, so nothing has to be shared: the
-/// codepoint goes in the low bits and the flags above it. Best-effort and
-/// quiet, like [`revert`] — no control window means nothing is injected.
-///
-/// Returns whether the strip was actually told. The caller remembers what it has
-/// posted so it can skip an identical restyle, and a post that never happened must
-/// not be remembered as one that did: the control window does not exist until the
-/// TAP's first visual-tree callback, so an early switch can land in that gap and
-/// would otherwise leave the strip showing the injection's glyphs for good.
+/// Tell an injected TAP the devices changed (codepoint plus flag bits in each message param).
+/// Returns whether it was actually posted: the control window appears only after the TAP's first
+/// tree callback, and the caller must not remember an unsent restyle as sent.
 #[must_use]
 pub fn restyle(icons: StripIcons) -> bool {
     use windows::Win32::Foundation::{LPARAM, WPARAM};
@@ -438,27 +328,20 @@ pub fn restyle(icons: StripIcons) -> bool {
     true
 }
 
-/// What the user did on the injected strip.
-///
-/// The TAP deliberately decides nothing: it reports the gesture and the segment,
-/// and every question about which device comes next is answered here, where the
-/// audio state actually lives.
+/// What the user did on the injected strip. The TAP only reports; all decisions are made here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
     CycleOutput,
     CycleInput,
     OpenPanel,
-    /// A transport glyph on the music tile. Codes 10+, deliberately far from the audio ones: the two
-    /// halves of the TAP post to the same window and mean unrelated things, and adjacent codes invite
-    /// an off-by-one that would cycle an audio device on a play click.
+    /// Music transport. Codes 10+, deliberately far from the audio ones on the same window.
     MusicPrevious,
     MusicPlayPause,
     MusicNext,
 }
 
 impl Action {
-    /// Wire codes are explicit on both sides so the exe and the DLL can be built
-    /// separately without silently disagreeing about enum ordering.
+    /// Decode an explicit wire code from `tap_proto`.
     pub fn from_code(code: usize) -> Option<Self> {
         match code {
             tap_proto::ACTION_CYCLE_OUTPUT => Some(Self::CycleOutput),
@@ -485,16 +368,8 @@ impl Action {
     }
 }
 
-/// Dev: hand a running tray the gesture the strip would have sent.
-///
-/// Clicks on the Win11 taskbar cannot be synthesised — `SendInput` moves the
-/// pointer (the hover plate lights up) but produces no `Tapped`, and the same is
-/// true of the plain tray icon, so it is the shell's input path rather than our
-/// wiring. That leaves the cycling behaviour unreachable from a script, which is
-/// what this exists for: it posts to the receiver window, so everything from
-/// [`WM_TASKBAR_ACTION`] inward runs exactly as it does for a real click. What it
-/// does *not* prove is the TAP's own half — the handlers, the segment routing and
-/// the doubled-event coalescing still only get exercised by a finger.
+/// Dev: post the gesture the strip would have sent to a running tray (taskbar clicks cannot be
+/// synthesised). Exercises everything from [`WM_TASKBAR_ACTION`] inward, not the TAP's half.
 #[cfg(feature = "dev")]
 pub fn post_action(action: Action) -> Result<()> {
     use windows::Win32::Foundation::{LPARAM, WPARAM};
@@ -506,13 +381,7 @@ pub fn post_action(action: Action) -> Result<()> {
         .context("post the action to the tray")
 }
 
-/// Dev: hand a running tray the scroll the TAP would have sent for `notches` wheel notches
-/// over one button.
-///
-/// The counterpart of [`post_action`], and it exists for the same reason plus one more: the
-/// touchpad half of the gesture cannot be synthesised at all (its deltas arrive from XAML,
-/// inside Explorer), so this is the only way to drive fractional notches — and the readout's
-/// coalescing and fade — from a script.
+/// Dev: post the scroll the TAP would send for `notches` (fractional allowed, as from a touchpad).
 #[cfg(feature = "dev")]
 pub fn post_scroll(flow: crate::audio::Flow, notches: f32) -> Result<()> {
     use windows::Win32::Foundation::{LPARAM, WPARAM};
@@ -532,23 +401,14 @@ pub fn post_scroll(flow: crate::audio::Flow, notches: f32) -> Result<()> {
     .context("post the scroll to the tray")
 }
 
-/// Hand the tray thread a progress-bar value for the player's window.
-///
-/// **Posted rather than applied by the caller because of apartments.** The music feed runs on an MTA
-/// (it blocks on `IAsyncOperation`s, which deadlocks an STA), and `ITaskbarList3` is an
-/// apartment-threaded shell object. Driving it from the MTA works, through a marshalling proxy, but
-/// the tray thread is a real STA and is where every measurement of this was actually taken.
-///
-/// `fraction` of `None` clears the bar. Unlike [`post_action`] this is called on a timer, so a
-/// missing receiver is reported to the caller rather than logged here.
+/// Post a progress-bar value (`None` clears) to the tray thread, whose STA owns `ITaskbarList3`
+/// (the music feed runs on an MTA).
 pub fn post_progress(fraction: Option<f64>, playing: bool) -> Result<()> {
     use windows::Win32::Foundation::{LPARAM, WPARAM};
     use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 
     let receiver = receiver().context("no receiver window — the tray is not up")?;
-    // `wParam` carries the fraction in `PROGRESS_SCALE`ths, or `PROGRESS_NONE` for "clear it".
-    // A message payload has to be plain integers, and a fraction quantised to a scale the caller
-    // already rounds to loses nothing.
+    // `wParam`: the fraction in `PROGRESS_SCALE`ths, or `PROGRESS_NONE` to clear.
     let step = match fraction {
         Some(fraction) => (fraction.clamp(0.0, 1.0) * PROGRESS_SCALE as f64).round() as usize,
         None => PROGRESS_NONE,
@@ -564,11 +424,8 @@ pub fn post_progress(fraction: Option<f64>, playing: bool) -> Result<()> {
     .context("post the progress to the tray")
 }
 
-/// Apply a [`WM_MUSIC_PROGRESS`] payload. Called by the tray's message window, on its STA.
-///
-/// **Gated on the taskbar controls being up**, which is the other half of a defect this move fixed:
-/// `--taskbar-revert` puts the tile away but leaves the feed running, and without this check the very
-/// next poll drew the bar straight back onto a button that no longer has a strip on it.
+/// Apply a [`WM_MUSIC_PROGRESS`] payload on the tray's STA. Clears instead while the strip is down
+/// (after `--taskbar-revert` the feed keeps polling).
 pub fn apply_progress(step: usize, playing: bool) {
     let fraction = (step != PROGRESS_NONE).then(|| step as f64 / PROGRESS_SCALE as f64);
     if fraction.is_some() && !strip_is_up() {
@@ -576,8 +433,7 @@ pub fn apply_progress(step: usize, playing: bool) {
         return;
     }
     if let Err(err) = crate::music::player::set_player_progress(fraction, playing) {
-        // Routine rather than exceptional: the player's window closes and this is how we find out.
-        // Logged only when there was something to draw, so a closed player is quiet.
+        // Routine when the player closes; logged only when there was something to draw.
         if fraction.is_some() {
             eprintln!("music: could not set the progress bar: {err:#}");
         }
@@ -604,8 +460,7 @@ pub use tap_proto::WM_TASKBAR_ACTION;
 
 pub use tap_proto::WM_TASKBAR_SCROLL;
 
-/// Wire code for a direction in [`WM_TASKBAR_SCROLL`]'s `wParam`. Explicit on both sides, so
-/// the exe and the DLL can be built separately without agreeing by accident.
+/// Wire code for a direction in [`WM_TASKBAR_SCROLL`]'s `wParam`.
 pub fn flow_code(flow: crate::audio::Flow) -> usize {
     match flow {
         crate::audio::Flow::Output => tap_proto::FLOW_OUTPUT,
@@ -613,8 +468,7 @@ pub fn flow_code(flow: crate::audio::Flow) -> usize {
     }
 }
 
-/// The other direction of [`flow_code`]. Anything unrecognised reads as output — the
-/// direction the wheel has always adjusted.
+/// The other direction of [`flow_code`]; anything unrecognised reads as output.
 pub fn flow_from_code(code: usize) -> crate::audio::Flow {
     match code {
         tap_proto::FLOW_INPUT => crate::audio::Flow::Input,
@@ -635,10 +489,8 @@ pub fn taskbar_created_message() -> u32 {
     })
 }
 
-/// Creates the hidden window the TAP posts to, with the tray's window procedure.
-///
-/// A never-shown, zero-sized *top-level* tool window rather than a message-only one: the TAP finds
-/// it by class with `EnumWindows`, which does not see message-only windows.
+/// Creates the hidden window the TAP posts to, with the tray's window procedure. Top-level, not
+/// message-only: the TAP finds it with `EnumWindows`, which skips message-only windows.
 pub fn create_receiver(proc: windows::Win32::UI::WindowsAndMessaging::WNDPROC) -> Result<windows::Win32::Foundation::HWND> {
     use windows::Win32::UI::WindowsAndMessaging::WS_EX_TOOLWINDOW;
     let class = windows_core::HSTRING::from(tap_proto::RECEIVER_CLASS);
@@ -655,22 +507,12 @@ pub fn receiver() -> Option<windows::Win32::Foundation::HWND> {
     (raw != 0).then_some(windows::Win32::Foundation::HWND(raw as *mut core::ffi::c_void))
 }
 
-/// Whether this process has already restarted Explorer to repair the strip.
-///
-/// One restart is the budget for the life of the process, and both repair triggers draw on that
-/// same one. The failures they answer can be permanent — an endpoint held by another
-/// XAML-diagnostics consumer survives any number of restarts — and a self-healing loop that
-/// rebuilds the shell over and over would be far worse than having no strip.
+/// Whether this process has already restarted Explorer to repair the strip. One restart per
+/// process, shared by both triggers: the failures can be permanent, and a loop would be worse.
 static HEALED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Rebuild Explorer to get a clean injection, at most once per process. Returns whether one
-/// was started.
-///
-/// The waiting happens on a worker thread because the caller is the tray thread, and
-/// `TaskbarCreated` is *sent* to our receiver window rather than posted (see
-/// [`create_receiver`]) — only a thread sitting in `GetMessage` receives it, and that message is
-/// what re-registers the notification icon and re-injects the strip. Blocking here would stall
-/// the very restart we asked for.
+/// Restart Explorer for a clean injection, at most once per process; returns whether started. On a
+/// worker thread: the tray thread must keep pumping to receive the *sent* `TaskbarCreated`.
 fn heal_explorer(reason: &str) -> bool {
     if HEALED.swap(true, std::sync::atomic::Ordering::SeqCst) {
         eprintln!("taskbar: {reason}, but Explorer has been restarted once already — leaving it");
@@ -685,25 +527,14 @@ fn heal_explorer(reason: &str) -> bool {
     true
 }
 
-/// Whether a TAP is *already* live in this Explorer, before we have injected — so one left
-/// behind by an earlier audio-tray, which the shell keeps loaded for its own lifetime whether
-/// or not it reverted (see the module docs).
-///
-/// Detected by its control window: every TAP instance creates its own (the class registration is
-/// shared, the window is not), and the window belongs to `explorer.exe`, so it outlives the
-/// audio-tray that put it there. Cheaper than reading Explorer's module list, and needs no
-/// rights over another process.
+/// Whether a TAP from an earlier audio-tray is already loaded in this Explorer, detected by its
+/// control window (owned by `explorer.exe`, so it outlives that audio-tray).
 fn tap_already_present() -> bool {
     control_window().is_some()
 }
 
-/// Attempts, and the gap between them, before an injection failure is treated as real.
-///
-/// What this absorbs is a shell that is not ready *yet* rather than one that never will be:
-/// audio-tray autostarts at sign-in, where it can easily beat Explorer's XAML runtime to being
-/// ready. Seconds spent retrying are cheap in a case that is already broken, and it keeps the
-/// Explorer restart below for failures that are genuinely persistent — rebuilding the shell in
-/// the middle of sign-in would be both disruptive and useless.
+/// Attempts, and the gap between them, before an injection failure is treated as real: at
+/// sign-in audio-tray can beat Explorer's XAML runtime, and that must not trigger a restart.
 const ENABLE_TRIES: u32 = 3;
 const ENABLE_GAP: std::time::Duration = std::time::Duration::from_millis(750);
 
@@ -725,21 +556,11 @@ fn enable_with_retries(icons: StripIcons) -> Result<()> {
     Err(last.expect("the loop runs at least once"))
 }
 
-/// Put the strip up at startup. Never fatal: a failure here leaves the plain tray
-/// icon as the whole of the UI, which is what the app looked like before the strip.
-///
-/// Rather than settle for that, this repairs the shell in the two situations where a fresh
-/// Explorer is what is actually needed — each at most once, see [`heal_explorer`].
+/// Put the strip up at startup. Never fatal; restarts Explorer (see [`heal_explorer`]) only when a
+/// loaded TAP refuses the handover or injection keeps failing.
 pub fn apply_at_startup(icons: StripIcons) {
-    // A TAP already in this Explorer means an earlier audio-tray injected into it (the shell keeps
-    // the DLL for its lifetime). Injecting a second one is not benign — the older one's
-    // owner-watch can undo the newer one's decoration — so either hand the loaded one our init
-    // data, or rebuild the shell and let `TaskbarCreated` inject into a clean one.
-    //
-    // The handover is the normal case (Quit then start, a kill, `restart_app`). The restart is
-    // kept for a TAP from another build — which is also what completes an update, since the
-    // restart frees `audio_tray_tap.dll` for `crate::update::place_staged_tap` — and for one that
-    // does not answer.
+    // Never inject beside a loaded TAP (its owner watch can undo ours): hand it over, or restart
+    // Explorer for another build's TAP (which also lets `place_staged_tap` finish an update).
     if tap_already_present() {
         match offer_handover(icons, std::process::id()) {
             Ok(()) => {
@@ -758,34 +579,16 @@ pub fn apply_at_startup(icons: StripIcons) {
         Ok(()) => eprintln!("taskbar: controls enabled"),
         Err(e) => {
             eprintln!("taskbar: integration unavailable, using the plain tray icon ({e:#})");
-            // Deliberately only from here and not from `apply_at_restart`: an injection failure
-            // straight after an Explorer restart the *user* performed should not be answered by
-            // restarting it again underneath them.
+            // Not from `apply_at_restart`: never restart Explorer right after the user did.
             heal_explorer("the injection failed");
         }
     }
 }
 
-/// Re-inject after Explorer restarted.
-///
-/// The TAP lives inside `explorer.exe` and dies with it, taking the strip along.
-/// Nothing needs reverting in that case — the process that held our changes is
-/// gone — but without this the strip would stay gone until audio-tray itself was
-/// restarted.
-///
-/// Runs on the tray thread, where COM is already initialized, and inherits
-/// [`enable`]'s contract: a failure means the plain tray icon carries on alone.
+/// Re-inject after Explorer restarted (the TAP died with it). Tray thread; failure leaves the plain icon.
 pub fn apply_at_restart(icons: StripIcons) {
-    // A shell that has just restarted broadcasts `TaskbarCreated`, and audio-tray
-    // starting up injects on its own account. Both can land within a second of each
-    // other, which put two TAP instances in one Explorer — observed in the log as a
-    // second `SetSite` for the same pid. The duplicate is harmless (the newer
-    // generation supersedes the older) but it costs a COM object and an owner-watch
-    // thread for nothing.
-    //
-    // Deliberately *not* a check for "is a TAP already loaded": after a revert the
-    // DLL and its control window are still there, so that test would refuse the
-    // re-injection it is meant to allow.
+    // `TaskbarCreated` can land right after our own startup injection. Not "is a TAP loaded":
+    // after a revert it still is, and that test would refuse a legitimate re-injection.
     if shell_pid().is_ok_and(just_injected) {
         return;
     }
@@ -795,51 +598,27 @@ pub fn apply_at_restart(icons: StripIcons) {
     }
 }
 
-/// The shell's private "exit Explorer" command — what the hidden Ctrl+Shift+right-click
-/// "Exit Explorer" item on the taskbar posts. Explorer shuts down the orderly way (it saves
-/// its state and closes its windows) *and* the exit counts as deliberate, so Winlogon's
-/// `AutoRestartShell` does not bring it back. That is why [`restart_explorer`] launches the
-/// replacement itself.
+/// The shell's private "Exit Explorer" command (Ctrl+Shift+right-click menu). Counts as deliberate,
+/// so `AutoRestartShell` does not relaunch; [`restart_explorer`] does.
 const WM_SHELL_EXIT: u32 = 0x5B4;
 
-/// How long the polite request gets before the process is terminated instead.
-///
-/// Short on purpose. Measured on Win11 26200, both outcomes: with no TAP in Explorer the
-/// graceful exit lands in well under a second, and with our TAP loaded — the normal state,
-/// since the strip is injected on every start — it does not happen at all and the wait is pure
-/// delay before the fallback does the work. So this only has to be long enough for the case
-/// that succeeds quickly, not generous enough for one that never finishes.
+/// How long the polite request gets before termination. Short: with our TAP loaded Explorer
+/// ignores it entirely, and without one it exits in under a second.
 const SHELL_EXIT_WAIT_MS: u32 = 2_500;
 
-/// Restart `explorer.exe`, and with it the strip.
-///
-/// Offered by the flyout's footer in the two cases where only a fresh Explorer will do — no
-/// strip this start, or a staged update whose new TAP is stuck behind the DLL Explorer holds
-/// open (see `flyout::layout::footer_buttons`). Both are conditions the user can otherwise
-/// only clear by signing out or rebooting.
-///
-/// **Blocks for as long as the shell takes to go and come back** (seconds), so callers keep
-/// it off a thread that has to pump messages — see `crate::tray`.
-///
-/// Nothing here puts the strip back, deliberately: a restarted Explorer broadcasts
-/// `TaskbarCreated`, and [`apply_at_restart`] is already wired to it for the Explorer restarts
-/// we do not cause. This path is not special enough to need its own.
+/// Restart `explorer.exe`, placing a staged TAP in between. Blocks for seconds: keep it off a
+/// thread that pumps messages. The strip comes back via `TaskbarCreated` → [`apply_at_restart`].
 pub fn restart_explorer() -> Result<()> {
     use windows::Win32::Storage::FileSystem::SYNCHRONIZE;
     use windows::Win32::System::Threading::{OpenProcess, PROCESS_ACCESS_RIGHTS, PROCESS_TERMINATE};
 
     let pid = shell_pid()?;
-    // Opened *before* Explorer is asked to leave, and waited on rather than polled for: a
-    // handle goes on identifying this process after it exits, where a pid can be recycled
-    // onto something else entirely in the gap. `SYNCHRONIZE` is bound as a *file* access
-    // right, but the bit is the generic one every waitable handle uses, so it only needs
-    // re-wrapping for a process.
+    // A handle, opened before asking, so a recycled pid cannot fool the wait. `SYNCHRONIZE` is the
+    // generic bit, re-wrapped as a process right.
     let access = PROCESS_ACCESS_RIGHTS(SYNCHRONIZE.0) | PROCESS_TERMINATE;
     let shell = unsafe { OpenProcess(access, false, pid) }.context("open the shell process")?;
 
-    // The strip dies with the process hosting it, and every path below ends with this
-    // Explorer gone. Cleared up front so a failure part-way cannot leave the tray icon
-    // believing its clicks still belong to a strip that is not there.
+    // Every path below ends with this Explorer (and the strip) gone.
     STRIP_UP.store(false, std::sync::atomic::Ordering::SeqCst);
 
     let outcome = exit_and_relaunch_shell(shell);
@@ -853,13 +632,11 @@ fn exit_and_relaunch_shell(shell: windows::Win32::Foundation::HANDLE) -> Result<
     use windows::Win32::System::Threading::{TerminateProcess, WaitForSingleObject};
     use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 
-    // Ask nicely first, so Explorer saves its state instead of being shot. `window_by_class`
-    // rather than `FindWindow` for the reason given in its own docs.
+    // Ask nicely first, so Explorer saves its state.
     let asked = match window_by_class("Shell_TrayWnd") {
         Some(tray) => unsafe { PostMessageW(Some(tray), WM_SHELL_EXIT, WPARAM(0), LPARAM(0)) }
             .inspect_err(|e| eprintln!("taskbar: could not ask Explorer to exit ({e})"))
             .is_ok(),
-        // No taskbar window at all — there is nothing to ask, so go straight to the fallback.
         None => {
             eprintln!("taskbar: no Shell_TrayWnd to ask for an exit");
             false
@@ -867,15 +644,9 @@ fn exit_and_relaunch_shell(shell: windows::Win32::Foundation::HANDLE) -> Result<
     };
 
     let gone = |ms: u32| unsafe { WaitForSingleObject(shell, ms) } == WAIT_OBJECT_0;
-    // Whether the shell had to be shot, which decides how long to wait for a replacement.
     let mut terminated = false;
     if !asked || !gone(SHELL_EXIT_WAIT_MS) {
-        // Routine rather than exceptional: measured, an Explorer with our TAP loaded ignores
-        // the request, and that is the state whenever the strip is up. `WM_SHELL_EXIT` is also
-        // undocumented and could stop working on a future build. Either way a button that
-        // silently does nothing would be the worse failure, so fall back to what
-        // `taskkill /f /im explorer.exe` does — the shell is built to be killed, which is what
-        // `AutoRestartShell` exists for.
+        // The usual path when our TAP is loaded (and `WM_SHELL_EXIT` is undocumented anyway).
         eprintln!("taskbar: Explorer did not exit on request — terminating it instead");
         unsafe { TerminateProcess(shell, 1) }.context("terminate the shell process")?;
         terminated = true;
@@ -884,30 +655,17 @@ fn exit_and_relaunch_shell(shell: windows::Win32::Foundation::HANDLE) -> Result<
         }
     }
 
-    // The one moment nothing holds `audio_tray_tap.dll`: the old Explorer has released it and
-    // the new one is not started yet. A TAP update that was waiting for a reboot can land
-    // now — and it has to be *here*, because the re-injection that follows `TaskbarCreated`
-    // would otherwise pull the stale DLL straight back into the new process.
+    // Must be here: the only moment no Explorer holds the DLL, before re-injection loads it again.
     crate::update::place_staged_tap();
 
-    // Launching explorer.exe while a shell is already up opens a file-browser window rather
-    // than a second shell, so look before leaping: a graceful exit is recorded as deliberate
-    // and nothing restarts the shell for us, but a terminate is the kind of death
-    // `AutoRestartShell` is meant to answer, so allow a little longer for one to appear on its
-    // own. Only a *ceiling* — `wait_for_shell` returns the moment one shows up.
-    //
-    // Kept small because every millisecond of it is a taskbar the user does not have. Measured
-    // on Win11 26200: nothing restarted the shell for us on either path, terminate included,
-    // so in practice this budget is spent in full and then our own launch does the work.
+    // Launching explorer.exe beside a live shell opens a file window, so wait briefly in case one
+    // restarts itself (in practice none does, so keep this short).
     let budget = std::time::Duration::from_millis(if terminated { 1_500 } else { 500 });
     if wait_for_shell(budget) {
         eprintln!("taskbar: Explorer restarted itself");
         return Ok(());
     }
-    // Detached from our streams on purpose. A child inherits them by default, and this child
-    // outlives us by the whole session — so an explorer.exe launched from, say, a dev CLI run
-    // would sit holding that console (or redirected file) open long after audio-tray is gone.
-    // Nothing here wants to read explorer's output either way.
+    // Detached from our streams: the shell outlives us and would hold a console or file open.
     std::process::Command::new("explorer.exe")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())

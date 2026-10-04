@@ -1,20 +1,12 @@
 //! A custom Windows-11-style flyout, modelled on the system sound flyout: an
 //! acrylic-blurred, rounded, dark surface with an accent "pill" on the selected row.
 //!
-//! Unlike a classic `TrackPopupMenu`, this is a live control surface: volume sliders,
-//! mute toggles, output + input device switching, and an inline per-device icon picker,
-//! all painted by hand into a per-pixel-alpha *layered* window (`UpdateLayeredWindow`),
-//! with acrylic blur from the compositor (`SetWindowCompositionAttribute`) and rounded
-//! corners from DWM. Rows and controls are laid out and hit-tested by hand; the flyout is
-//! modal via mouse capture, like a menu, but stays open while you operate it.
+//! Volume sliders, mute toggles, device switching, an icon picker and a footer (settings,
+//! update, quit), hand-painted into a layered window and hit-tested by hand. Modal via mouse
+//! capture, like a menu.
 //!
-//! There is one panel, not a panel and a menu: Quit and Sound settings live in the footer
-//! strip that closes it, modelled on the Win11 quick-settings footer. That is what frees the
-//! taskbar strip to spend its clicks on switching devices rather than on opening menus.
-//!
-//! This module is the **controller**: it owns the modal message pump and coordinates the
-//! focused pieces it delegates to — the display [`model`], pure [`layout`], the [`render`]
-//! passes, the drawing [`crate::canvas`], the [`window`] surface, and the [`theme`] tokens.
+//! This module is the controller: it owns the modal pump and delegates to [`model`],
+//! [`layout`], [`render`], [`window`] and [`theme`].
 
 mod layout;
 mod model;
@@ -54,43 +46,32 @@ use window::Surface;
 pub struct Outcome {
     pub quit: bool,
     pub config_changed: bool,
-    /// The user clicked the "restart to update" entry — the caller should relaunch the
-    /// (already-updated on disk) exe and exit.
+    /// Relaunch the already-updated exe and exit.
     pub restart: bool,
 }
 
-/// Where to open the flyout: horizontally centred on the tray icon (`cx`), sitting just
-/// above it (`bottom` = the icon's top), like the native tray flyouts.
+/// Where to open the flyout: centred on `cx`, its bottom at `bottom` (the tray icon's top).
 #[derive(Clone, Copy)]
 pub struct Anchor {
     pub cx: i32,
     pub bottom: i32,
 }
 
-// Posted (by the WASAPI volume callback) when a watched endpoint's volume/mute changes,
-// so external changes (media keys, other apps) are reflected live while we're open.
+// Posted by the volume callback when a watched endpoint's volume/mute changes.
 const WM_VOL_CHANGED: u32 = WM_APP + 10;
-// Posted by the window proc when we lose mouse capture (another window/app took focus,
-// e.g. the Start menu). WM_CAPTURECHANGED is *sent* to the proc, not queued, so it's
-// bounced back (see [`window`]) as a posted message the modal loop can act on to dismiss.
+// Posted on capture loss (`WM_CAPTURECHANGED` is sent, so [`window`] re-posts it for the pump).
 const WM_FLYOUT_CLOSE: u32 = WM_APP + 11;
 
-// A Win32 timer drives ~30 fps sampling of each default endpoint's live peak level
-// (IAudioMeterInformation) so the slider fill reacts to real audio while we're open.
+// ~30 fps peak-meter sampling.
 const METER_TIMER_ID: usize = 1;
 const METER_INTERVAL_MS: u32 = 33;
-// A second timer drives the screen-to-screen slide (see [`Flyout::navigate`]). 10 ms is the
-// Win32 floor (`USER_TIMER_MINIMUM`), and the ~15 ms system tick rounds it up anyway — each
-// frame is placed by *elapsed time*, not by tick count, so the slide always takes
-// [`ANIM_SECS`] whatever rate the ticks actually arrive at.
+// The screen slide's timer (10 ms is the Win32 floor); frames are placed by elapsed time.
 const ANIM_TIMER_ID: usize = 2;
 const ANIM_INTERVAL_MS: u32 = 10;
 const ANIM_SECS: f32 = 0.14;
 // Per-tick fall-off of the displayed peak: instant attack, gentle release (a VU-meter feel).
 const METER_DECAY: f32 = 0.82;
-// Volume change per wheel notch (`WHEEL_DELTA`) when scrolling over the flyout — 2%, matching
-// the native tray flyout. Applied proportionally to the delta, so precision-touchpad scroll
-// (which arrives in sub-notch steps) nudges the volume smoothly instead of in big jumps.
+// Volume change per wheel notch, applied proportionally so sub-notch touchpad deltas are smooth.
 const SCROLL_STEP: f32 = 0.02;
 
 /// Transient pointer-interaction state: what the cursor is over, and any in-flight
@@ -106,10 +87,8 @@ struct Interaction {
     pending: Option<usize>,    // index pressed on button-down, acted on button-up
 }
 
-/// A slide between two screens, in flight. Its frames are advanced from the modal loop's
-/// [`ANIM_TIMER_ID`] tick rather than from a blocking loop inside [`Flyout::navigate`]:
-/// the flyout holds the *mouse capture*, so a pump that stops pumping to sleep between
-/// frames starves pointer input — the cursor visibly freezes for the length of the slide.
+/// A slide between two screens, in flight, advanced by [`ANIM_TIMER_ID`] ticks. Never animate
+/// in a blocking loop: with the mouse captured, the cursor freezes while the pump sleeps.
 struct Transition {
     to: View,
     elems: Vec<LaidElem>, // the destination screen's layout, adopted when the slide lands
@@ -120,11 +99,8 @@ struct Transition {
     start: Instant,
 }
 
-/// The flyout controller. Slim on purpose: the shared services it borrows (`backend`,
-/// `config`), the render context (`scale`, `accent`), and three cohesive pieces — the
-/// display [`Model`], the pointer [`Interaction`], and the [`Surface`] (window + pixels) —
-/// plus the live audio subscriptions, which hold COM interfaces and so can't live in the
-/// plain-data model.
+/// The flyout controller: borrowed services, render context, [`Model`], [`Interaction`],
+/// [`Surface`], and the live audio subscriptions (COM, so kept out of the plain-data model).
 struct Flyout<'a> {
     backend: &'a WasapiBackend,
     config: &'a mut Config,
@@ -148,8 +124,7 @@ pub fn show(
     unsafe { show_inner(backend, config, anchor, false) }
 }
 
-/// Dev preview: open straight onto the first output device's icon-picker screen (so the
-/// picker can be iterated on without first hovering + clicking a device's edit pencil).
+/// Dev preview: open straight onto the first output device's icon-picker screen.
 #[cfg(feature = "dev")]
 pub fn show_icons_preview(
     backend: &WasapiBackend,
@@ -165,8 +140,7 @@ unsafe fn show_inner(
     anchor: Option<Anchor>,
     start_icons: bool,
 ) -> Outcome {
-    // Where it opens: centred above the tray icon, else at the cursor. Its monitor decides the scale
-    // and the work area it is clamped to.
+    // Centred above the tray icon, else at the cursor; that monitor sets scale and work area.
     let (cx, bottom) = match anchor {
         Some(a) => (a.cx, a.bottom),
         None => {
@@ -218,24 +192,18 @@ unsafe fn show_inner(
     fly.compose();
     let _ = ShowWindow(fly.surface.hwnd, SW_SHOWNA);
     fly.surface.animate_in(fly.scale);
-    // Foreground + capture so the flyout behaves like a menu: it sees every mouse
-    // move/click, and an outside click reliably dismisses it.
+    // Foreground + capture, like a menu: an outside click dismisses it.
     let _ = SetForegroundWindow(fly.surface.hwnd);
     SetCapture(fly.surface.hwnd);
-    // While the mouse is captured Windows stops sending WM_SETCURSOR, so force the arrow.
+    // No WM_SETCURSOR arrives under capture, so force the arrow.
     let _ = SetCursor(LoadCursorW(None, IDC_ARROW).ok());
-    // Subscribe to external volume/mute changes (media keys, other apps) while we're open.
     fly.setup_watches();
-    // Poll each endpoint's live peak meter ~30 fps so the slider fill reacts to audio.
     let _ = SetTimer(Some(fly.surface.hwnd), METER_TIMER_ID, METER_INTERVAL_MS, None);
 
     let mut msg = MSG::default();
     'pump: while GetMessageW(&mut msg, None, 0, 0).0 > 0 {
-        // A slide is in flight (see [`Flyout::navigate`]). The pump keeps running — that is
-        // the whole point, so the captured pointer stays live — but the two half-slid
-        // screens aren't hit-testable and `elems` still describes the outgoing one, so
-        // pointer input is dropped for the ~140 ms it lasts. Escape and losing the capture
-        // still dismiss.
+        // Mid-slide, `elems` still describes the outgoing screen, so pointer input is dropped;
+        // Escape and capture loss still dismiss.
         let sliding = fly.anim.is_some();
         match msg.message {
             WM_MOUSEMOVE | WM_LBUTTONDOWN | WM_LBUTTONUP | WM_RBUTTONDOWN | WM_MOUSEWHEEL
@@ -270,8 +238,7 @@ unsafe fn show_inner(
             }
             WM_LBUTTONUP => {
                 if let Some(si) = fly.hit.drag.take() {
-                    // Only an *output* volume change plays the "ding"; changing the input
-                    // (mic) level shouldn't trigger a notification sound.
+                    // Only output volume changes ding.
                     if let Elem::Slider { group } = fly.surface.elems[si].elem {
                         if fly.model.groups[group].flow == Flow::Output {
                             beep_volume();
@@ -296,8 +263,7 @@ unsafe fn show_inner(
                 }
             }
             WM_MOUSEWHEEL => {
-                // WM_MOUSEWHEEL reports the pointer in *screen* coordinates (unlike the other
-                // mouse messages) and the wheel delta in the high word of wParam.
+                // Screen coordinates, unlike the other mouse messages.
                 let delta = (msg.wParam.0 >> 16) as u16 as i16;
                 let (_, sy) = mouse_xy(msg.lParam);
                 fly.scroll_volume(sy - fly.surface.y, delta);
@@ -335,10 +301,8 @@ impl Flyout<'_> {
         self.hit = Interaction::default();
     }
 
-    /// Size the panel and lay out the current view, allocating buffers. Invalidates
-    /// transient hit state. Both the width and the height are fixed for the flyout's whole
-    /// life — the width from the main list, the height from the tallest screen — so
-    /// navigating between the main panel and an icon picker never resizes the window.
+    /// Size the panel, lay out the current view and allocate buffers; clears hit state. The size
+    /// fits every screen, so navigating never resizes the window.
     fn rebuild_layout(&mut self) {
         self.reset_hover();
         self.surface.width = layout::content_width(&self.model, self.scale);
@@ -350,16 +314,8 @@ impl Flyout<'_> {
         self.surface.buf = vec![0u8; bytes];
     }
 
-    /// Push the current devices' glyphs to the injected taskbar strip, at the moment of each
-    /// live change.
-    ///
-    /// The tray's own `refresh` cannot do it: while this flyout is open it owns the message
-    /// loop, so the endpoint-change notification is not processed until it closes — which made
-    /// the strip visibly lag the selection the user had just made.
-    ///
-    /// Through the tray rather than straight to `taskbar` because the tray owns the record of
-    /// what has been posted, and a restyle the strip is already showing costs the TAP a full
-    /// rebuild.
+    /// Push the current glyphs to the taskbar strip on each live change: the tray's refresh is
+    /// held back until the flyout closes. Goes through the tray, which dedupes restyles.
     fn sync_strip(&self) {
         crate::tray::restyle_strip(self.backend, self.config);
     }
@@ -371,9 +327,7 @@ impl Flyout<'_> {
         }
     }
 
-    /// Adjust volume in response to a wheel notch at client-y `cy`. Scrolls the slider under
-    /// the cursor, or the primary output slider otherwise, so scrolling anywhere on the panel
-    /// nudges the output volume like the native tray flyout.
+    /// Adjust volume for a wheel notch at client-y `cy` (see [`Self::scroll_target_group`]).
     fn scroll_volume(&mut self, cy: i32, delta: i16) {
         let Some(group) = self.scroll_target_group(cy) else {
             return;
@@ -385,9 +339,8 @@ impl Flyout<'_> {
         self.surface.flush();
     }
 
-    /// Which group a wheel event should adjust: the slider row under the cursor, else the
-    /// first output slider (the panel's primary volume). `None` when there's no slider (the
-    /// right-click quick menu), so scrolling there is a no-op.
+    /// The slider under the cursor, else the first output slider; `None` on a screen without
+    /// sliders (the icon picker).
     fn scroll_target_group(&self, cy: i32) -> Option<usize> {
         if let Some(i) = layout::elem_at(&self.surface.elems, cy) {
             if let Elem::Slider { group } = self.surface.elems[i].elem {
@@ -409,9 +362,8 @@ impl Flyout<'_> {
         }
     }
 
-    /// (Re)subscribe a group to its current default endpoint — called at open and whenever
-    /// the default is switched from within the flyout (the old endpoint's watch is dropped,
-    /// which unregisters it). Also re-activates the peak meter that feeds the activity glow.
+    /// (Re)subscribe a group's watch and peak meter to its current default endpoint; dropping
+    /// the old watch unregisters it.
     fn rewatch(&mut self, group: usize) {
         if group >= self.watches.len() {
             return;
@@ -424,27 +376,19 @@ impl Flyout<'_> {
         self.watches[group] = id
             .as_ref()
             .and_then(|id| backend.watch_volume(id, hwnd, WM_VOL_CHANGED, pending).ok());
-        // The activity glow is output-only: metering an input endpoint needs a running
-        // capture stream, which would keep Windows' "microphone in use" indicator lit the
-        // whole time the flyout is open. So we only meter output; the input slider stays a
-        // plain slider (its peak holds at 0, which the additive glow renders as no glow).
+        // Output only: metering an input needs a capture stream, which lights "microphone in use".
         self.meters[group] = match flow {
             Flow::Output => id.as_ref().and_then(|id| backend.meter_for(id, flow).ok()),
             Flow::Input => None,
         };
     }
 
-    /// Sample each default endpoint's live peak level and fold it into the smoothed `peak`
-    /// (fast attack, gentle release), then repaint if anything moved. Driven by the ~30 fps
-    /// timer. A muted endpoint reads as silent so its fill settles back to the resting glow.
+    /// Fold each endpoint's live peak into the smoothed `peak` (muted reads as silent) and
+    /// repaint if anything moved.
     fn tick_meters(&mut self) {
         let mut changed = false;
         let mut base_changed = false;
-        // The recording dot rides this same tick. Following it costs an atomic load, not a
-        // registry sweep — [`crate::audio::mic`] keeps the answer current from its own
-        // watcher thread, which is what makes it cheap enough to ask at 30 fps. Unlike the
-        // peaks it is drawn on the mic *glyph*, which lives in the static base layer, so a
-        // flip has to re-render that rather than just recompose.
+        // The recording dot rides this tick (an atomic load); it is in the base layer, so a flip re-renders it.
         let recording = crate::audio::mic::in_use();
         for group in 0..self.model.groups.len() {
             let raw = if self.model.groups[group].muted {
@@ -463,8 +407,7 @@ impl Flyout<'_> {
                 base_changed = true;
             }
         }
-        // Mid-slide the screen belongs to the transition — keep tracking the peaks, but let
-        // it paint. The screen it lands on is composed from this same model.
+        // Mid-slide the transition paints.
         if (changed || base_changed) && self.anim.is_none() {
             if base_changed {
                 self.render_base();
@@ -474,12 +417,9 @@ impl Flyout<'_> {
         }
     }
 
-    /// Re-read each default endpoint's volume/mute (from the cached watch interface, no COM
-    /// re-activation) so external changes show up live. Skipped mid-drag so it never fights
-    /// the user's own slider.
+    /// Re-read each default endpoint's volume/mute from its watch. Skipped mid-drag.
     fn refresh_volumes(&mut self) {
-        // Clear the coalescing flag *before* reading, so a change that lands during the
-        // read re-arms and posts again (we never miss the final state).
+        // Clear the coalescing flag before reading, so a change during the read posts again.
         self.vol_dirty.store(false, Ordering::SeqCst);
         if self.hit.drag.is_some() {
             return;
@@ -506,15 +446,11 @@ impl Flyout<'_> {
                 }
             }
         }
-        // Mid-slide the screen belongs to the transition (as in `tick_meters`): the model is
-        // up to date and the screen it lands on is rendered from it.
+        // Mid-slide the transition paints.
         if self.anim.is_some() {
             return;
         }
-        // A mute flip swaps the slider's leading glyph (which lives in `base`); a plain
-        // volume change only moves the fill/thumb/number, all drawn in the cheap `compose`
-        // overlay — so avoid re-rasterizing every glyph for a mere volume tick (a mic's
-        // auto-gain can fire these constantly).
+        // Only a mute flip touches `base` (the glyph); volume ticks (frequent with mic auto-gain) just recompose.
         if mute_changed {
             self.render_base();
         }
@@ -597,8 +533,7 @@ impl Flyout<'_> {
                 }
                 false
             }
-            // The footer carries its targets side by side; the inert strip between them
-            // (`None`) leaves the flyout open.
+            // The inert gap between footer targets (`None`) leaves the flyout open.
             Elem::Footer => match layout::footer_hit(&self.model, self.surface.width, self.scale, mx) {
                 Some(ActionKind::SoundSettings) => {
                     open_sound_settings();
@@ -619,14 +554,8 @@ impl Flyout<'_> {
         }
     }
 
-    /// Start a slide-transition from the current screen to `to`. `forward` slides the new
-    /// screen in from the right (drilling into the picker); otherwise it comes from the left
-    /// (backing out). The window keeps a constant size — the width and height are both fixed
-    /// — so this is a pure horizontal slide with no resize.
-    ///
-    /// Returns as soon as the first frame is up; the rest is driven by [`ANIM_TIMER_ID`] from
-    /// the modal loop (see [`Transition`]), so the pump keeps servicing input — and the
-    /// pointer keeps moving — for the whole slide.
+    /// Start a horizontal slide to `to` (`forward`: new screen enters from the right). Returns
+    /// after the first frame; [`ANIM_TIMER_ID`] drives the rest (see [`Transition`]).
     fn navigate(&mut self, to: View, forward: bool) {
         let (w, h) = (self.surface.width, self.surface.height);
         let n = (w * h * 4) as usize;
@@ -648,9 +577,7 @@ impl Flyout<'_> {
         self.tick_transition(); // put the first frame up without waiting for a tick
     }
 
-    /// Draw the in-flight slide wherever it should be *now*, and adopt the destination screen
-    /// once it lands. Placing each frame by elapsed time (rather than counting ticks) keeps
-    /// the slide the same length whether the ticks arrive every 10 ms or every 16.
+    /// Draw the slide at its elapsed-time position, and adopt the destination once it lands.
     fn tick_transition(&mut self) {
         let Some(mut anim) = self.anim.take() else {
             return;
@@ -684,16 +611,14 @@ impl Flyout<'_> {
         self.reset_hover();
         self.surface.base = vec![0u8; n];
         self.surface.buf = vec![0u8; n];
-        // The screen changed under a pointer that need not have moved — pick up what it is
-        // over *now* rather than sitting hover-less until the next WM_MOUSEMOVE.
+        // The pointer may not move again soon; pick up what it is over now.
         self.sync_hover_to_cursor();
         self.render_base();
         self.compose();
         self.surface.flush();
     }
 
-    /// Recompute what the pointer is over from client position `(mx, my)`. Returns whether
-    /// anything changed — i.e. whether the caller needs to repaint.
+    /// Recompute what the pointer is over at client `(mx, my)`; returns whether to repaint.
     fn set_hover(&mut self, mx: i32, my: i32) -> bool {
         let inside = layout::inside(self.surface.width, self.surface.height, mx, my);
         let hover = if inside { layout::elem_at(&self.surface.elems, my) } else { None };
@@ -725,8 +650,7 @@ impl Flyout<'_> {
         changed
     }
 
-    /// Seed the hover state from where the cursor actually is. The panel never moves while
-    /// it is open, so screen → client is a plain translation by its top-left corner.
+    /// Seed the hover state from where the cursor actually is.
     fn sync_hover_to_cursor(&mut self) {
         let mut p = POINT::default();
         if unsafe { GetCursorPos(&mut p) }.is_ok() {
@@ -744,9 +668,7 @@ impl Flyout<'_> {
 
     /// Copy the static base, then draw the dynamic overlays (see [`render::compose`]).
     fn compose(&mut self) {
-        // `Ctx::new` borrows `self.model` alone, which is what leaves `self.surface.buf` free
-        // to borrow mutably as the target while `elems`/`base` are read. `self.ctx()` would
-        // borrow all of `self` and could not.
+        // `Ctx::new` borrows only `self.model`, leaving `self.surface.buf` free; `self.ctx()` would not.
         let ctx = render::Ctx::new(&self.model, self.accent, self.scale, self.surface.size());
         render::compose(&ctx, &self.hit, &self.surface.elems, &self.surface.base, &mut self.surface.buf);
     }
@@ -763,9 +685,7 @@ fn mouse_xy(lp: LPARAM) -> (i32, i32) {
     (x, y)
 }
 
-/// Play the Windows "Default Beep" — the same ding Windows itself plays on a volume
-/// change (the `SystemDefault` sound). Async + best-effort; it honours the user's sound
-/// scheme and plays at the current level, so it doubles as audible volume feedback.
+/// Play the Windows volume-change ding (`SystemDefault`), async and best-effort.
 fn beep_volume() {
     use windows::Win32::System::Diagnostics::Debug::MessageBeep;
     use windows::Win32::UI::WindowsAndMessaging::MB_OK;
@@ -774,7 +694,7 @@ fn beep_volume() {
     }
 }
 
-/// Open Settings ▸ System ▸ Sound (the native page the right-click menu offers).
+/// Open Settings ▸ System ▸ Sound.
 fn open_sound_settings() {
     unsafe {
         ShellExecuteW(

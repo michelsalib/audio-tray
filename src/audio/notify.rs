@@ -14,7 +14,7 @@ use windows::Win32::Media::Audio::{
 use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_ALL};
 use windows::Win32::UI::WindowsAndMessaging::WM_APP;
 
-/// Posted to the tray thread when an endpoint change should trigger a refresh.
+/// Posted to the tray's message window when an endpoint change should trigger a refresh.
 pub const WM_AUDIO_REFRESH: u32 = WM_APP + 1;
 
 #[implement(IMMNotificationClient)]

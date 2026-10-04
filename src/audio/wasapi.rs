@@ -25,14 +25,9 @@ use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 
 use super::{Device, DeviceId, Flow, FormFactor};
 
-/// Posts `msg` to `hwnd` whenever an endpoint's volume or mute changes. The callback fires
-/// on a WASAPI-owned thread, so it does nothing but post — the UI thread re-reads and
-/// repaints. `hwnd` is stored as an `isize` to keep the COM object thread-agnostic.
-///
-/// `pending` coalesces: at most one message is queued at a time. Posted messages outrank
-/// input in `GetMessage`, so an unthrottled storm (e.g. a microphone's automatic gain
-/// control, which fires constantly) would starve the flyout of clicks and it could never
-/// be dismissed. The UI clears the flag when it handles the message.
+/// Posts `msg` to `hwnd` on each volume/mute change; runs on a WASAPI thread, so it only posts.
+/// `pending` keeps at most one message queued: posted messages outrank input, and an unthrottled
+/// storm (mic auto-gain) starves the flyout of clicks. The UI clears the flag when handling it.
 #[implement(IAudioEndpointVolumeCallback)]
 struct VolCallback {
     hwnd: isize,
@@ -83,13 +78,9 @@ impl Drop for VolumeWatch {
     }
 }
 
-/// A live peak-level meter for one endpoint, polled on a timer to drive the slider's
-/// activity glow. Render and capture need different plumbing: a render endpoint's meter is
-/// always live, but a capture endpoint's meter only reports while *something* is capturing,
-/// so we hold a silent capture stream open for the duration (see [`CaptureMeter`]).
+/// A live peak-level meter for one endpoint, polled to drive the slider's activity glow.
 pub enum Meter {
-    /// A render endpoint's own meter, which aggregates every stream on the device — so it
-    /// reflects whatever is playing without us opening a stream of our own.
+    /// A render endpoint's own meter, always live (aggregates every stream).
     Render(IAudioMeterInformation),
     #[cfg(feature = "dev")]
     Capture(CaptureMeter),
@@ -106,15 +97,9 @@ impl Meter {
     }
 }
 
-/// Only the `--meter` dev mode uses it: the flyout meters output alone (an input meter keeps the
-/// "microphone in use" indicator lit).
+/// Peak meter for a capture endpoint, whose meter is dormant without a running stream: holds
+/// a shared-mode capture stream open (lighting "microphone in use") until drop. Dev only (`--meter`).
 #[cfg(feature = "dev")]
-/// Peak meter for a capture endpoint. A capture endpoint's `IAudioMeterInformation` is
-/// dormant unless a capture stream is running (the same reason Windows' own mic level bar
-/// only moves while the Sound page is open), so we open a silent shared-mode capture stream
-/// and keep it running. Each poll drains and discards the queued frames (so the buffer
-/// keeps flowing) and reads the endpoint peak. The stream stops on drop; while it lives,
-/// Windows shows its "microphone in use" indicator, exactly as the Settings meter does.
 pub struct CaptureMeter {
     client: IAudioClient,
     capture: IAudioCaptureClient,
@@ -143,8 +128,7 @@ impl CaptureMeter {
 
     fn peak(&self) -> f32 {
         unsafe {
-            // Drain and discard queued packets so the capture buffer keeps flowing and the
-            // meter stays current.
+            // Drain queued packets so the buffer keeps flowing and the meter stays current.
             while let Ok(frames) = self.capture.GetNextPacketSize() {
                 if frames == 0 {
                     break;
@@ -180,8 +164,7 @@ impl Flow {
     }
 }
 
-/// Reads the WASAPI render-endpoint state. COM must already be initialized on the
-/// calling thread (see `main`).
+/// The WASAPI endpoint state, both directions. COM must be initialized on the calling thread.
 pub struct WasapiBackend {
     enumerator: IMMDeviceEnumerator,
 }
@@ -194,23 +177,9 @@ impl WasapiBackend {
         Ok(Self { enumerator })
     }
 
-    /// Move the default endpoint of one direction by `by` (a signed fraction of full
-    /// scale), and report where it landed — the level and whether it is muted.
-    ///
-    /// The reading comes back because every caller needs it: this is what a scroll over the
-    /// taskbar buttons calls, and the readout beside them ([`crate::osd`]) has to draw the
-    /// level the endpoint actually took, which is not `current + by` at either end of the
-    /// range. Reading it separately would mean a second `Activate` on the same endpoint.
-    ///
-    /// A *proportional* nudge rather than `VolumeStepUp`/`Down`, deliberately: the wheel is
-    /// no longer the only thing that gets here. Precision-touchpad scroll arrives as a
-    /// stream of sub-notch deltas, and one endpoint step per delta would run the volume from
-    /// 0 to 100 in a flick — where a fraction of the per-notch step tracks the finger. One
-    /// notch still comes to the same 2% Windows itself uses (see `tray::SCROLL_STEP`).
-    ///
-    /// Mute is reported, never changed. Muting from the taskbar buttons is a deliberate stop
-    /// in their click cycle (see `tray::Tray::taskbar_action`), so a scroll silently
-    /// clearing it would fight the gesture the user just made.
+    /// Move the default endpoint of one direction by `by` (a signed fraction of full scale) and
+    /// return the level it took and whether it is muted. Proportional, not `VolumeStepUp`, so
+    /// sub-notch touchpad deltas track the finger. Mute is reported, never changed.
     pub fn nudge_volume(&self, flow: Flow, by: f32) -> Result<(f32, bool)> {
         unsafe {
             let device = self
@@ -257,8 +226,7 @@ impl WasapiBackend {
         }
     }
 
-    /// Make an endpoint (any direction) the default across all three roles. The id itself
-    /// encodes the direction, so `IPolicyConfig` handles capture devices the same way.
+    /// Make an endpoint (either direction; the id encodes it) the default for all three roles.
     pub fn set_default_of(&self, id: &DeviceId) -> Result<()> {
         super::switch::set_default(id)
     }
@@ -298,9 +266,7 @@ impl WasapiBackend {
         unsafe { self.endpoint_volume(id)?.SetMute(muted, std::ptr::null()) }.context("set mute")
     }
 
-    /// Open a live peak-level meter for a specific endpoint (for the activity glow). Output
-    /// uses the always-live endpoint meter; input opens a silent capture stream so its
-    /// otherwise-dormant meter reports — see [`Meter`].
+    /// Open a live peak-level meter for an endpoint; input needs the `dev` feature ([`Meter`]).
     pub fn meter_for(&self, id: &DeviceId, flow: Flow) -> Result<Meter> {
         let device = self.device_by_id(id)?;
         match flow {
@@ -315,9 +281,7 @@ impl WasapiBackend {
         }
     }
 
-    /// Subscribe to volume/mute changes on `id` from any source (media keys, other apps,
-    /// us). `msg` is posted to `hwnd` on each change; the returned [`VolumeWatch`] keeps the
-    /// subscription alive and unregisters when dropped.
+    /// Post `msg` to `hwnd` on any volume/mute change of `id`, until the [`VolumeWatch`] drops.
     pub fn watch_volume(
         &self,
         id: &DeviceId,
@@ -358,8 +322,7 @@ impl WasapiBackend {
     }
 }
 
-/// Read a string property, freeing the COM allocation. `None` for absent, unreadable or
-/// empty — an empty value is no more use to a caller than a missing one.
+/// Read a string property, freeing the COM allocation; `None` for absent, unreadable or empty.
 unsafe fn prop_string(
     store: &windows::Win32::UI::Shell::PropertiesSystem::IPropertyStore,
     key: &windows::Win32::Foundation::PROPERTYKEY,
@@ -371,8 +334,7 @@ unsafe fn prop_string(
     text.filter(|text| !text.is_empty())
 }
 
-/// Read `PKEY_AudioEndpoint_FormFactor` and map to our [`FormFactor`]. Any failure or
-/// unrecognized value collapses to [`FormFactor::Unknown`] — it's only a hint (plan §2.2).
+/// Read `PKEY_AudioEndpoint_FormFactor` as a [`FormFactor`]; anything unexpected is `Unknown`.
 fn read_form_factor(store: &windows::Win32::UI::Shell::PropertiesSystem::IPropertyStore) -> FormFactor {
     unsafe {
         let Ok(pv) = store.GetValue(&PKEY_AudioEndpoint_FormFactor) else {

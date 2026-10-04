@@ -1,16 +1,11 @@
-//! Putting our own visuals into a tray icon.
+//! Putting our own visuals into a tray icon, plus the XAML helpers the rest of the TAP shares.
 //!
-//! Two routes were measured and rejected first (see `FINDINGS.md`):
-//! `IVisualTreeService::CreateInstance` is `E_NOTIMPL`, and WinRT
-//! `Panel.Children.Append` returns `0x800F1000` even though `get_Children` and
-//! `get_Size` on the same object succeed. What works — and what Windhawk's
-//! Taskbar Styler does — is to leave the tree shape alone and *set a property*:
+//! The tree shape is never changed; we *set a property*:
+//! `XamlReader.Load(markup)` → live element → `ContentPresenter.Content = it`
+//! (why not `CreateInstance`/`Children.Append`: see FINDINGS.md).
 //!
-//!   `XamlReader.Load(markup)` → a live element  →  `ContentPresenter.Content = it`
-//!
-//! Everything here must run on the XAML UI thread, i.e. from inside
-//! `OnVisualTreeChange`. `SetSite` runs on a different thread and WinRT calls
-//! from there fail with `RPC_E_WRONG_THREAD`.
+//! Everything here must run on the XAML UI thread; calls from any other thread fail
+//! with `RPC_E_WRONG_THREAD`.
 
 use crate::log::logf;
 use crate::winrt::{
@@ -24,107 +19,51 @@ use windows::Win32::Foundation::S_OK;
 use windows::Win32::System::WinRT::RoGetActivationFactory;
 use windows_core::{IInspectable, Interface, HSTRING};
 
-/// Segoe Fluent glyphs. The mute variants match what the flyout already uses, so
-/// the taskbar and the flyout never disagree about how "muted" looks.
+/// Segoe Fluent mute glyphs; match the flyout's so the two agree on how "muted" looks.
 const GLYPH_MUTE: char = '\u{E74F}';
 const GLYPH_MIC_OFF: char = '\u{EC54}';
 
-/// Warm tint on a muted segment — a *second* signal; the glyph swap is the first.
+/// Warm tint on a muted segment, a second signal after the glyph swap.
 const MUTED_TINT: &str = "#E8836A";
 
-/// The "an app is recording" dot, as fractions of the glyph box: the red disc's radius, the
-/// white ring around it, and the centre both sit on — the top-right corner, which the
-/// microphone glyph's ink leaves free.
-///
-/// Transcribed from `audio_tray::flyout::theme`'s `REC_*`, and they have to stay in step:
-/// the same badge is painted on the same glyph in the flyout and the scroll readout, and
-/// the eye moves between them.
+/// The recording dot, as fractions of the glyph box: disc radius, ring width, centre.
+/// Must stay in step with `audio_tray::flyout::theme`'s `REC_*` (same badge on the same glyph).
 const REC_R: f64 = 0.15;
 const REC_BORDER: f64 = 0.05;
 const REC_CX: f64 = 0.87;
 const REC_CY: f64 = 0.14;
 
-/// The dot's fill — `audio_tray::flyout::theme::RECORDING`, opaque.
+/// The dot's fill: `audio_tray::flyout::theme::RECORDING`, opaque.
 const RECORDING_FILL: &str = "#FFE81123";
 
-/// The ring around it. White, and *not* the segment's foreground: it is there to separate
-/// the dot from whatever is behind it, and behind it is the accent pill — whose colour is
-/// the user's, so nothing derived from it can be relied on to contrast with red.
+/// The ring: always white, since the accent behind it is the user's and may not contrast with red.
 const RECORDING_RING: &str = "#FFFFFFFF";
 
-// Pill geometry, agreed from the mockups ("V2 — shell-matched"): it deliberately
-// mirrors the Control Center button's metrics so the strip reads as a peer of
-// that control rather than as an oversized tray icon.
-//
-// The chevron segment was dropped: right-click opens the panel, so a permanent
-// glyph advertising it was paying 23 epx of scarce notification-area width for
-// an affordance the right mouse button already provides. Total width is 64 epx.
-//
-// Each segment is *half the pill* (32 epx) with no padding on the Border. It was
-// once 8 padding + 24 + 24 + 8, which is the same 64 overall but meant a segment
-// could not be filled by its own hover plate — the plate was stuck at 24 wide
-// against a 26 tall, i.e. permanently taller than wide, which is what made it
-// read as a slab dropped on the pill. Owning the full half is what lets the
-// hover fill it; the glyphs stay centred, now in 32 rather than 24.
-//
-// All values are effective pixels; XAML applies the per-monitor scale itself, so
-// nothing here needs DPI maths.
-//
-// `PILL_H` is the fix for the original defect: without an explicit height the
-// Border shrink-wrapped the FontIcon layout boxes, and Segoe Fluent glyph ink
-// overshoots those boxes — the microphone's stand was being clipped.
+// Pill geometry in effective pixels (XAML applies DPI scale), mirroring the Control Center
+// button. Two 32-epx segments, no Border padding, so each hover plate fills its half.
+// `PILL_H` is load-bearing: without it the Border shrink-wraps the FontIcon boxes and clips
+// glyph ink overshoot. See FINDINGS.md, "The agreed design".
 const PILL_H: u32 = 32;
 const PILL_RADIUS: u32 = 6;
 
-/// Gap between the pill and the edge of the notification-icon slot it sits in,
-/// the same on all four sides.
-///
-/// This is the only lever over how Explorer's *own* hover plate surrounds us: that
-/// plate fills the slot, so the surround is whatever is left after the pill.
-///
-/// **4, and measured rather than reasoned about.** Two wrong answers came before it,
-/// both from working off the wrong rectangle:
-///
-/// ```text
-/// slot         80 x 48   ->  8 at the ends, 8 top and bottom
-/// hover plate  80 x 40   ->  8 at the ends, 4 top and bottom   <- what is drawn
-/// ```
-///
-/// The *slot* is 48 epx tall, but the plate carries its own 4 epx vertical inset,
-/// so the gap the eye sees is 4 — not the 8 the slot implies. The plate's width
-/// tracks the slot exactly, so horizontally this margin *is* the whole gap. Setting
-/// it to the plate's vertical inset is what makes all four sides equal.
-///
-/// (`2` left it 2 against 4; `8` overshot to 8 against 4. Both were picked before
-/// `Border#BackgroundBorder` had ever been measured.)
-///
-/// Costs 8 epx of notification-area width. The alternative, growing `PILL_H` to 40
-/// to meet the plate instead, is free in width but makes the pill taller than the
-/// shell's own icons.
+/// Gap between the pill and its notification-icon slot on all sides. Equals the 4-epx vertical
+/// inset of Explorer's own hover plate, so its surround is even. See FINDINGS.md,
+/// "Explorer's own hover plate, and the one lever over it".
 const PILL_MARGIN: u32 = 4;
 const SEGMENT_W: u32 = 32;
 const GLYPH_PX: u32 = 16;
 
-/// The `x:` namespace. `XamlReader.Load` parses the markup standalone, so a root
-/// that uses `x:Name` has to declare this itself — omitting it fails the whole
-/// parse with `0x802B000A` and the strip silently never appears.
+/// The `x:` namespace. The root must declare it itself (standalone parse); without it the
+/// parse fails with `0x802B000A` and the strip silently never appears.
 const XAML_NS_X: &str = "http://schemas.microsoft.com/winfx/2006/xaml";
 
-/// `x:Name`s of the two interactive segments. They are found again by name in the
-/// recorded visual tree — our injected elements are announced back to us through
-/// `OnVisualTreeChange` like any other, which is how the handlers get attached.
+/// `x:Name`s of the two interactive segments, found again by name in the recorded tree
+/// to attach handlers.
 pub const SEGMENT_OUT: &str = "AudioTrayOutput";
 pub const SEGMENT_IN: &str = "AudioTrayInput";
 
-/// The lit half is flush on all four sides: it fills its half of the pill
-/// exactly, sharing the pill's radius on the outer corners and meeting the other
-/// half square in the middle.
-///
-/// Two earlier attempts are worth not repeating. An inset on all four sides put
-/// the plate's rounded corners about 3px inside the pill's own, and at taskbar
-/// scale two nested curves that close together read as a smeared double edge. A
-/// 2px gap down the middle then read as a crack splitting the pill. Flush is
-/// what makes it one control with two halves.
+/// The lit half is flush: the pill's radius on its outer corners, square in the middle.
+/// Insets and centre gaps both looked wrong; see FINDINGS.md, "The hover treatment".
 const HOVER_INNER_RADIUS: u32 = 0;
 
 /// Opacity of the white plate used when there is no pill to tint.
@@ -132,18 +71,8 @@ const HOVER_OPACITY_PLAIN: f64 = 0.10;
 /// Opacity of the accent plate used on the pill.
 const HOVER_OPACITY_ACCENT: f64 = 0.30;
 
-/// The hover plate's brush and the opacity it is lit to.
-///
-/// On the pill the plate is **the accent itself**, not white. White over a
-/// saturated fill bleaches it: measured on accent `#D88DE1`, the pill sits at
-/// `127,102,147` and a white wash at 0.16 composites to `148,127,164` — lighter
-/// but noticeably greyer, which is why the first version read as a grey sticker
-/// stuck on the pill rather than as the pill lighting up. Re-tinting with the
-/// same hue gives `154,114,170`: brighter *and* more saturated, and it stays
-/// on-palette for whatever accent the user has chosen.
-///
-/// With no pill (bare glyphs on the taskbar) there is no hue to intensify, so it
-/// falls back to the shell's own treatment — a white wash at low alpha.
+/// The hover plate's brush and the opacity it is lit to: the accent itself on the pill
+/// (white bleaches it; see FINDINGS.md, "The hover treatment"), a faint white wash without one.
 fn hover_plate(accent: Option<[u8; 3]>) -> (String, f64) {
     match accent {
         Some([r, g, b]) => (format!("#FF{r:02X}{g:02X}{b:02X}"), HOVER_OPACITY_ACCENT),
@@ -156,25 +85,18 @@ pub fn hover_opacity(accent: Option<[u8; 3]>) -> f64 {
     hover_plate(accent).1
 }
 
-/// Accent alpha ("A4"). A fully opaque accent block is brighter than anything
-/// Windows puts in a taskbar; at half alpha the pill sits at the same visual
-/// weight as the Control Center button beside it. Applied as alpha rather than a
-/// pre-blended colour so the taskbar's real backdrop shows through.
+/// Accent alpha: half, to match the Control Center button's weight. Applied as alpha (not
+/// pre-blended) so the taskbar backdrop shows through.
 const PILL_ALPHA: u8 = 0x80;
 
-/// What the strip should currently show.
-///
-/// `PartialEq` so a restyle can be compared against what is already up and dropped
-/// if it would change nothing — a rebuild is far too expensive to do for nothing.
+/// What the strip should currently show. `PartialEq` so a no-op restyle can skip the rebuild.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct StripState {
     pub output_glyph: char,
     pub input_glyph: char,
     pub output_muted: bool,
     pub input_muted: bool,
-    /// An app is holding the microphone open: the input segment carries a red dot. Set
-    /// independently of `input_muted` — an app that keeps the stream open while the user
-    /// is muted is still recording, which is what Windows' own indicator reports too.
+    /// An app holds the microphone open (red dot). Independent of `input_muted`, as in Windows.
     pub input_recording: bool,
     /// Accent fill for the pill. `None` draws bare glyphs on the taskbar.
     pub accent: Option<[u8; 3]>,
@@ -182,10 +104,8 @@ pub struct StripState {
     pub accent_alpha: u8,
     /// Collapse Explorer's own volume glyph, which our strip duplicates.
     pub hide_system_volume: bool,
-    /// Collapse Explorer's own "microphone in use" indicator, which our input button's
-    /// recording dot says instead. Separate from [`Self::hide_system_volume`] because it is
-    /// a separate icon with a separate failure mode: it only exists while something is
-    /// recording, so it is found — and hidden — mid-session rather than at injection.
+    /// Collapse Explorer's "microphone in use" indicator, which our recording dot replaces.
+    /// It only exists while recording, so it is found and hidden mid-session.
     pub hide_system_mic: bool,
 }
 
@@ -206,9 +126,8 @@ impl Default for StripState {
 }
 
 impl StripState {
-    /// Parse `out=E767;in=E720;outmuted=1` — the payload the injector passes as
-    /// `InitializeXamlDiagnosticsEx` initialization data. Unknown keys are
-    /// ignored so the format can grow without breaking an older TAP.
+    /// Parse the init-data payload (`out=E767;in=E720;outmuted=1`). Unknown keys are ignored
+    /// so the format can grow without breaking an older TAP.
     pub fn parse(data: &str) -> Self {
         let mut state = Self::default();
         for pair in data.split(';') {
@@ -243,32 +162,21 @@ impl StripState {
 
 use tap_proto::{GLYPH_ROUND_EARBUDS as EARBUDS_ROUND, GLYPH_WIRELESS_EARBUDS as EARBUDS_WIRELESS};
 
-/// Stroke width of the hand-drawn icons, as a fraction of the icon box.
-///
-/// `2 × OUTLINE_HW` from `audio_tray::icons`, which strokes ±0.030 either side of
-/// each shape's outline. Keep the two in step or the earbuds will not match the
-/// weight of the tray icon they mirror.
+/// Stroke width of the hand-drawn icons, as a fraction of the box. Must equal
+/// `2 × OUTLINE_HW` in `audio_tray::icons`.
 const VECTOR_STROKE: f64 = 0.060;
 
-/// One shape of a hand-drawn icon, in the same normalised (0..1, y down) space the
-/// tray's rasteriser uses — see `audio_tray::icons::Shape`.
+/// One shape of a hand-drawn icon, in normalised (0..1, y down) space like
+/// `audio_tray::icons::Shape`.
 enum Vector {
     /// Stroked outline of a circle.
     Circle { cx: f64, cy: f64, r: f64 },
-    /// Stroked outline of a near-vertical capsule: a bud's stem.
-    ///
-    /// The raster version tilts these a few degrees (0.03 of the box over 0.48);
-    /// this draws them upright, which is indistinguishable at 16 epx and avoids a
-    /// rotated `Path` for no visible gain.
+    /// Stroked upright capsule: a bud's stem (the raster version's slight tilt is invisible at 16 epx).
     Stem { cx: f64, top: f64, bottom: f64, r: f64 },
 }
 
-/// The shapes for a marker codepoint, or `None` if it is an ordinary font glyph.
-///
-/// Transcribed from `audio_tray::icons::render_earbuds` /
-/// `render_round_earbuds`. Duplicated rather than shared because the two renderers
-/// have nothing in common — one is a signed-distance rasteriser in the app, the
-/// other is XAML shapes inside Explorer — but the coordinates must stay in step.
+/// The shapes for a marker codepoint, or `None` for an ordinary font glyph. Coordinates must
+/// stay in step with `audio_tray::icons::render_earbuds` / `render_round_earbuds`.
 fn vector_icon(glyph: char) -> Option<&'static [Vector]> {
     // AirPods-style: a round bud on a slim stem.
     const WIRELESS: &[Vector] = &[
@@ -292,13 +200,8 @@ fn vector_icon(glyph: char) -> Option<&'static [Vector]> {
     }
 }
 
-/// The icon inside a segment: a `FontIcon` normally, or hand-drawn shapes for the
-/// two icons Segoe Fluent does not provide.
-///
-/// Shapes cannot inherit `Foreground` the way a `FontIcon` can, so they need an
-/// explicit `Stroke`. With a pill there is always a colour to use (`on_accent`
-/// picks black or white for the accent); without one — the bare-glyph dev mode —
-/// this falls back to white rather than guessing at the taskbar's brush.
+/// The icon inside a segment: a `FontIcon`, or hand-drawn shapes for the two icons Segoe
+/// Fluent lacks. Shapes cannot inherit `Foreground`, so they stroke `colour` or white.
 fn icon_markup(glyph: char, size: u32, colour: Option<&str>) -> String {
     let Some(shapes) = vector_icon(glyph) else {
         let fg = colour.map_or(String::new(), |c| format!(r#" Foreground="{c}""#));
@@ -313,14 +216,8 @@ fn icon_markup(glyph: char, size: u32, colour: Option<&str>) -> String {
     let stroke = colour.unwrap_or("#FFFFFFFF");
     let width = VECTOR_STROKE * box_px;
 
-    // Fit the ink to the box. The coordinates come from the tray's rasteriser, where
-    // they only span about 0.70 of the box — fine there, where an icon is never seen
-    // beside another, but in the strip these sit next to a Segoe Fluent glyph whose
-    // ink fills the full 16 epx. Measured before fitting: 11.3 epx tall against the
-    // microphone's 16.0, which reads as a smaller, weaker icon.
-    //
-    // Uniform scale about the centre, so nothing is distorted, and the stroke is
-    // *not* scaled — it is a weight, and it should stay matched to the font's.
+    // Fit the ink to the box so it matches the neighbouring font glyph's size: uniform scale
+    // about the centre; the stroke is a weight and is *not* scaled.
     let half = VECTOR_STROKE / 2.0;
     let (mut x0, mut y0, mut x1, mut y1) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
     let mut include = |ax: f64, ay: f64, bx: f64, by: f64| {
@@ -347,8 +244,7 @@ fn icon_markup(glyph: char, size: u32, colour: Option<&str>) -> String {
 
     let mut drawn = String::new();
     for shape in shapes {
-        // `Canvas` because these are absolute positions in a fixed box; every other
-        // panel would fight the coordinates.
+        // Absolute positions in a fixed box, hence a `Canvas`.
         let element = match *shape {
             Vector::Circle { cx, cy, r } => {
                 let (left, top) = at(cx - r, cy - r);
@@ -378,13 +274,10 @@ fn icon_markup(glyph: char, size: u32, colour: Option<&str>) -> String {
     )
 }
 
-/// Room left around the glyph box, on top of the badge's own overhang, so that rounding at
-/// whatever scale the monitor is running cannot shave the edge of the ring. A whole
-/// effective pixel, because that is the unit the rasteriser can be out by.
+/// Extra room beyond the badge's overhang so scale rounding cannot shave the ring.
 const REC_SLACK: f64 = 1.0;
 
-/// The badge and the wrapper it needs, in effective pixels: the wrapper `Grid`'s side, the
-/// `Ellipse`'s box and stroke, and where that box goes inside the wrapper.
+/// Badge geometry in epx: wrapper `Grid` side, `Ellipse` box and stroke, and its offset.
 struct Badge {
     grid: f64,
     width: f64,
@@ -393,23 +286,14 @@ struct Badge {
     top: f64,
 }
 
-/// Work out that geometry for a `box_px`-square glyph box.
-///
-/// Split out from the markup so the invariant behind the "cropped dot" bug is testable at
-/// every size: the ring, stroke included, has to land inside the wrapper.
+/// Badge geometry for a `box_px`-square glyph box. Invariant (tested): the ring, stroke
+/// included, lands inside the wrapper.
 fn badge_geometry(box_px: f64) -> Badge {
-    // A XAML stroke straddles the geometry it outlines — half of `StrokeThickness` falls
-    // outside the ellipse's box and half inside. So the box is the red disc *plus* one
-    // thickness: that puts the visible red at `2 · REC_R` and the ring's outer edge at
-    // `2 · (REC_R + REC_BORDER)`, which is exactly what the rasterised version draws.
-    //
-    // Never thinner than an effective pixel, for the same reason the rasteriser clamps it:
-    // at 100% the fraction comes out under 1 and a ring that faint is the one case the
-    // border exists to prevent.
+    // A XAML stroke straddles its outline, so the box is the disc plus one thickness; the
+    // ring is clamped to at least 1 epx, as in the rasteriser.
     let thickness = (REC_BORDER * box_px).max(1.0);
     let width = 2.0 * REC_R * box_px + thickness;
-    // Measured off the pixel geometry rather than the fractions, so the clamp above is
-    // accounted for: this is the ring's outer radius, and how far it reaches past the box.
+    // Outer ring radius in pixels (accounts for the clamp).
     let outer = (width + thickness) / 2.0;
     let (cx, cy) = (REC_CX * box_px, REC_CY * box_px);
     let pad = (cx + outer - box_px).max(outer - cy).max(0.0) + REC_SLACK;
@@ -417,8 +301,7 @@ fn badge_geometry(box_px: f64) -> Badge {
         grid: box_px + 2.0 * pad,
         width,
         thickness,
-        // Padding the wrapper equally on all sides leaves the badge exactly where it was
-        // relative to the glyph: both are centred, so the shared centre does not move.
+        // Equal padding keeps the badge's offset from the (centred) glyph unchanged.
         left: pad + cx - width / 2.0,
         top: pad + cy - width / 2.0,
     }
@@ -428,11 +311,8 @@ fn badge_geometry(box_px: f64) -> Badge {
 mod tests {
     use super::*;
 
-    /// The bug this guards: the badge sits at the corner of the glyph box and its ring
-    /// reaches past it, and whatever clips inside the tray's visual tree then cuts the dot
-    /// (observed at 100% scale as a flattened top-right). Every part of the ring has to be
-    /// inside the wrapper — at every size, since the strip's glyph size is a constant today
-    /// but the flyout's is not.
+    /// The ring overhangs the glyph box and the tray clips overflow, so it must fit the
+    /// wrapper at every size.
     #[test]
     fn the_ring_fits_inside_its_wrapper() {
         for size in 8..=64 {
@@ -449,8 +329,7 @@ mod tests {
         }
     }
 
-    /// The wrapper is padded *equally*, so growing it cannot shift the glyph — the badge and
-    /// the icon are both centred in it, and the offset between them is what was tuned.
+    /// Equal padding must not shift the badge relative to the glyph centre.
     #[test]
     fn the_badge_keeps_its_offset_from_the_glyph_centre() {
         for size in 8..=64 {
@@ -470,21 +349,9 @@ mod tests {
 
 /// The icon, plus the recording dot when something has the microphone open.
 ///
-/// The pair is wrapped in a `Grid` centred in the segment, and the *glyph box* inside it —
-/// not the segment — is the coordinate system the dot is placed in. Two reasons: it is the
-/// same box the flyout's rasteriser places its dot in, so one set of fractions describes
-/// both; and the segment's own height is *not* a constant (32 epx inside the pill,
-/// shrink-wrapped to the glyph in the bare-glyph mode), so anything measured from its edges
-/// would move.
-///
-/// The wrapper is deliberately **bigger than the glyph box**: the badge sits at the very
-/// corner and its ring reaches past it, which is what keeps it clear of the microphone's ink
-/// — and a child that overflows gets clipped somewhere in the tray's own visual tree. Seen
-/// at 100% scale as a dot with its top-right flattened. Padding the wrapper by the overhang
-/// (equally on all four sides, so the glyph stays centred) is what gives the ring room to be
-/// drawn in full. The glyph itself still overshoots and still is not clipped, which is the
-/// asymmetry worth knowing: Segoe Fluent ink overhang is *drawn* outside the layout box
-/// (see [`PILL_H`]), an `Ellipse` positioned outside its parent is not.
+/// The dot is placed relative to the glyph box (as in the flyout), inside a centred `Grid`
+/// padded by the ring's overhang: an `Ellipse` outside its parent gets clipped by the tray,
+/// unlike font ink overshoot.
 fn badged_icon_markup(glyph: char, size: u32, colour: Option<&str>, recording: bool) -> String {
     let icon = icon_markup(glyph, size, colour);
     if !recording {
@@ -505,17 +372,12 @@ fn badged_icon_markup(glyph: char, size: u32, colour: Option<&str>, recording: b
 
 /// The strip markup: two equal segments, output glyph then input glyph.
 ///
-/// The root needs an explicit `xmlns`: `XamlReader.Load` parses this standalone,
-/// with no surrounding document to inherit from. Unmuted glyphs set no
-/// `Foreground`, so they inherit the taskbar's own brush and follow light/dark
-/// theming for free; only a muted segment overrides it.
+/// The root declares its own `xmlns` (standalone parse). Without a pill, unmuted glyphs set
+/// no `Foreground` and so follow the taskbar's theme brush.
 fn strip_markup(state: StripState) -> String {
     let base = state.accent.map(|rgb| on_accent(rgb, state.accent_alpha));
     let (plate, _) = hover_plate(state.accent);
-    // `leading` is the left-hand half. The hover plate is mirrored between the
-    // two: each keeps the pill's radius on its own outer corners and is square
-    // where it meets the other, so whichever half lights up the pill still reads
-    // as one outline.
+    // `leading` is the left half; the plates are mirrored (outer corners rounded).
     let segment = |name: &str,
                    glyph: char,
                    size: u32,
@@ -524,20 +386,14 @@ fn strip_markup(state: StripState) -> String {
                    recording: bool,
                    leading: bool| {
         let colour = if muted { Some(MUTED_TINT) } else { base };
-        // XAML order for CornerRadius: top-left, top-right, bottom-right,
-        // bottom-left.
+        // CornerRadius order: top-left, top-right, bottom-right, bottom-left.
         let corners = if leading {
             format!("{PILL_RADIUS},{HOVER_INNER_RADIUS},{HOVER_INNER_RADIUS},{PILL_RADIUS}")
         } else {
             format!("{HOVER_INNER_RADIUS},{PILL_RADIUS},{PILL_RADIUS},{HOVER_INNER_RADIUS}")
         };
-        // `Background="Transparent"` is load-bearing: a `null` background is not
-        // hit-testable in XAML, so without it the pointer falls straight through
-        // to the pill and neither hover nor click can tell the segments apart.
-        //
-        // The hover plate is pre-built at `Opacity="0"` rather than created on
-        // demand, so hovering only has to set a double — no brush has to be
-        // constructed inside Explorer.
+        // `Background="Transparent"` is load-bearing: a null background is not hit-testable.
+        // The plate is pre-built at `Opacity="0"` so hover only sets a double.
         format!(
             r##"    <Grid x:Name="{name}" Width="{width}" Background="Transparent">
       <Border x:Name="{name}Hover" Background="{plate}" Opacity="0"
@@ -559,17 +415,9 @@ fn strip_markup(state: StripState) -> String {
         state.input_glyph
     };
 
-    // No divider: it existed to separate the two "act" segments from the "drill
-    // in" chevron, and with the chevron gone there is nothing left to separate.
     let strip = format!(
-        // No `VerticalAlignment="Center"` here, and that is load-bearing rather
-        // than an omission. Centred, the StackPanel sizes to its content, so the
-        // segment `Grid`s were only as tall as a 16px glyph (~21 epx) inside a 32
-        // epx pill — and a hover plate cannot be taller than the Grid it lives
-        // in, so the lit half came out visibly short at the top and bottom no
-        // matter what margin it was given. Stretching (the default) makes each
-        // segment the full height of the pill, which is what lets the hover fill
-        // it. The glyphs stay centred by their own alignment.
+        // No `VerticalAlignment` on purpose: stretching makes each segment (and its hover
+        // plate) the pill's full height.
         r#"  <StackPanel Orientation="Horizontal">
 {}
 {}
@@ -587,10 +435,7 @@ fn strip_markup(state: StripState) -> String {
     );
 
     match state.accent {
-        // `r##"…"##`: the markup contains `="#` (an ARGB literal right after an
-        // attribute quote), which would terminate a plain `r#"…"#`.
-        //
-        // The explicit `Height` is load-bearing — see `PILL_H`.
+        // `r##`: the markup contains `="#`. The explicit `Height` is load-bearing (`PILL_H`).
         Some([r, g, b]) => {
             let a = state.accent_alpha;
             format!(
@@ -622,21 +467,15 @@ fn parse_rgb(value: &str) -> Option<[u8; 3]> {
         .map(|v| [(v >> 16) as u8, (v >> 8) as u8, v as u8])
 }
 
-/// Approximate taskbar ground, used to composite the semi-transparent accent
-/// before judging contrast. The real backdrop is acrylic over the wallpaper, but
-/// it is always dark in the dark theme and the decision is not close.
+/// Approximate (dark) taskbar ground the translucent accent is composited over before
+/// judging contrast.
 const TASKBAR_GROUND: [u8; 3] = [0x1F, 0x1F, 0x1F];
 
-/// Threshold on relative luminance for flipping to a dark foreground.
-///
-/// Measured against Windows: on accent `#D88DE1` (luminance 0.39) Quick Settings
-/// draws *dark* glyphs. An earlier 0.45 threshold therefore picked white where
-/// Windows picks black — this is the corrected value.
+/// Relative luminance above which the foreground turns dark; matched to Quick Settings
+/// (see FINDINGS.md, "The agreed design").
 const DARK_FG_ABOVE: f32 = 0.32;
 
-/// Foreground that stays legible on the accent as it will actually appear —
-/// i.e. after `alpha` compositing over the taskbar. The accent is the user's
-/// choice, so this has to hold across the whole palette.
+/// Legible foreground for the accent after `alpha` compositing over the taskbar.
 fn on_accent(rgb: [u8; 3], alpha: u8) -> &'static str {
     let a = alpha as f32 / 255.0;
     let composite: Vec<f32> = (0..3)
@@ -660,9 +499,8 @@ fn on_accent(rgb: [u8; 3], alpha: u8) -> &'static str {
     }
 }
 
-/// A WinRT activation factory, cached per class on this (the XAML) thread: the sweep asks for the
-/// automation statics once per taskbar button per tick, and each `RoGetActivationFactory` is a
-/// string lookup plus a call into the runtime. Interfaces are not `Send`, hence thread-local.
+/// A WinRT activation factory, cached per class on the XAML thread (the sweep asks often).
+/// Thread-local because interfaces are not `Send`.
 pub(crate) fn factory<I: Interface>(class: &'static str) -> Option<I> {
     thread_local! {
         static CACHE: std::cell::RefCell<Vec<(&'static str, windows_core::IUnknown)>> = const { std::cell::RefCell::new(Vec::new()) };
@@ -684,14 +522,8 @@ pub(crate) fn factory<I: Interface>(class: &'static str) -> Option<I> {
     unknown.cast().ok()
 }
 
-/// The tooltip text Explorer exposes for a notify icon, used to tell tray icons
-/// apart. Index-based matching would break the moment the user reorders them.
-///
-/// `GetName` takes an **`IDependencyObject*`**, so the `IInspectable` from
-/// `GetIInspectableFromHandle` has to be QI'd first. Passing it straight through
-/// calls the wrong vtable and yields an empty string for every icon — which is
-/// what made tooltip matching silently never match, and why the strip never
-/// appeared once the app started passing a real tooltip.
+/// An element's automation name (for tray icons, the tooltip), used to identify icons.
+/// `GetName` takes an `IDependencyObject*`; passing the plain `IInspectable` yields "".
 ///
 /// # Safety
 /// XAML UI thread only.
@@ -709,10 +541,7 @@ pub unsafe fn automation_name(
     Some(name.to_string())
 }
 
-/// Automation names of a subtree, for finding what actually identifies an icon.
-///
-/// Explorer does not necessarily put the tooltip on the `NotifyIconView` itself,
-/// so this reports every non-empty name beneath it.
+/// Every non-empty automation name in a subtree, breadth-first to `depth`.
 ///
 /// # Safety
 /// XAML UI thread only.
@@ -742,9 +571,7 @@ pub unsafe fn probe_names(
     found
 }
 
-/// Replace a tray icon's `ContentPresenter.Content` with our glyph + chevron.
-///
-/// Returns whether the mutation landed.
+/// Replace a tray icon's `ContentPresenter.Content` with our strip. Returns whether it landed.
 ///
 /// # Safety
 /// XAML UI thread only; `presenter` must be a live `ContentPresenter` handle.
@@ -770,10 +597,8 @@ pub unsafe fn set_chevron_content(
         return false;
     };
 
-    // `put_Content` builds our subtree synchronously, which re-enters
-    // `OnVisualTreeChange` on this very thread. The thread id is here because
-    // this call never returning is the signature of doing it from an island that
-    // does not own the element — compare it against "tray island is thread N".
+    // Re-enters `OnVisualTreeChange` synchronously. The thread id is logged because a hang
+    // here means the wrong island's thread.
     logf!("setting content on 0x{presenter:x} from thread {}…", crate::tid());
     let hr = presenter_iface.put_Content(content.as_raw());
     if hr == S_OK {
@@ -785,18 +610,8 @@ pub unsafe fn set_chevron_content(
     }
 }
 
-/// The `ContentPresenter` inside a tray icon, found by asking XAML rather than
-/// by consulting our recorded tree.
-///
-/// The recorded tree cannot answer this reliably. When audio-tray restarts inside
-/// one Explorer session, the new `SystemTray.NotifyIconView` is announced but
-/// **nothing under it ever is** — XAML reuses the previous icon's child elements
-/// and re-parents them without telling us. Measured: the icon sits there with
-/// zero recorded children indefinitely, so the icon+presenter pair can never be
-/// formed and the strip never draws until Explorer restarts.
-///
-/// Walking the live tree is immune to that, and to the announce-children-before-
-/// parents ordering that the recorded-tree scan has to work around.
+/// The `ContentPresenter` inside a tray icon, found in the live tree. The recorded tree
+/// misses re-parented children; see FINDINGS.md, "The presenter must be found live".
 ///
 /// # Safety
 /// XAML UI thread only.
@@ -807,13 +622,8 @@ pub unsafe fn descendant_presenter(
     descendant_of_class(diagnostics, icon, "Windows.UI.Xaml.Controls.ContentPresenter")
 }
 
-/// Nearest descendant of `root` whose runtime class is `target`, breadth-first.
-///
-/// Breadth-first matters where a class appears at more than one depth. Searching
-/// for `…Controls.Border` under a tray icon finds the shell's own
-/// `BackgroundBorder` (a child of `ContainerGrid`) before our pill, which is a
-/// level deeper under the `ContentPresenter` — and it is the shell's one that
-/// draws the icon-slot hover.
+/// Nearest descendant of `icon` whose runtime class is `target`. Breadth-first matters:
+/// for `Border` it must find the shell's `BackgroundBorder` before our (deeper) pill.
 ///
 /// # Safety
 /// XAML UI thread only.
@@ -822,15 +632,13 @@ pub unsafe fn descendant_of_class(
     icon: InstanceHandle,
     target: &str,
 ) -> Option<InstanceHandle> {
-    /// The presenter sits two levels below the icon; the cap is slack rather
-    /// than a guess, and it bounds the work done on the shell's UI thread.
+    /// Bounds the work done on the shell's UI thread (the presenter is two levels down).
     const MAX_DEPTH: usize = 6;
-    /// Hard stop, so a tree we did not expect cannot spin inside Explorer.
+    /// Hard stop, so an unexpected tree cannot spin inside Explorer.
     const MAX_VISITED: usize = 256;
 
     let statics: IVisualTreeHelperStatics = factory(VISUAL_TREE_HELPER)?;
-    // `VisualTreeHelper` deals in `DependencyObject`; handing it the plain
-    // `IInspectable` would call through the wrong vtable.
+    // Must be a `DependencyObject`, not the plain `IInspectable` (wrong vtable).
     let root = element::<IDependencyObject>(diagnostics, icon)?;
 
     let mut frontier = vec![root];
@@ -852,8 +660,7 @@ pub unsafe fn descendant_of_class(
                 if statics.GetChild(parent.as_raw(), index, &mut raw) != S_OK || raw.is_null() {
                     continue;
                 }
-                // `GetChild` hands back a reference; taking it as an owned
-                // `IInspectable` is what releases it again.
+                // Owned: dropping it releases `GetChild`'s reference.
                 let child = core::mem::transmute::<*mut c_void, IInspectable>(raw);
                 if child.GetRuntimeClassName().is_ok_and(|name| name == target) {
                     let mut handle: InstanceHandle = 0;
@@ -876,13 +683,8 @@ pub unsafe fn descendant_of_class(
     None
 }
 
-/// Whether `presenter` currently holds *our* strip.
-///
-/// The shell data-binds this `Content`, so a `put_Content` that lands while the
-/// icon is still being set up gets overwritten when the binding evaluates — the
-/// mutation reports success and then silently loses. Reading the content back is
-/// how we notice and re-apply. Our root is a `Border`; the shell's is an
-/// `ImageIconContent`/`Grid`, so the runtime class is enough to tell them apart.
+/// Whether `presenter` currently holds *our* strip. The shell data-binds `Content` and can
+/// overwrite a successful `put_Content`, so callers read back and re-apply.
 ///
 /// # Safety
 /// XAML UI thread only.
@@ -898,11 +700,7 @@ pub unsafe fn holds_our_strip(
         return false;
     }
     let content = core::mem::transmute::<*mut c_void, IInspectable>(raw);
-    // Identity, not shape. This used to accept any `Border`, but the shell can
-    // legitimately put its own there — and mistaking one for ours means concluding
-    // the strip is up when it is not, which leaves the volume icon hidden and the
-    // tray reordered with nothing drawn in their place. Matching the automation
-    // name also works for the no-pill mode, whose root is a `StackPanel`.
+    // Identity (automation name), not shape: the shell can put its own `Border` here.
     let mut handle: InstanceHandle = 0;
     if diagnostics.GetHandleFromIInspectable(content.as_raw(), &mut handle) != S_OK || handle == 0 {
         return false;
@@ -910,32 +708,18 @@ pub unsafe fn holds_our_strip(
     automation_name(diagnostics, handle).as_deref() == Some(STRIP_NAME)
 }
 
-/// Automation name on the strip's root, so [`holds_our_strip`] can recognise our
-/// own content rather than merely something Border-shaped.
-///
-/// Not localised and never shown: `AutomationProperties.Name` on a decorative root
-/// is the cheapest identity XAML will carry for us, and it is readable back through
-/// the statics we already use to identify the tray icon itself.
+/// Automation name on the strip's root, how [`holds_our_strip`] recognises it. Never shown.
 pub const STRIP_NAME: &str = "AudioTrayStrip";
 
-/// Segoe Fluent codepoints Explorer uses for the taskbar volume indicator:
-/// muted, the generic speaker, and the four level glyphs. Matching on the glyph
-/// keeps this locale-independent — the element's automation name is translated.
+/// Codepoints of Explorer's volume indicator (muted, speaker, four levels). Matched by glyph
+/// because the automation name is localised.
 pub const VOLUME_GLYPHS: &[char] = &[
     '\u{E74F}', '\u{E767}', '\u{E992}', '\u{E993}', '\u{E994}', '\u{E995}',
 ];
 
-/// Codepoints for the shell's *microphone in use* indicator — the icon Windows adds to the
-/// tray while an app is recording, which our input button's red dot now says instead.
-///
-/// Matched the same way as [`VOLUME_GLYPHS`] and it has one extra hazard: our own input
-/// segment draws a microphone too. What keeps them apart is not the codepoint but the
-/// lookup — only a glyph inside a `SystemTray.IconView` is Explorer's (see
-/// `note_system_indicator`); ours lives in the strip we injected.
-///
-/// More than one entry because the shell has been seen using both the plain microphone and
-/// the filled "active" variant, and an unrecognised one costs the whole feature — the log
-/// names any tray glyph it does not know (see `note_unknown_glyph`) if this needs extending.
+/// Codepoints of the shell's "microphone in use" indicator. Our input segment draws a
+/// microphone too; only a glyph inside a `SystemTray.IconView` counts (`note_system_indicator`).
+/// `note_unknown_glyph` logs unrecognised tray glyphs if this needs extending.
 pub const MIC_GLYPHS: &[char] = &['\u{E720}', '\u{EC71}', '\u{F12E}', '\u{E1D6}'];
 
 /// Reads a `TextBlock`'s `Text`.
@@ -952,12 +736,8 @@ pub unsafe fn text_of(diagnostics: &IXamlDiagnostics, handle: InstanceHandle) ->
     Some(text.to_string())
 }
 
-/// Collapse an element — used on Explorer's own volume glyph, which our strip
-/// duplicates.
-///
-/// This edits the shell's own UI rather than our tray icon, so callers must have
-/// recorded the previous state through [`layout_of`] first; [`restore_layout`]
-/// is what puts it back when the feature is turned off.
+/// Collapse one of the shell's own elements. Callers must save it with [`layout_of`] first
+/// so [`restore_layout`] can put it back.
 ///
 /// # Safety
 /// XAML UI thread only.
@@ -975,13 +755,8 @@ pub unsafe fn collapse(diagnostics: &IXamlDiagnostics, handle: InstanceHandle) -
         return false;
     }
 
-    // `Visibility` alone is not enough here. Inside the Quick Settings button the
-    // icons sit in generated containers whose slot survives a collapsed child —
-    // measured: the glyph vanishes but wifi and battery do not move by a single
-    // pixel. Zeroing the width is what actually closes the gap.
-    //
-    // Quiet on success: this is re-applied many times to cover a layout race, so
-    // only failures are worth a line.
+    // `Visibility` alone leaves the slot in Quick Settings; zeroing the width closes it.
+    // Quiet on success: this is re-applied often.
     if let Ok(framework) = object.cast::<IFrameworkElement>() {
         let hr = framework.put_Width(0.0);
         let min = framework.put_MinWidth(0.0);
@@ -996,12 +771,8 @@ pub unsafe fn collapse(diagnostics: &IXamlDiagnostics, handle: InstanceHandle) -
     true
 }
 
-/// The layout properties [`collapse`] overwrites, as they were beforehand.
-///
-/// `Width` and `MinWidth` read back as `NaN` when they were never set — that is
-/// XAML's "Auto", and it is the value that has to go back. Restoring a literal
-/// `0.0` instead would leave the element permanently zero-width, which on screen
-/// is indistinguishable from still being hidden.
+/// The layout properties [`collapse`] overwrites, as they were. Unset widths read as `NaN`
+/// ("Auto"), which is what must be restored, never `0.0`.
 #[derive(Clone, Copy)]
 pub struct Layout {
     visibility: i32,
@@ -1019,8 +790,7 @@ pub unsafe fn layout_of(diagnostics: &IXamlDiagnostics, handle: InstanceHandle) 
     if element.get_Visibility(&mut visibility) != S_OK {
         return None;
     }
-    // Not every UIElement is a FrameworkElement; those simply have no width to
-    // put back, and `NaN` is the value `put_Width` treats as "unset" anyway.
+    // Non-FrameworkElements have no width; `NaN` means "unset".
     let (mut width, mut min_width) = (f64::NAN, f64::NAN);
     if let Ok(framework) = element.cast::<IFrameworkElement>() {
         if framework.get_Width(&mut width) != S_OK {
@@ -1037,12 +807,8 @@ pub unsafe fn layout_of(diagnostics: &IXamlDiagnostics, handle: InstanceHandle) 
     })
 }
 
-/// How putting something back turned out.
-///
-/// `Gone` exists because it is the *expected* outcome half the time and must not
-/// read as a failure. Killing audio-tray destroys its notify icon, so by the time
-/// the revert runs the presenter we decorated no longer exists — there is nothing
-/// left to undo, and that is success.
+/// How putting something back turned out. `Gone` is success (e.g. the app exited and its
+/// icon went with it).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Restored {
     /// Put back as it was.
@@ -1090,11 +856,8 @@ pub unsafe fn restore_layout(
     }
 }
 
-/// Takes the presenter's current `Content` as an owned raw reference.
-///
-/// A null content is `Some(null)`, not `None`: "there was nothing here" is a
-/// state that has to be restorable, and is a different thing from "we could not
-/// read it".
+/// The presenter's current `Content` as an owned raw reference. Empty content is
+/// `Some(null)` (restorable); `None` means it could not be read.
 ///
 /// # Safety
 /// XAML UI thread only. The caller owns the returned reference.
@@ -1107,9 +870,7 @@ pub unsafe fn content_of(
     (iface.get_Content(&mut raw) == S_OK).then_some(raw)
 }
 
-/// Sets `Content` from a raw pointer — the other half of [`content_of`].
-///
-/// Does not consume the reference; `put_Content` takes its own.
+/// Sets `Content` from a raw pointer (the inverse of [`content_of`]). Does not consume the reference.
 ///
 /// # Safety
 /// XAML UI thread only.
@@ -1151,11 +912,8 @@ pub unsafe fn set_opacity(
     hr == S_OK
 }
 
-/// The element's laid-out width, or `None` if it cannot be read.
-///
-/// Zero means one of two very different things — "layout has removed it" or
-/// "layout has not run yet" — so callers must only trust a zero *after* having
-/// seen a non-zero.
+/// The element's laid-out width. Zero is ambiguous (removed, or not laid out yet): trust it
+/// only after having seen a non-zero.
 ///
 /// # Safety
 /// XAML UI thread only.
@@ -1178,12 +936,7 @@ pub unsafe fn actual_size(
         .then_some((width, height))
 }
 
-/// Laid-out size of whatever is currently *inside* a presenter — for us, the pill.
-///
-/// Measuring the presenter itself is useless for judging the surround: it fills the
-/// icon slot by definition, so slot-minus-presenter can only ever be zero. The
-/// number that matters is slot-minus-pill, and the pill is the presenter's content,
-/// which we never hold a handle to.
+/// Laid-out size of a presenter's content (our pill); the presenter itself always fills the slot.
 ///
 /// # Safety
 /// XAML UI thread only.
@@ -1196,7 +949,7 @@ pub unsafe fn content_size(
     if iface.get_Content(&mut raw) != S_OK || raw.is_null() {
         return None;
     }
-    // Owned: `get_Content` hands back a reference and this drop releases it.
+    // Owned: dropping it releases `get_Content`'s reference.
     let content = core::mem::transmute::<*mut c_void, IInspectable>(raw);
     let framework = content.cast::<IFrameworkElement>().ok()?;
     let mut width = 0.0f64;
@@ -1207,9 +960,6 @@ pub unsafe fn content_size(
 }
 
 /// Turn a recorded handle back into the live XAML object.
-///
-/// `pub(crate)` for the music module, which needs `IBorder` and `IFrameworkElement` pointers of its
-/// own — a taskbar button is not a `ContentPresenter`, so it cannot go through the helpers above.
 ///
 /// # Safety
 /// XAML UI thread only.
@@ -1238,8 +988,7 @@ pub(crate) fn hstring_abi(value: &HSTRING) -> *mut c_void {
     unsafe { core::mem::transmute_copy::<HSTRING, *mut c_void>(value) }
 }
 
-/// `XamlReader.Load`: a live element built from markup (`IVisualTreeService::CreateInstance` is
-/// `E_NOTIMPL` inside Explorer).
+/// `XamlReader.Load`: a live element built from markup.
 ///
 /// # Safety
 /// XAML UI thread only.
@@ -1255,12 +1004,7 @@ pub(crate) unsafe fn load_xaml(markup: &str) -> Option<IInspectable> {
     Some(core::mem::transmute::<*mut c_void, IInspectable>(created))
 }
 
-/// Set a `TextBlock`'s `Text`.
-///
-/// **This is what makes a scrolling title possible without rebuilding the strip.** That distinction is
-/// load-bearing: rebuilding replaces the elements the click handlers are attached to, so a ticker
-/// driven by re-running `XamlReader.Load` would leave the transport buttons dead within a second of
-/// the strip appearing. Setting a property leaves every element — and every handler — in place.
+/// Set a `TextBlock`'s `Text`: updates text in place without rebuilding (and re-wiring) the tile.
 ///
 /// # Safety
 /// XAML UI thread only.

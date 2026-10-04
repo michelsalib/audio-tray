@@ -1364,3 +1364,82 @@ cargo build
 Logs to `%TEMP%\xaml-tap.log`. The TAP pins itself (`DllCanUnloadNow` returns
 `S_FALSE`), so **restart Explorer between iterations** or the rebuild fails with
 a locked `xaml_tap.dll`.
+
+## Notes moved out of the code
+
+Facts that used to live as long comments beside the code they explain. Code comments now state
+contracts and point here.
+
+### lib.rs — the microphone indicator reuses its IconView
+
+`Indicator::record` restarts the collapse retry budget when a *different* element turns up, on the
+theory that the "microphone in use" icon is rebuilt for every recording session. Measured on Win11
+26200: the shell actually reuses the same `IconView` for the next session, so the first collapse
+holds, no second announcement arrives, and the log says "indicator found" once. The reset stays as
+cover for builds that do rebuild it.
+
+### lib.rs — the microphone indicator forces the fast sweep pace
+
+The mic indicator is only born when an app starts recording, so a new `InnerTextBlock` in the tray
+puts the sweep back on its fast pace. At the idle 4 s cadence the shell's icon would sit visible for
+up to four seconds of every call before being collapsed.
+
+### lib.rs — recording must not be gated by generation (orphaned nodes)
+
+`OnVisualTreeChange` records unconditionally and gates only the edits on `GENERATION`. Gating the
+recording too was a bug: between a stand-down and the next injection no instance holds the current
+generation, so every event in that window was dropped, including our own tray icon being destroyed.
+That left a childless orphan `NotifyIconView` in the tree that no later scan could complete; the
+symptom was a re-enable that logged "1 NotifyIconView recorded" forever and never drew. Recording is
+keyed by handle and idempotent, so two live instances recording the same event costs nothing.
+
+### lib.rs — the sweep never settles while a music tile is configured
+
+The shell rebuilds the hover preview's thumbnail-toolbar buttons on every hover (and on every
+play/pause glyph change), so `music::thumbbar::wire` must catch them within the hover. At the idle 4 s
+cadence a hover is usually over before a sweep looks. There is no event to work from instead
+(`OnVisualTreeChange` may not touch XAML), so with a tile host the sweep stays at 250 ms; with no
+preview open the music half of a tick is one lookup by type that finds nothing. `nudge_transport`
+(posted from the callback when a `ThumbBarButton` is added) wires them sooner still.
+
+### lib.rs — slot metrics are logged from the sweep, not the callback
+
+`report_slot_metrics`' old doc said it was called from the visual-tree callback "because new WinRT
+calls are only introduced on the path already known to be safe". That predates the
+no-XAML-in-the-callback rule; it now runs from the sweep (via `try_decorate` and `sweep_claimed`).
+
+### log.rs / main.rs — verbose log volume
+
+With `debug=1`, a single session measured 15 MB and 197k lines of log, 92% of it visual-tree dumps.
+That is why the exploratory output (event trace, tree dumps) is off by default and the lifecycle
+lines (inject, decorate, revert, stand down) are always on.
+
+### winrt.rs — the GetColumn hang attribution
+
+An old comment on `IUIElement` said a vtable miscount "is how `GetColumn` once hung the shell".
+FINDINGS.md records that hang as passing an `IInspectable` where `IGridStatics` wants an
+`IFrameworkElement*` (wrong vtable), not a slot miscount; the comment was corrected to match.
+
+### decorate.rs: MIC_GLYPHS has several entries
+The shell has been seen drawing its "microphone in use" tray indicator with more than one codepoint (the plain microphone and a filled "active" variant), so `MIC_GLYPHS` lists several (E720, EC71, F12E, E1D6). If one is missing, hiding the system mic indicator silently fails. `note_unknown_glyph` logs any tray glyph it does not recognise, which is how to find a new one. Our own input segment also draws E720; only glyphs inside a `SystemTray.IconView` are treated as Explorer's.
+
+### music/layout.rs: `roomy` threshold recalibrated to 122
+`Layout::for_width` used `strip >= 200` when three 26-epx transport buttons were in the budget. Once they moved to the thumbnail toolbar the same room for the remaining parts is 200 − 78 = 122. Keeping 200 would have put every shipped width since (162, then 150) on the cramped branch and shrunk the cover even though it had more room.
+
+### music/layout.rs: content width vs. the width asked of the shell
+The width the strip draws in (`strip=` init key, default `STRIP_WIDTH`) is kept separate from the width the button is asked for. In the old Widgets host the measured gap was large (ask 320 epx, paints 249), so content sized to the ask clipped its trailing edge. On a task button the difference is `Host::SLOT_OVERHEAD` (4 epx).
+
+### music/layout.rs: fixed-width text column, not MaxWidth
+With `MaxWidth` the text column grew with its content, so a long artist name pushed later elements (then the transport buttons) sideways and the layout moved under the pointer depending on what was playing. A fixed `Width` plus an explicit `Clip` fixes it; XAML panels do not clip their children, so without the clip overflow draws over whatever is to the right.
+
+### music/layout.rs: why the cover is a reparsed subtree
+Title and artist update with `put_Text`, but changing an `Image` needs a fresh `BitmapImage`. The TAP has no binding for that WinRT class, and `BitmapImage` caches by URI, so even reusing a path would show the old art. Reparsing only the cover's `Border` (`MusicTileCoverHost`) is the cheap way to get one, and it keeps the strip's size, and so the button's layout, unchanged.
+
+### music/tile.rs: width before position when re-placing the progress bar
+An STA pumps messages while an outgoing COM call is in flight, so a frame can be rendered between two property writes. For `ProgressIndicator`, setting the width first means the intermediate frame is a full-width bar still centred, which then slides into place. Setting the position first shows a stub at the left edge that then grows, which looks worse. `restore` uses the opposite order (margin/alignment before width) for the same reason.
+
+### music/tile.rs: Stretch + explicit Width centres the element
+A XAML element left at `HorizontalAlignment=Stretch` and then given an explicit `Width` is centred in its slot, not left-aligned. On the task button this slid the strip right by half of `ask − content` (40 epx with the old 80-epx overhead) and pushed its trailing edge past the clip. `pin_left` sets `HorizontalAlignment=Left` on the Border.
+
+### music/mod.rs: the ItemsRepeater recycles task buttons
+`find_buttons` reads every `TaskListButton`'s accessible name on every sweep and caches no verdict, because the taskbar's `ItemsRepeater` recycles button elements: a handle named "YouTube Music" on one sweep can be another app's button on the next, and a remembered match would put the strip on that app.

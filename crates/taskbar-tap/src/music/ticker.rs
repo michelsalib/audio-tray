@@ -1,33 +1,11 @@
-//! Scrolling long titles horizontally.
-//!
-//! Two constraints shape this, and together they rule out the obvious approaches:
-//!
-//! * **The strip must not be rebuilt to animate.** Re-running `XamlReader.Load` builds new
-//!   elements, which drops the click handlers and breaks the buttons (measured — press and
-//!   release land on different objects). So scrolling is a `put_Text` on an existing
-//!   `TextBlock`, never a new subtree.
-//! * **No XAML storyboard.** A `Storyboard` would be the idiomatic answer, but UWP XAML has
-//!   no declarative event triggers to start one, so it would have to be found and `Begin()`d
-//!   through yet another hand-rolled interface. Advancing a character per tick on the sweep
-//!   that already exists is far less machinery for the same effect.
-//!
-//! The scroll is a **character window over a wrapped string** — the classic ticker — rather
-//! than a pixel offset, because a pixel offset needs a transform to animate and text
-//! measurement to know when to stop.
+//! Scrolling long titles: a character window over a wrapped string, advanced per sweep and
+//! written with `put_Text` (no rebuild, no `Storyboard`, no text measurement needed).
 
-/// What separates the end of the text from its start as it wraps around.
-///
-/// Without it a wrapping title reads as one run-on word; the bullet makes the seam obvious
-/// and gives the eye a rest point.
+/// Marks the seam where the text wraps around to its start.
 const SEPARATOR: &str = "   •   ";
 
-/// The visible slice of `text`, `width` characters wide, starting `offset` characters in.
-///
-/// Text that already fits is returned untouched — importantly *without* the separator, so a
-/// short title never grows a stray bullet.
-///
-/// Counts `char`s, not bytes: song titles are full of accents and CJK, and slicing a `String`
-/// by byte index would panic mid-character.
+/// The visible slice of `text`, `width` characters wide, starting `offset` characters in. Text
+/// that fits is returned trimmed, without the separator. Counts `char`s, not bytes.
 pub fn window(text: &str, width: usize, offset: usize) -> String {
     let trimmed = text.trim();
     let count = trimmed.chars().count();

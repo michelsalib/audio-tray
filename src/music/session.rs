@@ -1,62 +1,13 @@
-//! Which SMTC session is YouTube Music.
+//! Which SMTC session, and which window, is YouTube Music.
 //!
-//! There is no "app identity" field in SMTC beyond the User Model ID, and what
-//! that string looks like depends entirely on *how* YouTube Music is being run.
-//! Measured on Windows 11 26200, with a Chromium app-mode window standing in for
-//! an installed PWA:
-//!
-//! ```text
-//! MSEdge.localhost_/.edgeprofile.Default
-//! ^^^^^^ ^^^^^^^^^^^^ ^^^^^^^^^^^^^^^^^^
-//! browser  origin       profile
-//! ```
-//!
-//! So an **installed PWA carries its origin in the id**, which is the case worth
-//! having: `music.youtube.com` appears verbatim and the match is exact and
-//! unambiguous. A plain browser tab does not — it reports bare `Chrome` or
-//! `MSEdge`, indistinguishable from any other tab in the same browser, which is
-//! why [`Match::Browser`] exists as a separate, weaker verdict rather than being
-//! folded in with the certain ones.
-//!
-//! **A bare browser id is never followed on its own**, and that is the outcome of trying the
-//! alternative. It used to be a last-resort guess — with no YouTube Music session anywhere, a
-//! playing browser session was taken to be a YouTube Music tab — and what that actually does is
-//! put a YouTube video's title and thumbnail in the strip whenever the player is closed, which is
-//! wrong far more often than it is right.
-//!
-//! Nothing in the session can rescue the guess; measured on 26200 against a plain YouTube video in
-//! Edge, every field that looks like it should separate music from video does not:
-//!
-//! ```text
-//! app id  MSEdge      the same id every other tab in that browser reports
-//! kind    Music       Chromium reports Music for a video too (PlaybackType; no longer read)
-//! album   <empty>     and YouTube Music does not always publish one either
-//! ```
-//!
-//! So the escape hatch is explicit rather than inferred: a user who really does run YouTube Music
-//! as a plain tab pins `MSEdge` (or `Chrome`) as `app_id` in the config, which is the same rule
-//! this used to apply silently — but chosen, and only on the machine that wants it.
-//!
-//! **The same question is asked of a window**, by [`window_is_player`], and it had to be: the
-//! progress bar and the thumbnail toolbar are put on an HWND, and the HWND used to be found by
-//! title alone. A browser window shows its active tab's title, so a YouTube Music tab makes a plain
-//! Edge window answer to "the YouTube Music window" — and the toolbar, which has no removal call,
-//! then stays under that browser's hover preview long after the tab has moved on. Measured on 26200:
-//! the PWA window and the browser window are the same `msedge.exe`, the same process id and the same
-//! `Chrome_WidgetWin_1` class, and the only field that separates them is the shell's own id for the
-//! window.
-//!
-//! The patterns are matched case-insensitively as substrings. That is deliberately
-//! loose: the exact shape of a PWA's id varies across Chromium versions and
-//! channels, and a missed match means the app shows nothing at all — a far worse
-//! failure than an over-broad one, which at worst picks up a YouTube Music tab the
-//! user did want.
+//! An installed PWA carries its origin in its app id (`music.youtube.com`), so it is matched with
+//! certainty; a plain tab reports a bare `MSEdge`/`Chrome` like every other tab and is **never
+//! followed** (it put YouTube videos in the strip). Users who run it as a tab pin `music.app_id`.
+//! Windows are judged by the shell's app id, never by title alone. Patterns are case-insensitive
+//! substrings: a missed match shows nothing, which is worse than an over-broad one.
 
-/// App-id fragments that mean "this is YouTube Music", in confidence order.
-///
-/// Not a config knob — these are facts about how the players identify themselves. The
-/// user-facing escape hatch is an explicit `music.app_id`, which [`crate::music::feed::Ytm`]
-/// applies in place of this matching entirely.
+/// App-id fragments that mean "this is YouTube Music". Not a config knob: a pinned `music.app_id`
+/// replaces this matching entirely (see [`crate::music::feed::Ytm`]).
 const CERTAIN: &[&str] = &[
     // Chromium PWA or `--app=` window: the origin is in the id.
     "music.youtube.com",
@@ -66,10 +17,8 @@ const CERTAIN: &[&str] = &[
     "ytmdesktop",
 ];
 
-/// Browsers whose bare id could be a YouTube Music tab, or could be anything else.
-///
-/// Doubles as the executable list [`is_browser_process`] matches on, which is deliberate: the two
-/// questions are the same one asked of a session and of a window.
+/// Browsers whose bare id could be a YouTube Music tab, or anything else. Also the executable
+/// list for [`is_browser_process`].
 const BROWSERS: &[&str] = &["chrome", "msedge", "firefox", "brave", "opera", "vivaldi"];
 
 /// How confident we are that a given app id is YouTube Music.
@@ -77,9 +26,8 @@ const BROWSERS: &[&str] = &["chrome", "msedge", "firefox", "brave", "opera", "vi
 pub enum Match {
     /// The id names YouTube Music outright, or the user pinned this id in config.
     Certain,
-    /// A bare browser id. It *might* be a YouTube Music tab; nothing in SMTC can
-    /// say. Never followed by [`pick`] — it names an id worth *offering* to pin, and
-    /// `--music-probe` is where that offer is made.
+    /// A bare browser id: maybe a YouTube Music tab. Never followed by [`pick`]; only offered
+    /// for pinning by `--music-probe`.
     Browser,
     /// Something else entirely — Spotify, a video, a game.
     No,
@@ -91,17 +39,14 @@ pub fn classify(app_id: &str) -> Match {
     if CERTAIN.iter().any(|needle| id.contains(needle)) {
         return Match::Certain;
     }
-    // Bare browser only — an id that merely *starts* with a browser name but
-    // carries some other origin is that other site, not a YouTube Music tab.
+    // Bare browser only: a browser prefix with another origin is that other site.
     if BROWSERS.iter().any(|b| id == *b) {
         return Match::Browser;
     }
     Match::No
 }
 
-/// Whether an executable name is a browser's — `msedge.exe`, `chrome.exe`, and the rest.
-///
-/// The fallback half of [`window_is_player`], for a window that publishes no identity of its own.
+/// Whether an executable name is a browser's (`msedge.exe`, …); the fallback of [`window_is_player`].
 pub fn is_browser_process(exe: &str) -> bool {
     let exe = exe.to_ascii_lowercase();
     BROWSERS
@@ -109,34 +54,10 @@ pub fn is_browser_process(exe: &str) -> bool {
         .any(|browser| exe == format!("{browser}.exe"))
 }
 
-/// Whether a **window** is the player's own, rather than a browser window showing the same title.
-///
-/// **The title cannot answer this, and that is not a subtlety — it is measured.** On 26200 an
-/// installed PWA and a plain tab are windows of the *same* `msedge.exe`, same process id, same
-/// `Chrome_WidgetWin_1` class, and the browser's title reads `YouTube Music …` whenever that tab is
-/// the active one. The one field that separates them is the shell's own identity for the window,
-/// the `PKEY_AppUserModel_ID` its taskbar button is grouped under:
-///
-/// ```text
-/// PWA window      music.youtube.com-5929F88E_vezhnr0wkvrcy!App   Certain
-/// browser window  MSEdge.UserData.Profile1                       No
-/// ```
-///
-/// So a window is the player's when its id is [`Match::Certain`] — the same verdict the session
-/// side follows, on the same string kind — and nothing weaker. Note that a browser window's id is
-/// not even [`Match::Browser`]: the profile suffix makes it fail the bare-id test, which is exactly
-/// what [`classify`] means by "some other origin in the same browser".
-///
-/// `app_id` of `None` means the window publishes no id at all, which is the normal case for a
-/// plain Win32 or Electron player (th-ch/youtube-music, YTMDesktop) — there the title is all there
-/// is, and it has already matched by the time this is asked. The process is the guard on *that*
-/// path: a browser that published nothing must still not be followed, and the identity failing to
-/// read for any other reason must not quietly reopen the hole this closes.
-///
-/// A pinned `music.app_id` deliberately has no say here. It names a *session*, and the session it
-/// names when a user runs the player as a plain tab is a browser's — whose window plays everything
-/// else that browser plays. The strip follows it; the buttons and the progress bar, which land on a
-/// window and cannot be taken off one, do not.
+/// Whether a window (already matched on title) is the player's own rather than a browser window
+/// showing the same title. `app_id` is the window's `PKEY_AppUserModel_ID` and must be
+/// [`Match::Certain`]; with none published (Win32/Electron players) any non-browser process passes.
+/// A pinned `music.app_id` deliberately has no say: it names a session, not a window.
 pub fn window_is_player(app_id: Option<&str>, process: Option<&str>) -> bool {
     match app_id {
         Some(app_id) => classify(app_id) == Match::Certain,
@@ -144,24 +65,8 @@ pub fn window_is_player(app_id: Option<&str>, process: Option<&str>) -> bool {
     }
 }
 
-/// Pick the YouTube Music session out of a set of snapshots.
-///
-/// Preference order, and each step is there for a reason met in testing:
-///
-/// 1. A [`Match::Certain`] session that is **playing** — with two browser profiles
-///    open on YouTube Music, the one making sound is the one the strip should
-///    follow.
-/// 2. Any [`Match::Certain`] session — so a paused track still shows, rather than
-///    the strip emptying the moment you pause.
-///
-/// And nothing else: with no certain session on the machine the answer is **none**, not the
-/// closest thing available. See the module note — the third step this used to have followed any
-/// playing browser session, which is how a YouTube video ends up in the strip with the player
-/// closed.
-///
-/// Returns an **index**, not a reference: the caller reads the chosen session in full afterwards,
-/// and it needs to know *which* of the live session objects to read rather than getting a borrow of
-/// the cheap description it picked from.
+/// Pick the YouTube Music session: a playing [`Match::Certain`] one, else any certain one, else none.
+/// Returns an index into `snapshots` so the caller can read that live session in full.
 pub fn pick<S, F>(snapshots: &[S], app_id: F, playing: impl Fn(&S) -> bool) -> Option<usize>
 where
     F: Fn(&S) -> &str,
@@ -207,9 +112,6 @@ mod tests {
         assert_eq!(classify("Microsoft.ZuneMusic_8wekyb3d8bbwe!Microsoft.ZuneMusic"), Match::No);
     }
 
-    /// The index `pick` returns has to address the *same* slice the caller passed, because that is
-    /// what it then reads in full — an off-by-one here would draw one session's art under another's
-    /// title.
     fn picked(sessions: &[(&'static str, bool)]) -> Option<&'static str> {
         pick(sessions, |s| s.0, |s| s.1).map(|index| sessions[index].0)
     }
@@ -226,10 +128,7 @@ mod tests {
         assert!(picked(&sessions).is_some());
     }
 
-    /// **The bug this rule exists for.** With YouTube Music closed, the only session on the machine
-    /// is whatever else the browser is playing — a video, a stream, an autoplaying page — and it
-    /// reports the same bare `MSEdge` a YouTube Music tab would. Following it puts a video's title
-    /// and thumbnail in the strip; the strip stays empty instead.
+    /// With the player closed, a browser playing a video must not land in the strip.
     #[test]
     fn a_bare_browser_session_is_never_followed() {
         let only_browser = [("MSEdge", true)];
@@ -239,10 +138,7 @@ mod tests {
         assert_eq!(picked(&with_certain), Some("MSEdge.music.youtube.com_/.A"));
     }
 
-    /// **The bug the window rule exists for**, in the two ids measured on 26200 — one `msedge.exe`,
-    /// two windows, and only this string telling them apart. The browser window used to pass on its
-    /// title alone, which is how prev/play/next ended up under Edge's hover preview with the PWA
-    /// closed and the strip showing nothing.
+    /// The two window ids measured on 26200: same `msedge.exe`, only this string tells them apart.
     #[test]
     fn a_browser_window_is_not_the_player() {
         assert!(window_is_player(
@@ -255,26 +151,20 @@ mod tests {
         ));
     }
 
-    /// A player that publishes no window identity — an Electron build, or any plain Win32 one — is
-    /// still followed on its title, because that is all such a window offers.
     #[test]
     fn a_window_with_no_identity_falls_back_to_the_title() {
         assert!(window_is_player(None, Some("youtube-music.exe")));
     }
 
-    /// And the guard on that fallback: a browser whose window published nothing must not slip
-    /// through it. This is also what holds if the identity ever fails to read at all.
     #[test]
     fn a_browser_with_no_window_identity_is_still_not_the_player() {
         assert!(!window_is_player(None, Some("msedge.exe")));
         assert!(!window_is_player(None, Some("Chrome.exe")));
-        // Neither field readable: nothing says browser, so the title stands — the old behaviour,
-        // kept for the players it was right about.
+        // Neither field readable: nothing says browser, so the title stands.
         assert!(window_is_player(None, None));
     }
 
-    /// The index is into the slice as given, not into some filtered subsequence — the case that
-    /// would break if `pick` ever grew a `filter` before its `position`.
+    /// The index is into the slice as given, not a filtered subsequence.
     #[test]
     fn the_index_addresses_the_original_slice() {
         let sessions = [

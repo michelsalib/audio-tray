@@ -1,9 +1,6 @@
-//! Advancing the scrolling title, and wiring the transport glyphs.
+//! Advancing the scrolling title/artist text, and the [`Segment`] transport codes.
 //!
-//! **Both are property writes on existing elements, never a rebuild.** Rebuilding the strip to show
-//! the next window of a long title would replace every element in it — including the ones the click
-//! handlers are attached to — so the buttons would go dead a quarter of a second after the strip
-//! appeared. `put_Text` on the same `TextBlock` leaves the tree, and the handlers, alone.
+//! Scrolling is `put_Text` on the existing `TextBlock`s, never a rebuild of the tile.
 
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -11,10 +8,7 @@ use crate::xamlom::IXamlDiagnostics;
 
 use super::{layout, state, ticker};
 
-/// Sweeps between one-character advances of the scroll.
-///
-/// The sweep is 250 ms at its fastest, so four of them is a character a second: fast enough to read a
-/// long title in a reasonable time, slow enough not to be a flicker in the corner of the eye.
+/// Sweeps per one-character advance: about a character a second at the 250 ms sweep.
 const SWEEPS_PER_CHARACTER: u32 = 4;
 
 static SWEEP: AtomicU32 = AtomicU32::new(0);
@@ -35,8 +29,7 @@ pub unsafe fn scroll(diagnostics: &IXamlDiagnostics, strip: &state::Strip) {
         ("MusicTileTitle", strip.display_title(), l.title_chars),
         ("MusicTileArtist", strip.display_artist(), l.artist_chars),
     ] {
-        // Text that fits is written once, by the markup, and then left alone: re-setting an unchanged
-        // property four times a second is pointless work on the shell's UI thread.
+        // Text that fits was written by the markup; leave it alone.
         if !ticker::scrolls(full, width) {
             continue;
         }
@@ -47,14 +40,8 @@ pub unsafe fn scroll(diagnostics: &IXamlDiagnostics, strip: &state::Strip) {
     }
 }
 
-/// Which transport control was hit.
-///
-/// Lives here rather than in [`super::thumbbar`], which is what wires the shell's buttons, because
-/// both halves of the feature speak in it.
-///
-/// The strip *body* is deliberately not in here. On an app's own button the shell's own click already
-/// means "bring this app forward or minimise it", and its press is where drag-to-reorder begins — so
-/// leaving the body alone is what makes the tile behave like every other taskbar icon.
+/// Which transport control was hit (wired by [`super::thumbbar`]). The strip body is deliberately
+/// absent: its clicks stay the shell's (activate, minimise, drag).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Segment {
     Previous,

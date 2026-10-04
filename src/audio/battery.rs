@@ -1,11 +1,7 @@
 //! Bluetooth battery levels via the PnP configuration manager.
 //!
-//! Battery isn't a property of the audio endpoint — it lives on a sibling device node
-//! (typically "<name> Hands-Free AG") as `DEVPKEY_Bluetooth_Battery`. All functions of one
-//! physical device share a `ContainerId`, so we enumerate every present device node, read
-//! the battery + container of the ones that report a battery, and the caller matches by
-//! the audio endpoint's own `ContainerId` (see `wasapi::describe`). Devices that don't
-//! report battery to Windows (many do not) simply never appear here.
+//! Battery lives on a sibling device node (`DEVPKEY_Bluetooth_Battery`), not the endpoint;
+//! callers match it by the endpoint's `ContainerId`. Devices that don't report one never appear.
 
 use windows::core::{GUID, PCWSTR};
 use windows::Win32::Devices::DeviceAndDriverInstallation::{

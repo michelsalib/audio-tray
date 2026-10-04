@@ -1,10 +1,5 @@
-//! The flyout's *display model*: plain data describing what the panel shows — the output
-//! and input groups, their devices, the current level/mute/peak of each default endpoint,
-//! the active screen, and the outcome flags accumulated while the flyout is open.
-//!
-//! It deliberately holds no Win32/COM handles (those — the live volume watches and peak
-//! meters — stay on the controller), so the model is pure data: cheap to build, easy to
-//! reason about, and constructible in the layout unit tests.
+//! The flyout's display model: plain data for what the panel shows and the outcome flags.
+//! No Win32/COM handles (those stay on the controller), so tests can build it.
 
 use crate::audio::wasapi::WasapiBackend;
 use crate::audio::{DeviceId, Flow};
@@ -28,9 +23,7 @@ pub(super) struct Group {
     pub level: f32, // 0.0..=1.0 of the default endpoint
     pub muted: bool,
     pub peak: f32, // smoothed live peak level 0.0..=1.0 of the default endpoint (activity glow)
-    /// An app has the microphone open — the red dot on the mic glyph. Input groups only;
-    /// it is a property of the *capability*, not of this endpoint, so every input group
-    /// carries the same answer (see [`crate::audio::mic`]).
+    /// An app has the microphone open (any endpoint; see [`crate::audio::mic`]). Input only.
     pub recording: bool,
     pub devices: Vec<DeviceRow>,
 }

@@ -1,27 +1,9 @@
 //! "Is an app recording right now?" — the state behind the red dot on the mic icon.
 //!
-//! Read where Windows itself keeps it: the Capability Access Manager's consent store.
-//! When an app opens the microphone the audio service stamps `LastUsedTimeStart` under
-//! that app's key, and when it lets go it stamps `LastUsedTimeStop` — so a key with a
-//! start and a **zero stop** is an app that still has the microphone open. That is the
-//! same record the shell's own "microphone in use" indicator is driven from, which is
-//! the point: our dot says what Windows says, for every app, whatever endpoint it
-//! opened.
-//!
-//! Two roots, because the store is split by who is asking: `HKCU` carries the user's
-//! own apps — packaged ones by package family name, desktop ones one level down under
-//! `NonPackaged` — and `HKLM` the system and service side.
-//!
-//! A watcher thread blocks in `RegNotifyChangeKeyValue` on both roots and recomputes when
-//! the store changes, then posts [`WM_MIC_CHANGED`] to the tray's message window (which owns
-//! the taskbar strip). Everyone else reads the answer from
-//! [`in_use`] — a cached atomic, so the flyout can sample it on every frame for nothing.
-//! The wait carries a [`RECHECK_MS`] ceiling as a safety net; the notification is what
-//! makes it prompt, not what makes it correct.
-//!
-//! What this deliberately does *not* do is watch our own default input endpoint: an app
-//! recording from some other microphone is still an app recording, and hiding that would
-//! make the dot disagree with the system indicator sitting a few pixels away.
+//! Read from the Capability Access Manager's consent store (`HKCU` and `HKLM`), the record the
+//! shell's own indicator uses, so it covers every app and every endpoint. A watcher thread
+//! blocks in `RegNotifyChangeKeyValue`, recomputes, and posts [`WM_MIC_CHANGED`] to the tray;
+//! [`in_use`] is a cached atomic, cheap enough to sample per frame.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -45,11 +27,8 @@ const CONSENT_STORE: PCWSTR =
 /// The two roots the store is split across, in the order they are reported.
 const ROOTS: [HKEY; 2] = [HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE];
 
-/// How far below a root the timestamps can sit: a packaged app is one level down
-/// (`microphone\<family name>`), a desktop app two (`microphone\NonPackaged\<exe>`).
-///
-/// Three rather than two as slack for a nesting we have not seen, and a *budget* rather
-/// than a guess: [`users`] runs on a caller's thread, so the walk has to be bounded.
+/// Walk depth below a root: packaged apps sit one level down, desktop apps two (`NonPackaged\<exe>`);
+/// one level of slack, and bounded because [`users`] runs on the caller's thread.
 const MAX_DEPTH: u32 = 3;
 
 /// The cached answer, kept current by [`watch`].
@@ -58,11 +37,8 @@ static IN_USE: AtomicBool = AtomicBool::new(false);
 /// Whether the watcher has been started, so [`in_use`] starts exactly one.
 static WATCHING: AtomicBool = AtomicBool::new(false);
 
-/// Whether any app has the microphone open right now.
-///
-/// An atomic load, so callers can ask per frame; the work happens on the watcher thread
-/// instead. The first call starts that watcher and seeds the answer with one synchronous
-/// sweep, so it is never wrong for the first frame drawn.
+/// Whether any app has the microphone open right now. The first call starts the watcher
+/// after one synchronous sweep; later calls are an atomic load.
 pub fn in_use() -> bool {
     if !WATCHING.swap(true, Ordering::SeqCst) {
         IN_USE.store(!users().is_empty(), Ordering::SeqCst);
@@ -71,12 +47,8 @@ pub fn in_use() -> bool {
     IN_USE.load(Ordering::SeqCst)
 }
 
-/// The apps currently holding the microphone, named for a human — the exe path for a
-/// desktop app, the package family name for a packaged one.
-///
-/// The live sweep behind [`in_use`], and on its own the answer to `--mic`. Sweeping is
-/// cheap (a few dozen keys, two values each) but it is not free, which is why nothing on
-/// a paint path calls it directly.
+/// The apps holding the microphone (exe path or package family name). A live registry
+/// sweep: keep it off paint paths and use [`in_use`] there.
 pub fn users() -> Vec<String> {
     let mut found = Vec::new();
     for root in ROOTS {
@@ -89,9 +61,7 @@ pub fn users() -> Vec<String> {
 
 /// Walk `key` and its subkeys, recording every app that has the microphone open.
 fn collect(key: &Key, path: &str, depth: u32, found: &mut Vec<String>) {
-    // The root itself carries no timestamps (only the Allow/Deny `Value`), so testing it
-    // is harmless — and testing every key is what keeps this indifferent to how deep a
-    // given app's entry happens to sit.
+    // Every key is tested (the root has no timestamps), so app entries can sit at any depth.
     if holding(key) {
         found.push(label(path));
     }
@@ -112,35 +82,22 @@ fn collect(key: &Key, path: &str, depth: u32, found: &mut Vec<String>) {
     }
 }
 
-/// Whether this key's timestamps say its app has the microphone open *now*: it started
-/// using the microphone, and has not stopped **since**.
-///
-/// `stop < start` rather than `stop == 0`. Zeroing the stop is what Windows was seen doing
-/// — and a fresh key has no stop at all, which reads as 0 — but that is not something to
-/// rely on for every writer: an app whose previous session left a stop behind and whose new
-/// session only stamps the start would then look idle for as long as it recorded. Comparing
-/// the two timestamps is true in both spellings, and it is what the values mean anyway.
+/// Whether this key's app has the microphone open now. `stop < start`, not `stop == 0`:
+/// a writer may leave the previous session's stop behind.
 fn holding(key: &Key) -> bool {
     let start = qword(key, w!("LastUsedTimeStart")).unwrap_or(0);
     let stop = qword(key, w!("LastUsedTimeStop")).unwrap_or(0);
     start != 0 && stop < start
 }
 
-/// A consent-store key name as something worth printing: `NonPackaged` is an
-/// implementation detail, and a desktop app's path is stored with `#` where its
-/// separators were.
+/// A consent-store key path for display: drops `NonPackaged\`, turns `#` back into `\`.
 fn label(path: &str) -> String {
     path.trim_start_matches(r"NonPackaged\").replace('#', r"\")
 }
 
 /// The watcher thread: block on the store, recompute when it changes, announce a flip.
-///
-/// Runs for the life of the process. There is nothing to shut down — it holds two
-/// registry handles and an event apiece, and the loop exits only if the store cannot be
-/// opened at all.
+/// Runs for the life of the process.
 fn watch() {
-    // `KEY_NOTIFY` as well as `KEY_READ`: the same handle is both what we read through
-    // and what the notification is registered on.
     let keys: Vec<Key> = ROOTS
         .into_iter()
         .filter_map(|root| open(root, CONSENT_STORE, KEY_READ | KEY_NOTIFY))
@@ -156,10 +113,8 @@ fn watch() {
     }
 
     loop {
-        // Armed *before* the sweep, so a change that lands while we are reading re-signals
-        // rather than being missed — the same ordering the flyout's volume coalescing
-        // uses. A root that refuses to arm is not fatal: the wait below falls back to a
-        // slow poll, which is worse than free but still correct.
+        // Arm before the sweep so a change during it re-signals. A root that will not arm
+        // falls back to polling.
         let armed = keys
             .iter()
             .zip(&events)
@@ -183,25 +138,14 @@ fn watch() {
     }
 }
 
-/// Ceiling on the wait, even with both roots armed — so a change we were somehow not
-/// notified of costs a few seconds of a stale dot rather than a wrong one until the next
-/// app records.
-///
-/// The notification is the mechanism and this is the safety net: a sweep is a few dozen
-/// registry reads, so paying for one every few seconds in a background thread is cheaper
-/// than being wrong. It exists because the dot is *the* signal that something is listening
-/// — with Explorer's own indicator hidden, nothing else is going to correct us.
+/// Ceiling on the wait even when armed: a safety net for a missed notification.
 const RECHECK_MS: u32 = 5_000;
 
-/// Fallback interval for a store that would not arm a notification at all. Faster than
-/// [`RECHECK_MS`] because in that state the sweep is the only thing there is.
+/// Poll interval when no root would arm a notification.
 const POLL_MS: u32 = 2_000;
 
-/// Ask for one notification on `key`, signalled through `event`. Returns whether it took.
-///
-/// Subtree, because the timestamps live in the app keys below the root rather than on it,
-/// and `NAME` alongside `LAST_SET` because an app recording for the first time *creates*
-/// its key rather than writing to one.
+/// Ask for one notification on `key`'s subtree, signalled through `event`; returns whether it
+/// took. `NAME` too, because an app recording for the first time creates its key.
 fn arm(key: &Key, event: &Event) -> bool {
     let status = unsafe {
         RegNotifyChangeKeyValue(
@@ -275,8 +219,7 @@ fn subkeys(key: &Key) -> Vec<String> {
                 None,
             )
         };
-        // `ERROR_NO_MORE_ITEMS` is how the walk ends; anything else is a key we cannot
-        // read, and stopping is the same answer either way.
+        // `ERROR_NO_MORE_ITEMS` ends the walk; any other error stops it too.
         if status.is_err() {
             break;
         }

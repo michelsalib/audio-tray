@@ -1,18 +1,9 @@
-//! The TAP (Test Access Point) DLL — this is the half that runs inside
-//! `explorer.exe`.
+//! The TAP (Test Access Point) DLL that runs inside `explorer.exe`.
 //!
-//! Contract, as implemented by XAML diagnostics:
-//!   1. `InitializeXamlDiagnosticsEx` (called from the injector) loads this DLL
-//!      into the target and calls our `DllGetClassObject` for `CLSID_TAP`.
-//!   2. It creates the object and hands it the diagnostics site via
-//!      `IObjectWithSite::SetSite`.
-//!   3. We QI the site for `IVisualTreeService3` and subscribe with
-//!      `AdviseVisualTreeChange`, which replays the whole existing tree to us as
-//!      `Add` mutations and then streams live deltas.
-//!
-//! From there the tree is recorded ([`tree`]) and the edits are made from a timer
-//! rather than from the callback — see [`sweep`], which is where every rule about
-//! *when* a XAML call is safe lives.
+//! `InitializeXamlDiagnosticsEx` loads it, gets the object from `DllGetClassObject(CLSID_TAP)` and
+//! calls `SetSite`; we subscribe with `AdviseVisualTreeChange`, which replays the existing tree as
+//! `Add` mutations and then streams deltas. The callback only records the tree ([`tree`]); every
+//! edit is made from the timer-driven [`sweep`], which holds the rules for when a XAML call is safe.
 
 mod decorate;
 mod interact;
@@ -62,12 +53,8 @@ fn guarded<T>(what: &str, body: impl FnOnce() -> Result<T>) -> Result<T> {
     })
 }
 
-/// Locks a mutex, taking the contents of a poisoned one rather than panicking.
-///
-/// Every lock in this DLL goes through here. A panic inside Explorer's UI thread
-/// would abort the shell, and none of the state guarded by these locks is worth
-/// that: the worst a poisoned lock can hold is a stale handle, which every reader
-/// already re-validates.
+/// Locks a mutex, taking the contents of a poisoned one rather than panicking (a panic would
+/// abort Explorer; a poisoned lock holds at most a stale handle, which readers re-validate).
 pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
@@ -85,15 +72,8 @@ struct Site {
     generation: u64,
 }
 
-/// Which TAP instance is allowed to act.
-///
-/// Two things make a plain "am I set up?" flag insufficient. Injecting again
-/// (audio-tray restarting, or the user turning the feature back on) does not
-/// reuse the existing object — diagnostics builds a *second* TAP and advises it
-/// too, so without this both would mutate the tray and both would record into the
-/// one global visual tree. And after a revert the instance that made the changes
-/// has to go quiet, or the next tray rebuild silently re-applies everything the
-/// user just turned off.
+/// Which TAP instance is allowed to act: re-injecting builds a second TAP rather than reusing
+/// this one, and a reverted instance must go quiet.
 ///
 /// Each `SetSite` takes a fresh number from [`GENERATION`] and makes it [`CURRENT`];
 /// [`stand_down`] clears `CURRENT` to 0, and a handover ([`hand_over`]) makes the newest
@@ -101,13 +81,8 @@ struct Site {
 static GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static CURRENT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// The `(icon, ContentPresenter)` we last decorated.
-///
-/// Not a one-shot flag, for two reasons. The tray icon we care about usually
-/// appears *after* the TAP has attached — audio-tray restarting, or Explorer
-/// rebuilding the tray — so a one-shot would leave it undecorated forever. And
-/// the shell data-binds the presenter's `Content`, so a set that lands mid-setup
-/// gets overwritten; we have to notice and re-apply.
+/// The `(icon, ContentPresenter)` we last decorated. Not a one-shot flag: the icon can be
+/// rebuilt, and the shell data-binds `Content` and may overwrite our strip, so both are re-checked.
 static DECORATED: Mutex<Option<(xamlom::InstanceHandle, xamlom::InstanceHandle)>> =
     Mutex::new(None);
 
@@ -115,14 +90,8 @@ fn decorated_pair() -> Option<(xamlom::InstanceHandle, xamlom::InstanceHandle)> 
     *lock(&DECORATED)
 }
 
-/// Whether our strip is actually on the taskbar.
-///
-/// Gate for every edit to the *shell's own* UI. Hiding Windows' volume icon and
-/// moving the notification area are only defensible as part of replacing them
-/// with our strip — done on their own they take controls away and put nothing
-/// back. That is not hypothetical: with the strip targeted at audio-tray's icon
-/// by tooltip, an icon sitting in the overflow flyout is never decorated, and an
-/// ungated build removed the volume icon and reordered the tray anyway.
+/// Whether our strip is actually on the taskbar. Gates every edit to the shell's own UI (hiding
+/// its indicators, reordering): never take its controls away without ours in their place.
 fn strip_placed() -> bool {
     decorated_pair().is_some()
 }
@@ -148,15 +117,9 @@ static REORDERED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool:
 /// wires the new ones without double-wiring the old.
 static WIRED: Mutex<Vec<u64>> = Mutex::new(Vec::new());
 
-/// One of Explorer's own indicators that our strip says instead, and therefore hides: the
-/// volume glyph, and the "microphone in use" icon.
-///
-/// The two are the same problem — find a glyph `TextBlock` in the tray, collapse the icon and
-/// the slot holding it, keep re-applying until layout actually gives the slot up, and
-/// remember enough to put it back — so they are one type with two instances rather than two
-/// copies of the logic.
+/// One of Explorer's own indicators that our strip replaces and therefore hides (the volume
+/// glyph, the "microphone in use" icon): found by glyph, collapsed with its slot, restorable.
 struct Indicator {
-    /// For the log.
     what: &'static str,
     /// Codepoints that identify it. Names are localised; glyphs are not.
     glyphs: &'static [char],
@@ -164,14 +127,10 @@ struct Indicator {
     wanted: fn(&decorate::StripState) -> bool,
     /// The icon element and the container holding its slot, once found.
     slot: Mutex<Option<(xamlom::InstanceHandle, xamlom::InstanceHandle)>>,
-    /// How many times the collapse has been re-applied for the *current* slot.
-    ///
-    /// There is no clean "it worked" signal to stop on: a collapsed element goes on
-    /// reporting its last arranged `ActualWidth` (measured — still 24 long after the slot has
-    /// visibly closed), so success cannot be read back off the element. A bounded retry is
-    /// the honest way to cover the race instead.
+    /// Collapse re-applications for the current slot. Bounded, because a collapsed element keeps
+    /// reporting its old `ActualWidth`, so success cannot be read back.
     retries: std::sync::atomic::AtomicU32,
-    /// Whether it has been found at all, so the log says so once rather than per sweep.
+    /// Whether it has been logged as found.
     announced: std::sync::atomic::AtomicBool,
 }
 
@@ -195,14 +154,8 @@ impl Indicator {
         *lock(&self.slot)
     }
 
-    /// Record where it is. A *different* element than last time restarts the retry budget:
-    /// the microphone indicator comes and goes with each recording session, so an appearance
-    /// can be a fresh element to hide, and a spent counter would leave it on screen.
-    ///
-    /// Measured on Win11 26200: the shell in fact *reuses* the same `IconView` for the next
-    /// session, so the first collapse holds and no second announcement arrives — the log
-    /// says "indicator found" once and the icon stays gone. This is for the case where it
-    /// does not, which is not something to bet a visible regression on.
+    /// Record where it is. A *different* element than last time restarts the retry budget (the
+    /// microphone indicator may be rebuilt per recording session).
     fn record(&self, pair: (xamlom::InstanceHandle, xamlom::InstanceHandle)) {
         let mut held = lock(&self.slot);
         if *held != Some(pair) {
@@ -226,7 +179,6 @@ static SYSTEM_VOLUME: Indicator =
 static SYSTEM_MIC: Indicator =
     Indicator::new("microphone", decorate::MIC_GLYPHS, |s| s.hide_system_mic);
 
-/// Both, for the sweep and the revert.
 fn indicators() -> [&'static Indicator; 2] {
     [&SYSTEM_VOLUME, &SYSTEM_MIC]
 }
@@ -237,23 +189,16 @@ static PROBED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::ne
 /// Set once the section map has been logged (it only needs saying once).
 static REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Whether the strip is wanted at all.
-///
-/// [`GENERATION`] answers "which instance may act"; this answers "should anything
-/// act". They are different questions, and the periodic sweep needs the second
-/// one: it runs off a timer rather than a callback, so it has no instance to
-/// compare generations against, and without this it would happily re-apply the
-/// strip seconds after the user turned the feature off.
+/// Whether the strip is wanted at all. [`GENERATION`] says which instance may act; this says
+/// whether anything may, for the timer-driven sweep, which has no instance to compare.
 static ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 pub(crate) fn tid() -> u32 {
     unsafe { windows::Win32::System::Threading::GetCurrentThreadId() }
 }
 
-/// Borrows the stored `IXamlDiagnostics` without consuming the stored reference.
-///
-/// Event handlers reach it through here: they are invoked by XAML long after the
-/// call that installed them has returned, so there is no borrow to thread down.
+/// A new reference to the stored `IXamlDiagnostics`, for code (timers, event handlers) with no
+/// borrow to thread down.
 pub(crate) fn diagnostics() -> Option<xamlom::IXamlDiagnostics> {
     let raw = DIAGNOSTICS.load(Ordering::SeqCst);
     if raw == 0 {
@@ -265,27 +210,18 @@ pub(crate) fn diagnostics() -> Option<xamlom::IXamlDiagnostics> {
     Some((*stored).clone())
 }
 
-/// The live `IXamlDiagnostics`, as a raw pointer so other threads can reach it.
-/// Set once in `SetSite` and intentionally never released — the TAP is pinned in
-/// Explorer for the process lifetime anyway.
+/// The live `IXamlDiagnostics` as a raw pointer, so other threads can reach it. Stored on every
+/// `SetSite`; the previous pointer is leaked on purpose (the TAP is pinned in Explorer anyway).
 static DIAGNOSTICS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// Last thread the callback arrived on, so a change is visible rather than
-/// assumed. WinRT only works from the XAML UI thread, so which thread delivers
-/// the replay decides whether any of our mutations can run at all.
+/// Last thread the callback arrived on, so a change of thread gets logged.
 static CALLBACK_TID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
-/// The tooltip of the tray icon to decorate, taken from the injector's
-/// initialization data. Empty means "the first one", which is how the spike shows
-/// itself off without audio-tray running.
-///
-/// Not a `OnceLock`: turning the feature off and on again injects a second time,
-/// and a once-only cell would pin the first run's settings for the life of the
-/// Explorer process — a changed accent colour would silently not take.
+/// The tooltip (substring) of the tray icon to decorate, from the init data; empty means the
+/// first icon. A mutex, not a `OnceLock`: every injection re-reads the init data.
 static TARGET_TOOLTIP: Mutex<String> = Mutex::new(String::new());
 
-/// What the strip renders — also from the initialization data, and re-read on
-/// every injection for the same reason as [`TARGET_TOOLTIP`].
+/// What the strip renders, from the init data (re-read on every injection).
 static STRIP: Mutex<Option<decorate::StripState>> = Mutex::new(None);
 
 fn target_tooltip() -> String {
@@ -369,9 +305,8 @@ pub(crate) fn hand_over(data: &str) -> isize {
     HANDOVER_ACCEPTED
 }
 
-/// A raw COM pointer being handed to the advise thread. Both interfaces are
-/// non-agile, but this mirrors what the known-good C++ TAPs do: the pointer is
-/// only used for the one `AdviseVisualTreeChange` call, which marshals internally.
+/// A raw COM pointer handed to the advise thread, used only for the one `AdviseVisualTreeChange`
+/// call (which marshals internally), as the known-good C++ TAPs do.
 struct SendPtr(*mut c_void);
 unsafe impl Send for SendPtr {}
 
@@ -398,16 +333,10 @@ fn advise_on_new_thread(service: &IVisualTreeService3, callback: &IVisualTreeSer
     });
 }
 
-// Only the v2 callback is declared: its vtable already contains v1's slot, and
-// the generated `matches` answers QueryInterface for the v1 IID too. Declaring
-// both would build two vtables and make QI ambiguous.
-//
-// `Agile = false` is load-bearing. windows-core makes implementations agile by
-// default, which lets COM invoke us on whatever thread happens to call — measured
-// here as `OnVisualTreeChange` arriving on two different arbitrary threads, and
-// every WinRT call from them stalling or failing. Non-agile forces COM to marshal
-// back to the apartment the object was created on, which is the XAML UI thread.
-// The known-good C++ TAPs declare `winrt::non_agile` for the same reason.
+// Only the v2 callback is declared: it contains v1's slot and answers QI for v1 too; declaring
+// both would make QI ambiguous.
+// `Agile = false` is load-bearing: it makes COM call us back on the XAML UI thread's apartment
+// (agile, callbacks arrive on arbitrary threads and WinRT calls stall). See FINDINGS.md, "Threading, settled".
 #[implement(IObjectWithSite, IVisualTreeServiceCallback2, Agile = false)]
 struct Tap {
     site: Mutex<Site>,
@@ -429,8 +358,6 @@ impl Tap_Impl {
 
 impl IObjectWithSite_Impl for Tap_Impl {
     fn SetSite(&self, punksite: Ref<'_, windows_core::IUnknown>) -> Result<()> {
-        // A panic unwinding out of here would cross the COM boundary and abort
-        // explorer.exe, so the whole body runs inside a catch.
         guarded("SetSite", || self.set_site(punksite))
     }
 
@@ -451,9 +378,8 @@ impl IObjectWithSite_Impl for Tap_Impl {
 impl Tap_Impl {
     fn set_site(&self, punksite: Ref<'_, windows_core::IUnknown>) -> Result<()> {
         logf!("SetSite on thread {}", tid());
-        // Detach from any previous site first — SetSite(null) is also how the
-        // host tears us down, and leaving a stale subscription behind means
-        // explorer calls back into a DLL that may be on its way out.
+        // Detach from any previous site first (SetSite(null) is also the teardown), so no stale
+        // subscription is left behind.
         let previous = {
             let mut state = self.state();
             state.site = None;
@@ -493,21 +419,16 @@ impl Tap_Impl {
 
         tree::start_watchdog();
 
-        // Publish the site state BEFORE subscribing. Advise runs on its own
-        // thread (below) and the replay can begin immediately, so anything the
-        // callback needs has to be visible first — otherwise the whole initial
-        // burst is dropped on a `None` diagnostics, intermittently, depending on
-        // how the two threads interleave.
+        // Publish the site state BEFORE subscribing: the replay can start as soon as the advise
+        // thread runs, and anything the callback needs must already be visible.
         {
             let mut state = self.state();
-            // Claim the current generation, standing down whichever instance
-            // held it before.
+            // Claim the current generation, superseding whichever instance held it.
             state.generation = GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
             CURRENT.store(state.generation, Ordering::SeqCst);
             state.site = Some(site.clone());
             state.service = Some(service.clone());
             state.diagnostics = diagnostics.ok();
-            // Also publish it where the watchdog thread can reach it.
             if let Some(diagnostics) = state.diagnostics.as_ref() {
                 DIAGNOSTICS.store(diagnostics.clone().into_raw() as usize, Ordering::SeqCst);
             }
@@ -515,9 +436,8 @@ impl Tap_Impl {
 
         ACTIVE.store(true, Ordering::SeqCst);
 
-        // Advise from a *fresh* thread. Windhawk's Taskbar Styler documents that
-        // calling it from the site's own thread can hang in
-        // `Advising::RunOnUIThread` — and a hang here freezes the shell.
+        // Advise from a fresh thread: from the site's own thread it can hang in
+        // `Advising::RunOnUIThread` and freeze the shell (per Windhawk's Taskbar Styler).
         let callback: IVisualTreeServiceCallback2 = self.to_interface();
         advise_on_new_thread(&service, &callback);
         Ok(())
@@ -531,8 +451,7 @@ impl IVisualTreeServiceCallback_Impl for Tap_Impl {
         element: VisualElement,
         mutation_type: VisualMutationType,
     ) -> HRESULT {
-        // A Rust panic unwinding through the COM boundary would abort the
-        // process — i.e. take down the shell — so nothing is allowed to escape.
+        // Nothing may unwind into Explorer.
         let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let now = tid();
             if CALLBACK_TID.swap(now, Ordering::SeqCst) != now {
@@ -554,24 +473,17 @@ impl IVisualTreeServiceCallback_Impl for Tap_Impl {
                 element.num_children,
             );
 
-            // Explorer runs several XAML islands and calls back on more than one
-            // thread — measured, `OnVisualTreeChange` arriving on 9804 and 20008
-            // in one session. Track whichever thread the most recent tray event
-            // came in on; see `adopt_tray_thread` for why "most recent" rather
-            // than "first", and why the test is this broad.
+            // Explorer calls back on several islands' threads; track the one the latest tray
+            // event came from (see `adopt_tray_thread`).
             if type_name.starts_with("SystemTray.") {
                 lifecycle::adopt_tray_thread();
             }
 
-            // The revert channel, and the sweep timer that rides on it. Both
-            // deliver their messages to the thread that owns the window, so it
-            // has to be this one. Created even for a superseded instance — the
-            // window outlives any one of them.
+            // The control window (revert channel + sweep timer) must be owned by the tray thread.
+            // Created even for a superseded instance — the window outlives any one of them.
             if lifecycle::on_tray_thread() {
                 lifecycle::ensure_window();
-                // A revert whose owner died before the window existed. Running it
-                // here is the whole reason it was deferred: this is the thread
-                // that may touch the tray.
+                // A revert whose owner died before the window existed.
                 if let Some(pid) = lifecycle::take_pending_revert() {
                     // Posted, not run: no XAML from inside this callback.
                     logf!("posting the deferred revert");
@@ -579,27 +491,15 @@ impl IVisualTreeServiceCallback_Impl for Tap_Impl {
                 }
             }
 
-            // Recording happens above, unconditionally, and only the *edits*
-            // below are gated. Gating the bookkeeping too was a bug: between a
-            // stand-down and the next injection no instance holds the current
-            // generation, so every event in that window — including our own tray
-            // icon being destroyed — was dropped, leaving a childless orphan in
-            // the tree that no later scan could ever complete. The symptom was a
-            // re-enable that logged "1 NotifyIconView recorded" forever and never
-            // drew. Recording is keyed by handle and idempotent, so two live
-            // instances recording the same event costs nothing.
+            // Only the edits below are gated by generation; recording above must stay ungated
+            // (it is idempotent, and a gap between stand-down and re-injection would orphan nodes).
             if self.state().generation != CURRENT.load(Ordering::SeqCst) {
                 return;
             }
 
-            // A transport button in a hover preview, just built. Asking for it to be wired *now*
-            // rather than on the next sweep is the difference between the first press working and
-            // the first press doing nothing — see [`wire_transport`].
-            //
-            // Above the tray-thread gate on purpose: the flyout is not announced on one fixed
-            // thread, and a request that arrives on another island's would be dropped by it. The
-            // post is what moves the work onto the tray's thread, and it is not a XAML call, so it
-            // is allowed from in here.
+            // A hover-preview transport button was just built: ask for it to be wired now (see
+            // [`wire_transport`]). Above the tray-thread gate on purpose: the flyout is announced on
+            // varying threads, and the post (not a XAML call) moves the work to the tray thread.
             if added && type_name == music::thumbbar::BUTTON_TYPE {
                 lifecycle::nudge_transport();
             }
@@ -610,38 +510,19 @@ impl IVisualTreeServiceCallback_Impl for Tap_Impl {
                 lifecycle::nudge_repin();
             }
 
-            // Everything below touches the tray, so it may only run on the thread
-            // that owns it. The triggers are element *types* and *names*, which
-            // match in every island — "a ContentPresenter was added" fires on the
-            // other island's thread too, and acting on it there wedges the call
-            // forever. This is the single guard that made decoration reliable
-            // instead of a coin flip.
+            // Below only handles the tray island's events, whose handles are that island's to use.
+            // (Defensive: type/name triggers match in every island.)
             if !lifecycle::on_tray_thread() {
                 return;
             }
 
-            // **Nothing below touches XAML.** This callback is by definition inside
-            // the visual-tree event stream, and any WinRT call against a tray
-            // element from in there can fail to return — taking Explorer's UI
-            // thread and the whole taskbar with it. Every mutation therefore lives
-            // in `sweep`, which waits for the stream to fall quiet first.
-            //
-            // What is left here is bookkeeping: recording the tree, above, and
-            // noting the two things that are identified by an event's *handle*
-            // rather than by the recorded tree, since deferring those would
-            // otherwise lose the handle.
+            // **Nothing below touches XAML**: a WinRT call from inside the event stream can fail
+            // to return and wedge the taskbar. Mutations live in `sweep`; this only queues the
+            // handles that the recorded tree cannot give back later.
 
-            // Explorer's own volume and "microphone in use" indicators, which our strip
-            // says instead. Each is a glyph *TextBlock* inside a SystemTray.IconView, so it
-            // is matched on the codepoint rather than a (translated) name — done in the
-            // sweep, because reading `Text` is itself a XAML call.
-            //
-            // Not one-shot: Explorer rebuilds the tray on DPI and monitor changes, and the
-            // indicators come back. The microphone one is not even *born* until an app
-            // starts recording, which is why the sweep is asked to go back to its fast pace
-            // here — at the idle cadence the shell's icon would sit there for up to four
-            // seconds of every call before being collapsed, which is exactly long enough
-            // to be seen.
+            // A possible system indicator glyph (matched by codepoint in the sweep, since reading
+            // `Text` is a XAML call). Fast pace: the microphone icon appears only when recording
+            // starts, and must be collapsed before it is seen.
             if added && name == "InnerTextBlock" {
                 enqueue(&PENDING_GLYPHS, element.handle);
                 if lifecycle::on_tray_thread() {
@@ -649,9 +530,8 @@ impl IVisualTreeServiceCallback_Impl for Tap_Impl {
                 }
             }
 
-            // Our own injected segments being announced back to us. XAML reports
-            // children before parents, so by the time the segment `Grid` arrives
-            // its hover plate is already recorded and findable by name.
+            // Our own segments announced back. Children are reported before parents, so the
+            // segment's hover plate is already recorded.
             if added {
                 if let Some(segment) = interact::Segment::from_name(&name) {
                     enqueue(&PENDING_SEGMENTS, (segment, name.clone(), element.handle));
@@ -665,22 +545,13 @@ impl IVisualTreeServiceCallback_Impl for Tap_Impl {
     }
 }
 
-/// Undo everything and go quiet.
-///
-/// The one exit path: the user turned the feature off, or audio-tray is gone.
-/// Both mean the same thing here — put the shell back and stop touching it.
-///
-/// The DLL stays loaded, and that is deliberate. Unloading cannot do this work
-/// (`DLL_PROCESS_DETACH` holds the loader lock, runs on the wrong thread for
-/// XAML, and races the callbacks diagnostics still holds into our code) and does
-/// not need to: once this has run there is nothing of ours left on screen. A
-/// resident, inert DLL costs a page of memory; a wrong unload costs the shell.
+/// Undo everything and go quiet (feature turned off, or audio-tray gone). The DLL stays loaded,
+/// inert, on purpose: see FINDINGS.md, "Turning it off — revert in place, never unload".
 ///
 /// # Safety
-/// XAML UI thread only — it edits the tree.
+/// XAML UI thread only.
 pub(crate) unsafe fn stand_down() {
-    // First, so nothing re-applies behind the revert — neither a live callback
-    // nor the periodic sweep.
+    // First, so neither a callback nor the sweep re-applies behind the revert.
     ACTIVE.store(false, Ordering::SeqCst);
     CURRENT.store(0, Ordering::SeqCst);
     STAND_DOWN_PENDING.store(false, Ordering::SeqCst);
@@ -688,23 +559,17 @@ pub(crate) unsafe fn stand_down() {
     match diagnostics() {
         Some(diagnostics) => {
             restore::revert(&diagnostics);
-            // The music tile keeps its own record, because what it has to put back is different in
-            // kind: widths and margins on the *shell own* elements, not content in ours.
+            // The music tile keeps its own record (widths and margins on the shell's elements).
             music::revert(&diagnostics);
         }
-        // Without diagnostics no handle can be resolved, so there is no way to
-        // put anything back. Say so rather than reporting a silent success.
         None => logf!("stand down: no IXamlDiagnostics — cannot revert"),
     }
 
-    // Everything below is "have we done X yet?" state. Clearing it is what lets
-    // the feature be switched back on without restarting Explorer.
+    // Reset the "done yet?" state so the feature can be re-enabled without restarting Explorer.
     *lock(&DECORATED) = None;
     for indicator in indicators() {
         indicator.forget();
     }
-    // Our segments died with the content they lived in; these handles are stale,
-    // and keeping them would stop a fresh strip being wired up.
     lock(&WIRED).clear();
     REORDERED.store(false, Ordering::SeqCst);
     PROBED.store(false, Ordering::SeqCst);
@@ -712,15 +577,8 @@ pub(crate) unsafe fn stand_down() {
     logf!("stood down — the taskbar is as we found it");
 }
 
-/// Element handles the callback has noticed but not yet acted on.
-///
-/// The callback must not touch XAML at all — see [`sweep`] — but two of the steps
-/// are driven by the handle carried on an event rather than by the recorded tree.
-/// Deferring those means remembering the handle, so they are queued here and
-/// drained by the sweep.
-///
-/// Only ever pushed from the tray island's thread, so the handles are always that
-/// island's to use.
+/// Event handles the callback queued for the sweep (the callback may not touch XAML). Pushed only
+/// from the tray island's thread.
 static PENDING_GLYPHS: Mutex<Vec<xamlom::InstanceHandle>> = Mutex::new(Vec::new());
 static PENDING_SEGMENTS: Mutex<Vec<(interact::Segment, String, xamlom::InstanceHandle)>> =
     Mutex::new(Vec::new());
@@ -734,13 +592,8 @@ fn enqueue<T>(queue: &Mutex<Vec<T>>, item: T) {
     lock(queue).push(item);
 }
 
-/// Set while we are inside a XAML call, so the sweep timer cannot re-enter.
-///
-/// This is not paranoia. An STA thread **pumps messages while an outgoing COM
-/// call is in flight**, so a `WM_TIMER` posted to the control window is
-/// dispatched *inside* `put_Content` — on the same thread, in the middle of a
-/// decoration. Measured: the log stopped dead between "XamlReader.Load ok" and
-/// the mutation result, and the strip never appeared.
+/// Set while we are inside a XAML call. An STA pumps messages during outgoing COM calls, so a
+/// `WM_TIMER` or posted message can be dispatched inside `put_Content` on this same thread.
 static XAML_BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// RAII claim on [`XAML_BUSY`]. `None` means someone else already holds it.
@@ -758,24 +611,13 @@ impl Drop for BusyGuard {
     }
 }
 
-/// Periodic "is what should be true still true?" check, run off a timer on the
-/// XAML thread.
-///
-/// Everything else in the TAP is driven by visual-tree events, and that is not
-/// enough on its own. The shell data-binds the presenter's `Content` and can
-/// overwrite our strip with a freshly built visual of its own; the re-apply for
-/// that only runs when another tray mutation happens to arrive, so if the tree
-/// goes quiet the strip stays gone. Observed on screen: volume icon hidden, tray
-/// reordered, and nothing drawn in their place — the exact state the
-/// `strip_placed()` gate exists to prevent, reached from the other direction.
-///
-/// Cheap in the steady state: one handle resolve and a runtime-class read.
+/// Re-applies whatever should be true and is not (the shell can overwrite our strip with no
+/// further event). Every XAML mutation in the TAP happens from here.
 ///
 /// # Safety
-/// XAML UI thread only — it is called from the control window's timer.
+/// XAML UI thread only (the control window's timer).
 pub(crate) unsafe fn sweep() {
-    // Dropped if a visual-tree callback — or another sweep — is already inside a
-    // XAML call on this thread. Skipping is always safe: the next tick is at most 4 s away.
+    // Skipped if a XAML call is already in flight on this thread; the next tick retries.
     let Some(_busy) = BusyGuard::claim() else {
         return;
     };
@@ -795,9 +637,8 @@ pub(crate) fn live() -> bool {
 /// A revert that could not run because a XAML call was in flight; the sweep finishes it.
 static STAND_DOWN_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Answer a revert request: stand down now, or — if a XAML call further up this stack is in
-/// flight (an STA pumps during outgoing COM calls) — stop all writing at once and leave the
-/// restore to the sweep, which runs it under the busy claim as soon as that call returns.
+/// Answer a revert request: stand down now, or, if a XAML call is in flight further up this
+/// stack, stop all writing at once and leave the restore to the sweep.
 ///
 /// # Safety
 /// Tray thread only.
@@ -822,43 +663,24 @@ unsafe fn sweep_claimed() {
         return;
     };
 
-    // **Ahead of the gate below, deliberately** — see [`wire_transport`]. Everything after it waits
-    // for silence because it *writes* to a shell element; attaching a handler does not, and making
-    // it wait cost the user a click on every fresh set of transport buttons.
+    // Ahead of the mutation gate on purpose: attaching handlers writes nothing (see [`wire_transport`]).
     if tree::quiet_for(QUIET_BEFORE_WIRING) {
         wire_transport_now(&diagnostics);
     }
 
-    // **The fix for the shell freeze.** `put_Content` against a tray element
-    // while `AdviseVisualTreeChange` is still streaming does not return: the UI
-    // thread is inside a marshalled call, and it wedges there with the whole
-    // taskbar — CPU flat, clock stopped, recoverable only by restarting Explorer.
-    //
-    // Decoration used to run inline from the callback, which is *always* inside
-    // the stream. Whether it wedged then came down to timing: if the tray icon
-    // happened to arrive after the replay finished it worked, and if it arrived
-    // mid-replay it did not. That is exactly the coin-flip that made the same
-    // binary behave differently on consecutive runs, and why injecting *after*
-    // the icon already existed reproduced it every time.
-    //
-    // Waiting for silence is what makes the call safe. A `WM_TIMER` can itself be
-    // dispatched mid-burst — an STA thread pumps while a call is outstanding — so
-    // the timer is only the driver here; this check is the guard.
+    // **Do not remove.** `put_Content` while the event stream is still running never returns and
+    // wedges the whole taskbar; the timer is only the driver, this check is the guard.
+    // See FINDINGS.md, "Resolved: never mutate from inside the event stream".
     if !tree::quiet_for(QUIET_BEFORE_MUTATING) {
         return;
     }
 
-    // Order matters. Finding an indicator's slot only records it, and has to happen
-    // whether or not the strip is up yet. Decoration comes next, because
-    // collapsing those icons and reordering the tray are both gated on the
-    // strip actually being on screen — that gate is what stops us taking Windows'
-    // controls away and putting nothing back.
+    // Order matters: record indicator slots (ungated), then decorate, then the edits gated on
+    // `strip_placed()`.
     for text_block in drain(&PENDING_GLYPHS) {
         note_system_indicator(&diagnostics, text_block);
     }
 
-    // "Decorate unless it is already done", so this covers a strip the shell
-    // overwrote as well as an icon that arrived with no further event to notice it.
     try_decorate(&diagnostics);
     if !live() {
         return;
@@ -873,10 +695,7 @@ unsafe fn sweep_claimed() {
         reorder_now(&diagnostics);
     }
 
-    // Drained last, and deliberately after `try_decorate`: the segments only exist
-    // once the strip has been placed, and their own announcements arrive
-    // re-entrantly *during* that `put_Content`. By the time we get here they are
-    // already queued, so hover is wired in the same tick that drew the strip.
+    // After `try_decorate`: the segments only exist once the strip is placed.
     for (segment, name, element) in drain(&PENDING_SEGMENTS) {
         attach_segment(&diagnostics, segment, &name, element);
     }
@@ -886,31 +705,15 @@ unsafe fn sweep_claimed() {
         return;
     }
 
-    // The music tile, last: it decorates a *different* element from everything above — an app own
-    // taskbar button rather than our notify icon — so nothing here depends on it and it depends on
-    // nothing here except the two guards at the top of this function, which are the whole reason a
-    // `put_*` against a taskbar element is safe at all.
+    // The music tile: independent of the above, but relies on the same two guards.
     music::sweep(&diagnostics);
     if !live() {
         return;
     }
 
-    // Nothing left to apply — drop to the slow cadence until something comes
-    // undone. `strip_placed` going false again (the shell re-binding the
-    // presenter's content) is what brings it back.
-    //
-    // The wiring check earns its place: our own segments are announced *after*
-    // `put_Content` returns rather than during it, so they are always queued for
-    // the following tick. Without it the pace dropped first and hover took an idle
-    // interval to arrive instead of a fast one.
-    //
-    // **The music tile never settles, and that is deliberate.** The shell rebuilds the hover
-    // preview's thumbnail-toolbar buttons on every hover, so `music::thumbbar::wire` has to catch
-    // them inside that window — at the idle 4s cadence a hover is usually over before a sweep looks,
-    // and the buttons the user is pointing at would still be dead. There is no event to wait on
-    // instead: `OnVisualTreeChange` may not mutate XAML (it wedges the shell), so the timer is the
-    // only place the work can happen and it has to already be running. The cost is a 250ms tick
-    // whose music half, with no preview open, is one lookup by type that finds nothing.
+    // Drop to the idle pace once nothing is left to apply. Segments are wired on the tick after
+    // the strip is drawn, hence `segments_wired`. With a music tile the sweep never settles: the
+    // hover preview's buttons are rebuilt per hover and must be wired within it.
     let settled = strip_placed()
         && REORDERED.load(Ordering::SeqCst)
         && segments_wired()
@@ -918,21 +721,12 @@ unsafe fn sweep_claimed() {
     lifecycle::set_sweep_pace(settled);
 }
 
-/// Redraws the strip with new glyphs, because the default devices changed.
-///
-/// Marks the strip as needing redoing and then attempts it at once. The attempt is
-/// [`sweep`], not a `put_Content` from here: that is what carries the "the event
-/// stream has been quiet" check which mutating a tray element safely depends on. If
-/// the stream is mid-burst the sweep declines and the timer retries, so this is
-/// still safe to call from a window procedure — it just no longer *waits* for the
-/// timer in the common case, which was costing a redraw up to a full tick after the
-/// click that asked for it.
-///
-/// The restore record is untouched: [`restore::remember_content`] refuses to record
-/// our own strip, so redrawing cannot lose the shell's original visual.
+/// Redraws the strip with a new device state: marks it stale and runs [`sweep`] at once (which
+/// still applies the quiet-stream gate; the timer retries if it declines). The restore record is
+/// safe: [`restore::remember_content`] never records our own strip.
 ///
 /// # Safety
-/// Called from the control window's procedure, on the tray thread.
+/// Tray thread only (the control window's procedure).
 pub(crate) unsafe fn restyle(
     output: Option<char>,
     output_muted: bool,
@@ -951,11 +745,7 @@ pub(crate) unsafe fn restyle(
             input_recording,
             ..*state
         };
-        // A restyle that changes nothing is dropped here, before it costs a
-        // rebuild. audio-tray suppresses its own duplicates, so one arriving means
-        // a genuinely new state *or* an older audio-tray that does not: either way
-        // this is what keeps a redundant message from tearing down a strip that is
-        // already correct.
+        // A restyle that changes nothing is dropped before it costs a rebuild.
         if wanted == *state {
             logf!("restyle: already showing that — nothing to do");
             return;
@@ -968,12 +758,10 @@ pub(crate) unsafe fn restyle(
         input
     );
 
-    // Clearing these is what makes the redraw happen and re-wire. The segment
-    // elements are replaced wholesale, so their old handles are of no further use.
+    // Forces the redraw and re-wiring (the segments are replaced wholesale).
     *lock(&DECORATED) = None;
     lock(&WIRED).clear();
-    // Fast pace first, so that if the sweep below declines the retry is the short
-    // interval and not the idle one.
+    // Fast pace first, so a declined sweep is retried soon.
     lifecycle::set_sweep_pace(false);
     unsafe { sweep() };
 }
@@ -983,33 +771,22 @@ fn segments_wired() -> bool {
     !lock(&WIRED).is_empty()
 }
 
-/// Attach handlers to the hover preview's transport buttons, without waiting out the mutation gate.
-///
-/// **Split from [`sweep`] because it is the one job in there that changes nothing.** Everything else
-/// the sweep does writes content, width or margin onto a shell element, and [`QUIET_BEFORE_MUTATING`]
-/// is what makes that safe. This resolves handles and adds event handlers — and paying the same
-/// 400 ms of silence for it, on top of a timer tick, is what made the first press on a button do
-/// nothing at all: the shell rebuilds those buttons on every hover and on every play/pause glyph
-/// change, and an unwired one sends its click to the player's window instead of to us.
-///
-/// A *short* quiet period is still required, because the difference between an `add_Tapped` and a
-/// `put_Content` mid-burst is one nobody here has measured, and the failure mode on the wrong side of
-/// that guess is the whole taskbar wedging. [`QUIET_BEFORE_WIRING`] is the smallest wait that is
-/// still a wait.
+/// Attach handlers to the hover preview's transport buttons behind only the short
+/// [`QUIET_BEFORE_WIRING`] gate: it writes nothing, and the shell rebuilds these buttons per hover,
+/// so the 400 ms mutation gate would leave the first press dead. Keep *some* gate: an unmeasured
+/// risk whose failure mode is a wedged taskbar.
 ///
 /// # Safety
-/// XAML UI thread only — the tray island's, as for [`sweep`].
+/// XAML UI thread only (the tray island's).
 pub(crate) unsafe fn wire_transport() {
     if !ACTIVE.load(Ordering::SeqCst) {
         return;
     }
-    // Same claim as the sweep's, and for the same reason: an STA pumps while a XAML call is
-    // outstanding, so this message can be dispatched from inside one.
     let Some(_busy) = BusyGuard::claim() else {
         return;
     };
     if !tree::quiet_for(QUIET_BEFORE_WIRING) {
-        // The sweep timer is the fallback — at 250ms with the same short gate, not the long one.
+        // The sweep (fast pace, same short gate) is the fallback.
         return;
     }
     let Some(diagnostics) = diagnostics() else {
@@ -1029,21 +806,12 @@ unsafe fn wire_transport_now(diagnostics: &xamlom::IXamlDiagnostics) {
     music::thumbbar::wire(diagnostics, &host);
 }
 
-/// How long the stream must be silent before *attaching a handler*, as against mutating.
-///
-/// Two frames at 60 Hz: past the tight run of events the shell emits while it builds a flyout, and
-/// far short of the time it takes a hand to move from the taskbar button down to the buttons under
-/// it. See [`wire_transport`] for why this is not simply [`QUIET_BEFORE_MUTATING`].
+/// Silence required before *attaching a handler* (two frames at 60 Hz: past a flyout's build burst).
 const QUIET_BEFORE_WIRING: std::time::Duration = std::time::Duration::from_millis(32);
 
-/// How long the stream must be silent before the event-driven re-pin ([`repin`]).
-///
-/// Two frames, like [`QUIET_BEFORE_WIRING`]. The 400 ms gate exists for `put_Content`, which builds
-/// a subtree synchronously and so re-enters the very stream it was issued from — that is what wedged
-/// the shell (FINDINGS.md, "never mutate from inside the event stream"). A re-pin only writes
-/// `Width`/`MinWidth`/`HorizontalAlignment`/`Margin` on existing elements, which invalidates layout
-/// (run later, by the shell's own pass) and creates nothing; it still never runs inside the
-/// callback, only from the posted message, and still waits for the rebuild's own burst to end.
+/// Silence required before the event-driven re-pin ([`repin`]). Short, unlike `put_Content`'s 400 ms:
+/// a re-pin only sets layout properties on existing elements and creates nothing. See FINDINGS.md,
+/// "Re-pinning the indicators on the event, not the sweep".
 const QUIET_BEFORE_REPIN: std::time::Duration = std::time::Duration::from_millis(32);
 
 /// Re-pin the music tile's indicators right after the shell rebuilt one, instead of waiting for the
@@ -1095,23 +863,11 @@ pub(crate) unsafe fn timed_sweep() {
 const SWEEP_REPORT_EVERY: u32 = 2400;
 const SWEEP_REPORT_FIRST: u32 = 120;
 
-/// How long the visual-tree stream must be silent before we touch XAML.
-///
-/// Comfortably longer than the gaps *within* a replay burst and far shorter than
-/// a user would notice the strip taking to appear.
+/// Silence required before mutating XAML: longer than the gaps within a replay burst.
 const QUIET_BEFORE_MUTATING: std::time::Duration = std::time::Duration::from_millis(400);
 
-/// Logs, once, how big the shell's icon slot is next to our pill.
-///
-/// Explorer draws its own hover plate on the notify-icon slot, behind whatever we
-/// put in it — so how evenly that plate surrounds the pill is decided by the
-/// difference between the two, and that difference has to be measured rather than
-/// assumed.
-///
-/// Called from the visual-tree callback rather than the sweep timer. Layout has to
-/// have run first (`ActualWidth` reads 0 until it has), which the timer would also
-/// satisfy — but new WinRT calls are only introduced on the path that is already
-/// known to be safe.
+/// Logs, once, the shell's icon slot and hover plate sizes against our pill (diagnostic for how
+/// evenly the shell's hover plate surrounds the strip). Retries each tick until layout has run.
 ///
 /// # Safety
 /// XAML UI thread only.
@@ -1126,13 +882,10 @@ unsafe fn report_slot_metrics(diagnostics: &xamlom::IXamlDiagnostics) {
     let Some((slot_w, slot_h)) = decorate::actual_size(diagnostics, icon) else {
         return;
     };
-    // Zero means layout has not run yet; try again on the next tick.
     if slot_w <= 0.0 || slot_h <= 0.0 {
         return;
     }
-    // The pill, not the presenter: the presenter fills the slot, so measuring it
-    // could only ever report a zero surround. Retry next tick if layout has not
-    // reached our content yet.
+    // The pill, not the presenter (which fills the slot).
     let Some((pill_w, pill_h)) = decorate::content_size(diagnostics, presenter) else {
         return;
     };
@@ -1146,14 +899,8 @@ unsafe fn report_slot_metrics(diagnostics: &xamlom::IXamlDiagnostics) {
         (slot_h - pill_h) / 2.0
     );
 
-    // The slot is not what gets drawn. Explorer's hover highlight is a Border
-    // inside the icon's ContainerGrid, and if its style insets it then the gap the
-    // eye sees is this one, not the slot's. Its *size* does not depend on hover —
-    // only its opacity does — so it can be measured cold, which beats trying to
-    // sample a screenshot while someone holds the pointer still.
-    //
-    // Breadth-first finds the shell's Border before our pill, which is a level
-    // deeper under the presenter.
+    // The visible hover highlight is a Border inside the icon (only its opacity depends on hover).
+    // Breadth-first finds it before our pill, a level deeper.
     match decorate::descendant_of_class(diagnostics, icon, "Windows.UI.Xaml.Controls.Border")
         .and_then(|plate| decorate::actual_size(diagnostics, plate).map(|size| (plate, size)))
     {
@@ -1180,10 +927,8 @@ fn ancestor_of_type(start: xamlom::InstanceHandle, wanted: &str, max_up: usize) 
     None
 }
 
-/// Move the notification area next to the wifi/battery button.
-///
-/// Retried until it succeeds: the tray's sections trickle in, so an early attempt
-/// can run before both of the sections it needs are recorded.
+/// Move the notification area next to the wifi/battery button. Retried until it succeeds (the
+/// sections trickle in).
 ///
 /// # Safety
 /// XAML UI thread only, and only once the event stream is quiet — see [`sweep`].
@@ -1196,11 +941,8 @@ unsafe fn reorder_now(diagnostics: &xamlom::IXamlDiagnostics) {
     }
 }
 
-/// Wires pointer handlers onto one of our segments, once per element.
-///
-/// Keyed on the element handle rather than a plain "done" flag: Explorer rebuilds
-/// the tray on DPI and monitor changes, which produces a fresh strip that needs
-/// wiring again.
+/// Wires pointer handlers onto one of our segments, once per element handle (a tray rebuild
+/// produces fresh segments).
 ///
 /// # Safety
 /// XAML UI thread only, and only once the event stream is quiet — see [`sweep`].
@@ -1217,8 +959,7 @@ unsafe fn attach_segment(
         }
         wired.push(element);
     }
-    // The plate is a child of the segment and shares its name plus a suffix, which
-    // is how the markup and this code stay in step.
+    // The plate is named after the segment plus "Hover" (a contract with the markup).
     let plate_name = format!("{name}Hover");
     let Some(&plate) = tree::find_by_name(&plate_name).first() else {
         logf!("no hover plate {plate_name:?} recorded yet for 0x{element:x}");
@@ -1229,11 +970,8 @@ unsafe fn attach_segment(
 
 /// Note one of Explorer's own indicators if this text block is it.
 ///
-/// Only *records* the slot — collapsing it is [`enforce_hidden`]'s job, gated on our strip
-/// actually being placed. The two have to be separate because the volume glyph is announced
-/// during the replay, well before our icon has been decorated; gating the search itself
-/// would mean the slot was never found and the icon never hidden even when the strip does
-/// appear.
+/// Only *records* the slot, ungated; collapsing it is [`enforce_hidden`]'s job, gated on the
+/// strip. (The glyph is announced during the replay, long before our icon is decorated.)
 ///
 /// # Safety
 /// XAML UI thread only, and only once the event stream is quiet — see [`sweep`].
@@ -1258,25 +996,19 @@ unsafe fn note_system_indicator(
         return;
     };
 
-    // What tells Explorer's microphone glyph from the one in our own input segment: only
-    // the shell's sits in a `SystemTray.IconView`. Ours is inside the strip we injected, so
-    // it falls out here — which is why matching on the codepoint alone is safe.
+    // Only the shell's glyphs sit in a `SystemTray.IconView`; our own strip's fall out here.
     let Some(icon) = ancestor_of_type(text_block, "SystemTray.IconView", 8) else {
         return;
     };
 
-    // Collapsing the `IconView` hides the glyph but leaves a hole between
-    // wifi and battery: inside the Quick Settings button each icon sits in
-    // its own generated `ContentPresenter`, and that container keeps its
-    // layout box no matter what happens to its content. Collapse the
-    // container so the `StackPanel` closes the slot up.
+    // The generated `ContentPresenter` around the icon keeps its layout box, so it must be
+    // collapsed too or a hole remains.
     let slot = tree::parent_of(icon)
         .filter(|&parent| {
             tree::type_of(parent).as_deref() == Some("Windows.UI.Xaml.Controls.ContentPresenter")
         })
         .unwrap_or(icon);
 
-    // Log only the first time, so a tray rebuild doesn't spam.
     if !wanted.announced.swap(true, Ordering::SeqCst) {
         logf!(
             "system {} indicator found: glyph {:04X} in IconView 0x{icon:x}, slot 0x{slot:x} (hidden only once our strip is placed)",
@@ -1284,22 +1016,15 @@ unsafe fn note_system_indicator(
             glyph as u32
         );
     }
-    // Remembered so it can be re-applied: a collapse that lands before the
-    // shell has measured this item does not free the slot (observed —
-    // `ActualWidth` still 0 at that point, and the gap survives).
+    // Remembered so it can be re-applied: a collapse before layout has measured it frees nothing.
     wanted.record((icon, slot));
     enforce_hidden(diagnostics);
 }
 
-/// Names a tray glyph we do not recognise, once per codepoint.
-///
-/// This is the diagnostic for the one thing [`decorate::MIC_GLYPHS`] cannot be sure of:
-/// which codepoint *this* Windows build uses for "microphone in use". If the indicator is
-/// not being hidden, its glyph is in the log — as long as it was announced, which is the
-/// same condition the hiding itself needs.
+/// Logs a tray glyph we do not recognise, once per codepoint: the diagnostic for a Windows build
+/// whose "microphone in use" glyph is missing from [`decorate::MIC_GLYPHS`].
 fn note_unknown_glyph(glyph: char) {
-    /// A tray holds a couple of dozen glyphs; past that something is announcing far more
-    /// than we expected and the log is worth more than the completeness.
+    /// Cap on distinct glyphs logged.
     const MAX_SEEN: usize = 48;
 
     let mut seen = lock(&UNKNOWN_GLYPHS);
@@ -1313,16 +1038,11 @@ fn note_unknown_glyph(glyph: char) {
 /// Codepoints [`note_unknown_glyph`] has already reported.
 static UNKNOWN_GLYPHS: Mutex<Vec<char>> = Mutex::new(Vec::new());
 
-/// Re-applies each indicator's collapse until layout actually gives up its slot.
-///
-/// Called on every sweep, so it costs one `ActualWidth` read per tick per indicator until
-/// they settle — then nothing.
+/// Re-applies each indicator's collapse (bounded by [`HIDE_MAX_RETRIES`]) once layout has measured it.
 ///
 /// # Safety
 /// XAML UI thread only, and only once the event stream is quiet — see [`sweep`].
 unsafe fn enforce_hidden(diagnostics: &xamlom::IXamlDiagnostics) {
-    // Windows' own icons stay until ours is actually on the taskbar. This is the gate that
-    // stops us taking the shell's controls away and putting nothing back.
     if !strip_placed() {
         return;
     }
@@ -1333,13 +1053,11 @@ unsafe fn enforce_hidden(diagnostics: &xamlom::IXamlDiagnostics) {
         let Some((icon, slot)) = indicator.recorded() else {
             continue;
         };
-        // Only worth repeating once layout has actually measured the item — a
-        // zero here means it has not run yet, and collapsing then does nothing.
+        // Zero means layout has not run yet, and a collapse now would do nothing.
         if decorate::actual_width(diagnostics, slot).is_none_or(|width| width <= 0.0) {
             continue;
         }
-        // Before, never after: from the second attempt onwards what we would read
-        // back is our own zero width, not Explorer's original.
+        // Before the collapse, never after (we would record our own zero width).
         restore::remember_layout(diagnostics, icon);
         decorate::collapse(diagnostics, icon);
         if slot != icon {
@@ -1355,23 +1073,13 @@ unsafe fn enforce_hidden(diagnostics: &xamlom::IXamlDiagnostics) {
     }
 }
 
-/// Find the tray icon we were asked to decorate and replace its content.
-///
-/// The icons come from the recorded tree — that part is reliable, they are always
-/// announced. Their presenters do **not**: see
-/// [`decorate::descendant_presenter`] for why they have to be looked up live.
-///
-/// A free function rather than a method, because [`sweep`] calls it from a timer
-/// where there is no TAP instance in hand — only the process-wide diagnostics.
+/// Find the tray icon we were asked to decorate and replace its content. Icons come from the
+/// recorded tree; presenters must be looked up live (see [`decorate::descendant_presenter`]).
 ///
 /// # Safety
 /// XAML UI thread only.
 unsafe fn try_decorate(diagnostics: &xamlom::IXamlDiagnostics) {
-    // Every path out of here used to be silent, which made "the strip did not
-    // appear" undiagnosable from the log — the interesting cases are all early
-    // returns. Logged on *change* rather than capped at a count: this runs on
-    // every tray mutation, so a plain limit spends itself on the replay burst and
-    // then hides the reason that actually mattered.
+    // Logs why nothing was decorated, on change only (a count cap would spend itself on the replay).
     let why = |reason: &str| {
         static LAST: Mutex<String> = Mutex::new(String::new());
         let mut last = lock(&LAST);
@@ -1382,8 +1090,7 @@ unsafe fn try_decorate(diagnostics: &xamlom::IXamlDiagnostics) {
         }
     };
 
-    // Checked before the live walk below, which is the expensive part: once the
-    // strip is up this is the path every remaining tray mutation takes.
+    // Cheap check before the expensive live walk below.
     if already_decorated(diagnostics) {
         why("already decorated");
         report_slot_metrics(diagnostics);
@@ -1411,8 +1118,7 @@ unsafe fn try_decorate(diagnostics: &xamlom::IXamlDiagnostics) {
 
     let target = target_tooltip();
 
-    // One-shot: what each tray icon actually calls itself. Logged once so a
-    // mismatch is diagnosable from the log instead of guessed at.
+    // Log once what each tray icon calls itself, so a tooltip mismatch is diagnosable.
     if !PROBED.swap(true, Ordering::SeqCst) {
         logf!("looking for tray icon named {target:?}; candidates:");
         for &(icon, _) in &candidates {
@@ -1424,12 +1130,8 @@ unsafe fn try_decorate(diagnostics: &xamlom::IXamlDiagnostics) {
 
     for (icon, presenter) in candidates {
         let tooltip = decorate::automation_name(diagnostics, icon).unwrap_or_default();
-        // Substring, not equality: a tray icon's accessible name is its tooltip,
-        // and audio-tray's is mostly the current device's name. Only the app's
-        // marker within it is stable across device switches and locales.
-        //
-        // An empty target means "the first icon found", which is how the spike
-        // demonstrates itself without audio-tray running.
+        // Substring: the tooltip mostly names the current device; only the app's marker is stable.
+        // An empty target takes the first icon.
         if !target.is_empty() && !tooltip.contains(&target) {
             why(&format!("icon 0x{icon:x} named {tooltip:?} is not {target:?}"));
             continue;
@@ -1537,8 +1239,7 @@ pub unsafe extern "system" fn DllGetClassObject(
     caught.unwrap_or(E_POINTER)
 }
 
-/// Deliberately pins the DLL for the lifetime of the spike: returning `S_OK`
-/// invites a free while explorer still holds callbacks into our code.
+/// Never unloadable: Explorer may still hold callbacks into our code.
 #[no_mangle]
 pub extern "system" fn DllCanUnloadNow() -> HRESULT {
     S_FALSE

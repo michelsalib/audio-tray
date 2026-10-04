@@ -1,24 +1,10 @@
-//! Drawing the strip into an app's **own** taskbar button.
+//! Drawing the tile into an app's **own** taskbar button (`TaskListButton`).
 //!
-//! This is the half audio-tray's TAP had no counterpart for. Its own strip lives in the notification
-//! area, where `ContentPresenter.Content` takes arbitrary XAML and the slot sizes itself to whatever
-//! you put in it. A taskbar button gives you neither:
-//!
-//! ```text
-//! notification area   NotifyIconView → ContentPresenter.Content   slot sizes itself
-//! taskbar button      TaskListButton → Border#BackgroundElement   fixed at 44 epx, must be widened
-//! ```
-//!
-//! So three things here are new: `Border.Child` (nothing at that end of the taskbar is a
-//! `ContentControl`), a **widening chain** (the Border honours a width its parent then clips, so every
-//! ancestor up to the repeater has to be asked too), and placing the shell's own `RunningIndicator`
-//! and `ProgressIndicator`, which are centred in a button that is now five times its normal width.
-//!
-//! **Whose button, and why that is the whole point.** Matching an app's existing button by name makes
-//! the strip that app's taskbar presence, so the shell keeps doing what it already does well:
-//! launching adds no second icon, minimising goes there, dragging reorders it, and a right-click gives
-//! its jump list. The click on the strip *body* is left to the shell for the same reason — only the
-//! three transport glyphs are ours.
+//! Content goes in `Border#BackgroundElement.Child`; the Border and every ancestor up to the
+//! `ItemsRepeater` must be widened (re-applied each sweep); the shell's `RunningIndicator` and
+//! `ProgressIndicator` are moved under the strip. Every write is recorded first so [`restore`] can
+//! undo it. Clicks, drag, jump list etc. stay the shell's; the transport buttons live on the
+//! thumbnail toolbar (`super::thumbbar`). See FINDINGS.md, "The music tile".
 
 use std::sync::Mutex;
 
@@ -34,36 +20,22 @@ use crate::xamlom::{InstanceHandle, IXamlDiagnostics};
 
 use super::layout;
 
-/// The taskbar button the strip is drawn into.
-///
-/// One host, unlike media-tray's three: the Widgets entry point needs `TaskbarDa` enabled and clips
-/// 71 epx of what it is asked for, and a `NotifyIconView` of our own is where audio-tray's *audio*
-/// strip already lives. An app's own button is the one that earns its place — see the module docs.
+/// The app's taskbar button the tile is drawn into.
 pub struct Host {
-    /// Matched as a **substring** of `AutomationProperties.Name`, because the shell's name carries a
-    /// localised suffix: `"YouTube Music épinglé"`, `"Visual Studio Code - 1 fenêtre …"`.
+    /// Matched as a **substring** of `AutomationProperties.Name`, which carries a localised suffix
+    /// (`"YouTube Music épinglé"`).
     pub name: String,
 }
 
-/// The type XAML reports for the repeater that lays the taskbar's buttons out.
-///
-/// The level [`widen`] stops below — and, because every display's taskbar has one of its own, the
-/// identity of a taskbar in [`super::find_buttons`].
+/// The repeater laying out a taskbar's buttons: where [`widen`] stops, and one per display's
+/// taskbar in [`super::find_buttons`].
 pub const REPEATER_TYPE: &str = "Microsoft.UI.Xaml.Controls.ItemsRepeater";
 
 impl Host {
     pub const TYPE: &'static str = "Taskbar.TaskListButton";
 
-    /// How much wider than the strip the *button* is asked for, in epx.
-    ///
-    /// **Not slack — measured, and it buys one specific thing.** The plate has to be narrower than the
-    /// button, or its rounded right corner lands on the boundary and gets shaved square; a flat
-    /// `240/240/240` does exactly that. A task button's natural geometry is `button 44 → panel 44 →
-    /// Border 40`, so 4 epx is the inset the shell itself uses, and 4 is what works on screen.
-    ///
-    /// Every epx here is paid twice, which is why it is worth being exact: the button owns the hit
-    /// area and the tooltip, so overhang is hover that fires before the strip is reached — and it is
-    /// taskbar width spent on nothing.
+    /// How much wider than the strip the button's ancestors are asked to be: the shell's own 4-epx
+    /// inset, so the plate's rounded corner is not shaved. Measured; more is wasted hover area.
     pub const SLOT_OVERHEAD: f64 = 4.0;
 
     fn ask(&self, content: u32) -> f64 {
@@ -71,10 +43,7 @@ impl Host {
     }
 }
 
-/// Which button to decorate, from `tile=<app name>` in the initialization data.
-///
-/// `None` disables the tile and nothing else: the feed still runs and the progress bar still appears,
-/// because that one is the shell's own and needs no strip.
+/// Which button to decorate, from `tile=<app name>` in the init data; `None` disables the tile.
 static HOST: Mutex<Option<String>> = Mutex::new(None);
 
 pub fn set_host(name: Option<String>) {
@@ -85,20 +54,12 @@ pub fn host() -> Option<Host> {
     crate::lock(&HOST).clone().map(|name| Host { name })
 }
 
-/// The shell's own visuals inside the button that have to go.
-///
-/// **`RunningIndicator` and `ProgressIndicator` are deliberately absent.** The first is the only cue
-/// that the app is open — the strip cannot supply it, since "closed" and "open, nothing playing" both
-/// read as `Nothing playing` — and the second is where the track position goes, the same bar MPC-HC
-/// draws. Both are later siblings than our host `Border`, so they paint *over* the strip's bottom edge
-/// rather than being hidden by it. They are moved instead, by [`place_button_state`].
+/// The shell's visuals inside the button that are collapsed. `RunningIndicator` and
+/// `ProgressIndicator` are deliberately kept and moved instead ([`place_button_state`]).
 const HIDE: &[&str] = &["Icon", "DefaultIcon", "OverlayIcon"];
 
-/// Everything we have written to, with what it held first.
-///
-/// **First write wins, and that is load-bearing.** A second recording would capture *our* value as the
-/// original, and the revert would then put our value back — which for a `Width` on the shell's own
-/// Border means leaving somebody's taskbar button 240 epx wide until Explorer restarts.
+/// Everything we have written to, with what it held first. First record wins (load-bearing):
+/// a later one would capture our own value and the revert would keep it.
 static ORIGINALS: Mutex<Vec<(InstanceHandle, Original)>> = Mutex::new(Vec::new());
 
 #[derive(Clone, Copy)]
@@ -119,9 +80,7 @@ unsafe fn remember(diagnostics: &IXamlDiagnostics, handle: InstanceHandle) {
     let Some(framework) = element::<IFrameworkElement>(diagnostics, handle) else {
         return;
     };
-    // `NaN` for a width that was never set, which is what `put_Width` itself treats as unset. Writing
-    // `0.0` there would leave the element permanently zero-width — on screen, indistinguishable from
-    // still being hidden.
+    // `NaN` = never set ("Auto"); restoring `0.0` instead would leave it zero-width.
     let (mut width, mut min_width) = (f64::NAN, f64::NAN);
     let mut alignment = HORIZONTAL_ALIGNMENT_LEFT;
     let mut margin = Thickness::default();
@@ -154,8 +113,7 @@ pub unsafe fn restore(diagnostics: &IXamlDiagnostics) {
         let Some(framework) = element::<IFrameworkElement>(diagnostics, handle) else {
             continue;
         };
-        // Position before size: putting the margin and alignment back first means the element is
-        // never briefly our size *and* its own position, which is a visible jump.
+        // Position before size, to avoid a visible intermediate frame.
         let margin = framework.put_Margin(original.margin) == S_OK;
         let aligned = framework.put_HorizontalAlignment(original.alignment) == S_OK;
         let width = framework.put_Width(original.width) == S_OK;
@@ -169,9 +127,8 @@ pub unsafe fn restore(diagnostics: &IXamlDiagnostics) {
 /// Hang our markup inside a `Border` via its `Child` property.
 ///
 /// # Safety
-/// XAML UI thread only, and only with the visual-tree event stream quiet — a `put_*` against a
-/// taskbar element while `AdviseVisualTreeChange` is streaming does not return, and takes the whole
-/// taskbar with it.
+/// XAML UI thread only, never while the visual-tree event stream is delivering (a `put_*` there
+/// hangs the taskbar).
 pub unsafe fn set_child(
     diagnostics: &IXamlDiagnostics,
     handle: InstanceHandle,
@@ -210,31 +167,20 @@ unsafe fn load_markup(markup: &str) -> Option<IInspectable> {
     crate::decorate::load_xaml(markup)
 }
 
-/// Widen the host `Border` **and every ancestor up to the `ItemsRepeater`**.
-///
-/// **One level is not enough, and that is the trap that hid the strip for a long time.** The Border
-/// alone reports the width it was given and still draws 44 epx, because its parent
-/// `TaskListButtonPanel` sits at an explicit `Width` the shell set — so the Border honours our width
-/// and its parent clips it. The walk therefore continues upward and stops *below* the repeater, the
-/// one level with no width property of its own. The repeater was never a wall: with the slot widened
-/// the centred cluster moves right by exactly half the growth, so its layout is allocating the space
-/// rather than refusing it.
-///
-/// Re-applied every sweep, because **the shell puts its own `Width=44` back** — measured, repeatedly.
+/// Widen the host `Border` **and every ancestor below the `ItemsRepeater`** (each parent clips to
+/// its own width). Re-applied every sweep: the shell puts `Width=44` back.
 ///
 /// # Safety
 /// XAML UI thread only.
 pub unsafe fn widen(diagnostics: &IXamlDiagnostics, border: InstanceHandle, host: &Host) {
     let content = layout::layout().strip;
-    // The Border gets the *content* width and is pinned left; its ancestors get the ask. That gap is
-    // what keeps the plate's rounded right corner clear of the boundary instead of shaved square.
+    // The Border gets the content width, pinned left; its ancestors get the ask (corner clearance).
     set_width(diagnostics, border, f64::from(content));
     pin_left(diagnostics, border);
 
     let ask = host.ask(content);
     let mut handle = border;
-    // Bounded rather than a `while`: a tree that somehow has no repeater above us must not turn into
-    // an unbounded walk to the root, widening everything on the way.
+    // Bounded, so a tree with no repeater cannot widen everything up to the root.
     for _ in 0..6 {
         let Some(parent) = crate::tree::parent_of(handle) else {
             return;
@@ -247,10 +193,7 @@ pub unsafe fn widen(diagnostics: &IXamlDiagnostics, border: InstanceHandle, host
     }
 }
 
-/// Set `Width` and `MinWidth`, remembering what was there first.
-///
-/// Both, because both are written: a `MinWidth` of ours left behind would pin the shell's own element
-/// at our size for as long as Explorer lives.
+/// Set `Width` and `MinWidth`, remembering both first.
 ///
 /// # Safety
 /// XAML UI thread only.
@@ -258,8 +201,7 @@ unsafe fn set_width(diagnostics: &IXamlDiagnostics, handle: InstanceHandle, widt
     let Some(framework) = element::<IFrameworkElement>(diagnostics, handle) else {
         return;
     };
-    // Already ours: writing the same value four times a second buys nothing, and skipping is also the
-    // measurement — reaching here on a later sweep means the shell put its own width back.
+    // Skip if already ours (this runs every sweep).
     let mut live = f64::NAN;
     if framework.get_Width(&mut live) == S_OK && (live - width).abs() < 0.5 {
         return;
@@ -269,11 +211,7 @@ unsafe fn set_width(diagnostics: &IXamlDiagnostics, handle: InstanceHandle, widt
     let _ = framework.put_MinWidth(width);
 }
 
-/// Pin an element to the left of its slot.
-///
-/// Needed because of a XAML rule that bites exactly once: an element left at `Stretch` and then given
-/// an explicit `Width` is **centred**, not left-aligned. That slid the strip 40 epx right — half of
-/// `ask − content` — and pushed the `next` glyph past the clip.
+/// Pin an element to the left of its slot (a `Stretch` element given an explicit `Width` is centred).
 ///
 /// # Safety
 /// XAML UI thread only.
@@ -315,16 +253,11 @@ pub fn prune_originals() {
     crate::lock(&ORIGINALS).retain(|(handle, _)| crate::tree::type_of(*handle).is_some());
 }
 
-/// Bring a strip already on screen in line with a new track, without replacing it.
+/// Bring a strip already on screen in line with a new track, without replacing it. Returns
+/// whether it now shows `next`; `false` means fall back to a full placement.
 ///
-/// Returns whether the strip is now showing `next` — `false` means the elements could not be found,
-/// which is the caller's cue to fall back to a full placement.
-///
-/// Only what differs is touched. Title and artist are `put_Text` on the `TextBlock`s the markup
-/// named; the cover is the one part that has to be reparsed, because pointing an `Image` somewhere
-/// new needs a fresh `BitmapImage` — see [`layout::cover_markup`]. Even that is contained to the
-/// `Border` around it, so the strip's own size never changes and the shell has no reason to re-lay
-/// out the button.
+/// Only what differs is touched: `put_Text` for title/artist, and a rebuild of just the cover's
+/// `Border` (see [`layout::cover_markup`]), so the strip's size never changes.
 ///
 /// # Safety
 /// XAML UI thread only.
@@ -348,8 +281,7 @@ pub unsafe fn update_in_place(
         if was == now {
             continue;
         }
-        // The ticker owns this text from here on, so write the window it would show at step 0
-        // rather than the whole string — otherwise a long title appears unscrolled for a tick.
+        // Write the ticker's step-0 window, not the whole string.
         let text = super::ticker::window(now, character_budget(name, &l), 0);
         let mut wrote = false;
         for node in crate::tree::find_by_name(name) {
@@ -357,7 +289,7 @@ pub unsafe fn update_in_place(
         }
         ok &= wrote;
         wrote_anything |= wrote;
-        // The new text starts at the beginning of its scroll, not wherever the old one had got to.
+        // New text scrolls from the start.
         super::tick::restart();
     }
 
@@ -371,9 +303,7 @@ pub unsafe fn update_in_place(
         wrote_anything |= wrote;
     }
 
-    // Only when something actually moved. A play/pause toggle changes `Strip` without changing
-    // anything this function draws — the transport glyphs left for the hover preview — so logging
-    // every call would be a line a second saying nothing happened.
+    // Log only real writes: a play/pause change alters `Strip` but nothing drawn here.
     if wrote_anything {
         logf!(
             "music: strip updated in place — {:?} / {:?}",
@@ -392,15 +322,9 @@ fn character_budget(name: &str, l: &layout::Layout) -> usize {
     }
 }
 
-/// Move the shell's running indicator and progress bar under the strip's app icon.
-///
-/// Both are centred in the *button* by the template, which is right at 44 epx and wrong once it is
-/// the width of a strip. Pinning left and setting a margin fixes each, but they want opposite
-/// things: the running pill is about the *app*, so it goes under the icon, and the progress bar is
-/// about the *track*, so it spans the whole plate.
-///
-/// The pill's own width is **read** rather than assumed, because the shell grows it when the window is
-/// in the foreground — a hard-coded margin would be off-centre in one of the two states.
+/// Re-place the shell's indicators, which the template centres in the (now wide) button: the
+/// running pill under the icon (its width is read, since it grows in the foreground), the
+/// progress bar across the whole plate.
 ///
 /// # Safety
 /// XAML UI thread only.
@@ -410,29 +334,20 @@ pub unsafe fn place_button_state(diagnostics: &IXamlDiagnostics, button: Instanc
             let name = crate::tree::name_of(child).unwrap_or_default();
             let fixed_width = match name.as_str() {
                 "RunningIndicator" => None,
-                // The full plate, not the icon — see [`layout::strip_width`].
-                //
-                // **The shell's own bar, deliberately.** Drawing our own line inside the strip was
-                // tried, to escape the shell re-asserting this element from the button's template;
-                // it works and it is wrong. Windows merges the progress bar *into* the running
-                // indicator — one underline that fills — and a separate line of ours alongside the
-                // shell's pill reads as two controls saying different things about the same app.
+                // The shell's own bar, deliberately (it merges with the running indicator).
                 "ProgressIndicator" => Some(layout::strip_width()),
                 _ => continue,
             };
             let left = match fixed_width {
-                // Flush with the plate's own left edge, so the bar and the strip start together.
+                // Flush with the plate's left edge.
                 Some(_) => 0.0,
                 None => {
                     let width = crate::decorate::actual_width(diagnostics, child).unwrap_or(0.0);
                     (layout::icon_centre() - width / 2.0).max(0.0)
                 }
             };
-            // **Width first, then position.** An STA pumps messages while an outgoing COM call is in
-            // flight, so a frame can be rendered *between* these writes — and the order decides what
-            // that frame looks like. Sizing first means the intermediate is a full-width bar still
-            // centred, which slides into place; the other order shows a stub at the left edge that
-            // then grows, which is the more obviously wrong-looking of the two.
+            // Width first, then position: a frame can render between these writes, and this order
+            // looks least wrong.
             if let Some(width) = fixed_width {
                 set_width(diagnostics, child, width);
             }
@@ -442,10 +357,7 @@ pub unsafe fn place_button_state(diagnostics: &IXamlDiagnostics, button: Instanc
     }
 }
 
-/// Collapse the app's own bitmap, which would otherwise paint across the strip.
-///
-/// Named rather than positional, so a future Windows build reordering the template's children can
-/// never make us collapse our own strip. See [`HIDE`] for what is deliberately left alone.
+/// Collapse the app's own icon, matched by name (never by position) so we cannot hit our strip.
 ///
 /// # Safety
 /// XAML UI thread only.

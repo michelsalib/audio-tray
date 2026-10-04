@@ -1,13 +1,8 @@
 //! What the strip should show right now, as published by audio-tray.
 //!
-//! The TAP runs inside `explorer.exe` and cannot call into the app, so the now-playing
-//! state arrives as a small file that audio-tray rewrites on every change. A file rather
-//! than `WM_COPYDATA` for two reasons: the cover art has to reach XAML as an `Image`
-//! source, and the only way to give XAML a bitmap it did not create is a path — so there
-//! is a file in play regardless, and one mechanism is better than two.
-//!
-//! Written atomically by the app (temp file then rename), so a half-written state is never
-//! read. Both sides must agree on [`STATE_FILE`] and on the key names.
+//! The state arrives as a `key=value` file audio-tray rewrites atomically (temp + rename) on
+//! every change; a file because the cover art must reach XAML as a path anyway. Both sides must
+//! agree on [`STATE_FILE`] and the key names.
 
 pub use tap_proto::MUSIC_STATE_FILE as STATE_FILE;
 
@@ -40,10 +35,7 @@ pub struct Strip {
     pub title: String,
     pub artist: String,
     pub playback: Playback,
-    /// Absolute path to a cover image, if there is one.
-    ///
-    /// The app writes a **new filename per cover**, because `BitmapImage` caches by URI:
-    /// rewriting the same path leaves the previous cover on screen.
+    /// Absolute path to a cover image. A new filename per cover: `BitmapImage` caches by URI.
     pub cover: Option<String>,
 }
 
@@ -53,13 +45,8 @@ impl Strip {
         !self.title.trim().is_empty()
     }
 
-    /// The title to draw, substituting an idle label when nothing is playing.
-    ///
-    /// **The strip never stands down to the weather while audio-tray is running.** A gap in the
-    /// feed is routine — YouTube Music reports no track for a moment while it buffers the next
-    /// one — and handing the slot back for that produced a visible flip through the weather UI
-    /// on every song change. Showing an idle label instead also removes any need for a
-    /// keep-the-last-song timeout, which would have been a guess about how long a gap lasts.
+    /// The title to draw, or an idle label when there is no track (gaps between songs are routine,
+    /// so the tile stays up rather than handing the button back).
     pub fn display_title(&self) -> &str {
         if self.has_track() {
             self.title.trim()
@@ -68,7 +55,7 @@ impl Strip {
         }
     }
 
-    /// The artist to draw; blank while idle, so the idle state reads as one line.
+    /// The artist to draw, or the player's name while idle.
     pub fn display_artist(&self) -> &str {
         if self.has_track() {
             self.artist.trim()
@@ -77,16 +64,8 @@ impl Strip {
         }
     }
 
-    /// Read the published state, or `None` if the app has not written one yet.
-    ///
-    /// **Cached on the file's modification time.** The sweep that calls this runs up to four times a
-    /// second while there is work outstanding, and re-reading and re-parsing an unchanged file on
-    /// every one of those ticks is work done on the shell's UI thread for an answer that cannot have
-    /// changed. A stat is what is left.
-    ///
-    /// Keyed on mtime *and* length: a state file rewritten within the filesystem's timestamp
-    /// resolution is possible — audio-tray writes on every track change and every play/pause — and
-    /// the two together have never been seen to collide where mtime alone could.
+    /// Read the published state, or `None` if the app has not written one yet. Cached on mtime
+    /// and length so an unchanged file costs only a stat on the shell's UI thread.
     pub fn read() -> Option<Self> {
         use std::sync::Mutex;
         static CACHED: Mutex<Option<(u64, u64, Strip)>> = Mutex::new(None);
@@ -125,8 +104,7 @@ impl Strip {
                 "title" => strip.title = value.to_string(),
                 "artist" => strip.artist = value.to_string(),
                 "status" => strip.playback = Playback::parse(value),
-                // An empty value means "no cover", which is a normal state — plenty of
-                // sessions publish no artwork at all.
+                // Empty means no cover (common).
                 "cover" => {
                     strip.cover = (!value.trim().is_empty()).then(|| value.to_string());
                 }
@@ -137,11 +115,7 @@ impl Strip {
     }
 }
 
-/// Escape text for inclusion in XAML markup.
-///
-/// Not optional: track and artist names really do contain `&` and quotes, and an
-/// unescaped one fails the whole `XamlReader.Load` — which shows up as the strip
-/// silently vanishing for one song and coming back for the next.
+/// Escape text for XAML markup; an unescaped `&` or quote fails the whole `XamlReader.Load`.
 pub fn escape(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for ch in text.chars() {

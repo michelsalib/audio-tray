@@ -1,8 +1,6 @@
 //! The player behind the strip: which window it is, how to bring it forward, and its progress bar.
 //!
-//! Nothing here handles a click on the tile. The strip sits on the app's *own* taskbar button, so
-//! the shell already answers both buttons better than we could — left brings the player forward or
-//! minimises it, right opens its jump list.
+//! Clicks on the tile body are left to the shell (it is the app's own taskbar button).
 
 use anyhow::{bail, Context, Result};
 use windows::Win32::Foundation::HWND;
@@ -10,22 +8,14 @@ use windows_core::PCWSTR;
 
 use super::session;
 
-/// Where the player's AUMID is remembered between runs.
-///
-/// **Needed because the identity outlives the session.** A media session only exists while
-/// something is playing, so with YouTube Music shut down there is no app id to activate — and
-/// falling back to the `https://music.youtube.com` URL is wrong in a specific, visible way: the
-/// shell hands it to the default browser, which opens it as a *tab in Edge's last-used profile*
-/// rather than launching the installed PWA.
+/// Where the player's AUMID is remembered between runs: the session (and its id) only exists while
+/// playing, and the URL fallback opens a browser tab instead of the PWA.
 fn remembered_path() -> Option<std::path::PathBuf> {
     let base = std::env::var_os("LOCALAPPDATA")?;
     Some(std::path::PathBuf::from(base).join("audio-tray").join("player-aumid.txt"))
 }
 
-/// Remember a packaged app id, so the PWA can be launched later from cold.
-///
-/// Only packaged identities are kept: a bare `Chrome`/`MSEdge` id names a browser, not an app,
-/// and could not be activated anyway.
+/// Remember a packaged app id (`…!App`) so the PWA can be launched from cold; others are ignored.
 pub fn remember_player(app_id: &str) {
     if !app_id.contains('!') {
         return;
@@ -55,8 +45,7 @@ pub fn remembered_player() -> Option<String> {
     (!id.is_empty()).then_some(id)
 }
 
-/// What [`activate_player`] actually did — worth reporting, because the three outcomes fail in
-/// different places and only one of them can be checked afterwards by looking for a window.
+/// What [`activate_player`] actually did.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Activation {
     /// A window was already open; this is which route brought it forward, or that none did.
@@ -68,39 +57,24 @@ pub enum Activation {
 }
 
 pub fn activate_player(app_id: Option<&str>) -> Result<Activation> {
-    // Find and raise the existing window first, because activation is **not** idempotent: each
-    // call starts a *fresh* YouTube Music window rather than activating the running one. Measured
-    // the hard way — four activations left four cascaded windows, all live at once. So launching
-    // is only for when there is genuinely no window to raise.
+    // Raise an existing window first: activation is not idempotent, each call opens a new window.
     if let Some(hwnd) = player_window() {
         return Ok(Activation::Raised(raise(hwnd)));
     }
 
-    // The live session id if there is one, otherwise the identity remembered from when there
-    // last was. Only a packaged identity can be launched as an app; the URL is the last resort
-    // for a machine where YouTube Music has never played, and it will open as a browser tab.
+    // Live packaged id, else the remembered one; the URL is the last resort (opens a browser tab).
     let identity = app_id
         .filter(|id| id.contains('!'))
         .map(str::to_string)
         .or_else(remembered_player);
     match identity {
-        // A packaged identity goes through the activation manager, which is what the shell's own
-        // app list uses and the only route that reports *why* it failed.
         Some(aumid) => activate_packaged(&aumid).map(Activation::Started),
         None => launch("https://music.youtube.com").map(|()| Activation::OpenedUrl),
     }
 }
 
-/// Activate a packaged app by AUMID, the way the Start menu does.
-///
-/// `IApplicationActivationManager` rather than a shell target, because it is the one route that
-/// answers back: it returns an `HRESULT` **and the pid it started**, where `ShellExecuteW` on
-/// `shell:AppsFolder\<aumid>` returns only a handle-shaped number that says the shell accepted the
-/// request. Measured: `Started(14812)`, and a window 3 s later.
-///
-/// The pid is the point. A long hunt for a launch that "silently did nothing" turned out to be a
-/// launch that worked and a *measurement* that was broken — see FINDINGS.md — and no amount of
-/// staring at `ShellExecuteW`'s return value could have told the two apart. This one can.
+/// Activate a packaged app by AUMID, the way the Start menu does. Unlike `ShellExecuteW` on
+/// `shell:AppsFolder`, this reports failure and returns the started pid.
 fn activate_packaged(aumid: &str) -> Result<u32> {
     use windows::Win32::System::Com::{
         CoCreateInstance, CoInitializeEx, CLSCTX_LOCAL_SERVER, COINIT_APARTMENTTHREADED,
@@ -110,8 +84,7 @@ fn activate_packaged(aumid: &str) -> Result<u32> {
     };
 
     unsafe {
-        // Already-initialized is not an error here: the caller may or may not have set the
-        // apartment up, and this call works in either one.
+        // Already-initialised (either apartment) is fine; this call works in both.
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
         let manager: IApplicationActivationManager =
             CoCreateInstance(&ApplicationActivationManager, None, CLSCTX_LOCAL_SERVER)
@@ -123,17 +96,8 @@ fn activate_packaged(aumid: &str) -> Result<u32> {
     }
 }
 
-/// Open a URL in the default browser — the last resort, for a machine where YouTube Music has
-/// never played and so has left no packaged identity to activate.
-///
-/// **`ShellExecuteW`, not `Command::new("explorer.exe")`.** Spawning explorer only reports that a
-/// process started, so explorer exiting without honouring its argument reads as success — which is
-/// exactly how the strip could claim "brought the player forward" and do nothing. `ShellExecuteW`
-/// performs the activation itself and returns a value ≤ 32 on failure.
-///
-/// That makes it the better of the two, not a proof of anything: a return above 32 says the shell
-/// took the request, not that a window appeared. Where that difference matters — activating the
-/// packaged player — [`activate_packaged`] is used instead, because it hands back a pid.
+/// Open a URL in the default browser (no packaged identity known). `ShellExecuteW` rather than
+/// spawning explorer.exe, which reports success even when it ignores the argument.
 fn launch(target: &str) -> Result<()> {
     use windows::Win32::UI::Shell::ShellExecuteW;
     use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
@@ -150,21 +114,15 @@ fn launch(target: &str) -> Result<()> {
             SW_SHOWNORMAL,
         )
     };
-    // The documented convention: an `HINSTANCE` of 32 or less is an error code, not a handle.
+    // An `HINSTANCE` of 32 or less is an error code.
     if result.0 as usize <= 32 {
         bail!("ShellExecute refused {target} (code {})", result.0 as usize);
     }
     Ok(())
 }
 
-/// The identity the **shell** has for a window: its Application User Model ID.
-///
-/// This is the string the taskbar groups buttons by, which is exactly the question the title
-/// cannot answer — a Chromium PWA window and a plain browser tab live in the *same* `msedge.exe`
-/// and differ only here. An installed YouTube Music PWA publishes an id carrying its origin; a
-/// browser window publishes the browser's own, or none at all.
-///
-/// `None` means the window publishes no id, which is the normal case for a plain Win32 app.
+/// The shell's AppUserModelID for a window (what the taskbar groups by); `None` if it publishes
+/// none, the normal case for a plain Win32 app.
 pub fn window_app_id(hwnd: HWND) -> Option<String> {
     use windows::Win32::Storage::EnhancedStorage::PKEY_AppUserModel_ID;
     use windows::Win32::System::Com::CoTaskMemFree;
@@ -174,8 +132,7 @@ pub fn window_app_id(hwnd: HWND) -> Option<String> {
     unsafe {
         let store: IPropertyStore = SHGetPropertyStoreForWindow(hwnd).ok()?;
         let value = store.GetValue(&PKEY_AppUserModel_ID).ok()?;
-        // A window with no id set answers with an empty VT_EMPTY variant rather than an error, so
-        // the emptiness — not the call — is what says "this window has no identity of its own".
+        // No id set answers VT_EMPTY rather than an error, so emptiness means "no identity".
         let text = PropVariantToStringAlloc(&value).ok()?;
         let id = text.to_string().ok();
         CoTaskMemFree(Some(text.0 as *const core::ffi::c_void));
@@ -183,11 +140,7 @@ pub fn window_app_id(hwnd: HWND) -> Option<String> {
     }
 }
 
-/// The image name of the process owning a window — `msedge.exe`, `chrome.exe`, and so on.
-///
-/// Needed alongside [`window_app_id`] because the two answer different halves of the same
-/// question: the id says *which* app the shell thinks a window is, the image says whether it is a
-/// browser at all. A window that is a browser's and does not carry a YouTube Music id is a tab.
+/// The lowercase image name of the process owning a window (`msedge.exe`, …).
 pub fn window_process(hwnd: HWND) -> Option<String> {
     use windows::Win32::System::Threading::{
         OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
@@ -220,19 +173,8 @@ pub fn window_process(hwnd: HWND) -> Option<String> {
     }
 }
 
-/// Every top-level window with `youtube` in its title, described — for `--music-windows`.
-///
-/// The point is the *rejected* ones. `player_window` takes the first visible match and
-/// `raise` then reports success, so a window that is visible but cloaked (another virtual desktop,
-/// or Edge holding a PWA window it is not showing) makes the strip claim it brought the player
-/// forward while nothing appears. This is what distinguishes those cases from "no window at all",
-/// which needs the opposite fix.
-///
-/// One surveyed window: the verdict, the handle it was reached by, and the line describing it.
-///
-/// The handle is an `isize` rather than an `HWND` so the list can cross a thread — which is the
-/// whole point of [`crate::music::player_verdicts_from_mta`], asking the same windows the same
-/// question from the apartment the toolbar actually runs in.
+/// One window surveyed by [`player_windows`]. `hwnd` is an `isize` so the list can cross to
+/// [`crate::music::player_verdicts_from_mta`].
 #[cfg(feature = "dev")]
 pub struct WindowReport {
     pub hwnd: isize,
@@ -240,10 +182,8 @@ pub struct WindowReport {
     pub line: String,
 }
 
-/// `all` drops the title filter, which is how the *other* failure was measured: a plain browser
-/// window whose active tab is YouTube Music passes the title test, and the only fields that say so
-/// are the app id and the process — neither of which is visible without listing windows the title
-/// rule would never have shown.
+/// Every top-level window with `youtube` in its title, described for `--music-windows` (cloak state,
+/// app id, process, verdict). `all` lists every visible titled window instead.
 #[cfg(feature = "dev")]
 pub fn player_windows(all: bool) -> Vec<WindowReport> {
     use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
@@ -268,7 +208,6 @@ pub fn player_windows(all: bool) -> Vec<WindowReport> {
         let _ = unsafe { GetWindowRect(hwnd, &mut rect) };
         let class = crate::win::class_name(hwnd);
         let ex_style = unsafe { GetWindowLongW(hwnd, GWL_EXSTYLE) };
-        // The shell's identity for the window and its process: the two fields the title cannot supply.
         let app_id = window_app_id(hwnd);
         let process = window_process(hwnd);
         let player = session::window_is_player(app_id.as_deref(), process.as_deref());
@@ -294,11 +233,8 @@ pub fn player_windows(all: bool) -> Vec<WindowReport> {
     found
 }
 
-/// Whether a window is the player's own — the shell's identity for it, then its process.
-///
-/// The process is only asked for when the identity is missing, which keeps this to a single
-/// cross-process call on the normal path. See [`session::window_is_player`] for what the two
-/// answers mean.
+/// Whether a window is the player's own (see [`session::window_is_player`]); the process is read
+/// only when the window has no app id.
 pub fn is_player_window(hwnd: HWND) -> bool {
     let app_id = window_app_id(hwnd);
     let process = match app_id {
@@ -308,15 +244,8 @@ pub fn is_player_window(hwnd: HWND) -> bool {
     session::window_is_player(app_id.as_deref(), process.as_deref())
 }
 
-/// The YouTube Music window, if it is open.
-///
-/// Visible top-level windows only, titled `youtube music`, **and belonging to the player itself**.
-/// The title alone is not enough and was never sufficient: a browser window carries its active
-/// tab's title, so a YouTube Music tab makes a plain Edge window answer to it — and everything
-/// this window feeds (the thumbnail toolbar, the taskbar progress bar, the raise) then lands on
-/// the browser. The toolbar cannot be taken off again, so the buttons outlive the tab that caused
-/// them; that is the bug [`session::window_is_player`] exists to stop, and the title check is now
-/// only the cheap first half of it.
+/// The YouTube Music window: visible, titled `youtube music`, and the player's own (a browser window
+/// with that tab active must not match — the toolbar put on it cannot be removed).
 pub fn player_window() -> Option<HWND> {
     use windows::Win32::UI::WindowsAndMessaging::IsWindowVisible;
 
@@ -325,8 +254,7 @@ pub fn player_window() -> Option<HWND> {
         if !unsafe { IsWindowVisible(hwnd) }.as_bool() {
             return true;
         }
-        // The identity is asked second, and only of a title match: it is a cross-process shell
-        // call, and this runs on every poll.
+        // Title first: the identity is a cross-process call and this runs every poll.
         if crate::win::window_title(hwnd).to_lowercase().contains("youtube music") && is_player_window(hwnd) {
             found = Some(hwnd);
         }
@@ -335,25 +263,11 @@ pub fn player_window() -> Option<HWND> {
     found
 }
 
-/// Set the taskbar progress bar on the player's window — the line MPC-HC draws under its icon.
-///
-/// **Cross-process, which is the part that had to be measured.** `ITaskbarList3` is normally an app
-/// reporting its *own* progress, and nothing in the documentation says a different process may report
-/// it for someone else's window. If the shell accepts it, the bar we get is the shell's own: right
-/// colour, right place, right animation, and no drawing of ours to keep in step with it.
-///
-/// `fraction` is 0.0–1.0 and `playing` picks the colour, matching what the taskbar already means by
-/// them elsewhere: green while it runs, yellow when it is paused. A fraction outside the track — no
-/// timeline, or nothing playing — clears the bar rather than drawing a zero-length one.
+/// Set the taskbar progress bar on the player's (another process's) window. `fraction` is 0.0–1.0,
+/// `None` clears; `playing` picks normal vs paused colour. Call on an STA (the tray thread).
 pub fn set_player_progress(fraction: Option<f64>, playing: bool) -> Result<()> {
     let hwnd = player_window().context("no YouTube Music window to put a progress bar on")?;
-    // **Cached per thread, not rebuilt per call.** `CoCreateInstance` plus `HrInit` is a broker
-    // round-trip, and this is called from a poll; the object is apartment-affine, so a thread-local
-    // is exactly the right lifetime for it — it lives as long as the apartment that may use it.
-    //
-    // A `RefCell` rather than a `OnceCell` because it has to be droppable: this is a **proxy into
-    // explorer.exe**, so an Explorer restart leaves it pointing at a process that no longer exists.
-    // See [`forget_taskbar_list`].
+    // Cached per thread (apartment-affine); droppable because an Explorer restart kills the proxy.
     TASKBAR.with(|cell| {
         if cell.borrow().is_none() {
             *cell.borrow_mut() = Some(taskbar_list()?);
@@ -369,21 +283,13 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-/// Drop the cached `ITaskbarList3` so the next call builds a fresh one.
-///
-/// **An `ITaskbarList3` is a proxy into `explorer.exe`.** When Explorer restarts, every interface
-/// pointer we are holding refers to a dead process — and the calls do not necessarily *fail* in a way
-/// that shows up, they simply stop having any effect. That is the whole reason a progress bar and a
-/// thumbnail toolbar could both come back "successfully" after a restart and neither appear.
+/// Drop the cached `ITaskbarList3` (a proxy into Explorer, which silently stops working after an
+/// Explorer restart) so the next call builds a fresh one.
 pub fn forget_taskbar_list() {
     TASKBAR.with(|cell| *cell.borrow_mut() = None);
 }
 
-/// The shell's taskbar list, initialised.
-///
-/// `pub` because the thumbnail toolbar needs one of its own, on the feed's thread — see
-/// [`super::thumbbar::Toolbar`]. Everything on this side goes through [`set_player_progress`],
-/// which caches one per apartment.
+/// A fresh, initialised `ITaskbarList3` (the thumbnail toolbar keeps its own on the feed thread).
 pub fn taskbar_list() -> Result<windows::Win32::UI::Shell::ITaskbarList3> {
     use windows::Win32::System::Com::{
         CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_APARTMENTTHREADED,
@@ -399,11 +305,7 @@ pub fn taskbar_list() -> Result<windows::Win32::UI::Shell::ITaskbarList3> {
     }
 }
 
-/// Fill `hwnd`'s taskbar progress bar to `fraction`, or clear it.
-///
-/// The state picks the colour, matching what the taskbar already means by them: green while it runs,
-/// yellow when it is paused — which is why MPC-HC's bar is yellow in the screenshot that prompted
-/// this.
+/// Fill `hwnd`'s taskbar progress bar to `fraction` (paused state when not playing), or clear it.
 fn set_progress(
     taskbar: &windows::Win32::UI::Shell::ITaskbarList3,
     hwnd: HWND,
@@ -418,10 +320,8 @@ fn set_progress(
     unsafe {
         match fraction {
             Some(fraction) => {
-                // **Never 0.** The shell treats a zero value as no progress: the bar collapses into the
-                // running dot, and the next non-zero value builds a fresh `ProgressIndicator` from the
-                // template — centred, natural width — until the TAP's sweep re-pins it. That was the
-                // jump on every track change. One thousandth is invisible and keeps the element alive.
+                // Never 0: the shell treats zero as no progress and rebuilds `ProgressIndicator`, which
+                // jumps until the TAP re-pins it.
                 let completed = ((fraction.clamp(0.0, 1.0) * TOTAL as f64).round() as u64).max(1);
                 taskbar
                     .SetProgressState(hwnd, if playing { TBPF_NORMAL } else { TBPF_PAUSED })
@@ -438,12 +338,8 @@ fn set_progress(
     Ok(())
 }
 
-/// Which route actually brought the window forward.
-///
-/// Reported rather than swallowed because **every one of these calls returns success while doing
-/// nothing.** `SetForegroundWindow` returns non-zero, `SwitchToThisWindow` returns nothing at all,
-/// and the window stays behind whatever the user was looking at — which is exactly how the strip
-/// logged `Activate -> Raised` six times in a row against a player that never came forward.
+/// Which route actually brought the window forward, checked with `GetForegroundWindow` because
+/// every call reports success while doing nothing.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Raise {
     /// It was already the foreground window.
@@ -458,23 +354,9 @@ pub enum Raise {
     Refused,
 }
 
-/// Bring a window to the front, restoring it if minimised — and **check that it worked**.
-///
-/// Windows refuses a foreground change from a process the user has not just interacted with, and
-/// audio-tray is exactly that process: the click lands in Explorer, which posts us a message, so by
-/// the time we ask we have no rights. There is no single call that fixes it, so this escalates and
-/// reports which rung it got to:
-///
-/// 1. `SetForegroundWindow`, which works when the TAP managed to hand its rights over
-///    (`AllowSetForegroundWindow`, called from Explorer where the click actually happened).
-/// 2. `AttachThreadInput` to the foreground window's thread, then ask again. Sharing an input queue
-///    makes the check see one process where there were two — the standard route for this, and the
-///    reason it is second rather than first is that it perturbs another process's input queue.
-/// 3. `SwitchToThisWindow`, which the shell uses for Alt-Tab. Undocumented and increasingly ignored
-///    on Windows 11, so last.
-///
-/// `GetForegroundWindow` after each rung is the only honest test, because none of the calls tell
-/// the truth about whether they did anything.
+/// Bring a window to the front, restoring it if minimised, escalating `SetForegroundWindow` →
+/// `AttachThreadInput` + retry → `SwitchToThisWindow` and verifying each rung. We usually lack
+/// foreground rights (the click reached us as a message from Explorer).
 fn raise(hwnd: HWND) -> Raise {
     use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
     use windows::Win32::UI::WindowsAndMessaging::{
@@ -485,8 +367,7 @@ fn raise(hwnd: HWND) -> Raise {
     let arrived = |hwnd: HWND| unsafe { GetForegroundWindow() } == hwnd;
 
     unsafe {
-        // Restoring first, always: a minimised window cannot be foregrounded, and this is also the
-        // one step that needs no rights at all.
+        // Restore first: needs no rights, and a minimised window cannot be foregrounded.
         if IsIconic(hwnd).as_bool() {
             let _ = ShowWindow(hwnd, SW_RESTORE);
         } else {
@@ -502,9 +383,7 @@ fn raise(hwnd: HWND) -> Raise {
             return Raise::Foreground;
         }
 
-        // Borrow the input queue of whoever holds the foreground. Detached again immediately: a
-        // thread left attached shares keyboard focus with ours, which would be a real bug in
-        // somebody else's app.
+        // Borrow the foreground thread's input queue; always detach immediately after.
         let foreground = GetForegroundWindow();
         let their_thread = GetWindowThreadProcessId(foreground, None);
         let ours = GetCurrentThreadId();

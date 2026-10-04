@@ -1,12 +1,5 @@
-//! A tiny straight-alpha RGBA software canvas: every pixel this app draws by hand goes
-//! through here — the control flyout ([`crate::flyout`]) and the scroll readout
-//! ([`crate::osd`]) both paint into one.
-//!
-//! It owns nothing — it borrows a `width`×`height` RGBA byte slice and paints into it — and
-//! knows nothing about Win32, the audio model, or the layout. Every primitive is a method on
-//! [`Canvas`], so no caller has to thread `(buf, w, h)` through a draw call.
-//!
-//! [`crate::layered`] is the other half: this fills a buffer, that puts it on the screen.
+//! A tiny straight-alpha RGBA software canvas over a borrowed buffer, used by the flyout and
+//! the OSD. No Win32 here; [`crate::layered`] puts the buffer on screen.
 
 use ab_glyph::{Font, FontVec, PxScale, ScaleFont};
 
@@ -75,18 +68,13 @@ impl<'a> Canvas<'a> {
         self.fill_rounded(rect, r, col, alpha, false);
     }
 
-    /// Fill a rectangle whose **bottom** corners are rounded and whose top edge is square —
-    /// the shape of a strip that closes a rounded panel, so a fill of the panel's last band
-    /// follows its corners instead of spilling into them.
+    /// Fill a rectangle with only its bottom corners rounded (a strip closing a rounded panel).
     pub(crate) fn fill_round_rect_bottom(&mut self, rect: Rect, r: f32, col: [u8; 3], alpha: f32) {
         self.fill_rounded(rect, r, col, alpha, true);
     }
 
-    /// The rounded-rectangle SDF both fills share.
-    ///
-    /// `bottom_only` drops the vertical mirror, so only the bottom corners curve, and
-    /// intersects (`max`) with the half-plane below the top edge — which is what puts the
-    /// missing top boundary back.
+    /// The rounded-rectangle SDF both fills share. `bottom_only` drops the vertical mirror and
+    /// intersects with the half-plane below the top edge to restore that boundary.
     fn fill_rounded(&mut self, rect: Rect, r: f32, col: [u8; 3], alpha: f32, bottom_only: bool) {
         let Rect { x0, y0, x1, y1 } = rect;
         let cx = (x0 + x1) / 2.0;
@@ -130,9 +118,7 @@ impl<'a> Canvas<'a> {
         }
     }
 
-    /// Copy a same-size (`w`×`h`) page buffer into this canvas shifted horizontally by `dx`
-    /// (opaque copy, no blending), clipping to bounds. Used to slide two pre-rendered
-    /// screens across each other during a navigation transition.
+    /// Opaquely copy a same-size page buffer shifted horizontally by `dx`, clipped (for slides).
     pub(crate) fn blit_shift(&mut self, page: &[u8], dx: i32) {
         let (w, h) = (self.w, self.h);
         let x_lo = dx.max(0);
@@ -172,9 +158,8 @@ impl<'a> Canvas<'a> {
     }
 }
 
-/// Convert a desired **em size** (in px) into the ab_glyph `PxScale` that actually yields
-/// it. ab_glyph scales a font by its *height*, so a plain `PxScale::from(px)` renders an
-/// em of only ~0.75·px for Segoe UI. Sizing by em keeps our text matched to Windows.
+/// Convert an em size (px) into the ab_glyph `PxScale` that yields it; ab_glyph scales by
+/// height, so `PxScale::from(px)` would give Segoe UI an em of ~0.75·px.
 pub(crate) fn em_scale(font: &FontVec, em_px: f32) -> PxScale {
     match font.units_per_em() {
         Some(upem) => PxScale::from(em_px * font.height_unscaled() / upem),
@@ -211,8 +196,7 @@ pub(crate) fn fit_label(font: &FontVec, px: f32, text: &str, max_w: f32) -> Stri
     out
 }
 
-/// Linear interpolation between two RGB colours (`t` clamped to 0..=1). Used to lighten
-/// the slider fill toward white as live audio activity rises.
+/// Linear interpolation between two RGB colours (`t` clamped to 0..=1).
 pub(crate) fn lerp3(a: [u8; 3], b: [u8; 3], t: f32) -> [u8; 3] {
     let t = t.clamp(0.0, 1.0);
     let l = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;

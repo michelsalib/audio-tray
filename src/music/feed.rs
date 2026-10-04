@@ -1,10 +1,7 @@
 //! The YouTube Music feed: what is playing, and how to drive it.
 //!
-//! [`smtc`] knows how to talk to Windows; [`session`] knows which session is
-//! YouTube Music. This module is the pairing of the two that the rest of the app
-//! uses, and it owns one piece of state neither of them has: *which* session we
-//! settled on last time, so a command goes to the same player the strip is
-//! currently showing rather than to whatever is momentarily current.
+//! Pairs [`smtc`] with [`session`], and remembers which session was last settled on so commands
+//! reach the player the strip is showing.
 
 
 use super::{session, smtc};
@@ -37,9 +34,7 @@ pub struct Ytm {
     smtc: smtc::Smtc,
     /// An app id pinned in config, which overrides the built-in matching.
     pinned: Option<String>,
-    /// The app id the last [`Ytm::read`] settled on. Commands address this rather
-    /// than re-deciding, so a click always reaches the player the user is looking
-    /// at — even if another app became "current" in between.
+    /// The app id the last [`Ytm::read`] settled on; commands address this rather than re-deciding.
     current_app_id: Option<String>,
 }
 
@@ -52,12 +47,8 @@ impl Ytm {
         })
     }
 
-    /// Read the current state and the track position together, remembering which session they came
-    /// from.
-    ///
-    /// **One enumeration, and the artwork is read once.** The picking rule runs against the cheap
-    /// [`smtc::Brief`]s and only the session it returns is read in full — which is the difference
-    /// between one cross-process round-trip per poll and one *per session on the machine*.
+    /// Read the current state and track position, remembering which session they came from. Picks
+    /// on the cheap [`smtc::Brief`]s and reads only the chosen session in full.
     pub fn read(&mut self) -> Result<(State, Option<smtc::Timeline>)> {
         let pinned = self.pinned.clone();
         let reading = self.smtc.read_current(|briefs| match pinned.as_deref() {
@@ -74,8 +65,7 @@ impl Ytm {
         };
 
         self.current_app_id = Some(reading.snapshot.app_id.clone());
-        // A session that exists but has no title yet is a track change in flight. Keeping the
-        // previous app id means the buttons stay live through it.
+        // No title yet = a track change in flight; the app id is kept so buttons stay live.
         let state = if reading.snapshot.has_track() {
             State::Track(reading.snapshot)
         } else {
@@ -84,11 +74,8 @@ impl Ytm {
         Ok((state, reading.timeline))
     }
 
-    /// Send a transport command to the session the last [`Ytm::read`] found.
-    ///
-    /// Returns `Ok(false)` when there is nothing to command — no YouTube Music
-    /// session, or one that refused. The caller treats that as "the click did
-    /// nothing", not as an error worth surfacing.
+    /// Send a transport command to the session the last [`Ytm::read`] found. `Ok(false)` means no
+    /// session or a refusal: the click did nothing, which is not an error.
     pub fn send(&self, command: Command) -> Result<bool> {
         let Some(app_id) = self.current_app_id.as_deref() else {
             return Ok(false);
@@ -96,18 +83,12 @@ impl Ytm {
         self.smtc.send(app_id, command)
     }
 
-    /// The app id of the session the strip is currently following.
-    ///
-    /// For an installed PWA this is a real AUMID (`<PackageFamilyName>!App`), which is exactly
-    /// what `shell:AppsFolder\<aumid>` needs to bring the player forward.
+    /// The app id of the followed session; for a PWA a real AUMID usable with `shell:AppsFolder\<aumid>`.
     pub fn current_app_id(&self) -> Option<&str> {
         self.current_app_id.as_deref()
     }
 
-    /// Every session on the machine, for `--music-probe`.
-    ///
-    /// The point of exposing this is diagnosis: when the built-in matching misses
-    /// an unusual YouTube Music build, this is what shows the real app id to pin.
+    /// Every session on the machine, for `--music-probe` (shows the real app id to pin).
     #[cfg(feature = "dev")]
     pub fn all_sessions(&self) -> Result<Vec<Snapshot>> {
         self.smtc.sessions()

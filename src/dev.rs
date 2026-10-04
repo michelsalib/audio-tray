@@ -5,7 +5,7 @@
 //!   --list                         defaults by role, and every active device
 //!   --set <q> / --set-icon <q> <IconId>
 //!                                  switch the default output / store a device's icon
-//!   --flyout [menu|icons|update]   preview the panel (icons = the picker, update = fake a staged update)
+//!   --flyout [icons|update]        preview the panel (icons = the picker, update = fake a staged update)
 //!   --vol <up|down|get>            nudge or read the default output volume by one scroll notch
 //!   --osd [out|in] [level%]        preview the scroll readout beside the cursor until it fades
 //!   --mic [secs]                   who holds the microphone, then watch it change
@@ -35,9 +35,7 @@ use crate::{flyout, music, osd, taskbar, tray, update};
 pub fn run(args: &[String], backend: &WasapiBackend) -> Result<bool> {
     match args.first().map(String::as_str) {
         Some("--flyout") => {
-            // Dev: show the flyout once. `--flyout menu` previews the right-click menu;
-            // `--flyout icons` jumps straight to the first device's icon-picker screen;
-            // `--flyout update` fakes a staged update so the footer's restart button shows.
+            // `icons` opens on the first device's picker; `update` fakes a staged update.
             let mut config = Config::load();
             let outcome = match args.get(1).map(String::as_str) {
                 Some("icons") => flyout::show_icons_preview(backend, &mut config, None),
@@ -105,9 +103,6 @@ pub fn run(args: &[String], backend: &WasapiBackend) -> Result<bool> {
             println!("volume: {:.0}% -> {:.0}%", before * 100.0, after * 100.0);
         }
         Some("--osd") => {
-            // Dev: show the scroll readout on its own, next to the cursor, and wait for it
-            // to fade. The only way to iterate on it (and screenshot it) without a taskbar
-            // strip to scroll — and with an explicit level, without touching the device.
             let flow = match args.get(1).map(String::as_str) {
                 Some("in") => Flow::Input,
                 Some("out") | None => Flow::Output,
@@ -125,10 +120,7 @@ pub fn run(args: &[String], backend: &WasapiBackend) -> Result<bool> {
             osd::preview(backend, flow, level)?;
         }
         Some("--mic") => {
-            // Dev: what the red recording dot is driven by — which apps hold the
-            // microphone open now, and then every change as it happens. The watcher
-            // itself prints the flips (see `audio::mic`), so this only has to report the
-            // starting state and stay alive to hear them.
+            // The watcher prints the flips itself; this reports the start state and waits.
             let seconds = match args.get(1) {
                 Some(value) => value
                     .parse::<u64>()
@@ -160,9 +152,7 @@ pub fn run(args: &[String], backend: &WasapiBackend) -> Result<bool> {
             }
         }
         Some("--taskbar-click") => {
-            // Dev: drive the strip's gestures against the running tray. Real clicks
-            // on the taskbar cannot be synthesised (see `crates/taskbar-tap/FINDINGS.md`),
-            // so this is the only way to exercise the cycling from a script.
+            // Real taskbar clicks cannot be synthesised (see FINDINGS.md), so post the gesture.
             let action = match args.get(1).map(String::as_str) {
                 Some("out") => taskbar::Action::CycleOutput,
                 Some("in") => taskbar::Action::CycleInput,
@@ -173,10 +163,7 @@ pub fn run(args: &[String], backend: &WasapiBackend) -> Result<bool> {
             println!("taskbar: posted {action:?} to the running tray.");
         }
         Some("--taskbar-scroll") => {
-            // Dev: the wheel/touchpad half of the strip's gestures. The wheel can be tested
-            // by hand; the touchpad's sub-notch deltas arrive from inside Explorer and
-            // cannot be synthesised, so this stands in for them — fractional notches
-            // included.
+            // Stands in for touchpad deltas from inside Explorer, fractional notches included.
             let flow = match args.get(1).map(String::as_str) {
                 Some("out") => Flow::Output,
                 Some("in") => Flow::Input,
@@ -217,9 +204,7 @@ pub fn run(args: &[String], backend: &WasapiBackend) -> Result<bool> {
             music::player::set_player_progress(fraction, args.get(2).map(String::as_str) != Some("paused"))?;
             println!("music: progress -> {fraction:?}");
         }
-        // The M12 spike: does the shell's own thumbnail toolbar accept a window we do not own?
-        // Nothing documents that case, and the answer decides whether the transport buttons can move
-        // off the strip and under the hover preview at all.
+        // Probe: does the shell's thumbnail toolbar accept a window we do not own?
         Some("--music-thumbbar") => {
             let playing = !matches!(args.get(1).map(String::as_str), Some("paused"));
             music::thumbbar::probe(playing)?;
@@ -235,9 +220,7 @@ pub fn run(args: &[String], backend: &WasapiBackend) -> Result<bool> {
             for window in &windows {
                 println!("{}", window.line);
             }
-            // This process is an STA; the thumbnail toolbar asks the same question from the feed's
-            // MTA. Reporting the comparison rather than a second listing keeps the tool readable
-            // and still says so loudly if the apartment ever changes the answer.
+            // This is an STA; the feed asks from an MTA, so report any disagreement.
             let handles: Vec<isize> = windows.iter().map(|window| window.hwnd).collect();
             match music::player_verdicts_from_mta(handles) {
                 Ok(from_mta) => {

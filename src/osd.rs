@@ -1,21 +1,9 @@
 //! The scroll readout: the level bar that appears next to the taskbar buttons while the
 //! wheel is turning.
 //!
-//! Scrolling over a button changes that endpoint's volume ([`crate::tray`] routes the
-//! gesture), and this is the feedback for it — otherwise the only sign that anything
-//! happened is the sound itself, which is no use at all on the input side. It shows the
-//! endpoint's glyph, its level as a bar, and the number; it holds for [`HOLD`] after the
-//! last change and then fades out over [`FADE`].
-//!
-//! A window of our own rather than something grown inside the strip, and that is the whole
-//! design decision here. The strip is XAML we hand to Explorer, and widening it to make
-//! room would reflow the notification area — every icon and the clock shifting sideways —
-//! on every scroll, at the cost of a `put_Content` rebuild inside the shell's UI thread per
-//! notch. A layered, click-through, topmost window costs the shell nothing, moves nothing,
-//! and is drawn by the same [`crate::canvas`] rasteriser and the same
-//! [`crate::flyout::theme`] palette as the control flyout, so it reads as part of the same
-//! app. What it does do is sit *over* whatever is to the right of our buttons (another tray
-//! icon, or the clock) for those three seconds.
+//! Shows the endpoint's glyph, level bar and number; holds for [`HOLD`] after the last
+//! change, then fades over [`FADE`]. A layered, click-through, topmost window of our own:
+//! growing the XAML strip instead would reflow the notification area on every notch.
 //!
 //! Everything here runs on the tray thread; the fade timer ticks on the tray's message window
 //! ([`Osd::new`]), which calls [`Osd::tick`].
@@ -41,22 +29,16 @@ use crate::flyout::theme::{
 };
 use crate::icons;
 
-/// How long the readout stays fully visible after the last change — the three seconds the
-/// gesture asks for — and how long it then takes to fade.
+/// How long the readout stays fully visible after the last change, then how long it fades.
 const HOLD: Duration = Duration::from_secs(3);
 const FADE: Duration = Duration::from_millis(400);
 
-/// Repaint cadence while it is up. Only the fade actually paints; a tick inside [`HOLD`] is
-/// a subtraction, so this costs nothing for most of the readout's life.
+/// Tick cadence while it is up; only the fade repaints.
 const TICK_MS: u32 = 33;
 /// The fade timer's id, on whichever window [`Osd::new`] was told ticks go to.
 pub(crate) const TIMER_ID: usize = 0x05D;
 
-// Geometry, in DIPs, scaled by the display DPI when the window is built.
-//
-// `PANEL_H` and `RADIUS` are the taskbar pill's own height and corner radius (see the TAP's
-// `decorate` module), so the readout reads as a piece detached from the buttons rather than
-// as a foreign panel dropped on the taskbar.
+// Geometry, in DIPs. `PANEL_H` and `RADIUS` match the TAP's taskbar pill (`decorate`).
 const PANEL_W: f32 = 128.0;
 const PANEL_H: f32 = 32.0;
 const RADIUS: f32 = 6.0;
@@ -68,22 +50,16 @@ const TRACK_X0: f32 = 34.0; // track's left edge
 const TRACK_RIGHT: f32 = 36.0; // …and its right edge, measured from the panel's right
 const VALUE_RIGHT: f32 = 11.0; // right inset of the level number
 const VALUE_PX: f32 = 12.5;
-/// Track background, and the fill of a *muted* endpoint — both borrowed from the flyout's
-/// sliders, which is where the same two states are already drawn.
+/// Track background and muted fill, as in the flyout's sliders.
 const TRACK_A: f32 = 0.28;
 const MUTED_FILL_A: f32 = 0.34;
 const MUTED_VALUE_A: f32 = 0.5;
 
-/// Warm tint on a muted endpoint's glyph.
-///
-/// The flyout draws its muted slider glyph in the *accent* colour, and this deliberately
-/// does not: the readout is only ever seen right beside the taskbar buttons, whose own muted
-/// glyph is this warm tint, and side by side two different colours for one state read as a
-/// mismatch. Keep it in step with `MUTED_TINT` in the TAP's `decorate` module.
+/// Warm tint on a muted glyph, matching the taskbar buttons beside it rather than the flyout's
+/// accent. Keep in step with `MUTED_TINT` in the TAP's `decorate` module.
 const MUTED_GLYPH: [u8; 3] = [0xE8, 0x83, 0x6A];
 
-/// The readout's window, pixels and fade state. Created on first use and then kept — it is
-/// hidden between appearances, not destroyed, so a scroll never waits for a window.
+/// The readout's window, pixels and fade state. The window is created on first use, then hidden, never destroyed.
 pub(crate) struct Osd {
     hwnd: HWND,
     /// Where the fade timer's `WM_TIMER` goes: the tray's message window, or our own (`None`).
@@ -96,8 +72,7 @@ pub(crate) struct Osd {
     x: i32,
     y: i32,
     shown: bool,
-    /// When the level last changed — the fade counts from here, so scrolling again while
-    /// the readout is up simply restarts the three seconds.
+    /// When the level last changed; the hold and fade count from here.
     changed: Instant,
 }
 
@@ -127,10 +102,8 @@ impl Osd {
         self.ticks_to.unwrap_or(self.hwnd)
     }
 
-    /// Show the level of one endpoint, or refresh it if it is already up, and restart the
-    /// hold. `anchor` is the tray icon's screen rect (the readout sits just to its right);
-    /// without one it falls back to the pointer, which is over the buttons anyway — that is
-    /// how the scroll got here.
+    /// Show or refresh one endpoint's level and restart the hold. `anchor` is the tray icon's
+    /// screen rect; without one the pointer is used.
     pub(crate) fn show(&mut self, flow: Flow, level: f32, muted: bool, anchor: Option<RECT>) {
         let at = match anchor {
             Some(slot) => POINT { x: (slot.left + slot.right) / 2, y: (slot.top + slot.bottom) / 2 },
@@ -152,8 +125,7 @@ impl Osd {
             let _ = unsafe { ShowWindow(self.hwnd, SW_SHOWNA) };
             self.shown = true;
         }
-        // Re-asserted on every appearance: the taskbar is itself topmost, and anything else
-        // that has since claimed the front would otherwise be in front of us.
+        // Re-asserted every time: the taskbar is topmost too.
         let _ = unsafe {
             SetWindowPos(
                 self.hwnd,
@@ -166,7 +138,7 @@ impl Osd {
             )
         };
         self.changed = Instant::now();
-        // Replaces the timer if one is already armed, which is what restarts the countdown.
+        // Replaces an armed timer.
         unsafe { SetTimer(Some(self.timer_window()), TIMER_ID, TICK_MS, None) };
     }
 
@@ -183,8 +155,7 @@ impl Osd {
             self.hide();
             return;
         }
-        // Ease-in: it barely dims to begin with and then goes quickly, so the readout looks
-        // like it is being dismissed rather than slowly running out.
+        // Ease-in.
         let alpha = 255.0 * (1.0 - t * t);
         crate::layered::present(
             self.hwnd,
@@ -209,8 +180,7 @@ impl Osd {
         self.shown = false;
     }
 
-    /// Size the geometry for `scale` (the DPI of the monitor it is about to appear on, re-read per
-    /// appearance) and create the window if it does not exist yet.
+    /// Size the geometry for `scale` (the target monitor's DPI) and create the window if needed.
     fn ensure_window(&mut self, scale: f32) -> windows::core::Result<()> {
         if (scale - self.scale).abs() > 0.01 {
             self.scale = scale;
@@ -222,8 +192,7 @@ impl Osd {
             return Ok(());
         }
 
-        // `WS_EX_TRANSPARENT` + `WS_EX_NOACTIVATE` make it a pure readout: clicks fall
-        // straight through to the taskbar underneath.
+        // Click-through and never activated.
         let hwnd = crate::win::create_popup(
             w!("AudioTrayVolumeOsd"),
             w!("Audio volume"),
@@ -232,8 +201,7 @@ impl Osd {
             (0, 0, self.width, self.height),
         )?;
         self.hwnd = hwnd;
-        // Same treatment as the flyout, but the smaller corner: the panel is only 32 DIP
-        // tall, and the flyout's radius over-curves it.
+        // The small corner: the flyout's radius over-curves a 32 DIP panel.
         unsafe { crate::layered::style_panel(hwnd, crate::layered::CORNER_ROUND_SMALL) };
         Ok(())
     }
@@ -248,9 +216,6 @@ impl Osd {
         cv.clear();
         cv.fill_round_rect(Rect::new(0.0, 0.0, w as f32, h as f32), RADIUS * scale, TINT, TINT_A);
 
-        // The same glyphs the flyout's sliders use, so "which endpoint, and is it muted" is
-        // the same picture in both places — in the buttons' warm muted tint rather than the
-        // flyout's accent, see [`MUTED_GLYPH`].
         let glyph = endpoint_glyph(flow, muted);
         let glyph_col = if muted { MUTED_GLYPH } else { TEXT };
         let gpx = (GLYPH_PX * scale).round() as u32;
@@ -258,17 +223,12 @@ impl Osd {
             let gx = (GLYPH_CX * scale).round() as i32 - gw as i32 / 2;
             let gy = cy as i32 - gh as i32 / 2;
             cv.blit(gx, gy, &rgba, gw, gh, 1.0);
-            // …and if an app is holding the microphone open, the same dot the strip and the
-            // flyout put on that glyph. Read here rather than passed in because it is not
-            // part of the gesture: what the readout reports is the level, and this is the
-            // state of the world at the moment it is drawn.
             if flow == Flow::Input && crate::audio::mic::in_use() {
                 recording_dot(&mut cv, gx, gy, gpx);
             }
         }
 
-        // Track, then the fill. No thumb, deliberately: this is a readout, and a thumb
-        // would advertise a control that cannot be dragged (the window is click-through).
+        // Track, then the fill; no thumb, since nothing here can be dragged.
         let x0 = TRACK_X0 * scale;
         let x1 = w as f32 - TRACK_RIGHT * scale;
         let th = TRACK_H * scale;
@@ -279,8 +239,7 @@ impl Osd {
             cv.fill_round_rect(Rect::new(x0, cy - th / 2.0, fx, cy + th / 2.0), th / 2.0, col, alpha);
         }
 
-        // The level as a number, right-aligned — same as the flyout's sliders, percent sign
-        // and all (i.e. none).
+        // The level as a number, right-aligned, no percent sign (as in the flyout).
         if let Some(font) = ui_font() {
             let vpx = VALUE_PX * scale;
             let text = (level * 100.0).round().to_string();
@@ -290,9 +249,7 @@ impl Osd {
         }
     }
 
-    /// Where the readout goes: to the right of the icon slot, vertically centred on it, and
-    /// on the other side instead if there is no room (which is where a right-aligned
-    /// taskbar's last icons put us).
+    /// Where the readout goes: right of the icon slot, centred on it, or left if there is no room.
     fn place(&self, anchor: Option<RECT>) -> (i32, i32) {
         let gap = (GAP * self.scale).round() as i32;
         let slot = anchor.unwrap_or_else(|| {
@@ -326,12 +283,7 @@ impl Drop for Osd {
 }
 
 /// Dev preview (`--osd`): put the readout up beside the cursor and pump until it has faded.
-///
-/// The readout only ever appears in response to a gesture on the taskbar buttons, so without
-/// this there is no way to look at it — let alone screenshot it for a pixel comparison —
-/// except by scrolling a live strip and racing the three-second hold. `level` overrides what
-/// it draws (a percentage, `None` for the endpoint's own), and nothing here writes to the
-/// device: this is the readout on its own, not a volume change.
+/// `level` overrides the drawn level; nothing is written to the device.
 #[cfg(feature = "dev")]
 pub(crate) fn preview(
     backend: &crate::audio::wasapi::WasapiBackend,
@@ -383,8 +335,7 @@ pub(crate) fn preview(
     Ok(())
 }
 
-/// Bounds of the display `rect` sits on, to keep the readout on screen. Falls back to the
-/// primary monitor, which is where the taskbar is unless the user has moved it.
+/// Bounds of the display `rect` sits on, else the primary screen.
 fn monitor_rect(rect: RECT) -> RECT {
     let monitor = unsafe { MonitorFromRect(&rect, MONITOR_DEFAULTTONEAREST) };
     let mut info = MONITORINFO {
@@ -402,8 +353,7 @@ fn monitor_rect(rect: RECT) -> RECT {
     }
 }
 
-/// A pass-through: the readout has no interaction of its own (it is click-through), and its
-/// `WM_TIMER` goes to the window [`Osd::new`] was given.
+/// A pass-through: the readout is click-through and its timer is handled by whoever pumps it.
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     DefWindowProcW(hwnd, msg, wp, lp)
 }

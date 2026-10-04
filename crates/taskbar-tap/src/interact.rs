@@ -1,18 +1,6 @@
-//! Making the injected strip react to the pointer.
-//!
-//! The strip is XAML we handed to a `ContentPresenter`, so it is ordinary tree
-//! content and ordinary routed events reach it. What is *not* ordinary is where
-//! the handlers live: they are Rust objects inside `explorer.exe`, invoked by the
-//! shell's own UI thread.
-//!
-//! Two consequences shape everything here:
-//!
-//! - A panic must never escape `Invoke` — unwinding through the COM boundary
-//!   would abort Explorer.
-//! - The handlers are attached from `OnVisualTreeChange` when our own elements
-//!   are announced back to us. Injected content is reported like any other, so
-//!   the segments are found by `x:Name` in the recorded tree rather than by
-//!   walking what `XamlReader` returned.
+//! Pointer handlers for the injected strip and the music tile's transport buttons: Rust delegates
+//! invoked on Explorer's UI thread, so a panic must never escape `Invoke`. Our segments are found
+//! by `x:Name` when the tree announces them back, and wired by the sweep.
 
 use crate::decorate;
 use crate::log::logf;
@@ -61,8 +49,7 @@ fn guard(what: &str, work: impl FnOnce()) -> HRESULT {
     S_OK
 }
 
-/// Sets the hover plate's opacity on enter/exit. One instance per event, each
-/// carrying the opacity it applies, so there is no state to track.
+/// Sets the hover plate's opacity on enter/exit (one instance per event, each with its opacity).
 #[implement(IPointerEventHandler)]
 struct Hover {
     plate: InstanceHandle,
@@ -75,23 +62,14 @@ impl IPointerEventHandler_Impl for Hover_Impl {
             let Some(diagnostics) = crate::diagnostics() else {
                 return;
             };
-            // Not deduped: setting the same opacity twice is idempotent, so the
-            // doubled delivery is harmless here.
+            // Not deduped: idempotent.
             decorate::set_opacity(&diagnostics, self.plate, self.opacity);
         })
     }
 }
 
-/// Suppresses the second delivery of a single event.
-///
-/// Measured: one click reaches a handler **twice** — same `sender`, same event
-/// args object, same thread, one registration. Whatever the taskbar's input
-/// hosting is doing, acting on both would cycle the device two steps per click.
-///
-/// Keyed on the identity of the event args rather than on a timer, because that
-/// is exactly what distinguishes the two cases: a redelivery carries the *same*
-/// args object, while a genuine second click carries a new one. The time bound
-/// only guards against COM recycling that address for a later event.
+/// Suppresses the second delivery of a single event (one click reaches a handler twice with the
+/// same args object). Keyed on the args' identity; the time bound guards against address reuse.
 fn already_seen(args: *mut c_void) -> bool {
     use std::time::{Duration, Instant};
     const RECYCLE_WINDOW: Duration = Duration::from_millis(500);
@@ -138,24 +116,11 @@ impl IRightTappedEventHandler_Impl for RightTap_Impl {
     }
 }
 
-/// Wheel or two-finger scroll over a segment — changes that endpoint's volume.
+/// Wheel or two-finger scroll over a segment: changes that endpoint's volume. The touchpad's way
+/// in (its scroll never reaches audio-tray's global hook, which swallows the wheel events it acts on).
 ///
-/// This is the *touchpad's* way in, and the reason it exists at all. A precision touchpad's
-/// two-finger scroll never reaches a global mouse hook — Windows routes it straight to the
-/// window under the pointer — so audio-tray's own hook, which has handled the wheel since
-/// before the strip existed, cannot see it. It does arrive here, on the element the finger is
-/// over, which also means the segment comes for free rather than being worked out from
-/// coordinates.
-///
-/// The two paths cannot both act on one notch: audio-tray's hook *swallows* the wheel event
-/// it acts on, so XAML never delivers that one here.
-///
-/// Deliberately **not** put through [`already_seen`], unlike the tap handlers. That test keys
-/// on the identity of the args object, and it is only sound where events are far apart: a
-/// touchpad emits tens of these a second, and if XAML ever pools the args (which the
-/// dedup's own `RECYCLE_WINDOW` exists because COM does) it would silently eat half a
-/// gesture. A doubled delivery here costs a slightly faster scroll; a dropped one costs a
-/// gesture that stutters. audio-tray sums the deltas either way.
+/// Deliberately **not** deduped with [`already_seen`]: at touchpad rates pooled args would eat
+/// half a gesture, while a doubled delivery only scrolls slightly faster.
 #[implement(IPointerEventHandler)]
 struct Wheel(Segment);
 
@@ -171,17 +136,11 @@ impl IPointerEventHandler_Impl for Wheel_Impl {
     }
 }
 
-/// The wheel delta on a `PointerWheelChanged` args object, in `WHEEL_DELTA` units — and, when
-/// there is one, the event marked handled so the shell does not get a second go at the same
-/// scroll.
-///
-/// `None` for anything that is not a vertical scroll to act on: a *horizontal* two-finger
-/// swipe raises this same event and must not touch the volume, and a zero delta says nothing.
-/// Those are left unhandled, so whatever the shell wants to do with them it still can.
+/// The vertical wheel delta (`WHEEL_DELTA` units) of a `PointerWheelChanged`, marking it handled.
+/// `None`, left unhandled, for horizontal swipes and zero deltas.
 ///
 /// # Safety
-/// `args` is the borrowed pointer XAML passed to the handler — it must not be released here,
-/// hence the [`ManuallyDrop`]. The two objects fetched below *are* ours and are dropped.
+/// `args` is borrowed from XAML: never release it (hence [`ManuallyDrop`]).
 unsafe fn claim_wheel(args: *mut c_void) -> Option<i32> {
     if args.is_null() {
         return None;
@@ -189,8 +148,7 @@ unsafe fn claim_wheel(args: *mut c_void) -> Option<i32> {
     let borrowed = ManuallyDrop::new(core::mem::transmute::<*mut c_void, IInspectable>(args));
     let event = borrowed.cast::<IPointerRoutedEventArgs>().ok()?;
 
-    // `relativeTo` is null: the position is of no interest, only the properties hanging off
-    // the point, and null asks for coordinates relative to the app rather than an element.
+    // `relativeTo` null: only the point's properties matter.
     let mut raw_point: *mut c_void = core::ptr::null_mut();
     if event.GetCurrentPoint(core::ptr::null_mut(), &mut raw_point) != S_OK || raw_point.is_null() {
         return None;
@@ -211,17 +169,11 @@ unsafe fn claim_wheel(args: *mut c_void) -> Option<i32> {
     if properties.get_MouseWheelDelta(&mut delta) != S_OK || delta == 0 {
         return None;
     }
-    // Unchecked, and unlogged: a property set on the args cannot meaningfully fail, and
-    // anything said here would be said once per event of a gesture.
     let _ = event.put_Handled(1);
     Some(delta)
 }
 
-/// The first scroll on each segment, and then only under `debug=1`.
-///
-/// A line per event is not an option — a touchpad gesture is tens of them — but the first one
-/// is exactly what a bug report needs: it says the route works at all, and what the device
-/// reports per step (±120 for a wheel notch, a fraction of that for a touchpad).
+/// Logs the first scroll on each segment, and every one under `debug=1`.
 fn log_wheel(segment: Segment, delta: i32) {
     static LOGGED_OUTPUT: AtomicBool = AtomicBool::new(false);
     static LOGGED_INPUT: AtomicBool = AtomicBool::new(false);
@@ -243,14 +195,11 @@ unsafe fn ui_element(
         .ok()
 }
 
-/// Wires hover, left click, right click and scroll onto one segment.
-///
-/// The delegates are handed to XAML, which takes its own reference — dropping
-/// our side afterwards is correct and is why no tokens are kept. Nothing here is
-/// ever detached: the TAP lives as long as the Explorer process it is pinned in.
+/// Wires hover, left click, right click and scroll onto one segment. XAML holds its own
+/// references to the delegates; nothing is ever detached, so no tokens are kept.
 ///
 /// # Safety
-/// XAML UI thread (i.e. the visual-tree callback thread) only.
+/// XAML UI thread (the tray's) only.
 pub unsafe fn attach(
     diagnostics: &IXamlDiagnostics,
     segment: Segment,
@@ -263,8 +212,7 @@ pub unsafe fn attach(
     };
 
     let mut token = 0i64;
-    // The lit opacity depends on what the plate is made of — accent on the pill,
-    // white without one — so it comes from the same place the markup does.
+    // The lit opacity depends on the accent, as in the markup.
     let accent = crate::strip_state().and_then(|state| state.accent);
     let enter: IPointerEventHandler = Hover {
         plate,
@@ -307,12 +255,8 @@ pub unsafe fn attach(
     ok
 }
 
-/// A click on one of the music tile's transport glyphs.
-///
-/// Separate from [`Tap`] because it means something different and goes somewhere different: the audio
-/// segments cycle a device, these drive a media session in another process. The suppression story
-/// differs too — this one **must** mark the gesture handled, or the shell's own button click activates
-/// YouTube Music on top of the track change the user asked for.
+/// A click on one of the music tile's transport glyphs. **Must** mark the tap handled, or the
+/// shell's own button also activates the player.
 #[implement(ITappedEventHandler)]
 struct MusicTap(crate::music::tick::Segment);
 
@@ -332,20 +276,15 @@ impl ITappedEventHandler_Impl for MusicTap_Impl {
     }
 }
 
-/// `PointerPressed` on a transport glyph, marked handled.
-///
-/// **The earliest point at which the chain to the button can be cut**, and it has to be cut here or
-/// pressing play also activates the app. Note this is exactly what is *not* done on the strip body:
-/// there, the press is the shell's drag-to-reorder gesture, and suppressing it made the tile the one
-/// taskbar item the user could not move.
+/// `PointerPressed` on a transport glyph, marked handled so the press does not activate the app.
+/// Never do this on the tile body: the press starts the shell's drag-to-reorder.
 #[implement(IPointerEventHandler)]
 struct MusicPress;
 
 impl IPointerEventHandler_Impl for MusicPress_Impl {
     unsafe fn Invoke(&self, _sender: *mut c_void, args: *mut c_void) -> HRESULT {
         guard("music-press", || {
-            // Deliberately not deduped: suppression has to be applied to every delivery, and marking
-            // an already-handled event handled again is free.
+            // Not deduped: every delivery must be suppressed.
             suppress_pointer(args);
         })
     }
@@ -384,13 +323,10 @@ unsafe fn suppress_pointer(args: *mut c_void) -> bool {
         .unwrap_or(false)
 }
 
-/// Wire one of the music tile's transport glyphs.
-///
-/// No hover plate and no wheel handler, unlike [`attach`]: the glyphs sit on the app's own button, so
-/// the shell already lights the whole button on hover, and a scroll there means nothing.
+/// Wire one of the music tile's transport glyphs (press suppression and tap; no hover or wheel).
 ///
 /// # Safety
-/// XAML UI thread (the visual-tree callback thread) only.
+/// XAML UI thread (the tray's) only.
 pub unsafe fn attach_music(
     diagnostics: &IXamlDiagnostics,
     segment: crate::music::tick::Segment,
@@ -400,9 +336,7 @@ pub unsafe fn attach_music(
         logf!("music: 0x{element:x} is not a UIElement — not wiring it up");
         return false;
     };
-    // A token each. Nothing detaches these — the DLL outlives every element it wires — but one
-    // variable for both registrations quietly discards the first token, so the day something does
-    // want to detach, the press handler is the one that cannot be.
+    // A token each, so either could be detached one day.
     let mut press_token = 0i64;
     let mut tap_token = 0i64;
     let pressed: IPointerEventHandler = MusicPress.into();

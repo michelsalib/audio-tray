@@ -1,18 +1,18 @@
-//! The music tile: YouTube Music's own taskbar button, drawn as a now-playing strip.
+//! The music tile: a player's own taskbar button, drawn as a now-playing strip.
 //!
-//! Runs inside the same TAP as audio-tray's own strip, because it has to — XAML Diagnostics takes one
-//! consumer per endpoint, so a second process drawing into the taskbar cannot coexist with this one.
+//! Lives in the same TAP as the audio strip because XAML Diagnostics takes one consumer per endpoint.
 //!
 //! ```text
 //! state     what the app published, re-read from a file
-//! ticker    the scrolling window over a title too long to fit
+//! ticker    the scrolling window over a title too long to fit; tick drives it
 //! layout    the geometry and the XAML, from one number: how wide the strip is
 //! tile      the button itself: Border.Child, the widening chain, the shell's own indicators
+//! thumbbar  wiring the transport buttons on the shell's thumbnail toolbar
 //! ```
 //!
-//! [`sweep`] is the whole of the entry point, called from the TAP's existing sweep. It is deliberately
-//! quiet when the feature is off, when the app has published nothing, or when the button is not there
-//! — a user with no YouTube Music sees no difference at all.
+//! [`sweep`] is the entry point, called from the TAP's sweep; it does nothing when the feature is off,
+//! nothing is published, or the button is absent. The hover preview is deliberately left alone (see
+//! FINDINGS.md, "Taking over the hover flyout — built, and abandoned").
 
 pub mod layout;
 pub mod state;
@@ -26,17 +26,8 @@ use std::sync::Mutex;
 use crate::log::logf;
 use crate::xamlom::{InstanceHandle, IXamlDiagnostics};
 
-/// Every `Border#BackgroundElement` we are drawing in, and the strip each one shows.
-///
-/// Kept so a sweep can tell "nothing changed" from "the shell rebuilt the button": the strip is only
-/// rebuilt when the *content* changed, because rebuilding replaces every element in it — including
-/// the ones the click handlers are attached to, which is how a track change could silently break the
-/// transport buttons.
-///
-/// **A list, because there is one button per taskbar.** With the taskbar shown on all displays the
-/// shell builds the app's button once per display, and one record meant every display but one kept
-/// the plain app icon. Keyed on the *button*, so a button the shell rebuilt replaces its own record
-/// rather than leaving one behind per rebuild.
+/// Every `Border#BackgroundElement` we draw in and the strip it shows, so a sweep can tell "nothing
+/// changed" from "the shell rebuilt the button". One per taskbar (one per display); keyed on the button.
 static PLACED: Mutex<Vec<Placed>> = Mutex::new(Vec::new());
 
 struct Placed {
@@ -73,51 +64,28 @@ fn record(button: InstanceHandle, border: InstanceHandle, strip: &state::Strip) 
     });
 }
 
-// **The hover preview is deliberately left alone.** Replacing its content with a now-playing card
-// was built and abandoned, and the two measurements that killed it are worth keeping:
-//
-// * **There is one `ContentPresenter#HoverFlyoutContent`, shared by every taskbar button** — not one
-//   per flyout, as its animation suggests. The shell shows a different app by *updating* the
-//   `TaskItemThumbnailList` inside it, so replacing the content leaves nothing for it to update and
-//   the card appears on every app's preview.
-// * **Handing it back on the next sweep does not rescue it.** Ownership can only be re-checked when
-//   the timer next runs, so a foreign preview shows our card until it does, and our own shows the
-//   shell's thumbnail until it does — a visible flip-flop either way, with no event to hang the work
-//   on instead (`OnVisualTreeChange` may not mutate XAML; it wedges the shell).
-//
-// The transport controls live on the shell's own thumbnail toolbar instead — `ITaskbarList3::
-// ThumbBarAddButtons`, driven from audio-tray in `music::thumbbar`, which needs no XAML at all.
-
 /// One pass: find the buttons, put a strip in each, and keep them there.
 ///
 /// # Safety
-/// XAML UI thread only, and only with the event stream quiet — the caller's own gating already
-/// guarantees both.
+/// XAML UI thread only, with the event stream quiet (the caller's gating guarantees both).
 pub unsafe fn sweep(diagnostics: &IXamlDiagnostics) {
     let Some(host) = tile::host() else {
         return;
     };
-    // Nothing published yet means audio-tray is running without the music half — or has only just
-    // started. Either way there is nothing to draw, and drawing an empty strip over somebody's button
-    // would be worse than leaving it alone.
+    // Nothing published: leave the button alone rather than draw an empty strip.
     let Some(strip) = state::Strip::read() else {
         return;
     };
 
-    // The transport buttons under the hover preview are **not** wired from here, though they were:
-    // this runs behind the sweep's mutation gate, and a button is only rebuilt at the moment someone
-    // is pointing at it. `crate::wire_transport` does it ahead of that gate, and off the
-    // announcement, so the first press lands on a live button.
+    // The thumbnail-toolbar buttons are wired by `crate::wire_transport`, not here (this runs behind
+    // the mutation gate, too late for the first press).
 
-    // A record whose button XAML has removed — a display unplugged, the app closed. Dropping it
-    // cannot lose a strip: the element it named is gone, so there is nothing left to hand back.
+    // Drop records whose button XAML has removed.
     crate::lock(&PLACED).retain(|placed| crate::tree::type_of(placed.button).is_some());
     tile::prune_originals();
 
-    // Where a strip now is, and what any out-of-date one is still showing. Both are collected before
-    // a single character is written, because the content writes reach **every** strip at once — they
-    // find their elements by name, and every taskbar's strip names them the same — so they are made
-    // once, below, rather than once per button.
+    // Collected first: content writes find elements by name, so they reach every strip at once and
+    // are made once below, not per button.
     let mut drawn: Vec<(InstanceHandle, InstanceHandle)> = Vec::new();
     let mut stale: Vec<state::Strip> = Vec::new();
 
@@ -130,13 +98,8 @@ pub unsafe fn sweep(diagnostics: &IXamlDiagnostics) {
             continue;
         };
 
-        // **A track change is an update, not a rebuild, and that distinction is visible.** Replacing
-        // the `Border`'s child changes the strip's identity and momentarily its measured size, which
-        // makes the shell re-run the button's layout and re-assert its own `RunningIndicator` and
-        // `ProgressIndicator` from the template. The user sees the progress line snap back to the
-        // shell's centred default and then step through our margin and width writes as they land — a
-        // "centre, left, full width" jump on every song. Keeping the strip's elements in place keeps
-        // the button's layout still, and the indicators with it.
+        // A track change is an update, never a rebuild: a rebuild re-lays out the button and makes
+        // the shell's indicators visibly jump (FINDINGS.md, "The progress line jumped…").
         match shown_on(button, border) {
             Some(shown) if shown == strip => drawn.push((button, border)),
             // Same button, different track: patch what differs and leave the tree alone.
@@ -148,9 +111,7 @@ pub unsafe fn sweep(diagnostics: &IXamlDiagnostics) {
             }
             // A button we have not drawn into — first sweep, or the shell rebuilt it under us.
             None => {
-                // Says *why* a rebuild is happening. A rebuild per track change is the defect this
-                // branch's neighbours exist to avoid, and the two causes — no record at all, versus a
-                // record against a different `BackgroundElement` — need opposite fixes.
+                // Log which cause: no record, or a record against a different `BackgroundElement`.
                 if let Some(previous) = border_of(button) {
                     logf!("music: border moved 0x{previous:x} -> 0x{border:x}; rebuilding");
                 }
@@ -169,8 +130,7 @@ pub unsafe fn sweep(diagnostics: &IXamlDiagnostics) {
         }
     }
 
-    // Once per *distinct* stale value, not once per button: what to write is decided by what differs
-    // from what is up, and the write itself lands on every strip naming those elements.
+    // Once per distinct stale value; each write lands on every strip.
     for shown in stale {
         if !tile::update_in_place(diagnostics, &shown, &strip) {
             continue;
@@ -185,9 +145,7 @@ pub unsafe fn sweep(diagnostics: &IXamlDiagnostics) {
         return;
     }
 
-    // Everything below is re-applied every sweep on purpose: the shell re-asserts the button's own
-    // width and rebuilds its indicators, so a single application is undone within a second. Each of
-    // these is a no-op when the value is already ours.
+    // Re-applied every sweep (the shell undoes them); each is a no-op when already ours.
     for (button, border) in drawn {
         if !crate::live() {
             return;
@@ -196,8 +154,7 @@ pub unsafe fn sweep(diagnostics: &IXamlDiagnostics) {
         tile::widen(diagnostics, border, &host);
         tile::place_button_state(diagnostics, button);
     }
-    // One call for every strip on screen, for the same reason the content writes are: the ticker
-    // writes its window to every `TextBlock` of that name, wherever it is.
+    // One call covers every strip (writes go by name).
     tick::scroll(diagnostics, &strip);
 }
 
@@ -241,29 +198,19 @@ pub unsafe fn repin(diagnostics: &IXamlDiagnostics) {
 /// XAML UI thread only.
 pub unsafe fn revert(diagnostics: &IXamlDiagnostics) {
     let placed = std::mem::take(&mut *crate::lock(&PLACED));
-    // Order matters: the sizes and margins go back *before* the content comes out, so the button is
-    // never briefly its own size with our strip still in it.
+    // Sizes and margins go back before the content comes out.
     tile::restore(diagnostics);
     for placed in placed {
         let cleared = tile::clear_child(diagnostics, placed.border);
         logf!("music: cleared the strip on 0x{:x} -> {cleared}", placed.border);
     }
-    // **The progress bar, which is audio-tray's to set and ours to clean up after.** The one case
-    // that needs this is a *killed* audio-tray: it runs no teardown, so the bar it put on the
-    // player's button would stay frozen mid-track until Explorer restarts. This revert is already
-    // the thing that runs on owner death (`lifecycle::watch_owner`), and from in here the shell's own
-    // `ITaskbarList3` is a local call on an STA.
+    // audio-tray sets the progress bar, but a killed audio-tray cannot clear it; this revert runs on
+    // owner death (`lifecycle::watch_owner`), so clear it here.
     clear_progress_bar();
 }
 
-/// Take the taskbar progress bar off the player's window.
-///
-/// Finds the window the way audio-tray does — a visible top-level window whose title carries the
-/// host's name — because the pid in the init data is audio-tray's, not the player's, and the TAP has
-/// no other handle on it.
-///
-/// Failures are silent: no player window is the ordinary case (the user closed it), and this runs on
-/// a teardown path where there is nobody left to tell anyway.
+/// Take the taskbar progress bar off the player's window: the first visible top-level window whose
+/// title contains the host's name (as audio-tray finds it). Silent on failure (teardown path).
 fn clear_progress_bar() {
     use windows::Win32::Foundation::{HWND, LPARAM};
     use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_ALL};
@@ -320,26 +267,11 @@ fn clear_progress_bar() {
     }
 }
 
-/// The app's taskbar button on **every** taskbar, matched on its accessible name.
+/// The app's taskbar button on **every** taskbar (one per display), matched as a substring of its
+/// localised accessible name; a miss logs the names seen.
 ///
-/// A **substring** match, because the shell's name carries a localised suffix — `"YouTube Music
-/// épinglé"` on this machine. A miss logs every button it saw, which is the only way to discover those
-/// names: they are not documented anywhere and they change with the display language.
-///
-/// **One per taskbar, and that is what puts the strip on a second display.** With the taskbar shown
-/// on all displays the shell builds the app's button once per display — same type, same accessible
-/// name, each in a repeater of its own — and taking the first match left every display but one
-/// showing the plain app icon.
-///
-/// **The newest per taskbar, for the reason [`find_background_element`] takes the newest `Border`:**
-/// the recorded tree keeps elements whose removal XAML never announced, so one taskbar can offer
-/// several buttons that differ only in age. Grouping by the repeater they sit in drops the dead ones
-/// without collapsing several displays into one.
-///
-/// Every candidate's name is read rather than stopping at the first match, and none of them is
-/// cached: the answer is a set now, and the repeater **recycles** buttons — a handle that says
-/// "YouTube Music" on one sweep can be another app's button on the next, and a remembered verdict
-/// would put our strip on that app.
+/// The newest per repeater, since the recorded tree keeps unannounced-removed elements. Never
+/// cached: the repeater recycles buttons, so a handle can belong to another app next sweep.
 ///
 /// # Safety
 /// XAML UI thread only.
@@ -352,8 +284,7 @@ unsafe fn find_buttons(diagnostics: &IXamlDiagnostics, host: &tile::Host) -> Vec
             continue;
         };
         if !name.to_lowercase().contains(&wanted) {
-            // Deduplicated, because every app is now seen once per taskbar and the point of this list
-            // is the *names* the shell uses.
+            // Deduplicated: each app appears once per taskbar.
             if !seen.contains(&name) {
                 seen.push(name);
             }
@@ -372,16 +303,13 @@ unsafe fn find_buttons(diagnostics: &IXamlDiagnostics, host: &tile::Host) -> Vec
         .collect();
 
     if buttons.is_empty() {
-        // Once, not every sweep: this runs four times a second, and the answer does not change until
-        // the user pins something.
+        // Logged once, not every sweep.
         if !seen.is_empty() && !MISS_LOGGED.swap(true, std::sync::atomic::Ordering::SeqCst) {
             logf!("music: no button matching {:?} — saw {seen:?}", host.name);
         }
         return buttons;
     }
-    // How many taskbars carry the button, on the way in and whenever it changes. A display plugged in
-    // or unplugged is the whole of what moves it, and it is the first thing a "the strip is missing on
-    // my second screen" report needs.
+    // Log the taskbar count whenever it changes (displays plugged/unplugged).
     if FOUND.swap(buttons.len(), std::sync::atomic::Ordering::SeqCst) != buttons.len() {
         logf!(
             "music: {:?} has a button on {} taskbar(s)",
@@ -394,20 +322,14 @@ unsafe fn find_buttons(diagnostics: &IXamlDiagnostics, host: &tile::Host) -> Vec
 
 static MISS_LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// How many buttons the last log line reported, so it is written once per change rather than once per
-/// sweep.
+/// The button count last logged, so it is logged once per change.
 static FOUND: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// Which taskbar a button belongs to, as the handle of the `ItemsRepeater` laying it out.
-///
-/// Each display's taskbar has a repeater of its own, so the repeater **is** the identity of "this
-/// display's copy of the button" — and unlike a screen position it costs no XAML call to read.
-///
-/// Bounded, and it stops at the last *recorded* ancestor: a tree with no repeater above the button
-/// degrades to grouping by that ancestor rather than to an unbounded climb to the root.
+/// Which taskbar a button belongs to: the handle of its `ItemsRepeater` (one per display). Bounded;
+/// without a repeater it falls back to the last recorded ancestor.
 fn taskbar_of(button: InstanceHandle) -> InstanceHandle {
     let mut handle = button;
-    // The same depth `tile::widen` walks, and for the same reason: that is where the repeater is.
+    // Same depth as `tile::widen`.
     for _ in 0..6 {
         let Some(parent) = crate::tree::parent_of(handle) else {
             break;
@@ -423,22 +345,11 @@ fn taskbar_of(button: InstanceHandle) -> InstanceHandle {
     handle
 }
 
-/// The `Border#BackgroundElement` inside the button's panel.
+/// The `Border#BackgroundElement` inside the button's panel, by name from the recorded tree (the
+/// unnamed `Border` before it draws behind the background).
 ///
-/// By name through the recorded tree rather than by walking `VisualTreeHelper`: the tree is already
-/// recorded, the name is stable across Windows builds, and every level skipped is work not done on the
-/// shell's UI thread four times a second.
-///
-/// **The first `Border` in the panel is not it.** A `TaskListButton` panel holds an unnamed `Border`
-/// before the named one, and putting the strip in that one draws nothing — it sits behind the
-/// background rather than in it.
-///
-/// **The newest match, and that is load-bearing.** The recorded tree keeps elements whose removal
-/// XAML never announced, so a button the shell has rebuilt can offer two `BackgroundElement`s that
-/// are identical by name and parent. Taking the first meant the answer alternated between sweeps —
-/// and since the placement record is keyed on this handle, every alternation looked like "a button we
-/// have not drawn into" and rebuilt the whole strip. That is what made the progress line jump on
-/// every track change: the rebuild, not the track.
+/// The **newest** match is load-bearing: stale duplicates linger in the recorded tree, and alternating
+/// between them rebuilt the strip every sweep.
 fn find_background_element(button: InstanceHandle) -> Option<InstanceHandle> {
     let candidates = crate::tree::children_of(button)
         .into_iter()

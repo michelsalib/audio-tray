@@ -140,15 +140,9 @@ pub fn record(
     tree.dirty = true;
 }
 
-/// Whether the event stream has been silent for at least `period`.
-///
-/// This is the guard that keeps XAML mutations out of the initial replay burst.
-/// While `AdviseVisualTreeChange` is streaming, the UI thread is inside a
-/// marshalled call, and calling `put_Content` against a tray element from there
-/// **never returns** — it blocks Explorer's UI thread outright, taskbar and all.
-/// Waiting for quiet is what makes the mutation safe.
-///
-/// `false` before any event has arrived: there is nothing recorded to act on yet.
+/// Whether the event stream has been silent for at least `period`: the guard that keeps XAML
+/// mutations out of a burst (a `put_Content` mid-stream never returns and wedges the taskbar).
+/// `false` before any event has arrived.
 pub fn quiet_for(period: Duration) -> bool {
     let tree = lock();
     tree.last_event.is_some_and(|at| at.elapsed() >= period)
@@ -192,10 +186,8 @@ pub fn find_by_name(name: &str) -> Vec<u64> {
 
 /// When a handle was announced, as a monotonic sequence number.
 ///
-/// **For telling a live element from one XAML never told us it had removed.** The recorder drops a
-/// node on a `Remove`, but those do not always arrive — a rebuilt subtree can leave the old elements
-/// behind, indistinguishable by name or type from the new ones. Between two candidates the newest is
-/// the live one, and this is the only thing recorded that says which that is.
+/// Tells a live element from a stale one whose `Remove` never arrived: between candidates of the
+/// same name or type, the newest is the live one.
 pub fn seq_of(handle: u64) -> Option<u64> {
     let tree = lock();
     tree.nodes.get(&handle).map(|node| node.seq)
@@ -228,10 +220,8 @@ pub fn parent_of(handle: u64) -> Option<u64> {
     tree.nodes.get(&handle).map(|node| node.parent)
 }
 
-/// Starts the dump watchdog exactly once.
-///
-/// Only in verbose mode: the dumps are the bulk of the log, and the tree they print
-/// is a spike-exploration aid rather than something the strip needs.
+/// Starts the dump watchdog exactly once, in verbose mode only (a diagnostic aid, and the bulk
+/// of the log).
 pub fn start_watchdog() {
     if !crate::log::verbose() {
         return;

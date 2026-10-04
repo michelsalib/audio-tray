@@ -42,8 +42,7 @@ use audio::wasapi::WasapiBackend;
 fn main() -> Result<()> {
     // STA: conventional for the GUI/tray thread that owns the message pump.
     unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok()? };
-    // Per-monitor DPI aware for every windowed path, so glyphs and the panel render at the real
-    // size instead of being bitmap-scaled by the OS.
+    // Per-monitor DPI aware, so nothing is bitmap-scaled by the OS.
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     }
@@ -81,8 +80,7 @@ fn main() -> Result<()> {
                 eprintln!("audio-tray: already running — exiting");
                 return Ok(());
             };
-            // Fire-and-forget: checks GitHub releases in the background and replaces the exe on
-            // disk (applied on next launch). No-op in debug builds.
+            // Background self-update, applied on next launch. No-op in debug builds.
             update::spawn_background_check();
             tray::run(backend)?;
         }

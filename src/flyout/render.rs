@@ -1,10 +1,7 @@
 //! Painting the flyout: turn the display [`Model`] + a laid-out screen into pixels.
 //!
-//! Two entry points, both pure over their inputs and both drawing through a [`Canvas`]:
-//! [`render_page`] paints a screen's *static* layer (background, headers, device rows, the
-//! slider track, the icon grid), and [`compose`] copies that base and overlays the *dynamic*
-//! bits that change without a relayout — the slider fill/thumb/value with its activity glow,
-//! the hover highlights, and the trailing battery/edit-pencil affordances.
+//! [`render_page`] paints a screen's static layer; [`compose`] copies it and overlays what
+//! changes without a relayout (slider fill and glow, hover, battery and pencil).
 
 use ab_glyph::FontVec;
 
@@ -19,8 +16,7 @@ use super::model::Model;
 use super::theme::*;
 use super::Interaction;
 
-/// The render context shared by both passes: what to draw ([`Model`]), the accent colour,
-/// the DPI `scale`, and the panel size. Bundling these keeps the pass signatures small.
+/// The render context shared by both passes: model, accent, DPI `scale` and panel size.
 pub(super) struct Ctx<'a> {
     pub model: &'a Model,
     pub accent: [u8; 3],
@@ -35,9 +31,7 @@ impl<'a> Ctx<'a> {
     }
 }
 
-/// Render `elems` (a screen) into `out` (a `width`×`height` RGBA buffer): the panel
-/// background, then every element's static content. Pure — used both for the live base
-/// layer and for the two frames composited during a slide transition.
+/// Render a screen's static layer into `out`; used for the base layer and for slide frames.
 pub(super) fn render_page(ctx: &Ctx, elems: &[LaidElem], out: &mut [u8]) {
     let scale = ctx.scale;
     let accent = ctx.accent;
@@ -68,15 +62,13 @@ pub(super) fn render_page(ctx: &Ctx, elems: &[LaidElem], out: &mut [u8]) {
                 let g = &groups[group];
                 let cy_i = le.top + le.height / 2;
                 let cy = cy_i as f32;
-                // Muted draws in the accent, which is the flyout's own convention — the
-                // readout beside the taskbar uses a warm tint instead, see [`crate::osd`].
+                // Muted draws in the accent (the OSD uses a warm tint instead).
                 let col = if g.muted { accent } else { TEXT };
                 let glyph = endpoint_glyph(g.flow, g.muted);
                 if let Ok((rgba, gw, gh)) = icons::render_glyph(glyph, icon_px, col) {
                     let (gx, gy) = (d(ICON_X), cy_i - gh as i32 / 2);
                     cv.blit(gx, gy, &rgba, gw, gh, 1.0);
-                    // Something is holding the microphone open: the same dot the taskbar
-                    // strip's input button carries, on the same glyph.
+                    // An app is holding the microphone open.
                     if g.recording {
                         recording_dot(&mut cv, gx, gy, icon_px);
                     }
@@ -105,16 +97,13 @@ pub(super) fn render_page(ctx: &Ctx, elems: &[LaidElem], out: &mut [u8]) {
                 }
                 if let Some(f) = font {
                     let base = cy as f32 + text_px * 0.34;
-                    // Leave the trailing zone free — truncate a long name so it never runs
-                    // under the battery readout (or the hover pencil).
+                    // Truncate so the name never runs under the battery or pencil.
                     let reserve = if row.battery.is_some() { BATTERY_W } else { PENCIL_W };
                     let max_w = w as f32 - d(TEXT_X) as f32 - reserve * scale;
                     let label = fit_label(f, text_px, &row.label, max_w);
                     cv.draw_text(f, text_px, (d(TEXT_X) as f32, base), TEXT, 1.0, &label);
                 }
-                // The battery readout and the edit pencil both live on the right and are
-                // mutually exclusive (pencil on hover, battery otherwise) — drawn in
-                // `compose`, which knows the hover state.
+                // Battery and pencil depend on hover, so `compose` draws them.
             }
             Elem::PickerHeader { group, dev } => {
                 let cy_i = le.top + le.height / 2;
@@ -154,9 +143,7 @@ pub(super) fn render_page(ctx: &Ctx, elems: &[LaidElem], out: &mut [u8]) {
                 }
             }
             Elem::Footer => {
-                // The strip is a shade darker than the panel body and closed off by a
-                // full-bleed hairline — the way the Win11 quick-settings footer reads. It
-                // runs to the bottom edge, so its fill has to follow the panel's corners.
+                // A darker strip under a hairline; it reaches the bottom edge, so its fill follows the corners.
                 let top = le.top as f32;
                 let bottom = (le.top + le.height) as f32;
                 cv.fill_round_rect_bottom(
@@ -177,9 +164,7 @@ pub(super) fn render_page(ctx: &Ctx, elems: &[LaidElem], out: &mut [u8]) {
                 if let Some(f) = font {
                     let lpx = FOOTER_TEXT_PX * scale;
                     let base = cy as f32 + lpx * 0.34;
-                    // Unrounded FOOTER_TEXT_X, matching how `content_width` measured it —
-                    // using a rounded inset here can shave a fraction of a pixel and
-                    // ellipsise a label that was sized to fit.
+                    // Unrounded FOOTER_TEXT_X, as `content_width` measured it, or the label may ellipsise.
                     // Stop short of the *leftmost* button, whichever that is.
                     let last = footer_buttons(ctx.model).len() - 1;
                     let maxw = footer_btn_center_x(w, scale, last) - FOOTER_BTN * scale / 2.0
@@ -187,9 +172,7 @@ pub(super) fn render_page(ctx: &Ctx, elems: &[LaidElem], out: &mut [u8]) {
                     let label = fit_label(f, lpx, ActionKind::LEFT.label(), maxw);
                     cv.draw_text(f, lpx, (d(FOOTER_TEXT_X) as f32, base), TEXT, 1.0, &label);
                 }
-                // Right: the icon buttons, rightmost first. They are bare glyphs until
-                // hovered — except a call-to-action (the staged update), which carries a
-                // standing accent disc so it is noticed without a label to say so.
+                // Right: the icon buttons, rightmost first; a call-to-action keeps an accent disc.
                 for (i, k) in footer_buttons(ctx.model).into_iter().enumerate() {
                     let cxb = footer_btn_center_x(w, scale, i);
                     let col = if k == ActionKind::Restart { accent } else { TEXT };
@@ -208,9 +191,7 @@ pub(super) fn render_page(ctx: &Ctx, elems: &[LaidElem], out: &mut [u8]) {
     }
 }
 
-/// Copy the static `base`, then draw the dynamic overlays into `buf`: slider
-/// fill/thumb/value (with the live activity glow), the hover highlight, and the
-/// battery/edit-pencil affordances on the hovered device row.
+/// Copy the static `base` into `buf`, then draw the dynamic overlays.
 pub(super) fn compose(ctx: &Ctx, hit: &Interaction, elems: &[LaidElem], base: &[u8], buf: &mut [u8]) {
     buf.copy_from_slice(base);
     let scale = ctx.scale;
@@ -244,15 +225,9 @@ pub(super) fn compose(ctx: &Ctx, hit: &Interaction, elems: &[LaidElem], base: &[
                 }
                 cv.fill_round_rect(Rect::new(fx - tr, cy - tr, fx + tr, cy + tr), tr, TEXT, 0.5);
             } else {
-                // The fill glows with the endpoint's live peak. The glow is purely
-                // *additive*: at rest (p≈0) it's a normal full-accent slider — matching a
-                // non-metered slider — and as audio rises it lightens toward white and grows
-                // a soft bloom halo, with a pulsing halo around the thumb. `powf` lifts
-                // low/mid levels (speech/music rarely peaks near 1.0) so it reads.
+                // Additive glow from the live peak (none at rest); `powf` lifts low levels.
                 let p = g.peak.clamp(0.0, 1.0).powf(0.55);
-                // Outer bloom — the main "glow": a soft lightened-accent halo that grows tall
-                // and more opaque with the level (drawn under the fill so it reads as a halo
-                // above/below the track).
+                // Bloom halo, under the fill.
                 if p > 0.01 && fx > x0 {
                     let bloom = lerp3(accent, TEXT, 0.35);
                     let bh = th * (1.5 + 5.0 * p);
@@ -282,9 +257,8 @@ pub(super) fn compose(ctx: &Ctx, hit: &Interaction, elems: &[LaidElem], base: &[
         }
     }
 
-    // Right-hand affordances + hover highlights. On a device row the battery readout and the
-    // edit pencil are mutually exclusive: pencil on the hovered row, battery otherwise (so
-    // the current device still shows its battery when not hovered).
+    // Right-hand affordances + hover highlights. A hovered device row adds the pencil and
+    // shifts its battery left to make room.
     for (idx, le) in elems.iter().enumerate() {
         let hovered = hover == Some(idx);
         match le.elem {
@@ -298,8 +272,6 @@ pub(super) fn compose(ctx: &Ctx, hit: &Interaction, elems: &[LaidElem], base: &[
                         let ry1 = (le.top + le.height) as f32 - 1.0;
                         cv.fill_round_rect(Rect::new(mx, ry0, w as f32 - mx, ry1), d(ROW_RADIUS) as f32, TEXT, HOVER_A);
                     }
-                    // The battery stays visible but shifts left so the pencil can sit to its
-                    // right (rather than replacing it).
                     if let Some(pct) = dev_row.battery {
                         let pencil_left = pencil_center_x(panel_w, scale) - PENCIL_BTN * scale / 2.0;
                         draw_battery(&mut cv, scale, pencil_left - 6.0 * scale, cy, pct, font);
@@ -336,8 +308,7 @@ pub(super) fn compose(ctx: &Ctx, hit: &Interaction, elems: &[LaidElem], base: &[
                     cv.fill_round_rect(Rect::new(cx0 as f32, cy0 as f32, (cx0 + chip) as f32, (cy0 + chip) as f32), r, TEXT, a);
                 }
             }
-            // Only the hovered footer *item* lights up — a pill around the labelled one, a
-            // round button behind an icon one — never the whole strip.
+            // Only the hovered footer item lights up, never the whole strip.
             Elem::Footer if hovered => {
                 let cy = (le.top + le.height / 2) as f32;
                 if hit.hover_footer == Some(ActionKind::LEFT) {
@@ -349,8 +320,7 @@ pub(super) fn compose(ctx: &Ctx, hit: &Interaction, elems: &[LaidElem], base: &[
                     if hit.hover_footer != Some(k) {
                         continue;
                     }
-                    // A call-to-action deepens its own accent disc; the rest get the
-                    // neutral round button.
+                    // A call-to-action deepens its accent disc; the rest get a neutral one.
                     let (col, a) = match k {
                         ActionKind::Restart => (accent, FOOTER_CTA_HOVER_A - FOOTER_CTA_A),
                         _ => (TEXT, 0.10),

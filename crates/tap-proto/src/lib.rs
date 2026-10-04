@@ -1,6 +1,5 @@
-//! What audio-tray and its TAP (inside `explorer.exe`) must agree on. Both sides build from these
-//! constants, so they cannot drift; the exe and the DLL can still be *different builds* (see
-//! RELEASING.md), so values here are never renumbered, only added.
+//! What audio-tray and its TAP (inside `explorer.exe`) must agree on. The exe and DLL can be
+//! different builds (RELEASING.md), so values are never renumbered, only added.
 
 /// `WM_APP`, spelled out so this crate needs no Windows bindings.
 const WM_APP: u32 = 0x8000;
@@ -23,11 +22,9 @@ pub const WM_TASKBAR_ACTION: u32 = WM_APP + 20;
 pub const WM_TAP_REVERT: u32 = WM_APP + 21;
 /// App-internal: Explorer restarted (re-posted `TaskbarCreated`).
 pub const WM_TASKBAR_RESTARTED: u32 = WM_APP + 22;
-/// App → TAP: redraw the strip. `wParam` output, `lParam` input, each a glyph packed with
-/// [`RESTYLE_MUTED`] / [`RESTYLE_RECORDING`].
+/// App → TAP: redraw the strip. `wParam` output, `lParam` input, each a packed glyph (below).
 pub const WM_TAP_RESTYLE: u32 = WM_APP + 23;
-/// TAP or wheel hook → app: a scroll over a button; `wParam` a flow code, `lParam` the signed
-/// wheel delta in `WHEEL_DELTA` units.
+/// TAP or wheel hook → app: a scroll over a button; `wParam` flow code, `lParam` signed delta.
 pub const WM_TASKBAR_SCROLL: u32 = WM_APP + 24;
 /// App-internal: the music feed's progress-bar value for the tray thread.
 pub const WM_MUSIC_PROGRESS: u32 = WM_APP + 25;
@@ -41,8 +38,7 @@ pub const RESTYLE_GLYPH_MASK: usize = 0x00FF_FFFF;
 pub const RESTYLE_MUTED: usize = 1 << 24;
 pub const RESTYLE_RECORDING: usize = 1 << 25;
 
-/// Action codes in [`WM_TASKBAR_ACTION`]'s `wParam`. The music ones start at 10, far from the
-/// audio ones, so an off-by-one cannot turn a play click into a device switch.
+/// Action codes in [`WM_TASKBAR_ACTION`]'s `wParam`; music starts at 10, away from audio.
 pub const ACTION_CYCLE_OUTPUT: usize = 1;
 pub const ACTION_CYCLE_INPUT: usize = 2;
 pub const ACTION_OPEN_PANEL: usize = 3;
@@ -54,14 +50,12 @@ pub const ACTION_MUSIC_NEXT: usize = 12;
 pub const FLOW_OUTPUT: usize = 0;
 pub const FLOW_INPUT: usize = 1;
 
-/// Handover: `COPYDATASTRUCT::dwData` tagging a new owner's init payload ("ATH1"), sent to the
-/// control window as `WM_COPYDATA`, and the results it returns. 0 means a TAP without the handler.
+/// Handover `WM_COPYDATA` tag ("ATH1") and its results; 0 means a TAP without the handler.
 pub const HANDOVER_MAGIC: usize = 0x4154_4831;
 pub const HANDOVER_ACCEPTED: isize = 1;
 pub const HANDOVER_DECLINED: isize = 2;
 
-/// Plane-15 private-use markers for the two earbud icons Segoe Fluent has no glyph for; the TAP
-/// draws them as vectors. Outside the BMP PUA, which Segoe Fluent itself occupies.
+/// Plane-15 PUA markers (Segoe Fluent owns the BMP PUA) for earbuds the TAP draws as vectors.
 pub const GLYPH_WIRELESS_EARBUDS: char = '\u{F0001}';
 pub const GLYPH_ROUND_EARBUDS: char = '\u{F0002}';
 

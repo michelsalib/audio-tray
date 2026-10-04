@@ -1,32 +1,17 @@
-//! Hand-rolled WinRT projections for the bits of `Windows.UI.Xaml` we need.
+//! Hand-rolled WinRT projections for the bits of `Windows.UI.Xaml` we need (windows-rs does not
+//! project it), transcribed from the SDK's `winrt\windows.ui.xaml*.h`.
 //!
-//! windows-rs 0.61 does not project `Windows.UI.Xaml` any more than it projects
-//! `xamlOM.h`, so these are transcribed from
-//! `%ProgramFiles(x86)%\Windows Kits\10\Include\10.0.26100.0\winrt\windows.ui.xaml*.h`.
-//!
-//! Only the slots we actually call carry real signatures. The rest exist purely
-//! to occupy their vtable position — a function pointer is a function pointer,
-//! so an unused slot's parameter types are irrelevant as long as the *count* and
-//! *order* match the header exactly.
-//!
-//! Both interfaces derive from `IInspectable` in the header, but `#[interface]`
-//! can't express that: it wants the parent's `_Impl` trait, and windows-core has
-//! no `IInspectable_Impl` because `IInspectable` isn't implementable that way.
-//! We only ever *call* these, so the parent is declared as `IUnknown` and
-//! `IInspectable`'s three slots are spelled out at the top instead. The vtable
-//! layout is byte-identical either way.
+//! **Slot count and order must match the header exactly**: one slot out returns `S_OK` and silently
+//! calls something else. Unused slots are placeholders. Interfaces are declared on `IUnknown` with
+//! `IInspectable`'s three slots spelled out (`#[interface]` cannot derive from `IInspectable`, nor
+//! expand a macro for them); the layout is identical.
 
 #![allow(non_snake_case)]
 
 use core::ffi::c_void;
 use windows_core::{interface, IUnknown, IUnknown_Vtbl, HRESULT};
 
-// The three `IInspectable` slots are written out at the top of each trait below;
-// they can't be factored into a macro because `#[interface]` parses the trait
-// body before any `macro_rules!` expansion would happen.
-
-/// `Windows.Foundation.Point` / `Rect`, needed only so the unused `Find*` slots
-/// carry FFI-safe signatures.
+/// `Windows.Foundation.Point` / `Rect`, so the unused `Find*` slots have FFI-safe signatures.
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct Point {
@@ -43,8 +28,7 @@ pub struct Rect {
     pub height: f32,
 }
 
-/// `Windows.UI.Xaml.IDependencyObject`. We never call its methods — it is the
-/// currency `IVisualTreeHelperStatics` deals in, so we only need its IID.
+/// `Windows.UI.Xaml.IDependencyObject`; only its IID is used.
 #[interface("5c526665-f60e-4912-af59-5fe0680f089d")]
 pub unsafe trait IDependencyObject: IUnknown {
     pub fn GetIids(&self, count: *mut u32, iids: *mut *mut windows_core::GUID) -> HRESULT;
@@ -65,9 +49,7 @@ pub unsafe trait IDependencyObject: IUnknown {
     pub fn get_Dispatcher(&self, value: *mut *mut c_void) -> HRESULT;
 }
 
-/// `Windows.UI.Xaml.Media.IVisualTreeHelperStatics`.
-///
-/// The four `Find*` slots come first in the header and are unused here.
+/// `Windows.UI.Xaml.Media.IVisualTreeHelperStatics` (the `Find*` slots are unused).
 #[interface("e75758c4-d25d-4b1d-971f-596f17f12baa")]
 pub unsafe trait IVisualTreeHelperStatics: IUnknown {
     pub fn GetIids(&self, count: *mut u32, iids: *mut *mut windows_core::GUID) -> HRESULT;
@@ -113,13 +95,8 @@ pub unsafe trait IVisualTreeHelperStatics: IUnknown {
 /// `Windows.UI.Xaml.Visibility`.
 pub const VISIBILITY_COLLAPSED: i32 = 1;
 
-/// `Windows.UI.Xaml.IUIElement`.
-///
-/// Only the members this spike calls are named; every other slot is a
-/// placeholder purely to keep the vtable offsets right. The numbering follows
-/// the SDK header — `get_Opacity` is slot 9, `get_Visibility` 21, the pointer
-/// and tap events 57..80 — and a miscount here calls the wrong function
-/// pointer, which is how `GetColumn` once hung the shell.
+/// `Windows.UI.Xaml.IUIElement`. Slot numbers follow the header: `get_Opacity` 9,
+/// `get_Visibility` 21, the pointer and tap events 57..80.
 #[interface("676d0be9-b65c-41c6-ba40-58cf87f201c1")]
 pub unsafe trait IUIElement: IUnknown {
     pub fn GetIids(&self, count: *mut u32, iids: *mut *mut windows_core::GUID) -> HRESULT;
@@ -203,21 +180,8 @@ pub unsafe trait IUIElement: IUnknown {
     pub fn remove_RightTapped(&self, token: i64) -> HRESULT;
 }
 
-// Pointer event args, for the one handler that reads them. Hover and the two tap handlers
-// ignore theirs entirely — which element was hit and which handler fired is all they need —
-// but a scroll has to get at the wheel delta, and that sits two hops down: the args yield a
-// `PointerPoint`, whose properties carry it.
-
-/// `Windows.UI.Xaml.Input.IPointerRoutedEventArgs` — the args of `PointerWheelChanged`
-/// (and of every other pointer event, whose args we never look at).
-///
-/// Needed for two things a scroll cannot do without. The delta is *not* on the args — it
-/// comes from `GetCurrentPoint(null).Properties.MouseWheelDelta`, which is why
-/// [`IPointerPoint`] and [`IPointerPointProperties`] are transcribed below as well — and
-/// `put_Handled` is how a scroll we have acted on is kept from also reaching the shell.
-///
-/// Slot order is the header's: the three `IInspectable` ones, then `Pointer`,
-/// `KeyModifiers`, `Handled` (get and put), and only then `GetCurrentPoint`.
+/// `Windows.UI.Xaml.Input.IPointerRoutedEventArgs`: `put_Handled`, and `GetCurrentPoint` (the
+/// wheel delta is at `GetCurrentPoint(null).Properties.MouseWheelDelta`).
 #[interface("da628f0a-9752-49e2-bde2-49eccab9194d")]
 pub unsafe trait IPointerRoutedEventArgs: IUnknown {
     pub fn GetIids(&self, count: *mut u32, iids: *mut *mut windows_core::GUID) -> HRESULT;
@@ -239,8 +203,7 @@ pub unsafe trait IPointerRoutedEventArgs: IUnknown {
     ) -> HRESULT;
 }
 
-/// `Windows.UI.Input.IPointerPoint`. Only `get_Properties` is called; the seven slots
-/// before it are the header's own order.
+/// `Windows.UI.Input.IPointerPoint`. Only `get_Properties` is called.
 #[interface("e995317d-7296-42d9-8233-c5be73b74a4a")]
 pub unsafe trait IPointerPoint: IUnknown {
     pub fn GetIids(&self, count: *mut u32, iids: *mut *mut windows_core::GUID) -> HRESULT;
@@ -256,13 +219,8 @@ pub unsafe trait IPointerPoint: IUnknown {
     pub fn get_Properties(&self, value: *mut *mut c_void) -> HRESULT;
 }
 
-/// `Windows.UI.Input.IPointerPointProperties`, for the two members a scroll needs.
-///
-/// `get_MouseWheelDelta` is the 14th of the interface's own methods and
-/// `get_IsHorizontalMouseWheel` the 15th, so the thirteen pen/touch/button properties ahead
-/// of them are placeholders. The horizontal flag is not optional: a touchpad's *sideways*
-/// two-finger scroll arrives as this same event, and without the test it would change the
-/// volume too.
+/// `Windows.UI.Input.IPointerPointProperties`: `get_MouseWheelDelta` (14th own method) and
+/// `get_IsHorizontalMouseWheel` (15th; a sideways swipe raises the same event).
 #[interface("c79d8a4b-c163-4ee7-803f-67ce79f9972d")]
 pub unsafe trait IPointerPointProperties: IUnknown {
     pub fn GetIids(&self, count: *mut u32, iids: *mut *mut windows_core::GUID) -> HRESULT;
@@ -285,13 +243,9 @@ pub unsafe trait IPointerPointProperties: IUnknown {
     pub fn get_IsHorizontalMouseWheel(&self, value: *mut u8) -> HRESULT;
 }
 
-// WinRT delegates. Unlike the interfaces above these derive from `IUnknown`, not
-// `IInspectable` — `Invoke` is slot 3 with no `GetIids`/`GetRuntimeClassName`/
-// `GetTrustLevel` ahead of it. Getting that wrong calls the wrong function
-// pointer, so it is worth stating explicitly.
+// WinRT delegates derive from `IUnknown`, not `IInspectable`: `Invoke` is slot 3.
 
-/// `Windows.UI.Xaml.Input.PointerEventHandler`, for hover enter/exit — and for
-/// `PointerWheelChanged`, which uses this same delegate type.
+/// `Windows.UI.Xaml.Input.PointerEventHandler` (hover, press and wheel events).
 #[interface("e4385929-c004-4bcf-8970-359486e39f88")]
 pub unsafe trait IPointerEventHandler: IUnknown {
     pub fn Invoke(&self, sender: *mut c_void, args: *mut c_void) -> HRESULT;
@@ -340,10 +294,8 @@ pub unsafe trait ITextBlock: IUnknown {
     pub fn put_Text(&self, value: *mut c_void) -> HRESULT;
 }
 
-/// `Windows.UI.Xaml.Markup.IXamlReaderStatics`.
-///
-/// `XamlReader.Load` is how elements get created: `IVisualTreeService::CreateInstance`
-/// is `E_NOTIMPL` in Explorer, and this is the route the known-good C++ TAPs use.
+/// `Windows.UI.Xaml.Markup.IXamlReaderStatics`. `Load` is how elements get created
+/// (`IVisualTreeService::CreateInstance` is `E_NOTIMPL` in Explorer).
 #[interface("9891c6bd-534f-4955-b85a-8a8dc0dca602")]
 pub unsafe trait IXamlReaderStatics: IUnknown {
     pub fn GetIids(&self, count: *mut u32, iids: *mut *mut windows_core::GUID) -> HRESULT;
@@ -357,9 +309,8 @@ pub unsafe trait IXamlReaderStatics: IUnknown {
     ) -> HRESULT;
 }
 
-/// `Windows.UI.Xaml.Controls.IContentPresenter`. Setting `Content` is the
-/// supported way to put our own visuals into a tray icon — `Panel.Children`
-/// mutation is refused (`0x800F1000`).
+/// `Windows.UI.Xaml.Controls.IContentPresenter`. `Content` is how our visuals enter a tray icon
+/// (`Panel.Children` mutation is refused, `0x800F1000`).
 #[interface("79fde5b4-cd37-491c-8845-daf472defff6")]
 pub unsafe trait IContentPresenter: IUnknown {
     pub fn GetIids(&self, count: *mut u32, iids: *mut *mut windows_core::GUID) -> HRESULT;
@@ -369,11 +320,8 @@ pub unsafe trait IContentPresenter: IUnknown {
     pub fn put_Content(&self, value: *mut c_void) -> HRESULT;
 }
 
-/// `Windows.UI.Xaml.Automation.IAutomationPropertiesStatics`.
-///
-/// `GetName` carries the notify icon's tooltip text, which is how a specific tray
-/// icon is identified (Windhawk's selectors use `[AutomationProperties.Name=…]`).
-/// `GetName` is slot 26 of the interface's own methods.
+/// `Windows.UI.Xaml.Automation.IAutomationPropertiesStatics`. `GetName` (26th own method) carries
+/// a tray icon's tooltip, which is how ours is identified.
 #[interface("b618fd7b-32d0-4970-9c42-7c039ac7be78")]
 pub unsafe trait IAutomationPropertiesStatics: IUnknown {
     pub fn GetIids(&self, count: *mut u32, iids: *mut *mut windows_core::GUID) -> HRESULT;
@@ -407,31 +355,13 @@ pub unsafe trait IAutomationPropertiesStatics: IUnknown {
     pub fn GetName(&self, element: *mut c_void, value: *mut *mut c_void) -> HRESULT;
 }
 
-/// `Windows.UI.Xaml.IFrameworkElement`. Primarily a QI target: the `Grid`
-/// statics take an `IFrameworkElement*`, and COM requires that exact interface
-/// pointer — handing over the `IInspectable` instead calls through the wrong
-/// vtable.
+/// `Windows.UI.Xaml.IFrameworkElement`. Also a QI target: the `Grid` statics need this exact
+/// interface pointer (an `IInspectable` calls through the wrong vtable and hangs).
 ///
-/// `put_Width` earns its place separately. Collapsing the system volume icon
-/// hides the glyph but does *not* free its slot inside the Quick Settings
-/// button, so the width has to be zeroed explicitly (see `decorate::collapse`).
-///
-/// `HorizontalAlignment` and `Margin` came with the music tile, and each pays for a defect that is
-/// invisible from the code:
-///
-/// * An element left at `Stretch` and then given an explicit `Width` is **centred**, not
-///   left-aligned. That slid the strip 40 epx right — half of `ask − content` — taking the `next`
-///   glyph off the end with it.
-/// * The shell centres its `RunningIndicator` and `ProgressIndicator` in the *button*. Fine at 44
-///   epx; at the 244 the strip needs, the running pill lands under the middle of the title and reads
-///   as a stray dot. Alignment moves them to the button's left edge; the margin places them under the
-///   app icon.
-///
-/// Verified against the SDK header, whose members after `MaxWidth` run **MinHeight g/p, MaxHeight
-/// g/p**, HorizontalAlignment g/p, **VerticalAlignment g/p**, Margin g/p, Name g/p, … — so four
-/// placeholders separate `put_MaxWidth` from `get_HorizontalAlignment`, and two more separate that
-/// from `get_Margin`. Count these against the header, never by eye: one slot out returns `S_OK` and
-/// silently does something else.
+/// `Width`/`MinWidth` zero a collapsed slot (see `decorate::collapse`); `HorizontalAlignment` and
+/// `Margin` pin the music tile's strip and the shell's indicators (a `Stretch` element given an
+/// explicit `Width` is centred). After `MaxWidth` the header has MinHeight and MaxHeight g/p, then
+/// HorizontalAlignment, VerticalAlignment, Margin: count against the header, never by eye.
 #[interface("a391d09b-4a99-4b7c-9d8d-6fa5d01f6fbf")]
 pub unsafe trait IFrameworkElement: IUnknown {
     pub fn GetIids(&self, count: *mut u32, iids: *mut *mut windows_core::GUID) -> HRESULT;
@@ -479,19 +409,9 @@ pub struct Thickness {
     pub bottom: f64,
 }
 
-/// `Windows.UI.Xaml.Controls.IBorder`.
-///
-/// **The one property that makes a taskbar *button* usable as a host.** Nothing at that end of the
-/// taskbar is a `ContentControl`, so the notification area's `ContentPresenter.Content` route has no
-/// counterpart there — but every `TaskListButton` template contains a `Border#BackgroundElement`, and
-/// `Border.Child` is a single-value property rather than a `UIElementCollection`, which sidesteps the
-/// `0x800F1000` that blocks `Panel.Children.Append`.
-///
-/// Verified against the SDK header: the interface's own members run BorderBrush g/p, BorderThickness
-/// g/p, Background g/p, CornerRadius g/p, Padding g/p, **Child g/p** — so `put_Child` is the
-/// fourteenth slot, and the ten before it have to be spelled out to reach it. The `Thickness` and
-/// `CornerRadius` ones are declared with `*mut c_void` operands because nothing here calls them; only
-/// their *width in the vtable* matters.
+/// `Windows.UI.Xaml.Controls.IBorder`. `Border.Child` (single-valued, so not refused like
+/// `Panel.Children`) on a `TaskListButton`'s `Border#BackgroundElement` is how the music tile is
+/// hosted. Uncalled slots take `*mut c_void`; only their position matters.
 #[interface("797c4539-45bd-4633-a044-bfb02ef5170f")]
 pub unsafe trait IBorder: IUnknown {
     pub fn GetIids(&self, count: *mut u32, iids: *mut *mut windows_core::GUID) -> HRESULT;
@@ -511,11 +431,8 @@ pub unsafe trait IBorder: IUnknown {
     pub fn put_Child(&self, value: *mut c_void) -> HRESULT;
 }
 
-/// `Windows.UI.Xaml.Controls.IGridStatics`.
-///
-/// The tray's sections are children of one `Grid`, ordered by the `Grid.Column`
-/// attached property. These helpers take a plain `i32`, which avoids needing a
-/// `DependencyProperty` and the `IPropertyValue` boxing dance.
+/// `Windows.UI.Xaml.Controls.IGridStatics`: `Grid.Column` (which orders the tray's sections) as a
+/// plain `i32`, without `DependencyProperty` boxing.
 #[interface("64fe2e9f-f951-42b6-a9ce-bb179af11595")]
 pub unsafe trait IGridStatics: IUnknown {
     pub fn GetIids(&self, count: *mut u32, iids: *mut *mut windows_core::GUID) -> HRESULT;
@@ -529,11 +446,8 @@ pub unsafe trait IGridStatics: IUnknown {
     pub fn SetColumn(&self, element: *mut c_void, value: i32) -> HRESULT;
 }
 
-// There is deliberately no `ICoreDispatcher` binding. Marshalling XAML work through the
-// dispatcher `IXamlDiagnostics::GetDispatcher` hands back is a dead end — it belongs to
-// another of Explorer's XAML islands, and every call against a tray element from there fails
-// `RPC_E_WRONG_THREAD`. See "GetDispatcher is a trap" in FINDINGS.md; the TAP learns the
-// tray's own thread instead (`lifecycle::adopt_tray_thread`) and runs inline on it.
+// Deliberately no `ICoreDispatcher`: `GetDispatcher` returns another island's dispatcher
+// (`RPC_E_WRONG_THREAD`). See FINDINGS.md, "Threading, settled".
 
 /// The runtime class whose activation factory implements the statics above.
 pub const VISUAL_TREE_HELPER: &str = "Windows.UI.Xaml.Media.VisualTreeHelper";
@@ -542,13 +456,8 @@ pub const XAML_READER: &str = "Windows.UI.Xaml.Markup.XamlReader";
 pub const AUTOMATION_PROPERTIES: &str = "Windows.UI.Xaml.Automation.AutomationProperties";
 
 
-/// `Windows.UI.Xaml.Input.ITappedRoutedEventArgs`, for the `put_Handled` lever on a completed tap.
-///
-/// The music tile's transport glyphs need it: a tap they act on must not also reach the app button
-/// underneath, or pressing play activates YouTube Music on top of the track change.
-///
-/// Verified against the SDK header: `PointerDeviceType`, `Handled` g/p, `GetPosition` — so `put_Handled`
-/// is the sixth slot after the three `IInspectable` ones.
+/// `Windows.UI.Xaml.Input.ITappedRoutedEventArgs`, for `put_Handled` on a transport tap (so it
+/// does not also activate the app).
 #[interface("a099e6be-e624-459a-bb1d-e05c73e2cc66")]
 pub unsafe trait ITappedRoutedEventArgs: IUnknown {
     pub fn GetIids(&self, count: *mut u32, iids: *mut *mut windows_core::GUID) -> HRESULT;

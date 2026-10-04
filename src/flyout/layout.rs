@@ -1,10 +1,6 @@
-//! Pure layout + hit-testing for the flyout: the element taxonomy ([`Elem`]), how a screen
-//! is measured and stacked into positioned [`LaidElem`]s ([`build_view`]), the panel's
-//! width/height, the wrapping icon-grid geometry, and where a mouse coordinate lands.
-//!
-//! Every function here is pure — it takes the display [`Model`] (or bare geometry) plus the
-//! DPI `scale` and returns numbers, touching no `self`, no Win32, and no pixel buffer. That
-//! is what makes the fiddly geometry unit-testable (see the tests at the bottom).
+//! Pure layout and hit-testing for the flyout: [`Elem`]s stacked into [`LaidElem`]s by
+//! [`build_view`], panel size, icon-grid geometry, and what a mouse coordinate hits.
+//! No Win32 or pixel buffers here, so it stays unit-testable.
 
 use ab_glyph::FontVec;
 
@@ -14,9 +10,7 @@ use crate::canvas::measure;
 use super::model::Model;
 use super::theme::*;
 
-/// Which screen the flyout is showing. The icon picker is a *dedicated* sub-screen you
-/// slide to from a device row's edit pencil (rather than an inline row), so it can lay its
-/// icons out in a wrapping grid without ever changing the flyout's width.
+/// Which screen the flyout is showing.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum View {
     /// The main audio panel (sliders + device lists).
@@ -34,8 +28,7 @@ pub(super) enum ActionKind {
 }
 
 impl ActionKind {
-    /// The footer's labelled left-hand item (glyph + text, like the battery readout in the
-    /// Win11 quick-settings footer).
+    /// The footer's labelled left-hand item (glyph + text).
     pub(super) const LEFT: ActionKind = ActionKind::Quit;
 
     pub(super) fn label(self) -> &'static str {
@@ -74,10 +67,7 @@ pub(super) struct LaidElem {
     pub height: i32,
 }
 
-/// The panel width, measured from the *main* view's content only. Constant for the life of
-/// the flyout (the device set and labels don't change while open), so it anchors the width
-/// for every screen — the icon picker wraps its grid into this width rather than forcing the
-/// panel wider.
+/// The panel width, measured from the main view only and shared by every screen.
 pub(super) fn content_width(model: &Model, scale: f32) -> i32 {
     let font = ui_font();
     let font_sb = ui_font_semibold().or(font);
@@ -96,17 +86,13 @@ pub(super) fn content_width(model: &Model, scale: f32) -> i32 {
             max_w = max_w.max(TEXT_X * scale + mw(font, text_px, &row.label) + reserve * scale);
         }
     }
-    // The former right-click menu now lives in the footer strip: its labelled item and its
-    // icon buttons sit on the same line, so the panel has to be wide enough for both.
+    // Wide enough for the footer's label and buttons on one line.
     max_w = max_w.max(footer_min_width(model, scale));
-    // `ceil`, not `round`: rounding down by a fraction of a pixel makes the panel
-    // narrower than the text it was measured from, which then gets ellipsised by
-    // `fit_label` even though it was supposed to fit exactly.
+    // `ceil`, not `round`, or `fit_label` ellipsises text that was measured to fit.
     max_w.clamp(MIN_W * scale, MAX_W * scale).ceil() as i32
 }
 
-/// The fixed panel height shared by every screen: the taller of the main panel and the icon
-/// picker (in practice the main panel, which has the sliders + device lists).
+/// The fixed panel height shared by every screen: the tallest screen's.
 pub(super) fn panel_height(model: &Model, scale: f32, width: i32) -> i32 {
     let main_h = build_view(model, scale, width, View::Main, 0).1;
     let picker_h = if model.groups.iter().any(|g| !g.devices.is_empty()) {
@@ -117,14 +103,8 @@ pub(super) fn panel_height(model: &Model, scale: f32, width: i32) -> i32 {
     main_h.max(picker_h)
 }
 
-/// Build (and vertically lay out) the elements for `view`, returning them plus the total
-/// panel height. Pure — used both to render the current screen and to render the two screens
-/// involved in a slide transition. Uses the fixed `width`.
-///
-/// `fill_h` is the fixed panel height every screen shares (so navigating never resizes the
-/// window): the layout is grown to at least `fill_h`, and on the icon-picker screen the grid
-/// is centred in the slack below the header. Pass `0` to lay out naturally (used once, to
-/// measure each screen's intrinsic height).
+/// Lay out the elements for `view` at `width`, returning them and the total height. The layout
+/// grows to at least `fill_h` (picker grid centred in the slack); `0` measures the natural height.
 pub(super) fn build_view(model: &Model, scale: f32, width: i32, view: View, fill_h: i32) -> (Vec<LaidElem>, i32) {
     let d = |v: f32| (v * scale).round() as i32;
     let mut kinds: Vec<Elem> = Vec::new();
@@ -139,8 +119,7 @@ pub(super) fn build_view(model: &Model, scale: f32, width: i32, view: View, fill
                     kinds.push(Elem::Device { group: gi, dev: di });
                 }
             }
-            // The former right-click menu, now the strip that closes the panel. A staged
-            // update rides in it too, as an extra button (see [`footer_buttons`]).
+            // The closing strip (settings, quit, and a staged update; see [`footer_buttons`]).
             kinds.push(Elem::Footer);
         }
         View::IconPicker { group, dev } => {
@@ -152,15 +131,12 @@ pub(super) fn build_view(model: &Model, scale: f32, width: i32, view: View, fill
     let mut elems = Vec::with_capacity(kinds.len());
     let mut y = d(PAD_V);
     for (i, elem) in kinds.into_iter().enumerate() {
-        // The footer stands off from the row above it, and the gap stays *outside* the
-        // element — so the strip's hover/hit band starts at its hairline, not under the
-        // last device row.
+        // The gap stays outside the element, so the footer's hit band starts at its hairline.
         if matches!(elem, Elem::Footer) {
             y += d(FOOTER_TOP_GAP);
         }
         let height = match elem {
-            // The first header sits at the very top (small gap); a later header separates
-            // one group from the one above it.
+            // Later headers get a larger top gap to separate groups.
             Elem::Header(_) => d(if i == 0 { HEADER_FIRST_H } else { HEADER_H }),
             Elem::Slider { .. } => d(SLIDER_H),
             Elem::Device { .. } => d(ITEM_H),
@@ -171,15 +147,12 @@ pub(super) fn build_view(model: &Model, scale: f32, width: i32, view: View, fill
         elems.push(LaidElem { elem, top: y, height });
         y += height;
     }
-    // The footer runs to the panel's bottom edge (its own height is the padding), so it
-    // replaces the closing gap rather than sitting above one.
+    // The footer runs to the bottom edge, replacing the closing gap.
     let ends_flush = matches!(elems.last().map(|le| le.elem), Some(Elem::Footer));
     let natural = y + if ends_flush { 0 } else { d(PAD_V) };
     let total = natural.max(fill_h);
 
-    // Spend any extra vertical space: centre the icon grid in it, so the picker fills the
-    // shared panel height without a big empty band at the bottom (the header stays pinned
-    // top), and keep the footer flush against the bottom edge.
+    // Spend extra height: centre the icon grid in it and keep the footer flush to the bottom.
     let slack = total - natural;
     if slack > 0 {
         for le in &mut elems {
@@ -193,9 +166,8 @@ pub(super) fn build_view(model: &Model, scale: f32, width: i32, view: View, fill
     (elems, total)
 }
 
-/// Icon-grid geometry for a given panel `width`: `(cols, left_px, chip_px, step_px)`. The
-/// grid wraps to as many equal columns as fit the width and is centred within the panel, so
-/// the icons wrap onto multiple rows without ever widening the flyout.
+/// Icon-grid geometry for `width`: `(cols, left_px, chip_px, step_px)`, as many columns as
+/// fit, centred.
 pub(super) fn grid_metrics(width: i32, scale: f32) -> (i32, i32, i32, i32) {
     let chip = (GRID_CHIP * scale).round() as i32;
     let gap = (GRID_GAP * scale).round() as i32;
@@ -220,14 +192,8 @@ pub(super) fn grid_px_height(width: i32, scale: f32) -> i32 {
         + (GRID_BOTTOM_PAD * scale).round() as i32
 }
 
-/// The footer's round icon buttons, **rightmost first**: the settings gear always, and a
-/// restart-to-update button to its left while an update is staged on disk (which is where
-/// the old full-width "restart to update to v…" banner went).
-///
-/// Deliberately carries no "restart Explorer" button. One was tried and removed: the strip
-/// needing a fresh Explorer is a condition the app can detect and fix on its own (see
-/// `taskbar::apply_at_startup`), and a button only works if the user knows an unlabelled glyph
-/// is the answer to a taskbar that looks wrong.
+/// The footer's round icon buttons, rightmost first: the settings gear, then restart-to-update
+/// while an update is staged. No "restart Explorer" button by design (see docs/NOTES.md).
 pub(super) fn footer_buttons(model: &Model) -> Vec<ActionKind> {
     let mut buttons = vec![ActionKind::SoundSettings];
     if model.update.is_some() {
@@ -236,15 +202,13 @@ pub(super) fn footer_buttons(model: &Model) -> Vec<ActionKind> {
     buttons
 }
 
-/// Horizontal centre (px) of footer button `i`, counted from the right — shared by
-/// hit-testing, the hover circle, and the glyph so they always coincide.
+/// Horizontal centre (px) of footer button `i` from the right; shared by hit-test and paint.
 pub(super) fn footer_btn_center_x(width: i32, scale: f32, i: usize) -> f32 {
     let step = (FOOTER_BTN + FOOTER_BTN_GAP) * scale;
     width as f32 - (FOOTER_BTN_RIGHT + FOOTER_BTN / 2.0) * scale - i as f32 * step
 }
 
-/// Right edge (px) of the footer's labelled left item: its hover pill *and* its hit target,
-/// so the pill is exactly the area that responds — it never stretches across the strip.
+/// Right edge (px) of the footer's labelled item, for both its hover pill and its hit target.
 pub(super) fn footer_item_right(scale: f32) -> f32 {
     let label_w = ui_font()
         .map(|f| measure(f, FOOTER_TEXT_PX * scale, ActionKind::LEFT.label()))
@@ -259,8 +223,7 @@ pub(super) fn footer_min_width(model: &Model, scale: f32) -> f32 {
     footer_item_right(scale) + (FOOTER_GAP + buttons + FOOTER_BTN_RIGHT) * scale
 }
 
-/// Which footer action (if any) is under `mx`. The strip between the labelled item and the
-/// buttons is inert, so a click on the empty middle does nothing rather than quitting.
+/// Which footer action (if any) is under `mx`; the gap between item and buttons is inert.
 pub(super) fn footer_hit(model: &Model, width: i32, scale: f32, mx: i32) -> Option<ActionKind> {
     let x = mx as f32;
     for (i, k) in footer_buttons(model).into_iter().enumerate() {
@@ -327,8 +290,7 @@ pub(super) fn grid_chip_at(width: i32, scale: f32, mx: i32, my: i32, gy: i32) ->
     (k < IconId::ALL.len()).then_some(k)
 }
 
-/// Horizontal centre (in px) of the edit pencil's button — shared by hit-testing, the hover
-/// highlight, and the glyph so they always coincide.
+/// Horizontal centre (px) of the edit pencil's button; shared by hit-test and paint.
 pub(super) fn pencil_center_x(width: i32, scale: f32) -> f32 {
     width as f32 - (PENCIL_RIGHT + PENCIL_BTN / 2.0) * scale
 }
@@ -394,8 +356,7 @@ mod tests {
 
     #[test]
     fn main_view_always_ends_with_the_footer() {
-        // The former right-click menu is only reachable through the footer now, so losing
-        // it would strand Sound settings and Quit.
+        // Sound settings and Quit are only reachable through the footer.
         let m = model(vec![output_group(vec![dev("Speakers", None)])], None);
         let (elems, total) = build_view(&m, 1.0, 400, View::Main, 0);
         let last = elems.last().expect("main view is never empty");
@@ -406,8 +367,7 @@ mod tests {
 
     #[test]
     fn footer_stays_pinned_to_the_bottom_when_the_panel_is_stretched() {
-        // The panel is as tall as its tallest screen, so the main view can be handed more
-        // height than it needs; the footer must follow the bottom edge, not float.
+        // Given extra height, the footer must follow the bottom edge.
         let m = model(vec![output_group(vec![dev("Speakers", None)])], None);
         let (elems, natural) = build_view(&m, 1.0, 400, View::Main, 0);
         let natural_top = elems.last().map(|le| le.top).unwrap();
@@ -438,8 +398,7 @@ mod tests {
 
     #[test]
     fn a_staged_update_adds_a_restart_button_left_of_the_gear() {
-        // The banner row is gone, so this button is the only way to take a staged
-        // update from the panel — and it must not land on top of the gear.
+        // The update button must not land on top of the gear.
         let scale = 1.5;
         let staged = model(vec![output_group(vec![dev("Speakers", None)])], Some("9.9.9"));
         let plain = model(vec![output_group(vec![dev("Speakers", None)])], None);

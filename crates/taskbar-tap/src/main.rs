@@ -1,19 +1,13 @@
-//! The injector — runs as a normal user process and asks XAML diagnostics to
-//! load `audio_tray_tap.dll` into `explorer.exe`.
+//! Standalone dev injector: asks XAML diagnostics to load `audio_tray_tap.dll` into `explorer.exe`.
 //!
 //! Usage:
-//!   xaml-tap-inject [--pid N] [--dll PATH] [--diag-dll PATH] [--wait SECS]
-//!                   [--debug]
+//!   xaml-tap-inject [--pid N] [--dll PATH] [--diag-dll PATH] [--wait SECS] [--tooltip T]
+//!                   [--out HEX] [--in HEX] [--muted-out] [--muted-in] [--accent RRGGBB | --no-pill]
+//!                   [--alpha HEX] [--hide-system-volume] [--owner PID] [--debug]
 //!   xaml-tap-inject --revert
 //!
-//! `--debug` turns on the exploratory logging — the raw event trace and the
-//! periodic visual-tree dumps. Off by default: a single session with it on
-//! measured 15 MB and 197k lines, 92% of that the dumps.
-//!
-//! The TAP is never unloaded — it pins itself (`DllCanUnloadNow` returns
-//! `S_FALSE`), and the undo is a revert rather than an eject: `--revert` asks the
-//! injected TAP to put the taskbar back, after which it sits inert. Restarting
-//! Explorer is only needed to load a *rebuilt* DLL.
+//! The TAP is never unloaded: `--revert` asks it to put the taskbar back, after which it sits
+//! inert. Restarting Explorer is only needed to load a *rebuilt* DLL.
 
 use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
@@ -41,9 +35,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .cloned()
     };
 
-    // Asks an already-injected TAP to undo its changes, without injecting
-    // anything. Stands in for audio-tray quitting or the user toggling the
-    // feature off, so the revert path can be exercised on its own.
+    // Asks an already-injected TAP to undo its changes, without injecting anything.
     if args.iter().any(|a| a == "--revert") {
         return post_revert();
     }
@@ -68,17 +60,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `canonicalize` and confuses the loader on the far side.
     let dll = strip_verbatim(dll.canonicalize()?);
 
-    // Prior art (TranslucentTB's ExplorerTAP, Windhawk's Taskbar Styler) passes
-    // the TAP's own path for both DLL parameters. Overridable because the
-    // header documents the third parameter only as "the XAML diagnostics dll".
+    // Prior art (TranslucentTB, Windhawk) passes the TAP's own path for both DLL parameters.
     let diag_dll = flag("--diag-dll").map_or_else(|| dll.clone(), PathBuf::from);
     let wait_secs: u64 = flag("--wait").map_or(Ok(5), |v| v.parse())?;
 
-    // What the TAP should draw, passed through as initialization data. Glyphs are
-    // Segoe Fluent codepoints in hex. `--tooltip` picks which tray icon to
-    // decorate; empty means "the first one found".
+    // Initialization data: glyphs are Segoe Fluent codepoints in hex; an empty `--tooltip` takes
+    // the first tray icon; `--no-pill` drops the accent fill.
     let has = |name: &str| args.iter().any(|a| a == name);
-    // `--no-pill` drops the accent fill back to bare glyphs.
     let accent = if has("--no-pill") {
         String::new()
     } else {
@@ -86,12 +74,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             accent_rgb().map_or(String::new(), |[r, g, b]| format!("{r:02X}{g:02X}{b:02X}"))
         })
     };
-    // `--owner PID` is what audio-tray passes as its own process id: the TAP
-    // waits on that process and reverts when it dies, so a killed or crashed
-    // owner does not leave a dead strip on the taskbar.
-    // `--debug` turns on the exploratory logging: the raw event trace and the
-    // periodic visual-tree dumps. Off by default because it is measured in
-    // megabytes per session, and nothing the strip does needs it.
+    // `--owner PID`: the TAP reverts when that process exits. `--debug`: verbose logging (tree dumps).
     let init_data = format!(
         "tooltip={};out={};in={};outmuted={};inmuted={};accent={};alpha={};hidevolume={};pid={};debug={}",
         flag("--tooltip").unwrap_or_default(),
@@ -134,9 +117,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Finds the TAP's control window and asks it to revert.
 ///
-/// `EnumWindows` rather than `FindWindow` for the same reason the TAP uses it to
-/// find audio-tray: `FindWindow` does not locate this window across processes,
-/// while enumerating and matching the class name does.
+/// `EnumWindows`, because `FindWindow` does not locate it across processes.
 fn post_revert() -> Result<(), Box<dyn std::error::Error>> {
     use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
     use windows::Win32::UI::WindowsAndMessaging::{EnumWindows, GetClassNameW, PostMessageW};

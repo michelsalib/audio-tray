@@ -4,8 +4,7 @@
 //! **One window, one procedure.** The TAP, the endpoint and microphone watchers, the music feed,
 //! the wheel hook and tray-icon's click handler all post to the receiver window
 //! ([`crate::taskbar::create_receiver`]); [`wndproc`] queues each message and [`drain`] handles
-//! them. Any pump that dispatches — this loop, or the flyout's modal one — therefore delivers
-//! them, where thread messages used to be dropped while the panel was open.
+//! them, so any pump that dispatches (this loop or the flyout's modal one) delivers them.
 //!
 //! **Re-entrancy.** An STA pumps during outgoing COM calls, so a message can arrive while a
 //! handler is running. Handlers never run nested: a nested arrival only queues, and the outer

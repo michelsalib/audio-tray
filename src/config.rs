@@ -9,11 +9,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::icons::IconId;
 
-/// Unknown sections are ignored rather than rejected, which is what lets a config
-/// written by an older build load unchanged — `[taskbar]`, the opt-in that used to
-/// choose between the plain tray icon and the taskbar strip, is the case that
-/// matters today. Rejecting it would throw away the user's icon choices along with
-/// it.
+/// Unknown sections (e.g. a legacy `[taskbar]`) must be ignored, not rejected: a failed
+/// parse falls back to defaults and loses the user's icon choices.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -23,29 +20,18 @@ pub struct Config {
     pub music: Music,
 }
 
-/// Following YouTube Music, and drawing it into the taskbar.
-///
-/// **On by default, which is defensible because it is invisible until it applies.** Nothing here
-/// happens without a YouTube Music media session on the machine: no session, no state to publish, no
-/// progress bar, no tile. A user who never opens the player never sees a difference.
+/// Following YouTube Music and drawing it into the taskbar. On by default: it does nothing
+/// without a YouTube Music media session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Music {
     /// Follow the player at all. `false` turns the whole feature off, progress bar included.
     pub enabled: bool,
-    /// Draw the strip into this app's own taskbar button, matched on its name.
-    ///
-    /// The app's *own* button, so the shell keeps doing the things it already does well: launching
-    /// adds no second icon, minimising goes there, and dragging reorders it. Empty means no strip —
-    /// the feed and the progress bar still work.
+    /// Draw the strip into this app's own taskbar button, matched on its name. Empty means no
+    /// strip; the feed and the progress bar still work.
     pub tile: String,
-    /// Pin the SMTC app id instead of guessing it.
-    ///
-    /// Needed when the built-in matching misses an unusual build — the id is a Chromium
-    /// implementation detail, and `audio-tray --music-probe` prints the real one — and when
-    /// YouTube Music runs as a **plain browser tab**, which reports a bare `MSEdge`/`Chrome` that
-    /// is indistinguishable from any other tab. That one is never followed unless it is pinned
-    /// here; see [`crate::music::session`].
+    /// Pin the SMTC app id instead of guessing it (`--music-probe` prints it). Required for a
+    /// plain browser tab, which is never followed otherwise; see [`crate::music::session`].
     pub app_id: Option<String>,
 }
 
@@ -119,12 +105,8 @@ impl Config {
         self.icons.get(device_id).copied()
     }
 
-    /// The icon to draw for a device: the user's choice if there is one, otherwise the
-    /// form-factor default.
-    ///
-    /// One place, because all three surfaces have to agree — the tray icon, the strip and the
-    /// flyout's device rows. They did not when each resolved it for itself: the same speaker
-    /// appeared as a laptop in one and a speaker in another.
+    /// The icon to draw for a device: the user's choice, else the form-factor default.
+    /// Every surface (tray, strip, flyout) must resolve icons through this.
     pub fn icon_of(&self, device: &crate::audio::Device) -> IconId {
         self.icon_for(&device.id.0).unwrap_or_else(|| {
             crate::icons::default_icon(device.form_factor, &device.friendly_name)
@@ -140,9 +122,7 @@ impl Config {
 mod tests {
     use super::*;
 
-    /// TOML requires plain values before tables, so adding a plain field after the
-    /// icons map is exactly the kind of change that makes `save()` fail at runtime
-    /// while still compiling. Round-trip it.
+    /// TOML wants plain values before tables; a misplaced field fails `save()` at runtime.
     #[test]
     fn round_trips_through_toml() {
         let mut cfg = Config::default();
@@ -172,9 +152,7 @@ this is not toml").unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Every config written while the taskbar strip was an opt-in still has a
-    /// `[taskbar]` section. Loading must ignore it, not fail — a rejected parse
-    /// falls back to defaults and silently drops the user's icon choices.
+    /// Configs from when the strip was opt-in carry a `[taskbar]` section; it must be ignored.
     #[test]
     fn legacy_config_with_a_taskbar_section_still_loads() {
         let legacy = "[icons]\n\"{0.0.0.00000000}.{abc}\" = \"Speakers\"\n\n[taskbar]\nenabled = true\n";

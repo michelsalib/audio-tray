@@ -1,21 +1,5 @@
-//! What the shell looked like before we touched it.
-//!
-//! The TAP changes three things that belong to Explorer, not to us: the tray
-//! icon's `ContentPresenter.Content`, the `Grid.Column` of every tray section it
-//! steps over, and the visibility/width of Explorer's own volume slot. None of
-//! those can be undone by unloading the DLL — `DLL_PROCESS_DETACH` runs under the
-//! loader lock, on the wrong thread, while diagnostics still holds callbacks into
-//! our code. The undo has to be an ordinary edit, made from the same thread that
-//! made the original one.
-//!
-//! So every mutation site records the previous value here first, and [`revert`]
-//! plays them back. The rule the module exists to enforce: **nothing is changed
-//! before its original is captured.**
-//!
-//! Handles die. Explorer rebuilds the tray on DPI, theme and monitor changes, so
-//! by the time a revert runs an element may be long gone. Every step re-resolves
-//! its handle and skips what it cannot find — a missing element is not an error,
-//! it is a thing that no longer needs putting back.
+//! The shell's original values for everything we change. **Nothing is changed before its original
+//! is captured here**; [`revert`] plays them back, skipping elements that have since died.
 
 use core::ffi::c_void;
 use std::sync::{Mutex, MutexGuard};
@@ -29,19 +13,14 @@ use crate::xamlom::{IXamlDiagnostics, InstanceHandle};
 
 #[derive(Default)]
 struct Original {
-    /// Each tray section's `Grid.Column` before the reorder.
     columns: Vec<(InstanceHandle, i32)>,
-    /// Visibility and width of everything we collapsed.
     layouts: Vec<(InstanceHandle, Layout)>,
-    /// The presenter we took over, and the content we displaced — an owned
-    /// reference, held so the shell's own visual cannot be collected while we
-    /// have it out of the tree. Null is a legitimate value.
+    /// The presenter we took over and the content we displaced: an owned reference, so the shell's
+    /// visual is not collected while out of the tree. Null is a legitimate value.
     content: Option<(InstanceHandle, usize)>,
 }
 
-/// Only ever locked from the visual-tree callback thread — both the mutation
-/// sites and the revert handler run there — so this is a leaf lock with no
-/// ordering to respect.
+/// A leaf lock, only taken on the tray thread.
 static ORIGINAL: Mutex<Original> = Mutex::new(Original {
     columns: Vec::new(),
     layouts: Vec::new(),
@@ -52,15 +31,8 @@ fn lock() -> MutexGuard<'static, Original> {
     crate::lock(&ORIGINAL)
 }
 
-/// Records a section's column, the first time we touch it.
-///
-/// Takes the value rather than reading it, because the reorder has already read
-/// every section's column to plan the move — and because the recording then sits
-/// in the same function as the mutation, where the two cannot drift apart.
-///
-/// First-wins: the reorder can run again after a tray rebuild, and it is the
-/// column the section had before *our* first edit that has to go back, not the
-/// one it had in between.
+/// Records a section's column (already read by the reorder). First-wins: what goes back is the
+/// value from before our *first* edit.
 pub fn remember_column(handle: InstanceHandle, column: i32) {
     let mut original = lock();
     if original.columns.iter().any(|&(known, _)| known == handle) {
@@ -69,11 +41,8 @@ pub fn remember_column(handle: InstanceHandle, column: i32) {
     original.columns.push((handle, column));
 }
 
-/// Records an element's visibility and width, the first time we collapse it.
-///
-/// First-wins for the same reason as [`remember_column`], and it matters more
-/// here: the collapse is re-applied many times to cover a layout race, and every
-/// re-read after the first would record our own zero width as the original.
+/// Records an element's visibility and width. First-wins: the collapse is re-applied, and later
+/// reads would record our own zero width.
 ///
 /// # Safety
 /// XAML UI thread only.
@@ -87,18 +56,9 @@ pub unsafe fn remember_layout(diagnostics: &IXamlDiagnostics, handle: InstanceHa
     lock().layouts.push((handle, layout));
 }
 
-/// Records the content we are about to displace from a presenter.
-///
-/// Last-wins, unlike the two above. The shell data-binds this property, so it can
-/// overwrite our strip with a freshly built visual of its own; when we re-apply
-/// after that, the thing to put back at the end is the *new* shell visual, not
-/// the stale one from the first time round.
-///
-/// With one exception: **never record our own strip.** Redrawing it — which a device
-/// switch does, via `crate::restyle` — would otherwise make the strip itself the
-/// thing we "restore", and the shell's original visual would be lost for good. This
-/// is the guard that makes redrawing safe, and it is here rather than at the call
-/// site so every path gets it.
+/// Records the content we are about to displace from a presenter. Last-wins (the shell may
+/// rebuild its visual, and the newest is what goes back), but **never records our own strip**,
+/// or a redraw would lose the shell's visual for good.
 ///
 /// # Safety
 /// XAML UI thread only.
@@ -115,12 +75,7 @@ pub unsafe fn remember_content(diagnostics: &IXamlDiagnostics, presenter: Instan
     }
 }
 
-/// Puts everything back and forgets it.
-///
-/// Safe to call when nothing was ever changed, and safe to call twice — the
-/// record is taken, so the second call has nothing left to do. That matters
-/// because the two triggers overlap: a user who asks for the taskbar back and then
-/// quits audio-tray sends both.
+/// Puts everything back and forgets it. Idempotent (the record is taken).
 ///
 /// # Safety
 /// XAML UI thread only.
@@ -131,8 +86,6 @@ pub unsafe fn revert(diagnostics: &IXamlDiagnostics) {
         return;
     }
 
-    // Our strip goes first, so what follows happens behind a taskbar that no
-    // longer shows it.
     if let Some((presenter, raw)) = original.content {
         let outcome = decorate::set_content_raw(diagnostics, presenter, raw as *mut c_void);
         logf!("revert: content of presenter 0x{presenter:x} {outcome}");
@@ -140,23 +93,19 @@ pub unsafe fn revert(diagnostics: &IXamlDiagnostics) {
         release(raw);
     }
 
-    // Then Explorer's own volume icon comes back...
     for (handle, layout) in original.layouts {
         let outcome = decorate::restore_layout(diagnostics, handle, layout);
         logf!("revert: layout of 0x{handle:x} {outcome}");
     }
 
-    // ...and the tray sections return to the columns they started in.
     for (handle, column) in original.columns {
         let ok = reorder::restore_column(diagnostics, handle, column);
         logf!("revert: 0x{handle:x} back to column {column} = {ok}");
     }
 }
 
-/// Drops a reference we were holding on the shell's behalf.
-///
 /// # Safety
-/// XAML UI thread only — the objects are not agile.
+/// XAML UI thread only (the objects are not agile).
 unsafe fn release(raw: usize) {
     if raw != 0 {
         drop(core::mem::transmute::<*mut c_void, IInspectable>(

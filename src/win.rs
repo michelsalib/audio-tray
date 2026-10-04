@@ -1,18 +1,15 @@
-//! The two-line Win32 helpers that every other module needs a copy of otherwise:
-//! wide strings, a registry DWORD, and the shell's small-icon size.
+//! Small shared Win32 helpers: wide strings, registry DWORDs, icon size, window enumeration,
+//! popup creation and per-monitor scale.
 
 use windows::core::PCWSTR;
 
-/// A Rust string as the NUL-terminated UTF-16 buffer the `W` APIs take.
-///
-/// The buffer has to outlive the call, so callers bind it before taking a
-/// `PCWSTR` to it — a pointer into a temporary would dangle.
+/// A Rust string as a NUL-terminated UTF-16 buffer. Bind it to a local before taking a
+/// `PCWSTR`: a pointer into a temporary dangles.
 pub(crate) fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
-/// A `REG_DWORD` under `HKEY_CURRENT_USER`, or `None` if it is absent or another
-/// type. Both of Windows' theme signals we follow are stored this way.
+/// A `REG_DWORD` under `HKEY_CURRENT_USER`, or `None` if it is absent or another type.
 pub(crate) fn hkcu_dword(subkey: PCWSTR, name: PCWSTR) -> Option<u32> {
     use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
 
@@ -32,8 +29,7 @@ pub(crate) fn hkcu_dword(subkey: PCWSTR, name: PCWSTR) -> Option<u32> {
     (status.0 == 0).then_some(value)
 }
 
-/// The DPI-scaled small-icon size Windows wants for tray-sized glyphs — 24 px on a
-/// 144-DPI display, not 16, because the process is per-monitor DPI aware.
+/// The DPI-scaled small-icon size for tray-sized glyphs (24 px at 144 DPI).
 pub(crate) fn small_icon_size() -> u32 {
     use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSMICON};
 
@@ -83,10 +79,8 @@ pub(crate) fn windows_by_class(class: &str) -> Vec<windows::Win32::Foundation::H
     found
 }
 
-/// Register `class` (re-registering is a harmless no-op) and create a `WS_POPUP` window of it.
-///
-/// One helper for the app's three windows: the tray's hidden message window, the flyout and the
-/// readout. The arrow cursor is set on the class because a captured window gets no `WM_SETCURSOR`.
+/// Register `class` (re-registering is a no-op) and create a `WS_POPUP` window of it. The class
+/// carries the arrow cursor because a captured window gets no `WM_SETCURSOR`.
 pub(crate) fn create_popup(
     class: PCWSTR,
     title: PCWSTR,
@@ -112,9 +106,6 @@ pub(crate) fn create_popup(
 }
 
 /// The display scale (DPI / 96, at least 1) and work area of the monitor nearest `point`.
-///
-/// Per monitor rather than `GetDpiForSystem`: the process is per-monitor-DPI aware, and a panel
-/// shown on a secondary display at another scaling must be sized for that display.
 pub(crate) fn monitor_at(point: windows::Win32::Foundation::POINT) -> (f32, windows::Win32::Foundation::RECT) {
     use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONEAREST};
     use windows::Win32::UI::HiDpi::{GetDpiForMonitor, GetDpiForSystem, MDT_EFFECTIVE_DPI};

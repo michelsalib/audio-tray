@@ -1,12 +1,6 @@
-//! The [`Surface`]: the flyout's on-screen presence and pixel buffers, plus the Win32
-//! plumbing that puts them on screen.
-//!
-//! It owns the layered `HWND`, the panel geometry (size, position, work-area, anchor), the
-//! laid-out elements to draw, and the two RGBA buffers — `base` (the static layer) and `buf`
-//! (base + dynamic overlays, presented each frame). It knows how to create the window,
-//! reposition itself, and play the open animation — but nothing about the audio model, the
-//! drawing itself (the controller fills the buffers via [`super::render`] and hands them
-//! here to present), or the layered blend, which is [`crate::layered`]'s.
+//! The [`Surface`]: the flyout's layered `HWND`, geometry, laid-out elements and two RGBA
+//! buffers (`base`, the static layer; `buf`, base plus overlays, presented each frame).
+//! Knows nothing of the audio model or of drawing ([`super::render`] fills the buffers).
 
 use windows::core::w;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
@@ -96,19 +90,15 @@ impl Surface {
         self.present(&self.buf, self.x, self.y, 255);
     }
 
-    /// Push a rendered ARGB buffer (always the panel's own size) to the layered window,
-    /// scaled by a global `alpha` for the fade animations. `UpdateLayeredWindow` also moves
-    /// the window to `(x, y)`, so this is how the surface is positioned as well as painted.
+    /// Present a panel-sized buffer at `(x, y)` with a global `alpha` (this also moves the window).
     pub(super) fn present(&self, buf: &[u8], x: i32, y: i32, alpha: u8) {
         crate::layered::present(self.hwnd, buf, self.width, self.height, x, y, alpha);
     }
 }
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
-    // WM_CAPTURECHANGED is *sent* straight to the proc (it never reaches the modal loop's
-    // GetMessage), so losing capture — Start menu, Alt-Tab, another app grabbing focus —
-    // would otherwise orphan the flyout. Re-post it as a queued message the loop dismisses
-    // on. (Our own ReleaseCapture at teardown also lands here, harmlessly.)
+    // WM_CAPTURECHANGED is sent, never reaching the modal loop; re-post it so the loop
+    // dismisses on capture loss (our own ReleaseCapture lands here harmlessly).
     if msg == WM_CAPTURECHANGED {
         let _ = PostMessageW(Some(hwnd), super::WM_FLYOUT_CLOSE, WPARAM(0), LPARAM(0));
     }

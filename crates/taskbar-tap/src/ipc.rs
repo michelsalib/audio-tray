@@ -1,13 +1,7 @@
-//! Telling audio-tray what the user did on the strip.
+//! Reports gestures on the strip to audio-tray, which decides what they mean.
 //!
-//! The TAP runs inside `explorer.exe`; the thing that owns the audio devices is
-//! a separate process. The strip therefore does no work of its own — it reports
-//! the gesture and audio-tray decides what it means.
-//!
-//! Transport is a posted window message to a hidden window that audio-tray
-//! registers. `PostMessage` is used rather than `SendMessage` so a busy or wedged
-//! audio-tray can never block Explorer's UI thread, which is where these handlers
-//! run.
+//! Posted (never sent) to audio-tray's hidden receiver window, so a busy or wedged app can never
+//! block Explorer's UI thread.
 
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicIsize, Ordering};
@@ -36,8 +30,7 @@ pub enum Action {
 }
 
 impl Action {
-    /// Wire code. Kept explicit rather than derived from enum order so the TAP
-    /// and audio-tray can be rebuilt independently without silently disagreeing.
+    /// Wire code (explicit, shared via `tap_proto`, never derived from enum order).
     fn code(self) -> usize {
         match self {
             Self::Cycle(Segment::Output) => tap_proto::ACTION_CYCLE_OUTPUT,
@@ -47,13 +40,8 @@ impl Action {
     }
 }
 
-/// Finds audio-tray's receiver window by walking top-level windows.
-///
-/// `FindWindow` is the obvious tool and does not work here: with the receiver
-/// created as a message-only window it cannot see it at all, and even as a
-/// hidden top-level window `FindWindow`/`FindWindowEx` returned nothing while
-/// `EnumWindows` listed it. Enumerating and comparing the class name is what
-/// actually finds it.
+/// Finds audio-tray's receiver window by walking top-level windows (`FindWindow` does not find
+/// it from here; see FINDINGS.md, "Talking to audio-tray").
 fn find_receiver() -> Option<HWND> {
     unsafe extern "system" fn visit(hwnd: HWND, lparam: LPARAM) -> BOOL {
         // A panic must not unwind into user32 (and through it, Explorer): treat it as "stop".
@@ -83,19 +71,12 @@ unsafe fn class_of(hwnd: HWND) -> String {
     String::from_utf16_lossy(&class[..len as usize])
 }
 
-/// The receiver window, remembered between events.
-///
-/// A full `EnumWindows` per event is fine for a click and not for a scroll: a touchpad
-/// gesture posts tens of them, all from Explorer's UI thread, and walking every top-level
-/// window in the session that often is real work in the wrong place. The handle can go stale
-/// (audio-tray quitting, or restarting itself after an update), so it is checked before use
-/// and dropped whenever a post fails.
+/// The receiver window, cached so scroll bursts do not each walk every top-level window. May go
+/// stale: re-checked before use and dropped when a post fails.
 static RECEIVER: AtomicIsize = AtomicIsize::new(0);
 
-/// audio-tray's receiver window: the remembered one if it is still ours, else a fresh scan.
-///
-/// One `GetClassNameW` is what makes the cache safe to trust — a bare "is it non-null" test
-/// would eventually post our messages into whatever window inherited a recycled handle.
+/// audio-tray's receiver window: the cached one if its class still matches (handles get
+/// recycled), else a fresh scan.
 fn receiver() -> Option<HWND> {
     let cached = RECEIVER.load(Ordering::Relaxed);
     if cached != 0 {
@@ -117,13 +98,8 @@ pub fn set_receiver(hwnd: isize) {
     }
 }
 
-/// Posts one message to audio-tray, if it is running.
-///
-/// Deliberately silent about a missing window beyond one log line: there is a
-/// window between audio-tray exiting and the TAP noticing (see
-/// `lifecycle::watch_owner`) in which the strip is still on screen with nobody
-/// to answer it, and a user who has quit the app should not get errors from
-/// their taskbar.
+/// Posts one message to audio-tray if it is running; otherwise only logs (the strip can outlive
+/// the app briefly, until `lifecycle::watch_owner` reverts it).
 fn post(message: u32, wparam: usize, lparam: isize) {
     let Some(hwnd) = receiver() else {
         logf!("no audio-tray receiver window — dropping the gesture");
@@ -131,7 +107,6 @@ fn post(message: u32, wparam: usize, lparam: isize) {
     };
     let posted = unsafe { PostMessageW(Some(hwnd), message, WPARAM(wparam), LPARAM(lparam)) };
     if let Err(err) = posted {
-        // Whatever we had is no use — forget it so the next gesture looks again.
         RECEIVER.store(0, Ordering::Relaxed);
         logf!("PostMessage to audio-tray failed: {err}");
     }
@@ -142,9 +117,8 @@ pub fn send(action: Action) {
     post(WM_TASKBAR_ACTION, action.code(), 0);
 }
 
-/// Reports a scroll over one segment: `delta` in `WHEEL_DELTA` units, signed, exactly as the
-/// pointer reported it. What it *means* — how much volume that is, and whether to coalesce it
-/// with the ones behind it — is audio-tray's to decide, like every other gesture here.
+/// Reports a scroll over one segment: `delta` in signed `WHEEL_DELTA` units, as the pointer
+/// reported it; audio-tray scales and coalesces.
 pub fn send_scroll(segment: Segment, delta: i32) {
     let flow = match segment {
         Segment::Output => tap_proto::FLOW_OUTPUT,
@@ -153,12 +127,8 @@ pub fn send_scroll(segment: Segment, delta: i32) {
     post(WM_TASKBAR_SCROLL, flow, delta as isize);
 }
 
-/// Post a raw action code.
-///
-/// For the music tile, whose codes come from `music::tick::Segment` rather than from [`Action`]. Kept
-/// as a separate entry point rather than folding those into `Action`: the two halves of this TAP send
-/// to the same window but mean unrelated things, and one enum spanning both would invite a `match`
-/// that silently treats a media click as an audio one.
+/// Post a raw action code, for the music tile (its codes are unrelated to [`Action`]'s, so they
+/// are kept out of that enum).
 pub fn send_code(code: usize) {
     post(WM_TASKBAR_ACTION, code, 0);
 }

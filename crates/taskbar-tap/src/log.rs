@@ -11,14 +11,8 @@ use std::sync::Mutex;
 
 static SINK: Mutex<Option<std::fs::File>> = Mutex::new(None);
 
-/// Whether the spike's exploratory output is wanted.
-///
-/// Off unless the init data says `debug=1`, because it is *enormous*: measured at
-/// 15 MB and 197k lines from a single session, 92% of it visual-tree dumps. That is
-/// fine for a spike and unacceptable for something that runs inside the shell all
-/// day. The lifecycle lines — inject, decorate, revert, stand down — stay on
-/// unconditionally; they are low volume and they are exactly what a bug report
-/// needs.
+/// Whether the high-volume exploratory output (tree dumps) is wanted: only with `debug=1` in the
+/// init data. Lifecycle lines are always logged.
 static VERBOSE: AtomicBool = AtomicBool::new(false);
 
 /// Beyond this, the log is truncated on next open rather than growing forever.
@@ -45,15 +39,13 @@ pub fn line(text: &str) {
         );
     }
 
-    // A poisoned mutex must not take explorer down with it — a spike's log is
-    // never worth a shell crash.
+    // A poisoned mutex must not take Explorer down with it.
     let mut guard = match SINK.lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     };
     if guard.is_none() {
-        // Start over rather than append if the previous session left a large file.
-        // The TAP has no uninstall hook, so nothing else would ever reclaim it.
+        // Start over if the previous session left a large file; nothing else reclaims it.
         let oversized = std::fs::metadata(path()).is_ok_and(|meta| meta.len() > MAX_BYTES);
         *guard = OpenOptions::new()
             .create(true)

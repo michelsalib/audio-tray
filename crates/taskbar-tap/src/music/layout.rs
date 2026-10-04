@@ -1,92 +1,33 @@
-//! The strip's geometry and its XAML, both derived from one number: how wide the strip is.
+//! The tile's geometry and XAML, all derived from one number: the strip width.
 //!
-//! Ported from audio-tray, where every constant here was measured on a real taskbar rather than
-//! chosen. The two that cost the most to get right:
-//!
-//! * **Characters per epx** (`TITLE_EPX_PER_CHAR`) is read off *rendered* text. Eyeballed values were
-//!   14 % too wide, which left 16 epx of empty strip between the title and the transport buttons.
-//! * **The text column's height** is 32 with the title's line box forced to 17. The natural boxes are
-//!   18.6 + 14.6 = 33.2, which in a 30-epx column cut the descenders off the artist name.
-//!
-//! Nothing here touches XAML or the tree: it is a pure function of the width, which is why it can be
-//! unit-tested, and it is.
+//! The constants were measured on a real taskbar (see FINDINGS.md, "The music tile"). The
+//! geometry is a pure function of the width, so it is unit-tested here.
 
-/// The width the strip lays itself out in.
-///
-/// **240 → 162 when the transport controls left** for the shell's own thumbnail toolbar under the
-/// hover preview (`music::thumbbar`, audio-tray side), which freed the 78 epx three buttons occupied.
-/// That width went back to the taskbar rather than into the text column, which kept the 120 epx it
-/// had been measured and calibrated at.
-///
-/// **162 → 150 because a column sized for a song title is a hole in the taskbar the rest of the
-/// time.** `Nothing playing` is 100 epx of text in a 120 epx column, and the strip is exactly as wide
-/// as the button we ask the shell for — so the shortfall showed as dead taskbar between the label and
-/// the next app's icon. Narrowing only while idle was tried and is worse: the strip would then be two
-/// sizes, and since YouTube Music publishes no title for a moment between songs it would change size
-/// twice a track, shoving its neighbours about while you aim at them. **One width, and it is this
-/// one.** A title now scrolls a couple of characters sooner, which is what the ticker is for.
+/// The width the strip lays itself out in. One width whatever is showing, so the button never
+/// resizes under the pointer (sized so `Nothing playing` fits without scrolling).
 ///
 /// ```text
 /// 2·pad 4  +  cover 28  +  gap 6  +  text 108  +  slack 4  =  150
 /// ```
 pub const STRIP_WIDTH: u32 = 150;
 
-// How much wider than the strip the button has to be asked for is a property of *which* button —
-// 80 epx for the Widgets entry point, 4 for a task button — so it lives on
-// `super::tile::Host::SLOT_OVERHEAD` rather than here.
+// The extra width the button must be asked for lives on `super::tile::Host::SLOT_OVERHEAD`.
 
-/// Font sizes, in effective pixels.
-///
-/// Raised from 10/8, which was measured as "painful to read" at arm's length. The cost is
-/// paid in visible characters, not in layout: the column is a fixed width either way, and the
-/// ticker scrolls whatever does not fit.
+/// Font sizes, in effective pixels. The column is fixed width; the ticker scrolls overflow.
 pub const TITLE_SIZE: u32 = 14;
 pub const ARTIST_SIZE: u32 = 11;
 
-/// The text column's height, and the title's line box — both measured, because the two of them
-/// together are what clipped the artist's descenders.
-///
-/// Natural line boxes at these font sizes are 18.6 and 14.6 epx: 33.2 stacked, in a column that was
-/// 30 tall with a clip to match, so the bottom 3.2 epx went — the tails of `p` and `y` in
-/// `Periphery`. The strip is 32 epx tall and the button gives no more, so the fix is to spend the
-/// two spare epx and take the rest out of the *leading* rather than the glyphs:
-///
-/// ```text
-/// column 32   =   title line 17 (BlockLineHeight, was 18.6)   +   artist 14.6 natural
-/// ```
-///
-/// `LineStackingStrategy="BlockLineHeight"` is what makes `LineHeight` binding rather than a
-/// minimum; without it the line box stays at its natural 18.6 and nothing moves.
+/// The text column's height and the title's line box: 17 + the artist's natural 14.6 fits 32
+/// without clipping descenders. `BlockLineHeight` is what makes `LineHeight` binding.
 const TEXT_HEIGHT: u32 = 32;
 const TITLE_LINE: u32 = 17;
 
-/// Effective pixels per character, at [`TITLE_SIZE`] and [`ARTIST_SIZE`], × 100.
-///
-/// **Measured off the rendered text, not guessed.** These were 743 and 578, eyeballed from the
-/// 144 epx layout, and being 14 % too wide showed up as a visible hole: a 16-character title in a
-/// 120 epx column rendered `MusicTileTitle` at **103.9 epx**, leaving 16 epx of empty strip between
-/// the text and the transport buttons — reported as "we lose a lot of space". `MusicTileArtist` came
-/// to 47.5 epx for the 9 characters of `Periphery`.
-///
-/// ```text
-/// title   103.9 / 16 = 6.49 epx per character   (was 7.43)
-/// artist   47.5 /  9 = 5.28 epx per character   (was 5.78)
-/// ```
-///
-/// A character count rather than a measured width still, because the font is proportional and there
-/// is no cheap way to measure text from inside the TAP — but the *average* has to be right, or the
-/// column is either part empty or scrolling text that would have fit. An average also means a title
-/// of unusually wide characters overflows; that is what the `Clip` is for, and overflowing by a
-/// character is the better error, since the alternative is dead space on every normal title.
+/// Average epx per character × 100 at [`TITLE_SIZE`] / [`ARTIST_SIZE`], measured off rendered
+/// text. Unusually wide titles overflow by a character into the `Clip`, the lesser error.
 const TITLE_EPX_PER_CHAR: u32 = 649;
 const ARTIST_EPX_PER_CHAR: u32 = 528;
 
 /// The strip's internal geometry, derived from the width it has to fill.
-///
-/// Everything here used to be a constant tuned by hand for 144 epx. It is computed now because
-/// M11 showed the slot is not fixed: the same code has to lay out 144 and 240 without a second
-/// set of hand-tuned numbers, and every part has to move together or the space goes to whichever
-/// element happened to be hardcoded largest.
 pub struct Layout {
     /// Total content width — what the root plate is set to.
     pub strip: u32,
@@ -100,26 +41,16 @@ pub struct Layout {
 }
 
 impl Layout {
-    /// Fit the strip's parts into `strip` epx.
-    ///
-    /// The fixed parts get their size from how much room there is — a 144 epx strip cannot
-    /// afford a 28 epx cover and 26 epx buttons, and a 240 epx one looks starved with 26 and 19.
-    /// Whatever is left goes to the text column, because that is the only part with a graceful
-    /// response to being short: the ticker scrolls it.
+    /// Fit the strip's parts into `strip` epx: fixed parts sized by the room available, the rest
+    /// to the text column (the one part that degrades gracefully, by scrolling).
     pub fn for_width(strip: u32) -> Self {
-        // **Recalibrated when the transport buttons left the strip.** The old threshold was 200 with
-        // three 26-epx buttons in the budget; the same amount of room for the parts that remain is
-        // 200 − 78 = 122. Keeping 200 here would have made the strip take the cramped branch at every
-        // width it has had since — 162, then 150 — and shrink a cover that has more space, not less.
+        // The shipped width must take the roomy branch (tested).
         let roomy = strip >= 122;
         let pad = if roomy { 2 } else { 1 };
         let cover = if roomy { 28 } else { 26 };
         let gap = if roomy { 6 } else { 3 };
 
-        // **The slack is load-bearing, not rounding.** Segoe Fluent glyph ink overshoots its
-        // layout box, so without it the trailing bar of the `next` glyph clips — measured twice
-        // at 144. It is kept now the glyphs have gone because the same overshoot applies to the
-        // text column's last character against the plate's rounded corner.
+        // Load-bearing: room for the last character's ink overshoot at the plate's edge.
         const SLACK: u32 = 4;
         let fixed = 2 * pad + cover + gap + SLACK;
         let text = strip.saturating_sub(fixed);
@@ -130,20 +61,15 @@ impl Layout {
             cover,
             gap,
             text,
-            // Rounded, not truncated: the 144 epx column is 7.0 title characters exactly, and
-            // integer division would call it 6 and quietly scroll text that used to fit.
+            // Rounded, not truncated, so an exact fit is not scrolled.
             title_chars: ((text * 100 + TITLE_EPX_PER_CHAR / 2) / TITLE_EPX_PER_CHAR) as usize,
             artist_chars: ((text * 100 + ARTIST_EPX_PER_CHAR / 2) / ARTIST_EPX_PER_CHAR) as usize,
         }
     }
 }
 
-/// The width the strip lays its content out in — [`STRIP_WIDTH`] unless `strip=<epx>` was passed.
-///
-/// Deliberately separate from the `widen=` that opens the slot: one asks the shell for room, the
-/// other decides what to draw in it, and the measured gap between the two (ask 320, paint 249)
-/// means they cannot be the same number. Content wider than what paints would clip the `next`
-/// glyph — the exact defect the slack exists to prevent.
+/// The width the strip lays its content out in: [`STRIP_WIDTH`] unless the init data passed
+/// `strip=<epx>`. The button is asked for this plus `Host::SLOT_OVERHEAD`.
 static CONTENT_WIDTH: std::sync::atomic::AtomicU32 =
     std::sync::atomic::AtomicU32::new(STRIP_WIDTH);
 
@@ -151,8 +77,7 @@ pub fn set_content_width(width: u32) {
     CONTENT_WIDTH.store(width, std::sync::atomic::Ordering::SeqCst);
 }
 
-/// The live layout. Cheap enough to recompute per use — it is a handful of integer operations,
-/// and a cached copy would be one more thing to invalidate.
+/// The live layout; cheap, so recomputed per use rather than cached.
 pub fn layout() -> Layout {
     Layout::for_width(CONTENT_WIDTH.load(std::sync::atomic::Ordering::SeqCst))
 }
@@ -160,16 +85,10 @@ pub fn layout() -> Layout {
 /// `x:Name` of the `Border` holding the cover art, so a track change can swap the art alone.
 pub const COVER_HOST: &str = "MusicTileCoverHost";
 
-/// The cover art and its placeholder — the only part of the strip a track change has to rebuild.
-///
-/// A cover if there is one, otherwise a note glyph on a muted plate: a hole where the art should be
-/// looks like a bug, and plenty of sessions publish no artwork. Both are always present and stacked,
-/// with `Visibility` choosing between them, so the *shape* of this subtree never changes.
-///
-/// **It is a subtree and not a property write because of `Image.Source`.** Title and artist are
-/// `put_Text` on an existing `TextBlock`; pointing an `Image` at a new file needs a fresh
-/// `BitmapImage`, which is a WinRT object this TAP has no binding for — and cannot reuse a path
-/// anyway, since `BitmapImage` caches by URI. Reparsing this much markup is the cheap way to get one.
+/// The cover art and its note-glyph placeholder, the only part a track change rebuilds. Both are
+/// always present (`Visibility` picks one), so the subtree's shape never changes. Rebuilt rather
+/// than property-set because a new `Image.Source` needs a fresh `BitmapImage` (no binding here,
+/// and it caches by URI).
 pub fn cover_markup(strip: &super::state::Strip, cover_px: u32, gap: u32) -> String {
     use super::state::escape;
 
@@ -209,23 +128,14 @@ pub fn now_playing_markup(strip: &super::state::Strip) -> String {
 
     let l = layout();
 
-    // Wrapped in a `Border` of its own so a track change can replace **just this** — see
-    // [`COVER_HOST`] and `super::tile::update_cover`. Everything outside it keeps its identity, and
-    // more to the point its size, across a track change.
+    // Own `Border` so a track change replaces just this (`super::tile::update_cover`).
     let cover = format!(
         r#"<Border x:Name="{COVER_HOST}">{}</Border>"#,
         cover_markup(strip, l.cover, l.gap)
     );
 
-    // The text column is a **fixed** width, not a `MaxWidth`, and that is the fix for a real
-    // defect: with `MaxWidth` the column grew with the content, so a long artist name pushed
-    // the transport buttons sideways and off the end — the layout moved under the pointer
-    // depending on what was playing. Fixed width means the buttons never move.
-    //
-    // The `Clip` is what makes overflow disappear cleanly instead of spilling over the
-    // buttons: XAML panels do not clip their children, so without it a long name simply
-    // draws on top of everything to its right. Text longer than the column is scrolled by
-    // [`super::ticker`] rather than ellipsised, so it stays readable.
+    // Fixed width (not `MaxWidth`) so the layout never moves with the content. The `Clip` is
+    // needed because XAML panels do not clip children; overflow is scrolled by `super::ticker`.
     let text = format!(
         r#"<Border Width="{text_px}" Height="{TEXT_HEIGHT}" Margin="0,0,2,0" Background="Transparent">
              <Border.Clip>
@@ -246,18 +156,9 @@ pub fn now_playing_markup(strip: &super::state::Strip) -> String {
         artist = escape(&super::ticker::window(strip.display_artist(), l.artist_chars, 0)),
     );
 
-    // Both namespaces, and `Background="Transparent"` on the plate — see `strip_markup` for why
-    // each is load-bearing.
-    //
-    // **No `ToolTipService.ToolTip` here, and that is a requirement rather than a taste.** Measured:
-    // a tooltip declared on this element makes XAML's tooltip service own hover for the whole
-    // subtree, and the shell's `Taskbar.FlyoutFrame` preview then never opens at all — the tile was
-    // the one taskbar button with no window preview, and nothing said so. Removing it brings the
-    // preview straight back, which is also where the transport controls now are.
-    //
-    // **No transport glyphs either.** They are on the shell's thumbnail toolbar under that preview,
-    // where they cost no taskbar width. What is left is the thing a taskbar button should be: an
-    // icon and a label saying what is playing.
+    // Both namespaces and the transparent background are load-bearing (see `decorate::strip_markup`).
+    // Never add a `ToolTipService.ToolTip`: it takes over hover and the shell's window preview
+    // (where the transport buttons live) never opens.
     format!(
         r#"<Border xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
@@ -273,24 +174,14 @@ pub fn now_playing_markup(strip: &super::state::Strip) -> String {
     )
 }
 
-/// Where the shell's running indicator has to sit to be under the strip's app icon: the centre of
-/// the cover square, in epx from the strip's left edge.
-///
-/// The shell centres that indicator in the *button*, which is fine at 44 epx and wrong at 244 —
-/// centred there, it lands under the middle of the title text and reads as a stray dot. This is the
-/// one number needed to move it back under the icon, and it is the layout's, not a guess.
+/// Where the shell's running indicator goes (it centres in the button by default, under the
+/// text): the cover's centre, in epx from the strip's left edge.
 pub fn icon_centre() -> f64 {
     let layout = layout();
     f64::from(layout.pad) + f64::from(layout.cover) / 2.0
 }
 
-/// The strip's full width — what the shell's progress bar is sized to.
-///
-/// **The whole plate, not the icon.** Sizing the bar to the 28-epx cover was where it started, on the
-/// reasoning that it should sit under the app icon the way MPC-HC's does. On a strip that also
-/// carries the title and artist it reads as a stray underline instead: the bar is about the *track*,
-/// and the track is the whole strip. Spanning the plate makes it a progress bar for the thing the
-/// plate is showing, which is also the only reading at which its length means anything at a glance.
+/// The strip's full width, which the shell's progress bar spans (the whole plate, not the icon).
 pub fn strip_width() -> f64 {
     f64::from(layout().strip)
 }
@@ -310,10 +201,6 @@ mod tests {
     }
 
     /// The shipped width, and what it buys the parts.
-    ///
-    /// 150 rather than the 162 that came out of the transport buttons leaving: that width sized the
-    /// column for a *song title*, and the strip is one size whatever it is showing, so the 12 epx a
-    /// title used but `Nothing playing` did not were dead taskbar the rest of the time.
     #[test]
     fn the_shipped_width_spends_what_is_left_on_the_column() {
         assert_eq!(STRIP_WIDTH, 150);
@@ -323,12 +210,7 @@ mod tests {
         assert_eq!((l.title_chars, l.artist_chars), (17, 20));
     }
 
-    /// **The narrowing must not go so far that the idle label scrolls.** A strip permanently ticking
-    /// `Nothing playing` past a clip would be a worse answer to the dead space than the dead space.
-    ///
-    /// Measured through DirectWrite, the two labels come to 99.8 and 73.5 epx at [`TITLE_SIZE`] and
-    /// [`ARTIST_SIZE`] — both inside the 108 epx column, with room for the grid-fitted rendering the
-    /// shell uses to round each glyph's advance up.
+    /// The idle label must not scroll. DirectWrite measures it at 99.8 / 73.5 epx.
     #[test]
     fn the_idle_label_still_fits_the_column() {
         let idle = super::super::state::Strip::default();
@@ -345,8 +227,7 @@ mod tests {
         assert!(f64::from(l.text) >= 99.81, "a {} epx column cannot hold the title", l.text);
     }
 
-    /// The recalibrated `roomy` threshold has to put the shipped width on the generous branch.
-    /// At the old 200 it would have taken the cramped one and shrunk a cover that gained room.
+    /// The shipped width takes the generous branch.
     #[test]
     fn the_shipped_width_is_on_the_roomy_branch() {
         let shipped = Layout::for_width(STRIP_WIDTH);
@@ -357,9 +238,7 @@ mod tests {
         );
     }
 
-    /// **The dead space this recalibration exists to remove.** A title window has to come within a
-    /// couple of epx of filling its column: 16 characters rendered 103.9 epx of a 120 epx column,
-    /// and the 16 left over read as the strip losing space before the transport buttons.
+    /// A full title window comes within a couple of epx of filling its column.
     #[test]
     fn a_full_title_window_very_nearly_fills_the_column() {
         let l = Layout::for_width(STRIP_WIDTH);
@@ -370,8 +249,7 @@ mod tests {
         assert!(slack > -f64::from(TITLE_SIZE), "{slack}");
     }
 
-    /// The two text lines have to fit the column they are clipped to, or descenders are cut — which
-    /// is exactly what a 30 epx column did to the tail of `Periphery`.
+    /// The two text lines fit the clip, or descenders are cut.
     #[test]
     fn the_two_lines_fit_inside_the_clip() {
         /// Natural line box of the artist line, measured: 14.6 epx at `ARTIST_SIZE`.
@@ -384,9 +262,7 @@ mod tests {
         const { assert!(TEXT_HEIGHT <= 32) };
     }
 
-    /// The running indicator is placed against this, so it has to be the icon's centre and not the
-    /// strip's: a 240-epx strip centred its indicator at 120, under the title text, which is the
-    /// defect that made a real "the app is open" cue read as a stray dot.
+    /// The running indicator centres on the icon, not the strip.
     #[test]
     fn the_indicator_lands_under_the_icon() {
         let l = Layout::for_width(STRIP_WIDTH);
@@ -404,8 +280,7 @@ mod tests {
         assert!(wide.cover > narrow.cover && wide.gap > narrow.gap);
     }
 
-    /// The parts must never sum past the strip, at any width: overflowing is not a cosmetic
-    /// problem but the last of the text falling outside the plate's rounded corner.
+    /// The parts never sum past the strip, at any width.
     #[test]
     fn the_parts_always_fit_the_budget() {
         for width in CRAMPED..600 {
@@ -415,12 +290,7 @@ mod tests {
         }
     }
 
-    /// The strip carries no transport glyphs — those are the shell's thumbnail toolbar now — and,
-    /// critically, **no tooltip**.
-    ///
-    /// The tooltip is the one that would fail silently: declaring it makes XAML's tooltip service own
-    /// hover for this subtree, and the shell's window preview then never opens. That cost the tile
-    /// the very surface the controls were moved to, and nothing in any log said so.
+    /// No transport glyphs and, critically, no tooltip (it silently suppresses the window preview).
     #[test]
     fn the_strip_is_just_a_label_now() {
         let markup = now_playing_markup(&super::super::state::Strip::default());

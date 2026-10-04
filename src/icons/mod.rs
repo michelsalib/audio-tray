@@ -1,9 +1,5 @@
-//! Fixed built-in icon set (plan §3), rendered from **Segoe Fluent Icons** — the same
-//! font Windows uses for its own shell icons — so the tray glyph looks native and stays
-//! crisp when rendered at the exact display size.
-//!
-//! Users pick one icon per device in Settings; `default_icon` only chooses the starting
-//! glyph until then.
+//! The built-in icon set, rendered from Segoe Fluent Icons at the exact display size. Users
+//! pick one per device; `default_icon` only chooses the starting glyph.
 
 use std::cell::OnceCell;
 use std::mem::ManuallyDrop;
@@ -55,9 +51,7 @@ impl IconId {
         IconId::Unknown,
     ];
 
-    /// Segoe Fluent Icons code point for this icon. The two earbud variants have no
-    /// entry: the font ships no earbuds glyph, so [`render`](Self::render) hand-draws
-    /// them instead (this returns the headphone glyph only as a harmless fallback).
+    /// Segoe Fluent code point; the earbud variants are hand-drawn and return headphones here.
     pub fn glyph(self) -> char {
         match self {
             IconId::WirelessEarbuds => '\u{E7F6}', // Headphone (no earbuds glyph; see render)
@@ -81,13 +75,8 @@ impl IconId {
             .find(|i| format!("{i:?}").eq_ignore_ascii_case(s))
     }
 
-    /// Rasterize this icon into a `size`×`size` RGBA buffer, in colour `rgb` (with
-    /// anti-aliased alpha). Rendering at the target size keeps it crisp.
-    ///
-    /// Every icon is a Segoe Fluent glyph except the two earbud variants, which the font
-    /// doesn't provide — those are drawn by [`render_earbuds`] (AirPods-style, with a
-    /// stem) and [`render_round_earbuds`] (Sony-style, round and stemless), so each reads
-    /// as a distinct pair of buds rather than reusing the headphones glyph.
+    /// Rasterize this icon into a `size`×`size` RGBA buffer in colour `rgb`. The earbud
+    /// variants are drawn by [`render_earbuds`] and [`render_round_earbuds`].
     pub fn render(self, size: u32, rgb: [u8; 3]) -> Result<(Vec<u8>, u32, u32)> {
         match self {
             IconId::WirelessEarbuds => Ok(render_earbuds(size, rgb)),
@@ -97,9 +86,7 @@ impl IconId {
     }
 }
 
-/// A primitive for the hand-drawn earbud icons: a circle, or a capsule (a line segment
-/// with a radius — i.e. a stem). Its signed distance is negative inside the shape and ~0
-/// on the boundary, which is what [`render_outline`] strokes.
+/// A primitive for the hand-drawn earbuds: a circle or a capsule (a stem).
 enum Shape {
     Circle { cx: f32, cy: f32, r: f32 },
     Capsule { ax: f32, ay: f32, bx: f32, by: f32, r: f32 },
@@ -115,16 +102,11 @@ impl Shape {
     }
 }
 
-/// Stroke half-width for the hand-drawn icons, in normalised units. Tuned to sit at the
-/// line weight of the surrounding Segoe Fluent glyphs (≈1 px at the 16–20 px tray/picker
-/// sizes) while staying legible without the hinting a real font gets.
+/// Stroke half-width for the hand-drawn icons (normalised), matched to Segoe Fluent's weight.
 const OUTLINE_HW: f32 = 0.030;
 
-/// Rasterize `shapes` as line art into a `size`×`size` RGBA buffer, colour `rgb`: an
-/// anti-aliased stroke ([`OUTLINE_HW`] wide) is traced along *each* shape's outline, so
-/// overlapping shapes keep the seam between them (a bud reads as sitting on its stem,
-/// an ear-tip as fused to its bud). This mirrors the outline look of the font glyphs, and
-/// like them is drawn at the target size to stay crisp. 4×4 supersampled for smooth edges.
+/// Rasterize `shapes` as line art (4×4 supersampled), stroking each outline separately so
+/// overlapping shapes keep their seam.
 fn render_outline(size: u32, rgb: [u8; 3], shapes: &[Shape]) -> (Vec<u8>, u32, u32) {
     const SS: u32 = 4;
     let s = size as f32;
@@ -153,9 +135,7 @@ fn render_outline(size: u32, rgb: [u8; 3], shapes: &[Shape]) -> (Vec<u8>, u32, u
     (buf, size, size)
 }
 
-/// Draw a pair of AirPods-style wireless earbuds — a round bud on a slim stem — as line
-/// art. Segoe Fluent Icons has no earbuds glyph, so the shape is defined here in
-/// normalised coordinates (origin top-left, y down) and stroked by [`render_outline`].
+/// Draw stemmed wireless earbuds as line art (normalised coordinates, y down).
 fn render_earbuds(size: u32, rgb: [u8; 3]) -> (Vec<u8>, u32, u32) {
     render_outline(
         size,
@@ -169,13 +149,8 @@ fn render_earbuds(size: u32, rgb: [u8; 3]) -> (Vec<u8>, u32, u32) {
     )
 }
 
-/// Draw a pair of round, stemless earbuds (the Sony WF / Galaxy Buds silhouette) as line
-/// art: a rounded bud body with a smaller ear-tip fused at its inner-lower edge, the two
-/// buds mirrored so the ear-tips face each other. Companion to [`render_earbuds`].
-///
-/// The `y` values are chosen so the shape's bounding box is vertically centred in the box
-/// (body top ≈0.32, ear-tip bottom ≈0.68), matching the vertical placement of the font
-/// glyphs and the stem earbuds beside it.
+/// Draw round, stemless earbuds (body plus a fused ear-tip, mirrored) as line art, vertically
+/// centred like the font glyphs.
 fn render_round_earbuds(size: u32, rgb: [u8; 3]) -> (Vec<u8>, u32, u32) {
     render_outline(
         size,
@@ -203,15 +178,8 @@ fn dist_to_segment(px: f32, py: f32, ax: f32, ay: f32, bx: f32, by: f32) -> f32 
     ((px - cx).powi(2) + (py - cy).powi(2)).sqrt()
 }
 
-/// Rasterize an arbitrary Segoe Fluent glyph into a `size`×`size` RGBA buffer, colour
-/// `rgb`, its bounding box centred in the box. Used for the built-in [`IconId`] set and
-/// for the flyout's control glyphs (speaker, mic, gear…) so they all align identically.
-///
-/// Rendered through DirectWrite — the same engine the Windows shell uses for its own tray
-/// glyphs — with grid-fitting (hinting) so strokes snap to whole pixels and stay crisp at
-/// the 16–24 px tray size, instead of the soft, unhinted grey edges a plain glyph
-/// rasteriser produces. Falls back to [`render_glyph_ab`] only if DirectWrite is somehow
-/// unavailable.
+/// Rasterize a Segoe Fluent glyph into a `size`×`size` RGBA buffer, centred. Uses grid-fitted
+/// DirectWrite for crisp tray-size strokes, else [`render_glyph_ab`].
 pub fn render_glyph(glyph: char, size: u32, rgb: [u8; 3]) -> Result<(Vec<u8>, u32, u32)> {
     DWRITE.with(|cell| match cell.get_or_init(Dwrite::new) {
         Some(dw) => dw.render(glyph, size, rgb),
@@ -219,9 +187,7 @@ pub fn render_glyph(glyph: char, size: u32, rgb: [u8; 3]) -> Result<(Vec<u8>, u3
     })
 }
 
-/// A DirectWrite factory + Segoe Fluent font face, cached per thread (all rendering runs on
-/// the tray/flyout thread). DirectWrite objects are cheap to keep alive and avoid rebuilding
-/// the face on every icon refresh / flyout repaint.
+/// A DirectWrite factory and Segoe Fluent face, cached per thread.
 struct Dwrite {
     factory: IDWriteFactory2,
     face: IDWriteFontFace,
@@ -314,8 +280,7 @@ impl Dwrite {
     }
 }
 
-/// Fallback glyph rasteriser (unhinted, via `ab_glyph`) used only if DirectWrite can't be
-/// initialised. Kept because the earbud icons and flyout text still rely on `ab_glyph`.
+/// Fallback glyph rasteriser (unhinted `ab_glyph`) for when DirectWrite cannot initialise.
 fn render_glyph_ab(glyph: char, size: u32, rgb: [u8; 3]) -> Result<(Vec<u8>, u32, u32)> {
     let font = fluent_font().context("Segoe Fluent Icons font not found")?;
     let mut buf = vec![0u8; (size * size * 4) as usize];
@@ -353,10 +318,7 @@ pub(crate) fn fluent_font() -> Option<&'static FontVec> {
     .as_ref()
 }
 
-/// Starting glyph for a device before the user assigns one in Settings.
-///
-/// Form factor is the base (it can't tell earbuds from headphones — plan §2.2), then a
-/// friendly-name heuristic refines toward wireless earbuds when the name gives it away.
+/// Starting glyph for a device: from the form factor, refined toward earbuds by its name.
 pub fn default_icon(form_factor: FormFactor, name_hint: &str) -> IconId {
     let base = match form_factor {
         FormFactor::Speakers => IconId::Speakers,

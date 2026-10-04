@@ -1,13 +1,6 @@
-//! Publishing what the strip should show.
-//!
-//! The TAP lives in `explorer.exe` and cannot call into this process, so the now-playing
-//! state is handed over as a small file it re-reads. A file rather than a message because
-//! the cover art has to reach XAML as an image *source*, and the only way to give XAML a
-//! bitmap it did not create is a path — so a file is in play regardless, and one mechanism
-//! beats two.
-//!
-//! Written atomically (temp file, then rename over the target) so the TAP never reads a
-//! half-written state.
+//! Publishing what the strip should show, as a small file the TAP re-reads (the cover must reach
+//! XAML as a path anyway, so one file mechanism serves both). Written atomically so the TAP never
+//! reads a half-written state; key names are shared with the TAP's `music::state`.
 
 use std::io::Write;
 
@@ -17,33 +10,19 @@ use crate::music::feed::{PlaybackStatus, State};
 
 use tap_proto::MUSIC_STATE_FILE as STATE_FILE;
 
-/// Cover files are written as `audio-tray-cover-<pid>-<n>.png`.
-///
-/// A new name per cover, not one reused name: XAML's `BitmapImage` caches by URI, so
-/// rewriting the same path leaves the *previous* cover on screen — the track changes and
-/// the art does not.
-///
-/// **The pid is what makes that true across restarts, and it was missing.** The counter starts at
-/// zero every launch, so restarting audio-tray wrote the next cover to `…-1.png` — a path Explorer
-/// very likely still had cached from the previous run, since Explorer normally outlives us. The
-/// result is the exact defect the counter exists to prevent, reached the one way it was not guarding
-/// against. Names are unique per *process* now, not merely per cover.
+/// Cover files are `audio-tray-cover-<pid>-<n>.png`: a fresh name per cover because `BitmapImage`
+/// caches by URI, and the pid because Explorer outlives us and keeps the previous run's names cached.
 const COVER_PREFIX: &str = "audio-tray-cover-";
 
 pub struct Publisher {
-    /// The last state written, so an unchanged snapshot costs no disk write. The TAP
-    /// rebuilds its XAML subtree whenever this file changes, and rebuilding destroys the
-    /// elements under the cursor — so writing needlessly would break clicking.
+    /// The last state written, so an unchanged snapshot costs no write (or TAP re-read).
     last: Option<String>,
     /// Bumped per cover to defeat `BitmapImage`'s URI cache.
     cover_generation: u64,
     /// The cover file currently referenced, deleted once a newer one replaces it.
     current_cover: Option<std::path::PathBuf>,
-    /// Content fingerprint of the cover on disk, so identical artwork is not rewritten.
-    ///
-    /// Compared by content rather than by track, because consecutive tracks from one album
-    /// carry the same art — and a rewrite would change the URI, forcing the TAP to rebuild
-    /// the strip and dropping the click handlers for no reason.
+    /// Content fingerprint of the cover on disk: same-album tracks share art, and a rewrite would
+    /// change the URI and make the TAP rebuild the cover for nothing.
     current_cover_fingerprint: Option<(usize, u64)>,
 }
 
@@ -58,9 +37,7 @@ impl Publisher {
         }
     }
 
-    /// Write `state` out, if it differs from what was last written.
-    ///
-    /// Returns whether anything was written.
+    /// Write `state` out if it differs from what was last written; returns whether it wrote.
     pub fn publish(&mut self, state: &State) -> Result<bool> {
         let (title, artist, status, cover) = match state {
             State::Absent => (String::new(), String::new(), "stopped", None),
@@ -76,8 +53,6 @@ impl Publisher {
             ),
         };
 
-        // The cover is compared by *content*, because a track change can reuse artwork
-        // (same album) and rewriting it would force a needless rebuild.
         let cover_changed = cover.map(fingerprint) != self.current_cover_fingerprint;
         let cover_path = if cover_changed {
             self.write_cover(cover)?
@@ -103,7 +78,7 @@ impl Publisher {
         Ok(true)
     }
 
-    /// Remove the published state, so the TAP hands the Widgets button back.
+    /// Remove the published state and current cover, so the TAP has nothing new to draw.
     pub fn clear(&mut self) {
         let _ = std::fs::remove_file(state_path());
         if let Some(cover) = self.current_cover.take() {
@@ -113,10 +88,8 @@ impl Publisher {
         self.current_cover_fingerprint = None;
     }
 
-    /// Write new cover bytes to a fresh filename and drop the previous one.
-    ///
-    /// On a failed write the previous cover stays current (and on disk), so nothing is leaked and
-    /// the next poll retries.
+    /// Write new cover bytes to a fresh filename and drop the previous one. On failure the previous
+    /// cover stays current and the next poll retries.
     fn write_cover(&mut self, cover: Option<&[u8]>) -> Result<Option<String>> {
         let next = match cover {
             Some(bytes) => {
@@ -144,15 +117,8 @@ fn state_path() -> std::path::PathBuf {
     std::env::temp_dir().join(STATE_FILE)
 }
 
-/// Delete cover files left behind by earlier runs.
-///
-/// A cover is deleted when the next one replaces it, and the last one when the app shuts down
-/// cleanly — so the only files this finds are from a run that was *killed*, which skips both. Without
-/// this they accumulate in `%TEMP%` forever, one per track played in that session.
-///
-/// Files carrying our own pid are left alone. Reusing a pid is possible in principle; the worst it
-/// could do is delete a cover we are about to rewrite anyway, and the write does not depend on the
-/// file being absent.
+/// Delete cover files left in `%TEMP%` by killed runs (clean runs delete their own). Files with our
+/// own pid are left alone.
 fn sweep_orphaned_covers() {
     let ours = format!("{COVER_PREFIX}{}-", std::process::id());
     let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
@@ -167,16 +133,12 @@ fn sweep_orphaned_covers() {
     }
 }
 
-/// Cheap content fingerprint — length plus a sum, which is ample to notice a different
-/// cover and costs nothing next to hashing 25 KB four times a second.
+/// Cheap content fingerprint (length plus byte sum): ample to notice a different cover.
 fn fingerprint(bytes: &[u8]) -> (usize, u64) {
     (bytes.len(), bytes.iter().map(|b| u64::from(*b)).sum())
 }
 
-/// Strip anything that would corrupt the line-based format.
-///
-/// Newlines are the only real hazard — a title containing one would be read as a second
-/// key — and they do not occur in practice, but the format must not depend on that.
+/// Strip newlines, which would corrupt the line-based format.
 fn sanitise(text: &str) -> String {
     text.replace(['\r', '\n'], " ").trim().to_string()
 }
@@ -192,8 +154,7 @@ fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
         let _ = std::fs::remove_file(&temp);
         return Err(e.into());
     }
-    // `rename` over an existing file fails on Windows; `fs::rename` maps to MoveFileEx
-    // with replace semantics in std, so this is safe.
+    // std's `fs::rename` uses MoveFileEx with replace semantics, so this overwrites on Windows.
     std::fs::rename(&temp, path).inspect_err(|_| {
         let _ = std::fs::remove_file(&temp);
     })?;

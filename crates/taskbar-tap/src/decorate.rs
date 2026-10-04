@@ -667,14 +667,28 @@ fn on_accent(rgb: [u8; 3], alpha: u8) -> &'static str {
     }
 }
 
-fn factory<I: Interface>(class: &str) -> Option<I> {
-    match unsafe { RoGetActivationFactory(&HSTRING::from(class)) } {
-        Ok(f) => Some(f),
-        Err(err) => {
-            logf!("RoGetActivationFactory({class}) failed: {err}");
-            None
-        }
+/// A WinRT activation factory, cached per class on this (the XAML) thread: the sweep asks for the
+/// automation statics once per taskbar button per tick, and each `RoGetActivationFactory` is a
+/// string lookup plus a call into the runtime. Interfaces are not `Send`, hence thread-local.
+pub(crate) fn factory<I: Interface>(class: &'static str) -> Option<I> {
+    thread_local! {
+        static CACHE: std::cell::RefCell<Vec<(&'static str, windows_core::IUnknown)>> = const { std::cell::RefCell::new(Vec::new()) };
     }
+    let cached = CACHE.with(|cache| cache.borrow().iter().find(|(name, _)| *name == class).map(|(_, f)| f.clone()));
+    let unknown = match cached {
+        Some(unknown) => unknown,
+        None => match unsafe { RoGetActivationFactory::<windows_core::IUnknown>(&HSTRING::from(class)) } {
+            Ok(unknown) => {
+                CACHE.with(|cache| cache.borrow_mut().push((class, unknown.clone())));
+                unknown
+            }
+            Err(err) => {
+                logf!("RoGetActivationFactory({class}) failed: {err}");
+                return None;
+            }
+        },
+    };
+    unknown.cast().ok()
 }
 
 /// The tooltip text Explorer exposes for a notify icon, used to tell tray icons

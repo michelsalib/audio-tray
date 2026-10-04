@@ -21,31 +21,13 @@ use crate::tree;
 use crate::winrt::{IFrameworkElement, IGridStatics, GRID};
 use crate::xamlom::{IXamlDiagnostics, InstanceHandle};
 use windows::Win32::Foundation::S_OK;
-use windows::Win32::System::WinRT::RoGetActivationFactory;
-use windows_core::{Interface, HSTRING};
+use windows_core::Interface;
 
 /// The tray's root grid; its children are the sections we reorder.
 const FRAME_GRID: &str = "SystemTrayFrameGrid";
 
-thread_local! {
-    /// Cached because this is reached from the visual-tree callback, which fires
-    /// for every element in the replay — re-acquiring the factory each time made
-    /// the replay crawl. COM interfaces are not `Send`, hence thread-local rather
-    /// than a static.
-    static GRID_STATICS: std::cell::OnceCell<Option<IGridStatics>> = const { std::cell::OnceCell::new() };
-}
-
 fn grid_statics() -> Option<IGridStatics> {
-    GRID_STATICS.with(|cell| {
-        cell.get_or_init(|| match unsafe { RoGetActivationFactory(&HSTRING::from(GRID)) } {
-            Ok(statics) => Some(statics),
-            Err(err) => {
-                logf!("RoGetActivationFactory({GRID}) failed: {err}");
-                None
-            }
-        })
-        .clone()
-    })
+    crate::decorate::factory(GRID)
 }
 
 /// Cheap, tree-only precondition: both sections we need to reorder are recorded.

@@ -224,14 +224,7 @@ pub unsafe fn clear_child(diagnostics: &IXamlDiagnostics, handle: InstanceHandle
 /// # Safety
 /// XAML UI thread only.
 unsafe fn load_markup(markup: &str) -> Option<IInspectable> {
-    let reader: IXamlReaderStatics =
-        match windows::Win32::System::WinRT::RoGetActivationFactory(&HSTRING::from(XAML_READER)) {
-            Ok(factory) => factory,
-            Err(err) => {
-                logf!("music: XamlReader factory failed ({err})");
-                return None;
-            }
-        };
+    let reader: IXamlReaderStatics = crate::decorate::factory(XAML_READER)?;
     let markup = HSTRING::from(markup);
     // `HSTRING` is repr(transparent) over the handle; `as_ptr` would hand over the UTF-16 buffer
     // instead, which the callee would misread as a handle.
@@ -332,9 +325,11 @@ unsafe fn pin_left(diagnostics: &IXamlDiagnostics, handle: InstanceHandle) {
     let _ = framework.put_HorizontalAlignment(HORIZONTAL_ALIGNMENT_LEFT);
 }
 
+/// Set the left margin, keeping the template's other three sides.
+///
 /// # Safety
 /// XAML UI thread only.
-unsafe fn set_margin(diagnostics: &IXamlDiagnostics, handle: InstanceHandle, margin: Thickness) {
+unsafe fn set_margin_left(diagnostics: &IXamlDiagnostics, handle: InstanceHandle, left: f64) {
     let Some(object) = object_from_handle(diagnostics, handle) else {
         return;
     };
@@ -342,11 +337,19 @@ unsafe fn set_margin(diagnostics: &IXamlDiagnostics, handle: InstanceHandle, mar
         return;
     };
     let mut live = Thickness::default();
-    if framework.get_Margin(&mut live) == S_OK && (live.left - margin.left).abs() < 0.5 {
+    if framework.get_Margin(&mut live) != S_OK {
+        return;
+    }
+    if (live.left - left).abs() < 0.5 {
         return;
     }
     remember(diagnostics, handle);
-    let _ = framework.put_Margin(margin);
+    let _ = framework.put_Margin(Thickness { left, ..live });
+}
+
+/// Forget originals of elements the shell has since destroyed (every indicator rebuild leaves one).
+pub fn prune_originals() {
+    crate::lock(&ORIGINALS).retain(|(handle, _)| crate::tree::type_of(*handle).is_some());
 }
 
 /// Bring a strip already on screen in line with a new track, without replacing it.
@@ -391,6 +394,8 @@ pub unsafe fn update_in_place(
         }
         ok &= wrote;
         wrote_anything |= wrote;
+        // The new text starts at the beginning of its scroll, not wherever the old one had got to.
+        super::tick::restart();
     }
 
     if shown.cover != next.cover {
@@ -469,14 +474,7 @@ pub unsafe fn place_button_state(diagnostics: &IXamlDiagnostics, button: Instanc
                 set_width(diagnostics, child, width);
             }
             pin_left(diagnostics, child);
-            set_margin(
-                diagnostics,
-                child,
-                Thickness {
-                    left,
-                    ..Default::default()
-                },
-            );
+            set_margin_left(diagnostics, child, left);
         }
     }
 }

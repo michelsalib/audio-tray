@@ -1160,6 +1160,35 @@ The lesson worth carrying: three plausible fixes in a row all *reduced* the chur
 theory alive long after it should have died. What settled it was reading the log for what we were
 telling the shell to do, rather than reasoning about what the shell does to us.
 
+### Re-pinning the indicators on the event, not the sweep
+
+The shell rebuilds `ProgressIndicator` (and `RunningIndicator`) from the button template whenever the
+bar is taken away and given back, and the fresh element is centred at its natural width until
+something writes our margin and width again. With only the 250 ms sweep behind the 400 ms quiet gate,
+that default stayed on screen for about **500 ms** (filmed: centred from +56 ms to +540 ms after
+`--music-progress 40`, pinned at +589 ms).
+
+`OnVisualTreeChange` now posts `WM_TAP_REPIN` when it sees one of those two added under a button we
+draw into; the control window runs just `place_button_state` once the stream has been quiet for
+**32 ms**, retrying every 16 ms for up to a second. Filmed after: the centred default shows for one
+frame (+78..91 ms) and is pinned by +138 ms. The write still never happens inside the callback.
+
+Why 32 ms is enough here when `put_Content` needs 400: what wedged the shell was `put_Content`
+building a subtree synchronously and so re-entering the stream it was called from. The re-pin writes
+`Width`, `MinWidth`, `HorizontalAlignment` and `Margin` on elements that already exist; that only
+invalidates layout, which the shell runs on its own pass. Two frames is the margin `wire_transport`
+already uses for attaching handlers. The sweep still re-applies everything as the slower safety net.
+
+Same change: `set_margin` used to write `Thickness { left, ..Default }`, zeroing the template's other
+sides; the record of originals grew by one entry per indicator rebuild (now pruned to live elements);
+and a new title started mid-scroll because the ticker's step counter was never reset.
+
+Sweep cost, from the timing the TAP now logs (`sweep cost:`; debug build, one taskbar, music tile up):
+**1111 µs average / 7615 µs worst** per tick with whole-map scans in `children_of`/`find_by_*` and an
+activation-factory lookup per `TaskListButton`; **802 / 5512 µs** with a parent, type and name index
+on the recorded tree and a per-thread factory cache. The remainder is COM calls into XAML (automation
+names, width reads), not bookkeeping.
+
 ### Seen live
 
 The last mile is done: the strip has been watched through track changes with the title,

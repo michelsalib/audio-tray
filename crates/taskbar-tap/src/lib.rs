@@ -610,6 +610,12 @@ impl IVisualTreeServiceCallback_Impl for Tap_Impl {
                 lifecycle::nudge_transport();
             }
 
+            // The shell rebuilt a tracked button's progress bar or running pill from its template:
+            // ask for a re-pin now (posted — the write happens outside this callback).
+            if added && (name == "ProgressIndicator" || name == "RunningIndicator") && music::is_tracked_part(element.handle) {
+                lifecycle::nudge_repin();
+            }
+
             // Everything below touches the tray, so it may only run on the thread
             // that owns it. The triggers are element *types* and *names*, which
             // match in every island — "a ContentPresenter was added" fires on the
@@ -1035,6 +1041,65 @@ unsafe fn wire_transport_now(diagnostics: &xamlom::IXamlDiagnostics) {
 /// far short of the time it takes a hand to move from the taskbar button down to the buttons under
 /// it. See [`wire_transport`] for why this is not simply [`QUIET_BEFORE_MUTATING`].
 const QUIET_BEFORE_WIRING: std::time::Duration = std::time::Duration::from_millis(32);
+
+/// How long the stream must be silent before the event-driven re-pin ([`repin`]).
+///
+/// Two frames, like [`QUIET_BEFORE_WIRING`]. The 400 ms gate exists for `put_Content`, which builds
+/// a subtree synchronously and so re-enters the very stream it was issued from — that is what wedged
+/// the shell (FINDINGS.md, "never mutate from inside the event stream"). A re-pin only writes
+/// `Width`/`MinWidth`/`HorizontalAlignment`/`Margin` on existing elements, which invalidates layout
+/// (run later, by the shell's own pass) and creates nothing; it still never runs inside the
+/// callback, only from the posted message, and still waits for the rebuild's own burst to end.
+const QUIET_BEFORE_REPIN: std::time::Duration = std::time::Duration::from_millis(32);
+
+/// Re-pin the music tile's indicators right after the shell rebuilt one, instead of waiting for the
+/// sweep and its 400 ms gate (during which the template default — centred, natural width — shows).
+/// Returns `false` to be retried shortly: the thread is mid-call, or the burst is still going.
+///
+/// # Safety
+/// Tray thread only (the control window's procedure).
+pub(crate) unsafe fn repin() -> bool {
+    if !live() {
+        return true;
+    }
+    let Some(_busy) = BusyGuard::claim() else {
+        return false;
+    };
+    if !tree::quiet_for(QUIET_BEFORE_REPIN) {
+        return false;
+    }
+    if let Some(diagnostics) = diagnostics() {
+        music::repin(&diagnostics);
+    }
+    true
+}
+
+/// [`sweep`], timed: logs the average and worst cost once every [`SWEEP_REPORT_EVERY`] ticks.
+///
+/// # Safety
+/// As for [`sweep`].
+pub(crate) unsafe fn timed_sweep() {
+    static STATS: Mutex<(u32, u128, u128)> = Mutex::new((0, 0, 0));
+    static REPORTS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let started = std::time::Instant::now();
+    sweep();
+    let micros = started.elapsed().as_micros();
+    let mut stats = lock(&STATS);
+    stats.0 += 1;
+    stats.1 += micros;
+    stats.2 = stats.2.max(micros);
+    // The first report comes early (half a minute), so a fresh session shows the cost at once.
+    let every = if REPORTS.load(Ordering::SeqCst) == 0 { SWEEP_REPORT_FIRST } else { SWEEP_REPORT_EVERY };
+    if stats.0 >= every {
+        REPORTS.fetch_add(1, Ordering::SeqCst);
+        logf!("sweep cost: avg {} us, max {} us over {} ticks", stats.1 / u128::from(stats.0), stats.2, stats.0);
+        *stats = (0, 0, 0);
+    }
+}
+
+/// About ten minutes at the fast pace.
+const SWEEP_REPORT_EVERY: u32 = 2400;
+const SWEEP_REPORT_FIRST: u32 = 120;
 
 /// How long the visual-tree stream must be silent before we touch XAML.
 ///

@@ -7,7 +7,7 @@
 //! dumps again, which is how you watch a flyout open or the taskbar re-theme.
 
 use crate::log::logf;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -28,12 +28,56 @@ struct Node {
 #[derive(Default)]
 struct Tree {
     nodes: HashMap<u64, Node>,
+    /// Indexes over `nodes`, kept in step by [`Tree::link`]/[`Tree::unlink`], so the sweep's lookups
+    /// do not scan every recorded element.
+    children: HashMap<u64, HashSet<u64>>,
+    by_type: HashMap<String, HashSet<u64>>,
+    by_name: HashMap<String, HashSet<u64>>,
     adds: u64,
     removes: u64,
     seq: u64,
     last_event: Option<Instant>,
     dirty: bool,
     dumps: u32,
+}
+
+impl Tree {
+    fn link(&mut self, handle: u64, node: Node) {
+        if let Some(old) = self.nodes.remove(&handle) {
+            self.unindex(handle, &old);
+        }
+        self.children.entry(node.parent).or_default().insert(handle);
+        self.by_type.entry(node.type_name.clone()).or_default().insert(handle);
+        if !node.name.is_empty() {
+            self.by_name.entry(node.name.clone()).or_default().insert(handle);
+        }
+        self.nodes.insert(handle, node);
+    }
+
+    fn unlink(&mut self, handle: u64) {
+        if let Some(old) = self.nodes.remove(&handle) {
+            self.unindex(handle, &old);
+        }
+    }
+
+    fn unindex(&mut self, handle: u64, node: &Node) {
+        fn drop_from(map: &mut HashMap<String, HashSet<u64>>, key: &str, handle: u64) {
+            if let Some(list) = map.get_mut(key) {
+                list.remove(&handle);
+                if list.is_empty() {
+                    map.remove(key);
+                }
+            }
+        }
+        if let Some(list) = self.children.get_mut(&node.parent) {
+            list.remove(&handle);
+            if list.is_empty() {
+                self.children.remove(&node.parent);
+            }
+        }
+        drop_from(&mut self.by_type, &node.type_name, handle);
+        drop_from(&mut self.by_name, &node.name, handle);
+    }
 }
 
 fn tree() -> &'static Mutex<Tree> {
@@ -87,19 +131,10 @@ pub fn record(
         tree.adds += 1;
         let seq = tree.seq;
         tree.seq += 1;
-        tree.nodes.insert(
-            child,
-            Node {
-                parent,
-                child_index,
-                type_name,
-                name,
-                seq,
-            },
-        );
+        tree.link(child, Node { parent, child_index, type_name, name, seq });
     } else {
         tree.removes += 1;
-        tree.nodes.remove(&child);
+        tree.unlink(child);
     }
     tree.last_event = Some(Instant::now());
     tree.dirty = true;
@@ -125,10 +160,11 @@ pub fn quiet_for(period: Duration) -> bool {
 pub fn find_by_type(type_name: &str) -> Vec<u64> {
     let tree = lock();
     let mut hits: Vec<(u64, u64)> = tree
-        .nodes
-        .iter()
-        .filter(|(_, node)| node.type_name == type_name)
-        .map(|(&handle, node)| (node.seq, handle))
+        .by_type
+        .get(type_name)
+        .into_iter()
+        .flatten()
+        .filter_map(|handle| tree.nodes.get(handle).map(|node| (node.seq, *handle)))
         .collect();
     hits.sort_unstable();
     hits.into_iter().map(|(_, handle)| handle).collect()
@@ -138,10 +174,11 @@ pub fn find_by_type(type_name: &str) -> Vec<u64> {
 pub fn children_of(parent: u64) -> Vec<u64> {
     let tree = lock();
     let mut kids: Vec<(u32, u64, u64)> = tree
-        .nodes
-        .iter()
-        .filter(|(_, node)| node.parent == parent)
-        .map(|(&handle, node)| (node.child_index, node.seq, handle))
+        .children
+        .get(&parent)
+        .into_iter()
+        .flatten()
+        .filter_map(|handle| tree.nodes.get(handle).map(|node| (node.child_index, node.seq, *handle)))
         .collect();
     kids.sort_unstable();
     kids.into_iter().map(|(_, _, handle)| handle).collect()
@@ -150,11 +187,7 @@ pub fn children_of(parent: u64) -> Vec<u64> {
 /// Every recorded element carrying the given `x:Name`.
 pub fn find_by_name(name: &str) -> Vec<u64> {
     let tree = lock();
-    tree.nodes
-        .iter()
-        .filter(|(_, node)| node.name == name)
-        .map(|(&handle, _)| handle)
-        .collect()
+    tree.by_name.get(name).map(|set| set.iter().copied().collect()).unwrap_or_default()
 }
 
 /// When a handle was announced, as a monotonic sequence number.
@@ -289,5 +322,32 @@ fn write_subtree(tree: &Tree, children: &HashMap<u64, Vec<u64>>, handle: u64, de
         for &child in bucket {
             write_subtree(tree, children, child, depth + 1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn node(parent: u64, type_name: &str, name: &str, seq: u64) -> Node {
+        Node { parent, child_index: 0, type_name: type_name.into(), name: name.into(), seq }
+    }
+
+    #[test]
+    fn indexes_follow_adds_moves_and_removes() {
+        let mut tree = Tree::default();
+        tree.link(10, node(1, "Grid", "A", 0));
+        tree.link(11, node(1, "Border", "", 1));
+        assert_eq!(tree.children[&1].len(), 2);
+        // Re-announced under another parent with another name: old index entries go.
+        tree.link(10, node(2, "Grid", "B", 2));
+        assert_eq!(tree.children[&1].iter().copied().collect::<Vec<_>>(), vec![11]);
+        assert!(tree.children[&2].contains(&10));
+        assert!(!tree.by_name.contains_key("A"));
+        assert!(tree.by_name["B"].contains(&10));
+        tree.unlink(10);
+        tree.unlink(11);
+        assert!(tree.children.is_empty() && tree.by_type.is_empty() && tree.by_name.is_empty());
+        assert!(!tree.by_name.contains_key(""), "unnamed elements are not indexed by name");
     }
 }

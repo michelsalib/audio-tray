@@ -27,7 +27,7 @@ use windows::Win32::System::Threading::{
 };
 use windows::Win32::System::DataExchange::COPYDATASTRUCT;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, PostMessageW, RegisterClassW, SetTimer, HMENU, WM_APP,
+    CreateWindowExW, DefWindowProcW, KillTimer, PostMessageW, RegisterClassW, SetTimer, HMENU, WM_APP,
     WM_COPYDATA, WM_TIMER, WNDCLASSW, WS_EX_TOOLWINDOW, WS_POPUP,
 };
 
@@ -56,6 +56,17 @@ pub const WM_TAP_RESTYLE: u32 = WM_APP + 23;
 /// they all land on windows in this process: audio-tray uses `WM_APP + 20` through `+ 25`, so this
 /// starts after them rather than colliding with one from the other side.
 pub const WM_TAP_WIRE_TRANSPORT: u32 = WM_APP + 26;
+
+/// "A tracked button's `ProgressIndicator`/`RunningIndicator` was just rebuilt — re-pin it." In-process,
+/// like [`WM_TAP_WIRE_TRANSPORT`]; posted from the visual-tree callback, handled here.
+pub const WM_TAP_REPIN: u32 = WM_APP + 27;
+
+/// Retries a re-pin that met a busy thread or a stream that was not yet quiet.
+const REPIN_TIMER: usize = 2;
+const REPIN_RETRY_MS: u32 = 16;
+/// About a second of retries; past that the sweep (the safety net) takes over.
+const REPIN_MAX_TRIES: u32 = 60;
+static REPIN_TRIES: AtomicU32 = AtomicU32::new(0);
 
 /// Timer id for the periodic check that the strip is still there.
 const SWEEP_TIMER: usize = 1;
@@ -216,8 +227,24 @@ unsafe extern "system" fn control_proc(
             }
         }
     }
+    if msg == WM_TAP_REPIN || (msg == WM_TIMER && wparam.0 == REPIN_TIMER) {
+        if msg == WM_TAP_REPIN {
+            REPIN_PENDING.store(false, Ordering::SeqCst);
+            REPIN_TRIES.store(0, Ordering::SeqCst);
+        }
+        let done = std::panic::catch_unwind(|| unsafe { crate::repin() }).unwrap_or_else(|_| {
+            logf!("re-pin panicked");
+            true
+        });
+        if done || REPIN_TRIES.fetch_add(1, Ordering::SeqCst) >= REPIN_MAX_TRIES {
+            let _ = unsafe { KillTimer(Some(hwnd), REPIN_TIMER) };
+        } else {
+            unsafe { SetTimer(Some(hwnd), REPIN_TIMER, REPIN_RETRY_MS, None) };
+        }
+        return LRESULT(0);
+    }
     if msg == WM_TIMER && wparam.0 == SWEEP_TIMER {
-        let caught = std::panic::catch_unwind(|| unsafe { crate::sweep() });
+        let caught = std::panic::catch_unwind(|| unsafe { crate::timed_sweep() });
         if caught.is_err() {
             logf!("sweep panicked");
         }
@@ -280,6 +307,22 @@ pub fn nudge_transport() {
         // Nothing else clears the flag, and a lost post must not wedge every later request. The
         // sweep is the fallback either way.
         WIRE_PENDING.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Whether a re-pin is already queued, so a burst of indicator rebuilds costs one message.
+static REPIN_PENDING: AtomicBool = AtomicBool::new(false);
+
+/// Ask for the music tile's indicators to be re-pinned as soon as the stream allows. Safe from inside
+/// the visual-tree callback and from any thread: it only posts.
+pub fn nudge_repin() {
+    let hwnd = WINDOW.load(Ordering::SeqCst);
+    if hwnd == 0 || REPIN_PENDING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let posted = unsafe { PostMessageW(Some(HWND(hwnd as *mut core::ffi::c_void)), WM_TAP_REPIN, WPARAM(0), LPARAM(0)) };
+    if posted.is_err() {
+        REPIN_PENDING.store(false, Ordering::SeqCst);
     }
 }
 

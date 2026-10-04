@@ -112,6 +112,7 @@ pub unsafe fn sweep(diagnostics: &IXamlDiagnostics) {
     // A record whose button XAML has removed — a display unplugged, the app closed. Dropping it
     // cannot lose a strip: the element it named is gone, so there is nothing left to hand back.
     crate::lock(&PLACED).retain(|placed| crate::tree::type_of(placed.button).is_some());
+    tile::prune_originals();
 
     // Where a strip now is, and what any out-of-date one is still showing. Both are collected before
     // a single character is written, because the content writes reach **every** strip at once — they
@@ -161,6 +162,7 @@ pub unsafe fn sweep(diagnostics: &IXamlDiagnostics) {
                         strip.playback
                     );
                     record(button, border, &strip);
+                    tick::restart();
                     drawn.push((button, border));
                 }
             }
@@ -197,6 +199,40 @@ pub unsafe fn sweep(diagnostics: &IXamlDiagnostics) {
     // One call for every strip on screen, for the same reason the content writes are: the ticker
     // writes its window to every `TextBlock` of that name, wherever it is.
     tick::scroll(diagnostics, &strip);
+}
+
+/// Whether `handle` sits (within three levels) under a button we have drawn into. Tree-only, so it
+/// is safe from the visual-tree callback.
+pub fn is_tracked_part(handle: InstanceHandle) -> bool {
+    let placed: Vec<InstanceHandle> = crate::lock(&PLACED).iter().map(|placed| placed.button).collect();
+    if placed.is_empty() {
+        return false;
+    }
+    let mut at = handle;
+    for _ in 0..3 {
+        let Some(parent) = crate::tree::parent_of(at) else {
+            return false;
+        };
+        if placed.contains(&parent) {
+            return true;
+        }
+        at = parent;
+    }
+    false
+}
+
+/// Re-pin the shell's indicators on every button we draw into — the event-driven half of what the
+/// sweep re-applies. Property writes only.
+///
+/// # Safety
+/// XAML UI thread only, outside the visual-tree callback, with the stream briefly quiet.
+pub unsafe fn repin(diagnostics: &IXamlDiagnostics) {
+    let buttons: Vec<InstanceHandle> = crate::lock(&PLACED).iter().map(|placed| placed.button).collect();
+    for button in buttons {
+        if crate::tree::type_of(button).is_some() {
+            tile::place_button_state(diagnostics, button);
+        }
+    }
 }
 
 /// Hand the button back: our content out, the shell's own widths and indicators restored.

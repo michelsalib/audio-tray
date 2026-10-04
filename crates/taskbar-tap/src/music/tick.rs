@@ -19,6 +19,11 @@ const SWEEPS_PER_CHARACTER: u32 = 4;
 
 static SWEEP: AtomicU32 = AtomicU32::new(0);
 
+/// Start the scroll over from the first character — for a new title or a freshly placed strip.
+pub fn restart() {
+    SWEEP.store(0, Ordering::SeqCst);
+}
+
 /// Move the ticker on one step, if anything needs it.
 ///
 /// # Safety

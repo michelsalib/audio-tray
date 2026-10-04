@@ -655,14 +655,14 @@ fn handle_flyout(
         refresh(backend, tray, config);
     }
     if outcome.restart {
-        restart_app();
+        restart_app(backend, config);
     }
     if outcome.quit {
         // Put the taskbar back before we go. The TAP also watches this process
         // and reverts when it sees it exit, which is what covers a kill or a
         // crash — but asking explicitly means a normal quit tidies up promptly
         // and predictably instead of racing our own teardown.
-        crate::taskbar::revert();
+        crate::taskbar::revert(std::process::id());
         unsafe { PostQuitMessage(0) };
     }
     Ok(())
@@ -672,17 +672,23 @@ fn handle_flyout(
 /// the newer build takes over. Best-effort: if the relaunch fails we stay running rather
 /// than leaving the user with no tray.
 ///
-/// Deliberately does *not* revert the taskbar strip: the replacement process
-/// injects again and adopts the strip that is already there, so tearing it down
-/// here would only make it flicker. The TAP recognises the handover by process
-/// id and skips the revert its watcher would otherwise fire.
-fn restart_app() {
-    match std::env::current_exe() {
-        Ok(exe) => match std::process::Command::new(exe).spawn() {
-            Ok(_) => unsafe { PostQuitMessage(0) },
-            Err(e) => eprintln!("restart: failed to relaunch: {e:#}"),
-        },
-        Err(e) => eprintln!("restart: current_exe() failed: {e:#}"),
+/// Deliberately does *not* revert the taskbar strip: ownership is transferred to the child up
+/// front, so the TAP's owner watch ignores our exit, and the child (which waits for the instance
+/// mutex — see [`crate::instance`]) then offers its own handover, or restarts Explorer if it is a
+/// newer build than the loaded TAP.
+fn restart_app(backend: &WasapiBackend, config: &Config) {
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(e) => return eprintln!("restart: current_exe() failed: {e:#}"),
+    };
+    match std::process::Command::new(exe).arg(crate::instance::RELAUNCHED).spawn() {
+        Ok(child) => {
+            if crate::taskbar::strip_is_up() {
+                crate::taskbar::transfer_owner(child.id(), strip_icons(backend, config));
+            }
+            unsafe { PostQuitMessage(0) }
+        }
+        Err(e) => eprintln!("restart: failed to relaunch: {e:#}"),
     }
 }
 

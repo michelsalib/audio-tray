@@ -79,17 +79,24 @@ not help — the revert deliberately leaves the DLL pinned in `explorer.exe` (se
 **Users do not usually wait for that reboot.** Taking the update applies the DLL too,
 without anyone asking for it:
 
-1. `restart_app` relaunches audio-tray into the new exe.
-2. The new process starts, and `taskbar::apply_at_startup` finds the *old* process's TAP
-   still loaded in Explorer (the shell keeps it for its own lifetime). Rather than inject
-   alongside it, it calls `taskbar::restart_explorer`.
-3. That waits for the old shell to exit and, in the gap where nothing holds the DLL,
-   calls `update::place_staged_tap` — which finds the staging directory for its *own*
-   `CARGO_PKG_VERSION`, so it does not matter that a different process downloaded it.
+1. `restart_app` relaunches audio-tray into the new exe (with `--relaunched`, so it waits
+   for the single-instance mutex instead of exiting), and hands the strip's ownership to the
+   child so the TAP's owner watch ignores the old process exiting.
+2. The new process starts, and `taskbar::apply_at_startup` finds the *old* TAP still loaded
+   in Explorer (the shell keeps it for its own lifetime). It first offers it a **handover**:
+   its init data (`ver=`, `tap=`, `hwnd=`, `pid=` …) over `WM_COPYDATA` to the TAP's control
+   window. A TAP from the same version and the same DLL file accepts, re-binds owner watch and
+   receiver, and re-applies the strip — no Explorer restart. That is what happens on Quit then
+   start, after a kill, and on a relaunch that did not change the version.
+3. After an update the versions differ, so the TAP declines (an older TAP that predates the
+   handover, or one that does not answer within 3 s, counts the same) and audio-tray calls
+   `taskbar::restart_explorer`. That waits for the old shell to exit and, in the gap where
+   nothing holds the DLL, calls `update::place_staged_tap` — which finds the staging directory
+   for its *own* `CARGO_PKG_VERSION`, so it does not matter that a different process downloaded it.
 4. The fresh Explorer is injected into off `TaskbarCreated`, with the new DLL.
 
 The pending boot rename is left scheduled throughout, so a reboot remains the fallback if
-any of that does not happen. Note step 2 is also the general repair path — it is not
+any of that does not happen. The restart in step 3 is also the general repair path — it is not
 update-specific — and it is budgeted to one restart per run.
 
 Failing to place the DLL is logged and otherwise ignored: the exe has already been

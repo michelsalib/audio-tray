@@ -144,7 +144,7 @@ const WM_TAP_REVERT: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 21;
 ///
 /// Best-effort and quiet: a missing control window means nothing is injected, so
 /// there is nothing to put back.
-pub fn revert() {
+pub fn revert(owner_pid: u32) {
     use windows::Win32::Foundation::{LPARAM, WPARAM};
     use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 
@@ -152,13 +152,13 @@ pub fn revert() {
     // whole of the UI again, so its clicks have to go back to being the ones that
     // matter. Nothing about a failed post would make a strip reappear.
     STRIP_UP.store(false, std::sync::atomic::Ordering::SeqCst);
-    let Some(control) = control_window() else {
-        return;
-    };
     // Posted, not sent: this must never block on Explorer's UI thread, and there
-    // is nothing to learn from the answer.
-    if let Err(e) = unsafe { PostMessageW(Some(control), WM_TAP_REVERT, WPARAM(0), LPARAM(0)) } {
-        eprintln!("taskbar: could not ask for a revert ({e})");
+    // is nothing to learn from the answer. `owner_pid` 0 is unconditional; otherwise the TAP
+    // ignores it once another process owns the strip.
+    for control in crate::win::windows_by_class(TAP_CONTROL_CLASS) {
+        if let Err(e) = unsafe { PostMessageW(Some(control), WM_TAP_REVERT, WPARAM(owner_pid as usize), LPARAM(0)) } {
+            eprintln!("taskbar: could not ask for a revert ({e})");
+        }
     }
 }
 
@@ -173,29 +173,14 @@ fn control_window() -> Option<windows::Win32::Foundation::HWND> {
 /// across processes — measured in both directions, for us finding the TAP's
 /// control window and for the TAP finding our receiver.
 fn window_by_class(class_name: &str) -> Option<windows::Win32::Foundation::HWND> {
-    use windows::Win32::Foundation::{HWND, LPARAM};
-    use windows::Win32::UI::WindowsAndMessaging::{EnumWindows, GetClassNameW};
-    use windows_core::BOOL;
-
-    struct Search<'a> {
-        wanted: &'a str,
-        found: HWND,
-    }
-
-    unsafe extern "system" fn visit(hwnd: HWND, lparam: LPARAM) -> BOOL {
-        let search = unsafe { &mut *(lparam.0 as *mut Search) };
-        let mut class = [0u16; 64];
-        let len = unsafe { GetClassNameW(hwnd, &mut class) };
-        if len > 0 && String::from_utf16_lossy(&class[..len as usize]) == search.wanted {
-            search.found = hwnd;
-            return BOOL(0);
+    let mut found = None;
+    crate::win::enum_windows(|hwnd| {
+        if crate::win::class_name(hwnd) == class_name {
+            found = Some(hwnd);
         }
-        BOOL(1)
-    }
-
-    let mut search = Search { wanted: class_name, found: HWND(std::ptr::null_mut()) };
-    let _ = unsafe { EnumWindows(Some(visit), LPARAM(&mut search as *mut Search as isize)) };
-    (!search.found.0.is_null()).then_some(search.found)
+        found.is_none()
+    });
+    found
 }
 
 /// The process owning the desktop window — the Explorer that hosts the taskbar,
@@ -225,7 +210,7 @@ unsafe fn inject(pid: u32, dll: &std::path::Path, icons: StripIcons) -> Result<(
     // Both DLL parameters get the TAP's own path, matching the known-good C++ TAPs.
     let endpoint = crate::win::wide(ENDPOINT_NAME);
     let path = crate::win::wide(&dll.to_string_lossy());
-    let init_data = crate::win::wide(&init_data(icons));
+    let init_data = crate::win::wide(&init_data(icons, std::process::id()));
 
     let hr = initialize(
         PCWSTR(endpoint.as_ptr()),
@@ -344,22 +329,91 @@ const PILL_ALPHA: &str = "80";
 /// the glyphs, it never changes while we run — the button is chosen by the user, not by which device
 /// happens to be default — and because the strip's *content* does not travel this way at all. That
 /// goes through a file the TAP re-reads, since cover art has to reach XAML as an image source.
-fn init_data(icons: StripIcons) -> String {
+///
+/// `ver=`, `tap=` and `hwnd=` serve the handover ([`offer_handover`]): which exe version and DLL
+/// file this payload belongs to, and which receiver window to post to. Older TAPs ignore them.
+fn init_data(icons: StripIcons, owner_pid: u32) -> String {
     let [r, g, b] = crate::flyout::theme::accent_rgb();
     let music = crate::config::Config::load().music;
     let tile = if music.enabled { music.tile } else { String::new() };
+    let tap = tap_path().map(|path| path.display().to_string()).unwrap_or_default();
     format!(
         "tooltip={};out={:04X};in={:04X};\
          outmuted={};inmuted={};inrec={};accent={r:02X}{g:02X}{b:02X};alpha={PILL_ALPHA};\
-         hidevolume=1;hidemic=1;tile={tile};pid={}",
+         hidevolume=1;hidemic=1;tile={tile};pid={owner_pid};ver={};tap={tap};hwnd={}",
         crate::tray::TRAY_MARKER,
         icons.output as u32,
         icons.input as u32,
         u8::from(icons.output_muted),
         u8::from(icons.input_muted),
         u8::from(icons.input_recording),
-        std::process::id()
+        env!("CARGO_PKG_VERSION"),
+        RECEIVER.load(std::sync::atomic::Ordering::SeqCst),
     )
+}
+
+/// Our receiver window, for the `hwnd=` key. Set by [`create_receiver`].
+static RECEIVER: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+
+/// `COPYDATASTRUCT::dwData` tagging a handover. Must match `HANDOVER_MAGIC` in the TAP's
+/// `lifecycle` module, as must the two result codes below (its `HANDOVER_*`).
+const HANDOVER_MAGIC: usize = 0x4154_4831;
+const HANDOVER_ACCEPTED: usize = 1;
+const HANDOVER_DECLINED: usize = 2;
+
+/// Hand every TAP already loaded in Explorer a fresh init payload naming `owner_pid` as its owner.
+///
+/// A TAP from this exact build adopts it — re-binds owner watch and receiver, and re-applies the
+/// strip — which is what lets a relaunch skip the Explorer restart. `Err` says why none did: a
+/// different version or DLL (declined), a TAP that predates the handover, or one that did not
+/// answer within the timeout.
+fn offer_handover(icons: StripIcons, owner_pid: u32) -> Result<()> {
+    use windows::Win32::Foundation::{LPARAM, WPARAM};
+    use windows::Win32::System::DataExchange::COPYDATASTRUCT;
+    use windows::Win32::UI::WindowsAndMessaging::{SendMessageTimeoutW, SMTO_ABORTIFHUNG, WM_COPYDATA};
+
+    let payload = crate::win::wide(&init_data(icons, owner_pid));
+    let copy = COPYDATASTRUCT {
+        dwData: HANDOVER_MAGIC,
+        cbData: (payload.len() * 2) as u32,
+        lpData: payload.as_ptr() as *mut core::ffi::c_void,
+    };
+    let mut why = Vec::new();
+    for control in crate::win::windows_by_class(TAP_CONTROL_CLASS) {
+        let mut result = 0usize;
+        // Sent, not posted: `WM_COPYDATA` only carries its payload synchronously. Bounded so a
+        // wedged shell cannot hang the tray; the TAP's handler only flips state, so it is quick.
+        let sent = unsafe {
+            SendMessageTimeoutW(
+                control,
+                WM_COPYDATA,
+                WPARAM(RECEIVER.load(std::sync::atomic::Ordering::SeqCst) as usize),
+                LPARAM(&copy as *const COPYDATASTRUCT as isize),
+                SMTO_ABORTIFHUNG,
+                3_000,
+                Some(&mut result),
+            )
+        };
+        match (sent.0, result) {
+            (0, _) => why.push("did not answer".to_string()),
+            (_, HANDOVER_ACCEPTED) => return Ok(()),
+            (_, HANDOVER_DECLINED) => why.push("is from another build".to_string()),
+            _ => why.push("predates the handover".to_string()),
+        }
+    }
+    if why.is_empty() {
+        bail!("no TAP is loaded");
+    }
+    bail!("the loaded TAP {}", why.join(", "))
+}
+
+/// Make `child_pid` the owner of the strip before this process exits, so the TAP's owner watch
+/// does not revert it when we go. For `tray::restart_app`; the child then offers its own handover.
+pub fn transfer_owner(child_pid: u32, icons: StripIcons) {
+    match offer_handover(icons, child_pid) {
+        Ok(()) => println!("taskbar: strip handed to pid {child_pid}"),
+        Err(e) => eprintln!("taskbar: could not hand the strip to pid {child_pid} ({e:#}); it will be redrawn"),
+    }
 }
 
 /// "Redraw the strip with these glyphs." Must match `WM_TAP_RESTYLE` in the TAP's
@@ -701,6 +755,7 @@ pub fn create_receiver() -> Result<windows::Win32::Foundation::HWND> {
             None,
         )
         .context("create the taskbar IPC receiver window")
+        .inspect(|hwnd| RECEIVER.store(hwnd.0 as isize, std::sync::atomic::Ordering::SeqCst))
     }
 }
 
@@ -780,20 +835,28 @@ fn enable_with_retries(icons: StripIcons) -> Result<()> {
 /// Rather than settle for that, this repairs the shell in the two situations where a fresh
 /// Explorer is what is actually needed — each at most once, see [`heal_explorer`].
 pub fn apply_at_startup(icons: StripIcons) {
-    // A TAP already in this Explorer means an earlier audio-tray injected into it and the DLL is
-    // still there. Injecting now would make ours the *second*, and two TAPs in one shell is not
-    // benign: observed live, the older one's owner-watch fired its revert and undid the
-    // decoration the newer one had just applied — leaving a bare notification icon, and
-    // Explorer's own volume slot back, while every signal we have said the strip was up.
+    // A TAP already in this Explorer means an earlier audio-tray injected into it (the shell keeps
+    // the DLL for its lifetime). Injecting a second one is not benign — the older one's
+    // owner-watch can undo the newer one's decoration — so either hand the loaded one our init
+    // data, or rebuild the shell and let `TaskbarCreated` inject into a clean one.
     //
-    // So rebuild the shell and let `TaskbarCreated` inject into a clean one. This is also what
-    // completes an update: taking one relaunches audio-tray, so the new process meets the old
-    // process's TAP right here, and the restart that clears it is the same restart that frees
-    // `audio_tray_tap.dll` for `crate::update::place_staged_tap`.
-    //
-    // Silent in the normal case — at sign-in Explorer is new and carries no TAP.
-    if tap_already_present() && heal_explorer("another TAP is already loaded in Explorer") {
-        return;
+    // The handover is the normal case (Quit then start, a kill, `restart_app`). The restart is
+    // kept for a TAP from another build — which is also what completes an update, since the
+    // restart frees `audio_tray_tap.dll` for `crate::update::place_staged_tap` — and for one that
+    // does not answer.
+    if tap_already_present() {
+        match offer_handover(icons, std::process::id()) {
+            Ok(()) => {
+                STRIP_UP.store(true, std::sync::atomic::Ordering::SeqCst);
+                eprintln!("taskbar: controls handed over to the TAP already in Explorer");
+                return;
+            }
+            Err(e) => {
+                if heal_explorer(&format!("{e:#}")) {
+                    return;
+                }
+            }
+        }
     }
     match enable_with_retries(icons) {
         Ok(()) => eprintln!("taskbar: controls enabled"),

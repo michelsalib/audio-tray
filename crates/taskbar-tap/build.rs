@@ -20,11 +20,15 @@ fn main() {
     let root = workspace_manifest();
     println!("cargo:rerun-if-changed={}", root.display());
 
+    let version = app_version(&root);
+    // The same number, compiled in: `lifecycle::hand_over` accepts a new owner only from the exe
+    // version it shipped with.
+    println!("cargo:rustc-env=AUDIO_TRAY_VERSION={version}");
+
     if std::env::var("CARGO_CFG_WINDOWS").is_err() {
         return;
     }
 
-    let version = app_version(&root);
     let (major, minor, patch) = triple(&version);
 
     let mut res = winresource::WindowsResource::new();

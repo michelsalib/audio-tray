@@ -52,6 +52,7 @@ features = [
     # `RegisterClassW`/`WNDCLASSW` are gated behind Gdi (the struct carries
     # HBRUSH/HICON), and the revert channel needs its own window class.
     "Win32_Graphics_Gdi",
+    "Win32_System_DataExchange",         # COPYDATASTRUCT, for the handover (lifecycle.rs)
 ]
 
 [build-dependencies]

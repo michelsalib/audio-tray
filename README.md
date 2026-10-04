@@ -138,8 +138,11 @@ things worth knowing:
 - **It repairs itself by restarting Explorer.** Two situations need a fresh shell, and
   audio-tray handles both on startup without asking: an injection that fails (after a
   couple of retries, which is usually all a shell that is merely slow to be ready
-  needs), and a TAP from an earlier audio-tray still loaded in Explorer — injecting
-  alongside that one is what leaves you with a taskbar that looks untouched. At most
+  needs), and a TAP from a *different build* of audio-tray still loaded in Explorer —
+  injecting alongside that one is what leaves you with a taskbar that looks untouched. A
+  TAP from the same build is simply handed over to the new process, so quitting and
+  starting again, or a second launch (which exits — only one tray runs at a time), never
+  restarts Explorer. At most
   one restart per run, so a machine where the injection can never succeed is not
   restarted round and round. `audio-tray --taskbar-restart` does the same by hand.
 - **Your icon must be on the taskbar, not in the overflow.** Nothing is drawn if it

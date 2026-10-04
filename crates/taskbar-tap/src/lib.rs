@@ -90,9 +90,11 @@ struct Site {
 /// has to go quiet, or the next tray rebuild silently re-applies everything the
 /// user just turned off.
 ///
-/// Bumped on every `SetSite` and every [`stand_down`]. An instance whose stored
-/// generation is not the current one drops its callbacks on the floor.
+/// Each `SetSite` takes a fresh number from [`GENERATION`] and makes it [`CURRENT`];
+/// [`stand_down`] clears `CURRENT` to 0, and a handover ([`hand_over`]) makes the newest
+/// instance current again. An instance whose generation is not `CURRENT` drops its callbacks.
 static GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static CURRENT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// The `(icon, ContentPresenter)` we last decorated.
 ///
@@ -300,6 +302,71 @@ fn value_from(data: &str, wanted: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+/// Apply a `key=value;` init payload: what to decorate, what to draw, and whom to report to.
+/// Shared by `SetSite` and [`hand_over`]; touches no XAML, so it is safe in any message handler.
+fn configure(data: &str) {
+    log::set_verbose(value_from(data, "debug").as_deref() == Some("1"));
+    *lock(&TARGET_TOOLTIP) = value_from(data, "tooltip").unwrap_or_default();
+    *lock(&STRIP) = Some(decorate::StripState::parse(data));
+    // `tile=<app name>` names the taskbar button for the music tile; absent disables that half.
+    music::tile::set_host(value_from(data, "tile"));
+    if let Some(width) = value_from(data, "strip").and_then(|w| w.parse().ok()) {
+        music::layout::set_content_width(width);
+    }
+    if let Some(hwnd) = value_from(data, "hwnd").and_then(|h| h.parse::<isize>().ok()) {
+        ipc::set_receiver(hwnd);
+    }
+    // Whoever asked for the strip is also who we put it away for.
+    lifecycle::watch_owner(value_from(data, "pid"));
+}
+
+/// The app version this DLL shipped with (stamped by build.rs from the root manifest).
+pub const APP_VERSION: &str = env!("AUDIO_TRAY_VERSION");
+
+/// Outcome codes of a handover, returned from the control window's `WM_COPYDATA`. 0 is what an
+/// older TAP without the handler answers (`DefWindowProc`). Must match `taskbar.rs`.
+pub const HANDOVER_ACCEPTED: isize = 1;
+pub const HANDOVER_DECLINED: isize = 2;
+
+/// Whether a new audio-tray may adopt this already-loaded TAP: the same app version, and the
+/// same DLL file it would have injected. Anything else needs a fresh Explorer.
+fn compatible(data: &str, own_path: Option<&str>) -> core::result::Result<(), String> {
+    match value_from(data, "ver") {
+        Some(version) if version == APP_VERSION => {}
+        other => return Err(format!("exe is v{}, TAP is v{APP_VERSION}", other.unwrap_or_default())),
+    }
+    if let (Some(wanted), Some(own)) = (value_from(data, "tap"), own_path) {
+        if !wanted.eq_ignore_ascii_case(own) {
+            return Err(format!("exe wants {wanted}, TAP is {own}"));
+        }
+    }
+    Ok(())
+}
+
+/// A new audio-tray adopting this TAP instead of restarting Explorer: take its init data, make
+/// the newest instance current again and let the sweep re-apply whatever is missing.
+///
+/// Runs inside a cross-process `SendMessage`, so it only flips state; all XAML work is left to
+/// the sweep timer.
+pub(crate) fn hand_over(data: &str) -> isize {
+    if let Err(why) = compatible(data, lifecycle::own_module_path().as_deref()) {
+        logf!("handover declined: {why}");
+        return HANDOVER_DECLINED;
+    }
+    let before = strip_state();
+    configure(data);
+    let was_active = ACTIVE.swap(true, Ordering::SeqCst);
+    CURRENT.store(GENERATION.load(Ordering::SeqCst), Ordering::SeqCst);
+    if was_active && strip_state() != before {
+        // The strip is up but shows the old owner's state: redraw it, as a restyle would.
+        *lock(&DECORATED) = None;
+        lock(&WIRED).clear();
+    }
+    logf!("handover accepted (strip was {}): init data = {data:?}", if was_active { "up" } else { "reverted" });
+    unsafe { lifecycle::set_sweep_pace(false) };
+    HANDOVER_ACCEPTED
+}
+
 /// A raw COM pointer being handed to the advise thread. Both interfaces are
 /// non-agile, but this mirrors what the known-good C++ TAPs do: the pointer is
 /// only used for the one `AdviseVisualTreeChange` call, which marshals internally.
@@ -415,22 +482,8 @@ impl Tap_Impl {
                 } else {
                     String::new()
                 };
-                // Before any other logging, so the flag governs the whole session.
-                log::set_verbose(value_from(&data, "debug").as_deref() == Some("1"));
+                configure(&data);
                 logf!("SetSite: IXamlDiagnostics ok, init data = {data:?}");
-                // The injector passes both which icon to decorate and what to
-                // draw in it, as a `key=value;` payload.
-                *lock(&TARGET_TOOLTIP) = value_from(&data, "tooltip").unwrap_or_default();
-                *lock(&STRIP) = Some(decorate::StripState::parse(&data));
-                // The music tile is opt-in through the same payload: `tile=<app name>` names whose
-                // taskbar button to draw the now-playing strip into, and its absence disables that
-                // half without touching the audio one.
-                music::tile::set_host(value_from(&data, "tile"));
-                if let Some(width) = value_from(&data, "strip").and_then(|w| w.parse().ok()) {
-                    music::layout::set_content_width(width);
-                }
-                // Whoever asked for the strip is also who we put it away for.
-                lifecycle::watch_owner(value_from(&data, "pid"));
             }
             Err(err) => logf!("SetSite: no IXamlDiagnostics ({err}) — continuing"),
         }
@@ -447,6 +500,7 @@ impl Tap_Impl {
             // Claim the current generation, standing down whichever instance
             // held it before.
             state.generation = GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+            CURRENT.store(state.generation, Ordering::SeqCst);
             state.site = Some(site.clone());
             state.service = Some(service.clone());
             state.diagnostics = diagnostics.ok();
@@ -515,9 +569,11 @@ impl IVisualTreeServiceCallback_Impl for Tap_Impl {
                 // A revert whose owner died before the window existed. Running it
                 // here is the whole reason it was deferred: this is the thread
                 // that may touch the tray.
-                if lifecycle::take_pending_revert() {
-                    logf!("running the deferred revert");
-                    stand_down();
+                if let Some(pid) = lifecycle::take_pending_revert() {
+                    if lifecycle::revert_is_current(pid) {
+                        logf!("running the deferred revert");
+                        stand_down();
+                    }
                 }
             }
 
@@ -530,7 +586,7 @@ impl IVisualTreeServiceCallback_Impl for Tap_Impl {
             // re-enable that logged "1 NotifyIconView recorded" forever and never
             // drew. Recording is keyed by handle and idempotent, so two live
             // instances recording the same event costs nothing.
-            if self.state().generation != GENERATION.load(Ordering::SeqCst) {
+            if self.state().generation != CURRENT.load(Ordering::SeqCst) {
                 return;
             }
 
@@ -618,7 +674,7 @@ pub(crate) unsafe fn stand_down() {
     // First, so nothing re-applies behind the revert — neither a live callback
     // nor the periodic sweep.
     ACTIVE.store(false, Ordering::SeqCst);
-    GENERATION.fetch_add(1, Ordering::SeqCst);
+    CURRENT.store(0, Ordering::SeqCst);
 
     match diagnostics() {
         Some(diagnostics) => {
@@ -1368,4 +1424,24 @@ pub unsafe extern "system" fn DllGetClassObject(
 #[no_mangle]
 pub extern "system" fn DllCanUnloadNow() -> HRESULT {
     S_FALSE
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn handover_needs_the_same_version_and_dll() {
+        let own = r"C:\App\audio_tray_tap.dll";
+        let ok = format!(r"ver={APP_VERSION};tap=c:\app\AUDIO_TRAY_TAP.dll;pid=1");
+        assert!(compatible(&ok, Some(own)).is_ok());
+        // No path to compare (older payload, or the module path unreadable) still matches on version.
+        assert!(compatible(&format!("ver={APP_VERSION}"), Some(own)).is_ok());
+        assert!(compatible(&ok, None).is_ok());
+        assert!(compatible("ver=0.0.1;pid=1", Some(own)).is_err());
+        // An exe that predates the handover sends no version at all.
+        assert!(compatible("pid=1", Some(own)).is_err());
+        let other = format!(r"ver={APP_VERSION};tap=D:\dev\audio_tray_tap.dll");
+        assert!(compatible(&other, Some(own)).is_err());
+    }
 }

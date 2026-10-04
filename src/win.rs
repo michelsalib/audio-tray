@@ -44,3 +44,41 @@ pub(crate) fn small_icon_size() -> u32 {
         px as u32
     }
 }
+
+/// Calls `visit` for every top-level window, in any process, until it returns `false`.
+///
+/// `EnumWindows` rather than `FindWindow`, which does not find our hidden windows across processes.
+pub(crate) fn enum_windows(mut visit: impl FnMut(windows::Win32::Foundation::HWND) -> bool) {
+    use windows::Win32::Foundation::{HWND, LPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::EnumWindows;
+    use windows_core::BOOL;
+
+    type Visit<'a> = &'a mut dyn FnMut(HWND) -> bool;
+    unsafe extern "system" fn thunk(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        let visit = unsafe { &mut *(lparam.0 as *mut Visit) };
+        // A panic must not unwind into user32; treat it as "stop".
+        BOOL::from(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| visit(hwnd))).unwrap_or(false))
+    }
+    let mut visit: Visit = &mut visit;
+    let _ = unsafe { EnumWindows(Some(thunk), LPARAM(&mut visit as *mut Visit as isize)) };
+}
+
+/// A window's class name, empty for a dead handle.
+pub(crate) fn class_name(hwnd: windows::Win32::Foundation::HWND) -> String {
+    use windows::Win32::UI::WindowsAndMessaging::GetClassNameW;
+    let mut buf = [0u16; 256];
+    let len = unsafe { GetClassNameW(hwnd, &mut buf) };
+    String::from_utf16_lossy(&buf[..len.max(0) as usize])
+}
+
+/// Every top-level window with exactly this class, in any process.
+pub(crate) fn windows_by_class(class: &str) -> Vec<windows::Win32::Foundation::HWND> {
+    let mut found = Vec::new();
+    enum_windows(|hwnd| {
+        if class_name(hwnd) == class {
+            found.push(hwnd);
+        }
+        true
+    });
+    found
+}

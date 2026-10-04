@@ -25,9 +25,10 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{
     OpenProcess, WaitForSingleObject, INFINITE, PROCESS_SYNCHRONIZE,
 };
+use windows::Win32::System::DataExchange::COPYDATASTRUCT;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, PostMessageW, RegisterClassW, SetTimer, HMENU, WM_APP,
-    WM_TIMER, WNDCLASSW, WS_EX_TOOLWINDOW, WS_POPUP,
+    WM_COPYDATA, WM_TIMER, WNDCLASSW, WS_EX_TOOLWINDOW, WS_POPUP,
 };
 
 use crate::log::logf;
@@ -153,6 +154,11 @@ unsafe extern "system" fn control_proc(
         // This runs inside Explorer's own message pump; a panic escaping here
         // would take the shell down with it.
         let caught = std::panic::catch_unwind(|| {
+            let from = wparam.0 as u32;
+            if !revert_is_current(from) {
+                logf!("revert from pid {from} ignored — pid {} owns the strip now", OWNER_PID.load(Ordering::SeqCst));
+                return;
+            }
             logf!("revert requested — on thread {}", crate::tid());
             unsafe { crate::stand_down() };
         });
@@ -191,6 +197,25 @@ unsafe extern "system" fn control_proc(
         }
         return LRESULT(0);
     }
+    if msg == WM_COPYDATA {
+        let caught = std::panic::catch_unwind(|| {
+            let copy = unsafe { (lparam.0 as *const COPYDATASTRUCT).as_ref() }?;
+            if copy.dwData != HANDOVER_MAGIC || copy.lpData.is_null() {
+                return None;
+            }
+            let units = unsafe { core::slice::from_raw_parts(copy.lpData as *const u16, copy.cbData as usize / 2) };
+            let data = String::from_utf16_lossy(units);
+            Some(crate::hand_over(data.trim_end_matches('\0')))
+        });
+        match caught {
+            Ok(Some(code)) => return LRESULT(code),
+            Ok(None) => {}
+            Err(_) => {
+                logf!("handover handler panicked");
+                return LRESULT(0);
+            }
+        }
+    }
     if msg == WM_TIMER && wparam.0 == SWEEP_TIMER {
         let caught = std::panic::catch_unwind(|| unsafe { crate::sweep() });
         if caught.is_err() {
@@ -205,8 +230,20 @@ unsafe extern "system" fn control_proc(
 ///
 /// Consumed by the visual-tree callback, which is on the only thread that may
 /// act on it.
-pub fn take_pending_revert() -> bool {
-    PENDING_REVERT.swap(false, Ordering::SeqCst)
+pub fn take_pending_revert() -> Option<u32> {
+    PENDING_REVERT
+        .swap(false, Ordering::SeqCst)
+        .then(|| PENDING_REVERT_PID.load(Ordering::SeqCst))
+}
+
+/// The pid that asked for the deferred revert (0 = unconditional).
+static PENDING_REVERT_PID: AtomicU32 = AtomicU32::new(0);
+
+/// Whether a revert asked for by `pid` still applies: 0 is unconditional (`--taskbar-revert`, an
+/// older audio-tray), anything else only while that process still owns the strip — a revert from
+/// an owner that has since handed over must not dismantle its successor's strip.
+pub fn revert_is_current(pid: u32) -> bool {
+    pid == 0 || pid == OWNER_PID.load(Ordering::SeqCst)
 }
 
 /// Whether a wiring request is already queued, so the three buttons of one rebuild cost one message.
@@ -356,6 +393,15 @@ pub fn watch_owner(pid: Option<String>) {
         return;
     };
     OWNER_PID.store(pid, Ordering::SeqCst);
+    // A handover can name the same owner twice (restart_app transfers to its child, which then
+    // hands over itself); one watcher per pid is enough.
+    {
+        let mut watched = crate::lock(&WATCHED);
+        if watched.contains(&pid) {
+            return;
+        }
+        watched.push(pid);
+    }
     std::thread::spawn(move || {
         let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, pid) };
         let Ok(handle) = handle else {
@@ -365,6 +411,7 @@ pub fn watch_owner(pid: Option<String>) {
         logf!("watching owner pid {pid}");
         let waited = unsafe { WaitForSingleObject(handle, INFINITE) };
         let _ = unsafe { CloseHandle(handle) };
+        crate::lock(&WATCHED).retain(|&watched| watched != pid);
         // Someone else owns the strip now — our owner handed over rather than
         // going away. Reverting here would dismantle the new owner's strip.
         let current = OWNER_PID.load(Ordering::SeqCst);
@@ -373,7 +420,7 @@ pub fn watch_owner(pid: Option<String>) {
             return;
         }
         logf!("owner pid {pid} exited (wait -> {}) — asking for a revert", waited.0);
-        request_revert();
+        request_revert(pid);
     });
 }
 
@@ -381,11 +428,12 @@ pub fn watch_owner(pid: Option<String>) {
 ///
 /// `PostMessage` rather than `SendMessage`: the caller must not block on the
 /// shell's UI thread, and has nothing to learn from the answer.
-pub fn request_revert() {
+pub fn request_revert(pid: u32) {
     let hwnd = WINDOW.load(Ordering::SeqCst);
     if hwnd == 0 {
         // Nowhere to post it yet. Leave it for the next visual-tree callback,
         // which runs on the right thread anyway.
+        PENDING_REVERT_PID.store(pid, Ordering::SeqCst);
         PENDING_REVERT.store(true, Ordering::SeqCst);
         logf!("revert requested before the control window existed — deferred");
         return;
@@ -394,11 +442,38 @@ pub fn request_revert() {
         PostMessageW(
             Some(HWND(hwnd as *mut core::ffi::c_void)),
             WM_TAP_REVERT,
-            WPARAM(0),
+            WPARAM(pid as usize),
             LPARAM(0),
         )
     };
     if let Err(err) = posted {
         logf!("posting the revert failed: {err}");
+    }
+}
+
+/// Owner pids with a watcher thread running.
+static WATCHED: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+
+/// `COPYDATASTRUCT::dwData` tagging a handover payload ("ATH1"). Must match `taskbar.rs`.
+pub const HANDOVER_MAGIC: usize = 0x4154_4831;
+
+/// Full path of this DLL, to tell our own copy from another build's.
+pub fn own_module_path() -> Option<String> {
+    use windows::Win32::System::LibraryLoader::{
+        GetModuleFileNameW, GetModuleHandleExW, GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+        GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+    };
+    let mut module = windows::Win32::Foundation::HMODULE::default();
+    let anchor = own_module_path as *const () as *const u16;
+    unsafe {
+        GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            windows_core::PCWSTR(anchor),
+            &mut module,
+        )
+        .ok()?;
+        let mut buf = [0u16; 1024];
+        let len = GetModuleFileNameW(Some(module), &mut buf) as usize;
+        (len > 0).then(|| String::from_utf16_lossy(&buf[..len]))
     }
 }

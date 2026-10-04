@@ -75,6 +75,7 @@ mod canvas;
 mod config;
 mod flyout;
 mod icons;
+mod instance;
 mod layered;
 mod music;
 mod osd;
@@ -353,10 +354,15 @@ fn main() -> Result<()> {
             // process that died badly) and how the revert path gets exercised end
             // to end — the strip's own gestures cannot be synthesised, see
             // `crates/taskbar-tap/FINDINGS.md`.
-            taskbar::revert();
+            taskbar::revert(0);
             println!("taskbar: controls removed.");
         }
         _ => {
+            // One tray per session. A second launch exits quietly once the wait runs out.
+            let Some(_instance) = instance::acquire(instance::wait_budget(&args)) else {
+                eprintln!("audio-tray: already running — exiting");
+                return Ok(());
+            };
             // Fire-and-forget auto-update: checks GitHub releases in the background
             // and self-replaces the on-disk exe (applied on next launch). No-op in
             // debug builds. See src/update.rs.

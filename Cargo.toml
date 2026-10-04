@@ -57,6 +57,8 @@ features = [
     "Win32_System_Com_StructuredStorage",
     "Win32_System_Variant",
     "Win32_Graphics_Gdi",
+    # COPYDATASTRUCT: handing a running TAP its new owner (taskbar::hand_over).
+    "Win32_System_DataExchange",
     "Win32_Graphics_Dwm",
     "Win32_Graphics_DirectWrite",
     "Win32_Media_Audio",

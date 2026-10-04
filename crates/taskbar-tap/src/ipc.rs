@@ -115,6 +115,14 @@ fn receiver() -> Option<HWND> {
     Some(found)
 }
 
+/// Adopt the receiver window named in the init data (`hwnd=`), so a handover takes effect at once
+/// instead of waiting for the old window to die. Ignored unless it really is a receiver.
+pub fn set_receiver(hwnd: isize) {
+    if unsafe { class_of(HWND(hwnd as *mut c_void)) } == RECEIVER_CLASS_NAME {
+        RECEIVER.store(hwnd, Ordering::Relaxed);
+    }
+}
+
 /// Posts one message to audio-tray, if it is running.
 ///
 /// Deliberately silent about a missing window beyond one log line: there is a

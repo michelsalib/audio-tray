@@ -35,7 +35,9 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 
-pub use feed::{State, Ytm};
+pub use feed::Ytm;
+#[cfg(feature = "dev")]
+use feed::State;
 
 /// **This feature cannot run on audio-tray's own thread, and that is not a style choice.**
 ///
@@ -48,6 +50,7 @@ pub use feed::{State, Ytm};
 /// So the feed lives on a thread of its own that initialises **MTA**, paces its own poll, and takes
 /// requests by channel. The tray thread never touches WinRT media APIs at all, which also means a
 /// slow or wedged session can never stall the audio half.
+#[cfg(feature = "dev")]
 fn on_mta_thread<T, F>(what: &'static str, body: F) -> Result<T>
 where
     T: Send + 'static,
@@ -317,6 +320,7 @@ impl Music {
 /// A `Browser` verdict means the opposite — an id that could be YouTube Music or could be any
 /// other tab, which is followed only if the user pins it. This says so when it is the only thing
 /// on offer.
+#[cfg(feature = "dev")]
 pub fn probe() -> Result<()> {
     on_mta_thread("music-probe", || {
         let mut feed = Ytm::new(None)?;
@@ -324,6 +328,7 @@ pub fn probe() -> Result<()> {
     })
 }
 
+#[cfg(feature = "dev")]
 fn report_sessions(feed: &mut Ytm) -> Result<()> {
     let sessions = feed.all_sessions()?;
     if sessions.is_empty() {
@@ -338,9 +343,7 @@ fn report_sessions(feed: &mut Ytm) -> Result<()> {
         println!("  verdict  : {:?}", session::classify(&snapshot.app_id));
         println!("  title    : {}", show(&snapshot.title));
         println!("  artist   : {}", show(&snapshot.artist));
-        println!("  album    : {}", show(&snapshot.album));
         println!("  status   : {:?}", snapshot.status);
-        println!("  kind     : {:?}", snapshot.kind);
         match &snapshot.cover {
             Some(bytes) => println!("  cover    : {} bytes", bytes.len()),
             None => println!("  cover    : <none published>"),
@@ -384,6 +387,7 @@ fn report_sessions(feed: &mut Ytm) -> Result<()> {
 /// Takes the handles the survey already found rather than enumerating again, because a second
 /// enumeration answers about a *different set of windows* — one opening or closing in between reads
 /// as a disagreement that is nothing of the sort.
+#[cfg(feature = "dev")]
 pub fn player_verdicts_from_mta(windows: Vec<isize>) -> Result<Vec<bool>> {
     on_mta_thread("music-windows", move || {
         Ok(windows
@@ -401,6 +405,7 @@ pub fn player_verdicts_from_mta(windows: Vec<isize>) -> Result<Vec<bool>> {
 ///
 /// Shows the position as a checkpoint plus its age (a player republishes it only when something
 /// happens) and what a track change looks like from here: the session vanishes for about a second.
+#[cfg(feature = "dev")]
 pub fn report_timeline(seconds: u64, skip: Option<smtc::Command>) -> Result<()> {
     on_mta_thread("music-timeline", move || {
         let mut feed = Ytm::new(None)?;
@@ -408,6 +413,7 @@ pub fn report_timeline(seconds: u64, skip: Option<smtc::Command>) -> Result<()> 
     })
 }
 
+#[cfg(feature = "dev")]
 fn report_position(feed: &mut Ytm, seconds: u64, skip: Option<smtc::Command>) -> Result<()> {
     let started = std::time::Instant::now();
     let mut skipped = false;
@@ -441,6 +447,7 @@ fn report_position(feed: &mut Ytm, seconds: u64, skip: Option<smtc::Command>) ->
     Ok(())
 }
 
+#[cfg(feature = "dev")]
 fn show(value: &str) -> String {
     if value.trim().is_empty() {
         "<empty>".to_string()

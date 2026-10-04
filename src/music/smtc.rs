@@ -28,7 +28,6 @@ use windows::Media::Control::{
     GlobalSystemMediaTransportControlsSessionManager as SessionManager,
     GlobalSystemMediaTransportControlsSessionPlaybackStatus as WinRtPlaybackStatus,
 };
-use windows::Media::MediaPlaybackType;
 use windows::Storage::Streams::DataReader;
 
 /// What a session is doing, reduced to the states a transport control cares about.
@@ -61,36 +60,6 @@ impl PlaybackStatus {
     }
 }
 
-/// What kind of media the session says it is carrying.
-///
-/// Read from `GetPlaybackInfo`, so it costs nothing beyond the status that is already read there.
-///
-/// **Do not use this to tell music from video in a browser — it cannot.** It looks exactly like the
-/// field that would separate a YouTube Music tab from a YouTube video, and it was added to try
-/// that; measured on 26200, a plain YouTube video playing in Edge reports `Music`. Chromium sets
-/// the type once for its whole SMTC integration, because that is what lets it publish title,
-/// artist and album at all. Kept because it is free, `--music-probe` prints it, and the next person
-/// to have this idea should be able to see the answer without wiring it up again.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-pub enum MediaKind {
-    #[default]
-    Unknown,
-    Music,
-    Video,
-    Image,
-}
-
-impl MediaKind {
-    fn from_winrt(kind: MediaPlaybackType) -> Self {
-        match kind {
-            MediaPlaybackType::Music => Self::Music,
-            MediaPlaybackType::Video => Self::Video,
-            MediaPlaybackType::Image => Self::Image,
-            _ => Self::Unknown,
-        }
-    }
-}
-
 // There is deliberately no `Capabilities` here. `GetPlaybackInfo`'s `Controls` says which
 // transport commands the app will honour, and it was read into every snapshot and brief for a
 // strip that was going to grey the buttons out — but the buttons are the shell's thumbnail
@@ -109,9 +78,7 @@ pub struct Snapshot {
     pub app_id: String,
     pub title: String,
     pub artist: String,
-    pub album: String,
     pub status: PlaybackStatus,
-    pub kind: MediaKind,
     /// Cover art bytes, as published (PNG or JPEG — read the magic, don't assume).
     /// `None` whenever the app publishes no artwork; see the module note.
     pub cover: Option<Vec<u8>>,
@@ -126,7 +93,6 @@ pub struct Snapshot {
 pub struct Brief {
     pub app_id: String,
     pub status: PlaybackStatus,
-    pub kind: MediaKind,
 }
 
 /// One poll's answer: the session that won, and where it is in the track.
@@ -165,14 +131,17 @@ pub struct Timeline {
 }
 
 impl Timeline {
+    #[cfg(feature = "dev")]
     const TICKS_PER_SECOND: f64 = 10_000_000.0;
 
     /// Track length in seconds, or `None` when the app publishes no end.
+    #[cfg(feature = "dev")]
     pub fn duration_seconds(self) -> Option<f64> {
         let span = self.end - self.start;
         (span > 0).then(|| span as f64 / Self::TICKS_PER_SECOND)
     }
 
+    #[cfg(feature = "dev")]
     pub fn position_seconds(self) -> f64 {
         (self.position - self.start).max(0) as f64 / Self::TICKS_PER_SECOND
     }
@@ -249,6 +218,7 @@ impl Smtc {
     /// means an async round-trip to the owning app plus a decode of its artwork; doing that for every
     /// session is what [`Smtc::read_current`] exists to avoid. Kept because diagnosis genuinely does
     /// want every session's title, and pays for it once.
+    #[cfg(feature = "dev")]
     pub fn sessions(&self) -> Result<Vec<Snapshot>> {
         let sessions = self.manager.GetSessions().context("GetSessions")?;
         let mut out = Vec::new();
@@ -295,7 +265,6 @@ impl Smtc {
         let mut snapshot = Snapshot {
             app_id: briefs[index].app_id.clone(),
             status: briefs[index].status,
-            kind: briefs[index].kind,
             ..Default::default()
         };
         read_properties_into(session, &mut snapshot, Some(&mut self.covers.borrow_mut()));
@@ -354,12 +323,12 @@ fn dispatch(session: &Session, command: Command) -> Result<bool> {
 /// rather than failing the whole read: a session mid-track-change routinely has
 /// properties that are briefly unavailable, and losing the strip for a moment
 /// would be worse than showing a blank artist.
+#[cfg(feature = "dev")]
 fn read_session(session: &Session) -> Result<Snapshot> {
     let brief = read_brief(session);
     let mut snapshot = Snapshot {
         app_id: brief.app_id,
         status: brief.status,
-        kind: brief.kind,
         ..Default::default()
     };
     read_properties_into(session, &mut snapshot, None);
@@ -383,11 +352,6 @@ fn read_brief(session: &Session) -> Brief {
         if let Ok(status) = info.PlaybackStatus() {
             brief.status = PlaybackStatus::from_winrt(status);
         }
-        // An `IReference` that is null — the app published no type at all — reads as an error here,
-        // which is the `Unknown` default.
-        if let Ok(kind) = info.PlaybackType().and_then(|t| t.Value()) {
-            brief.kind = MediaKind::from_winrt(kind);
-        }
     }
     brief
 }
@@ -401,7 +365,6 @@ fn read_properties_into(session: &Session, snapshot: &mut Snapshot, covers: Opti
         if let Ok(props) = op.get() {
             snapshot.title = props.Title().map(|s| s.to_string()).unwrap_or_default();
             snapshot.artist = props.Artist().map(|s| s.to_string()).unwrap_or_default();
-            snapshot.album = props.AlbumTitle().map(|s| s.to_string()).unwrap_or_default();
             snapshot.cover = match covers {
                 Some(covers) => covers.cover(CoverKey::of(snapshot), || read_thumbnail(&props)),
                 None => read_thumbnail(&props),

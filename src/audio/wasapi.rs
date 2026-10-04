@@ -14,10 +14,11 @@ use windows::Win32::Media::Audio::Endpoints::{
     IAudioMeterInformation,
 };
 use windows::Win32::Media::Audio::{
-    eCapture, eCommunications, eConsole, eMultimedia, eRender, EDataFlow, ERole, IAudioCaptureClient,
-    IAudioClient, IMMDevice, IMMDeviceEnumerator, MMDeviceEnumerator, AUDCLNT_SHAREMODE_SHARED,
+    eCapture, eConsole, eRender, EDataFlow, IMMDevice, IMMDeviceEnumerator, MMDeviceEnumerator,
     AUDIO_VOLUME_NOTIFICATION_DATA, PKEY_AudioEndpoint_FormFactor, DEVICE_STATE_ACTIVE,
 };
+#[cfg(feature = "dev")]
+use windows::Win32::Media::Audio::{IAudioCaptureClient, IAudioClient, AUDCLNT_SHAREMODE_SHARED};
 use windows::Win32::System::Com::StructuredStorage::{PropVariantToStringAlloc, PropVariantToUInt32};
 use windows::Win32::System::Com::{CoCreateInstance, CoTaskMemFree, CLSCTX_ALL, STGM_READ};
 use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
@@ -90,6 +91,7 @@ pub enum Meter {
     /// A render endpoint's own meter, which aggregates every stream on the device — so it
     /// reflects whatever is playing without us opening a stream of our own.
     Render(IAudioMeterInformation),
+    #[cfg(feature = "dev")]
     Capture(CaptureMeter),
 }
 
@@ -98,11 +100,15 @@ impl Meter {
     pub fn peak(&self) -> f32 {
         match self {
             Meter::Render(meter) => unsafe { meter.GetPeakValue() }.unwrap_or(0.0).clamp(0.0, 1.0),
+            #[cfg(feature = "dev")]
             Meter::Capture(capture) => capture.peak(),
         }
     }
 }
 
+/// Only the `--meter` dev mode uses it: the flyout meters output alone (an input meter keeps the
+/// "microphone in use" indicator lit).
+#[cfg(feature = "dev")]
 /// Peak meter for a capture endpoint. A capture endpoint's `IAudioMeterInformation` is
 /// dormant unless a capture stream is running (the same reason Windows' own mic level bar
 /// only moves while the Sound page is open), so we open a silent shared-mode capture stream
@@ -115,6 +121,7 @@ pub struct CaptureMeter {
     meter: IAudioMeterInformation,
 }
 
+#[cfg(feature = "dev")]
 impl CaptureMeter {
     fn new(device: &IMMDevice) -> Result<Self> {
         unsafe {
@@ -155,6 +162,7 @@ impl CaptureMeter {
     }
 }
 
+#[cfg(feature = "dev")]
 impl Drop for CaptureMeter {
     fn drop(&mut self) {
         unsafe {
@@ -184,17 +192,6 @@ impl WasapiBackend {
             unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) }
                 .context("create IMMDeviceEnumerator")?;
         Ok(Self { enumerator })
-    }
-
-    /// Default render endpoint for a specific role. Returns `Ok(None)` when no default
-    /// is set for that role (`GetDefaultAudioEndpoint` fails with e.g. E_NOTFOUND).
-    pub fn default_for_role(&self, role: ERole) -> Result<Option<DeviceId>> {
-        unsafe {
-            match self.enumerator.GetDefaultAudioEndpoint(eRender, role) {
-                Ok(device) => Ok(Some(DeviceId(take_pwstr(device.GetId().context("GetId")?)?))),
-                Err(_) => Ok(None),
-            }
-        }
     }
 
     /// Move the default endpoint of one direction by `by` (a signed fraction of full
@@ -231,12 +228,6 @@ impl WasapiBackend {
             let muted = volume.GetMute().is_ok_and(|muted| muted.as_bool());
             Ok((level, muted))
         }
-    }
-
-    /// Master volume of the current default output endpoint, 0.0..=1.0.
-    pub fn master_volume(&self) -> Result<f32> {
-        let default = self.default_of(Flow::Output)?.context("no default output")?;
-        self.volume_of(&default)
     }
 
     /// Active endpoints for a direction (output = render, input = capture).
@@ -317,7 +308,10 @@ impl WasapiBackend {
                 unsafe { device.Activate(CLSCTX_ALL, None) }
                     .context("activate IAudioMeterInformation")?,
             )),
+            #[cfg(feature = "dev")]
             Flow::Input => Ok(Meter::Capture(CaptureMeter::new(&device)?)),
+            #[cfg(not(feature = "dev"))]
+            Flow::Input => anyhow::bail!("input metering is only built with the dev feature"),
         }
     }
 
@@ -336,15 +330,6 @@ impl WasapiBackend {
         unsafe { endpoint.RegisterControlChangeNotify(&callback) }
             .context("RegisterControlChangeNotify")?;
         Ok(VolumeWatch { endpoint, callback })
-    }
-
-    /// The default for each of the three roles Windows tracks independently.
-    pub fn defaults_by_role(&self) -> [(&'static str, Result<Option<DeviceId>>); 3] {
-        [
-            ("eConsole", self.default_for_role(eConsole)),
-            ("eMultimedia", self.default_for_role(eMultimedia)),
-            ("eCommunications", self.default_for_role(eCommunications)),
-        ]
     }
 
     /// Read the friendly name + form factor of an already-resolved endpoint.

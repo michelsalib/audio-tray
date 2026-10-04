@@ -73,18 +73,26 @@ input:
 
 On the fallback single tray icon, either button opens the flyout.
 
-### Command-line (dev/diagnostics)
+### Command-line
 
 ```
-audio-tray            run the tray (default)
-audio-tray --list     print the current default + all active output devices
-audio-tray --set <q>  switch default output to a device by name substring or id
+audio-tray            run the tray (default; a second launch exits)
 audio-tray --update   check GitHub Releases and self-update now
 audio-tray --tap-version
                       which taskbar TAP is on disk — the exe and the DLL ship
                       together, and only the exe is self-updated
 audio-tray --taskbar-revert
                       put the taskbar back, without stopping the running tray
+audio-tray --taskbar-restart
+                      restart Explorer (also places a TAP update waiting for the file)
+```
+
+Developer and diagnostic modes are built only with `cargo build --features dev` (see
+`src/dev.rs` for the full list), among them:
+
+```
+audio-tray --list     print the current defaults + all active devices
+audio-tray --set <q>  switch default output to a device by name substring or id
 audio-tray --music-probe
                       list every media session with its app id, and which one matched
 audio-tray --music-timeline

@@ -111,8 +111,6 @@ pub unsafe trait IVisualTreeHelperStatics: IUnknown {
 }
 
 /// `Windows.UI.Xaml.Visibility`.
-#[allow(dead_code)] // the other half of the enum; kept so the pair reads correctly
-pub const VISIBILITY_VISIBLE: i32 = 0;
 pub const VISIBILITY_COLLAPSED: i32 = 1;
 
 /// `Windows.UI.Xaml.IUIElement`.
@@ -311,36 +309,6 @@ pub unsafe trait IRightTappedEventHandler: IUnknown {
     pub fn Invoke(&self, sender: *mut c_void, args: *mut c_void) -> HRESULT;
 }
 
-/// `Windows.UI.Xaml.Controls.IPanel`. `get_Children` is its first own slot.
-#[interface("a50a4bbd-8361-469c-90da-e9a40c7474df")]
-pub unsafe trait IPanel: IUnknown {
-    pub fn GetIids(&self, count: *mut u32, iids: *mut *mut windows_core::GUID) -> HRESULT;
-    pub fn GetRuntimeClassName(&self, name: *mut *mut c_void) -> HRESULT;
-    pub fn GetTrustLevel(&self, level: *mut i32) -> HRESULT;
-    pub fn get_Children(&self, value: *mut *mut c_void) -> HRESULT;
-}
-
-/// `Windows.Foundation.Collections.IVector<Windows.UI.Xaml.UIElement>`.
-///
-/// The IID is the parameterized-interface GUID for this exact specialisation,
-/// taken from the header — it is not `IVector`'s own IID.
-#[interface("b4c1e3ac-8768-5b9d-a661-f63330b8507b")]
-pub unsafe trait IVectorUIElement: IUnknown {
-    pub fn GetIids(&self, count: *mut u32, iids: *mut *mut windows_core::GUID) -> HRESULT;
-    pub fn GetRuntimeClassName(&self, name: *mut *mut c_void) -> HRESULT;
-    pub fn GetTrustLevel(&self, level: *mut i32) -> HRESULT;
-    pub fn GetAt(&self, index: u32, item: *mut *mut c_void) -> HRESULT;
-    pub fn get_Size(&self, value: *mut u32) -> HRESULT;
-    pub fn GetView(&self, view: *mut *mut c_void) -> HRESULT;
-    pub fn IndexOf(&self, item: *mut c_void, index: *mut u32, found: *mut u8) -> HRESULT;
-    pub fn SetAt(&self, index: u32, item: *mut c_void) -> HRESULT;
-    pub fn InsertAt(&self, index: u32, item: *mut c_void) -> HRESULT;
-    pub fn RemoveAt(&self, index: u32) -> HRESULT;
-    pub fn Append(&self, item: *mut c_void) -> HRESULT;
-    pub fn RemoveAtEnd(&self) -> HRESULT;
-    pub fn Clear(&self) -> HRESULT;
-}
-
 /// `Windows.UI.Xaml.Controls.ITextBlock`. `put_Text` is slot 22 of the
 /// interface's own methods, so the 21 before it are placeholders.
 #[interface("ae2d9271-3b4a-45fc-8468-f7949548f4d5")]
@@ -500,8 +468,6 @@ pub unsafe trait IFrameworkElement: IUnknown {
 
 /// `Windows.UI.Xaml.HorizontalAlignment`.
 pub const HORIZONTAL_ALIGNMENT_LEFT: i32 = 0;
-#[allow(dead_code)] // the value everything starts at; kept so the pair reads correctly
-pub const HORIZONTAL_ALIGNMENT_STRETCH: i32 = 3;
 
 /// `Windows.UI.Xaml.Thickness` — four `DOUBLE`s, in XAML's `left,top,right,bottom` order.
 #[repr(C)]
@@ -543,22 +509,6 @@ pub unsafe trait IBorder: IUnknown {
     pub fn put_Padding(&self, value: *mut c_void) -> HRESULT;
     pub fn get_Child(&self, value: *mut *mut c_void) -> HRESULT;
     pub fn put_Child(&self, value: *mut c_void) -> HRESULT;
-}
-
-/// `Windows.UI.Xaml.Controls.IImage`.
-///
-/// Only `put_Source`, and only so cover art can be swapped **in place**. Rebuilding the strip to
-/// change the artwork would replace every element in it — including the ones the click handlers are
-/// attached to — so a track change would silently break the transport buttons.
-///
-/// Verified against the SDK header: `Source` g/p are the interface's first two own members.
-#[interface("495b7402-9af3-4e50-aa90-03388f3086d2")]
-pub unsafe trait IImage: IUnknown {
-    pub fn GetIids(&self, count: *mut u32, iids: *mut *mut windows_core::GUID) -> HRESULT;
-    pub fn GetRuntimeClassName(&self, name: *mut *mut c_void) -> HRESULT;
-    pub fn GetTrustLevel(&self, level: *mut i32) -> HRESULT;
-    pub fn get_Source(&self, value: *mut *mut c_void) -> HRESULT;
-    pub fn put_Source(&self, value: *mut c_void) -> HRESULT;
 }
 
 /// `Windows.UI.Xaml.Controls.IGridStatics`.

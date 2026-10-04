@@ -233,6 +233,7 @@ pub fn window_process(hwnd: HWND) -> Option<String> {
 /// The handle is an `isize` rather than an `HWND` so the list can cross a thread — which is the
 /// whole point of [`crate::music::player_verdicts_from_mta`], asking the same windows the same
 /// question from the apartment the toolbar actually runs in.
+#[cfg(feature = "dev")]
 pub struct WindowReport {
     pub hwnd: isize,
     pub player: bool,
@@ -243,6 +244,7 @@ pub struct WindowReport {
 /// window whose active tab is YouTube Music passes the title test, and the only fields that say so
 /// are the app id and the process — neither of which is visible without listing windows the title
 /// rule would never have shown.
+#[cfg(feature = "dev")]
 pub fn player_windows(all: bool) -> Vec<WindowReport> {
     use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
     use windows::Win32::UI::WindowsAndMessaging::{

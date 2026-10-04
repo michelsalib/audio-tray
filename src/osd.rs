@@ -120,6 +120,7 @@ impl Osd {
     }
 
     /// Whether `hwnd` is this readout's window (for [`preview`]'s own loop).
+    #[cfg(feature = "dev")]
     fn owns(&self, hwnd: HWND) -> bool {
         !self.hwnd.0.is_null() && self.hwnd.0 == hwnd.0
     }
@@ -359,6 +360,7 @@ impl Drop for Osd {
 /// except by scrolling a live strip and racing the three-second hold. `level` overrides what
 /// it draws (a percentage, `None` for the endpoint's own), and nothing here writes to the
 /// device: this is the readout on its own, not a volume change.
+#[cfg(feature = "dev")]
 pub(crate) fn preview(
     backend: &crate::audio::wasapi::WasapiBackend,
     flow: Flow,

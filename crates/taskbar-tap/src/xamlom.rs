@@ -72,10 +72,6 @@ pub struct CollectionElementValue {
     pub metadata_bits: i64,
 }
 
-/// `MetadataBit::IsValueHandle` — the element's `Value` string is an
-/// `InstanceHandle` rather than a literal.
-pub const IS_VALUE_HANDLE: i64 = 0x1;
-
 /// `enum ResourceType`
 #[repr(transparent)]
 #[derive(Clone, Copy)]

@@ -18,6 +18,10 @@ authors = ["Michel Salib"]
 # (and `cargo release`) from ever trying to publish it to the registry.
 publish = false
 
+[features]
+# Developer and diagnostic CLI modes (src/dev.rs). Off in release builds; CI builds it too.
+dev = []
+
 [dependencies]
 ab_glyph = "0.2.32"
 anyhow = "1"

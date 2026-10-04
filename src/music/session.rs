@@ -29,7 +29,7 @@
 //!
 //! ```text
 //! app id  MSEdge      the same id every other tab in that browser reports
-//! kind    Music       Chromium says Music for a video too — see smtc::MediaKind
+//! kind    Music       Chromium reports Music for a video too (PlaybackType; no longer read)
 //! album   <empty>     and YouTube Music does not always publish one either
 //! ```
 //!

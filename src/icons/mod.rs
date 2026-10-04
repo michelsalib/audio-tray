@@ -74,6 +74,7 @@ impl IconId {
     }
 
     /// Parse a variant name case-insensitively (e.g. "speakers" -> `Speakers`).
+    #[cfg(feature = "dev")]
     pub fn parse(s: &str) -> Option<IconId> {
         IconId::ALL
             .into_iter()

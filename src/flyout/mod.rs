@@ -150,6 +150,7 @@ pub fn show(
 
 /// Dev preview: open straight onto the first output device's icon-picker screen (so the
 /// picker can be iterated on without first hovering + clicking a device's edit pencil).
+#[cfg(feature = "dev")]
 pub fn show_icons_preview(
     backend: &WasapiBackend,
     config: &mut Config,

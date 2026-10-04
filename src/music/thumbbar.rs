@@ -387,6 +387,7 @@ impl Toolbar {
 /// through the TAP at all — depends on one unknown: does `ThumbBarAddButtons` accept a window this
 /// process does not own? Nothing documents that case. Hover the player's taskbar button after running
 /// this and the answer is on screen.
+#[cfg(feature = "dev")]
 pub fn probe(playing: bool) -> Result<()> {
     let window = super::player::player_window()
         .context("no YouTube Music window to put a thumbnail toolbar on")?;

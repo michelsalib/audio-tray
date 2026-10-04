@@ -108,6 +108,7 @@ impl Ytm {
     ///
     /// The point of exposing this is diagnosis: when the built-in matching misses
     /// an unusual YouTube Music build, this is what shows the real app id to pin.
+    #[cfg(feature = "dev")]
     pub fn all_sessions(&self) -> Result<Vec<Snapshot>> {
         self.smtc.sessions()
     }

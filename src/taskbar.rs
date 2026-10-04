@@ -498,6 +498,7 @@ impl Action {
     }
 
     /// The same codes in the other direction, for [`post_action`].
+    #[cfg(feature = "dev")]
     fn code(self) -> usize {
         match self {
             Self::CycleOutput => 1,
@@ -520,6 +521,7 @@ impl Action {
 /// [`WM_TASKBAR_ACTION`] inward runs exactly as it does for a real click. What it
 /// does *not* prove is the TAP's own half — the handlers, the segment routing and
 /// the doubled-event coalescing still only get exercised by a finger.
+#[cfg(feature = "dev")]
 pub fn post_action(action: Action) -> Result<()> {
     use windows::Win32::Foundation::{LPARAM, WPARAM};
     use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
@@ -537,6 +539,7 @@ pub fn post_action(action: Action) -> Result<()> {
 /// touchpad half of the gesture cannot be synthesised at all (its deltas arrive from XAML,
 /// inside Explorer), so this is the only way to drive fractional notches — and the readout's
 /// coalescing and fade — from a script.
+#[cfg(feature = "dev")]
 pub fn post_scroll(flow: crate::audio::Flow, notches: f32) -> Result<()> {
     use windows::Win32::Foundation::{LPARAM, WPARAM};
     use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WHEEL_DELTA};
@@ -627,6 +630,7 @@ pub const WM_MUSIC_PROGRESS: u32 = windows::Win32::UI::WindowsAndMessaging::WM_A
 
 /// Window class of the receiver. Must match `RECEIVER_CLASS` in the TAP's `ipc`
 /// module — the TAP finds this window by class name.
+#[cfg(feature = "dev")]
 const RECEIVER_CLASS_NAME: &str = "AudioTrayTaskbarIpc";
 
 /// The same name, wide and NUL-terminated, for `RegisterClassW`. `w!` takes a

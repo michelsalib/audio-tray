@@ -1,5 +1,8 @@
 //! What audio-tray and its TAP (inside `explorer.exe`) must agree on. The exe and DLL can be
 //! different builds (RELEASING.md), so values are never renumbered, only added.
+//!
+//! Message ids share the app's receiver window with app-internal ones: `WM_APP + 1..=19` and
+//! `+ 30..=39` are the app's own (audio and tray), `+ 20..=29` and `+ 40..` are this crate's.
 
 /// `WM_APP`, spelled out so this crate needs no Windows bindings.
 const WM_APP: u32 = 0x8000;
@@ -39,7 +42,7 @@ pub const WM_TAP_PROGRESS_WINDOW: u32 = WM_APP + 28;
 pub const WM_TAP_MUSIC_CHANGED: u32 = WM_APP + 29;
 /// TAP → app: which parts of the taskbar integration are not working (`wParam`, `STATUS_*` bits;
 /// 0 = all well). Posted when it changes, after a start-up grace period.
-pub const WM_TASKBAR_STATUS: u32 = WM_APP + 30;
+pub const WM_TASKBAR_STATUS: u32 = WM_APP + 40;
 
 /// Our buttons are not on the taskbar (the notification icon was not found or not decorated).
 pub const STATUS_NO_STRIP: usize = 1 << 0;

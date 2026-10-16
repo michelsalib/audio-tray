@@ -90,3 +90,23 @@ The strip needing a fresh Explorer is a condition the app can detect and repair 
 (`taskbar::apply_at_startup`), and an unlabelled glyph only helps a user who already knows that
 restarting the shell is the answer to a taskbar that looks wrong. `audio-tray --taskbar-restart`
 remains as the manual escape hatch. `footer_buttons`' doc comment points here.
+
+## Following the defaults' mute, and the icon after Explorer restarts (2026-10-17)
+
+- **Mute changed outside the app** (a keyboard media key, another mixer) used to leave the icon
+  and the strip stale until the next device event: only the open flyout watched volume. The tray
+  now holds an `IAudioEndpointVolumeCallback` on the default output and input, re-armed when a
+  default changes. A notification reads only the mute flag; volume-only changes (slider drags,
+  mic auto-gain: tens per second) cost that one read. A flip posts the usual coalesced refresh.
+- **The icon could vanish after two quick Explorer restarts.** tray-icon re-adds the icon on
+  `TaskbarCreated` but ignores `Shell_NotifyIcon(NIM_ADD)`'s result; a shell that is not taking
+  icons yet refuses it, and nothing retried. After every restart the tray now checks
+  `Shell_NotifyIconGetRect` (`None` only for an unregistered icon; an overflowed one reports the
+  chevron) at 1, 2, 4… s and rebuilds the `TrayIcon` when it is missing. Same tooltip and exe
+  path, so the "always show" choice carries over. Verified by deleting the icon by hand.
+- **Receiver-window message ids collided**: `tap_proto::WM_TASKBAR_STATUS` was given
+  `WM_APP + 30`, the tray's `WM_APPLY_SCROLL`, and the status check ran first — scroll-to-volume
+  would have stopped working. Moved to `+ 40`; `tap-proto` documents the id ranges and a tray test
+  asserts every id the receiver handles is distinct.
+- Cycling an output onto a device unmutes it **by design** (see `Tray::taskbar_action`); that is
+  not a mute-tracking bug.

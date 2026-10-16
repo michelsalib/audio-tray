@@ -65,6 +65,16 @@ const WM_APPLY_SCROLL: u32 = WM_APP + 30;
 /// A click on the plain icon, from tray-icon's handler: `wParam` 1 = left, 2 = right; `lParam` the
 /// anchor (icon centre x, icon top), packed by [`pack_point`].
 const WM_TRAY_CLICK: u32 = WM_APP + 31;
+/// A default endpoint's volume or mute changed, from anywhere (media keys, another app). Only a
+/// mute change matters to the icon and the strip; see [`Tray::check_mutes`].
+const WM_ENDPOINT_VOLUME: u32 = WM_APP + 32;
+/// Check that the icon survived an Explorer restart (`wParam`: attempt number); see
+/// [`Tray::ensure_icon`].
+const WM_ICON_CHECK: u32 = WM_APP + 33;
+
+/// Re-registration checks after a restart, and the first gap (doubling): ~1 min in all.
+const ICON_CHECKS: usize = 6;
+const ICON_CHECK_FIRST: Duration = Duration::from_secs(1);
 
 /// After the flyout closes, ignore clicks for this long: the dismissing click's release half
 /// arrives as a strip `Tapped` or tray-icon click after the panel has gone.
@@ -79,6 +89,14 @@ pub(crate) fn post(message: u32, wparam: usize, lparam: isize) -> bool {
     let raw = WINDOW.load(Ordering::SeqCst);
     raw != 0
         && unsafe { PostMessageW(Some(HWND(raw as *mut _)), message, WPARAM(wparam), LPARAM(lparam)) }.is_ok()
+}
+
+/// [`post`] after `delay`, from a short-lived thread (the tray thread must keep pumping).
+fn post_after(message: u32, wparam: usize, delay: Duration) {
+    std::thread::spawn(move || {
+        std::thread::sleep(delay);
+        post(message, wparam, 0);
+    });
 }
 
 /// A "the world changed, go and look" message, coalesced: at most one is queued at a time, and
@@ -152,6 +170,18 @@ struct Tray {
     reopen_guard: Instant,
     flyout_open: bool,
     scroll: ScrollTotals,
+    /// Volume/mute subscriptions on the current default output and input, with the mute last
+    /// seen: a mute toggled outside the app (a media key) must reach the icon and the strip.
+    /// Re-armed by [`Tray::refresh`] when a default changes.
+    mute_watches: Vec<MuteWatch>,
+    /// Coalesces [`WM_ENDPOINT_VOLUME`]: a slider drag or mic auto-gain fires tens per second.
+    mute_pending: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+struct MuteWatch {
+    id: crate::audio::DeviceId,
+    watch: crate::audio::wasapi::VolumeWatch,
+    muted: bool,
 }
 
 thread_local! {
@@ -223,6 +253,8 @@ pub fn run(backend: WasapiBackend) -> Result<()> {
             reopen_guard: Instant::now(),
             flyout_open: false,
             scroll: ScrollTotals::default(),
+            mute_watches: Vec::new(),
+            mute_pending: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     });
     with_tray(Tray::refresh);
@@ -278,6 +310,8 @@ fn is_ours(msg: u32, wparam: usize) -> bool {
             | WM_MUSIC_PROGRESS
             | WM_APPLY_SCROLL
             | WM_TRAY_CLICK
+            | WM_ENDPOINT_VOLUME
+            | WM_ICON_CHECK
     ) || (msg == WM_TIMER && wparam == crate::osd::TIMER_ID)
 }
 
@@ -313,6 +347,12 @@ fn handle(msg: Queued) {
         notify::WM_AUDIO_REFRESH => {
             AUDIO_CHANGED.take();
             with_tray(Tray::refresh);
+        }
+        WM_ENDPOINT_VOLUME => {
+            with_tray(Tray::check_mutes);
+        }
+        WM_ICON_CHECK => {
+            with_tray(|tray| tray.ensure_icon(msg.wparam));
         }
         mic::WM_MIC_CHANGED => {
             MIC_CHANGED.take();
@@ -473,10 +513,53 @@ impl Tray {
     /// brings us back here.
     fn refresh(&mut self) {
         let state = Current::read(&self.backend, &self.config);
+        self.rearm_mute_watches();
         self.push_strip(state.strip_icons());
         self.refresh_icon_rect();
         if let Err(e) = state.output.apply_to(&self.icon) {
             eprintln!("tray: could not update the icon, will retry when the taskbar is back ({e:#})");
+        }
+    }
+
+    /// Watch the current defaults' volume and mute, keeping existing subscriptions whose endpoint
+    /// is still the default. A failure leaves that flow unwatched (the next refresh retries).
+    fn rearm_mute_watches(&mut self) {
+        let receiver = taskbar::receiver().map_or(0, |hwnd| hwnd.0 as isize);
+        if receiver == 0 {
+            return;
+        }
+        let defaults: Vec<crate::audio::DeviceId> = [Flow::Output, Flow::Input]
+            .into_iter()
+            .filter_map(|flow| self.backend.default_of(flow).ok().flatten())
+            .collect();
+        self.mute_watches.retain(|w| defaults.contains(&w.id));
+        for id in defaults {
+            if self.mute_watches.iter().any(|w| w.id == id) {
+                continue;
+            }
+            match self.backend.watch_volume(&id, receiver, WM_ENDPOINT_VOLUME, self.mute_pending.clone()) {
+                Ok(watch) => {
+                    let muted = watch.read().is_some_and(|(_, muted)| muted);
+                    self.mute_watches.push(MuteWatch { id, watch, muted });
+                }
+                Err(e) => eprintln!("tray: cannot watch the volume of {} ({e:#})", id.0),
+            }
+        }
+    }
+
+    /// After a volume notification: refresh only if a watched mute flipped. Volume-only changes
+    /// cost one read each and nothing else.
+    fn check_mutes(&mut self) {
+        self.mute_pending.store(false, std::sync::atomic::Ordering::SeqCst);
+        let mut flipped = false;
+        for w in &mut self.mute_watches {
+            if let Some((_, muted)) = w.watch.read() {
+                flipped |= muted != w.muted;
+                w.muted = muted;
+            }
+        }
+        if flipped {
+            AUDIO_CHANGED.post();
         }
     }
 
@@ -569,6 +652,41 @@ impl Tray {
         crate::music::player::forget_taskbar_list();
         // tray-icon re-registered the icon with its build-time defaults; put ours back.
         self.refresh();
+        // ...unless that re-registration failed: see `ensure_icon`.
+        post_after(WM_ICON_CHECK, 0, ICON_CHECK_FIRST);
+    }
+
+    /// tray-icon re-adds the icon on `TaskbarCreated` but ignores the result, and a shell that is
+    /// not taking icons yet (two restarts in a row) refuses it: the icon is then simply gone.
+    /// `rect()` is `None` only for an unregistered icon (an overflowed one reports the chevron),
+    /// so a missing one is rebuilt, retrying with a doubling gap.
+    fn ensure_icon(&mut self, attempt: usize) {
+        if self.icon.rect().is_some() {
+            if attempt > 0 {
+                println!("tray: icon back after an Explorer restart (check {attempt})");
+            }
+            return;
+        }
+        let rebuilt = icon_image(Endpoint::read(&self.backend, &self.config, Flow::Output).icon)
+            .and_then(|image| {
+                TrayIconBuilder::new()
+                    .with_tooltip(INITIAL_TOOLTIP)
+                    .with_icon(image)
+                    .build()
+                    .map_err(anyhow::Error::from)
+            });
+        match rebuilt {
+            Ok(icon) => {
+                // The old one is already gone from the shell; dropping it only frees its window.
+                self.icon = icon;
+                println!("tray: the icon did not survive the Explorer restart — registered it again");
+                self.refresh();
+            }
+            Err(e) => println!("tray: icon still missing after an Explorer restart ({e:#})"),
+        }
+        if attempt + 1 < ICON_CHECKS {
+            post_after(WM_ICON_CHECK, attempt + 1, ICON_CHECK_FIRST * 2u32.pow(attempt as u32 + 1));
+        }
     }
 
     /// Act on a click from the injected strip.
@@ -809,6 +927,28 @@ fn taskbar_is_light() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every message the receiver window handles, the TAP's included: a shared id would route one
+    /// as the other (a status report swallowed scroll-to-volume before this test existed).
+    #[test]
+    fn receiver_message_ids_are_distinct() {
+        let ids = [
+            notify::WM_AUDIO_REFRESH,
+            mic::WM_MIC_CHANGED,
+            WM_APPLY_SCROLL,
+            WM_TRAY_CLICK,
+            WM_ENDPOINT_VOLUME,
+            WM_ICON_CHECK,
+            tap_proto::WM_TASKBAR_ACTION,
+            tap_proto::WM_TASKBAR_RESTARTED,
+            tap_proto::WM_TASKBAR_SCROLL,
+            tap_proto::WM_MUSIC_PROGRESS,
+            tap_proto::WM_TASKBAR_STATUS,
+        ];
+        for (i, a) in ids.iter().enumerate() {
+            assert!(ids[i + 1..].iter().all(|b| a != b), "0x{a:x} is used twice");
+        }
+    }
 
     #[test]
     fn wake_posts_once_until_taken() {

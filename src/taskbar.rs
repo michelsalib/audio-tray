@@ -766,14 +766,70 @@ fn exit_and_relaunch_shell(shell: windows::Win32::Foundation::HANDLE) -> Result<
         return Ok(());
     }
     // Detached from our streams: the shell outlives us and would hold a console or file open.
-    std::process::Command::new("explorer.exe")
+    let mut shell = std::process::Command::new("explorer.exe");
+    shell
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .context("launch explorer.exe")?;
+        .stderr(std::process::Stdio::null());
+    // Every program the shell starts inherits its environment, so it must not be ours: started
+    // from a VS Code terminal we carry `ELECTRON_RUN_AS_NODE=1`, which made every Electron app
+    // launched from the taskbar quit at once; and any snapshot of ours is stale once an installer
+    // has changed PATH. Fall back to ours only if the fresh one cannot be built.
+    match fresh_user_environment() {
+        Some(environment) => {
+            shell.env_clear().envs(environment);
+        }
+        None => eprintln!("taskbar: no fresh user environment — Explorer inherits ours"),
+    }
+    shell.spawn().context("launch explorer.exe")?;
     eprintln!("taskbar: Explorer restarted");
     Ok(())
+}
+
+/// The user's environment as Windows builds it at sign-in (registry, user profile), without
+/// anything this process inherited or set.
+fn fresh_user_environment() -> Option<Vec<(String, String)>> {
+    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows::Win32::Security::TOKEN_QUERY;
+    use windows::Win32::System::Environment::{CreateEnvironmentBlock, DestroyEnvironmentBlock};
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    unsafe {
+        let mut token = HANDLE::default();
+        OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).ok()?;
+        let mut block: *mut core::ffi::c_void = core::ptr::null_mut();
+        let built = CreateEnvironmentBlock(&mut block, Some(token), false);
+        let _ = CloseHandle(token);
+        built.ok()?;
+        let environment = parse_environment_block(block as *const u16);
+        let _ = DestroyEnvironmentBlock(block);
+        Some(environment)
+    }
+}
+
+/// Reads a `name=value\0…\0\0` UTF-16 environment block. Drive-current-directory entries (`=C:=…`)
+/// are skipped: they are not variables, and `Command::env` cannot set them.
+///
+/// # Safety
+/// `block` must point at a well-formed block (double-NUL terminated).
+unsafe fn parse_environment_block(block: *const u16) -> Vec<(String, String)> {
+    let mut entries = Vec::new();
+    let mut at = block;
+    loop {
+        let mut len = 0usize;
+        while *at.add(len) != 0 {
+            len += 1;
+        }
+        if len == 0 {
+            break;
+        }
+        let entry = String::from_utf16_lossy(std::slice::from_raw_parts(at, len));
+        if let Some((name, value)) = entry.split_once('=').filter(|(name, _)| !name.is_empty()) {
+            entries.push((name.to_string(), value.to_string()));
+        }
+        at = at.add(len + 1);
+    }
+    entries
 }
 
 /// Whether a shell is up, waiting up to `budget` for one to appear.
@@ -793,7 +849,28 @@ fn wait_for_shell(budget: std::time::Duration) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::status_notice;
+    use super::{fresh_user_environment, parse_environment_block, status_notice};
+
+    #[test]
+    fn an_environment_block_parses_and_skips_drive_directories() {
+        let block: Vec<u16> = "=C:=C:\\work\0PATH=C:\\bin;D:\\x\0A=b=c\0\0".encode_utf16().collect();
+        let parsed = unsafe { parse_environment_block(block.as_ptr()) };
+        assert_eq!(
+            parsed,
+            vec![("PATH".to_string(), "C:\\bin;D:\\x".to_string()), ("A".to_string(), "b=c".to_string())]
+        );
+    }
+
+    /// What broke Orca: a variable this process carries must not reach the relaunched shell.
+    #[test]
+    fn the_shell_environment_does_not_inherit_ours() {
+        std::env::set_var("AUDIO_TRAY_TEST_LEAK", "1");
+        let fresh = fresh_user_environment().expect("CreateEnvironmentBlock");
+        assert!(fresh.iter().all(|(name, _)| name != "AUDIO_TRAY_TEST_LEAK"));
+        // A real user environment, not an empty one.
+        assert!(fresh.iter().any(|(name, _)| name.eq_ignore_ascii_case("USERPROFILE")));
+        assert!(fresh.iter().any(|(name, _)| name.eq_ignore_ascii_case("PATH")));
+    }
 
     #[test]
     fn a_healthy_tap_shows_no_notice_and_the_worst_problem_wins() {

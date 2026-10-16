@@ -110,3 +110,14 @@ remains as the manual escape hatch. `footer_buttons`' doc comment points here.
   asserts every id the receiver handles is distinct.
 - Cycling an output onto a device unmutes it **by design** (see `Tray::taskbar_action`); that is
   not a mute-tracking bug.
+
+## Explorer is relaunched with a fresh environment (2026-10-17)
+
+When the shell does not come back by itself, `taskbar::restart_explorer` starts `explorer.exe`, and
+every program the user then launches from the taskbar or Start inherits that shell's environment.
+It used to be audio-tray's own. Found the hard way: an audio-tray started from a VS Code terminal
+carries `ELECTRON_RUN_AS_NODE=1`, the relaunched shell passed it on, and every Electron app pinned
+to the taskbar (Orca, here) ran as bare Node and quit before reaching Task Manager — until Explorer
+was restarted by hand. Even from a clean sign-in start, audio-tray's environment is a snapshot that
+an installer changing PATH makes stale. The shell now gets `CreateEnvironmentBlock(token, FALSE)`:
+the user's environment as Windows builds it at sign-in, nothing of ours.

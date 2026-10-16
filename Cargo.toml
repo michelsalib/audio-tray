@@ -85,6 +85,8 @@ features = [
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_System_Threading",
+    # CreateEnvironmentBlock: Explorer is relaunched with a fresh user environment, not ours.
+    "Win32_System_Environment",
     # CreateEventW / WaitForMultipleObjects, for the microphone-in-use watch.
     "Win32_Security",
     "Win32_System_Registry",

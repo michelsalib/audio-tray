@@ -68,9 +68,12 @@ Name: "autostart"; Description: "Start {#AppName} automatically when I sign in";
 Source: "{#SourceExe}"; DestDir: "{app}"; Flags: ignoreversion
 ; `skipifsourcedoesntexist` so a build without the TAP still produces an installer.
 ; Explorer keeps the DLL loaded once the strip has been injected, so it cannot be
-; replaced in place — `restartreplace` defers it to the next reboot rather than
-; failing the install.
-Source: "{#SourceTap}"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist restartreplace uninsrestartdelete
+; overwritten. `restartreplace` cannot help: its boot-time rename needs administrator
+; rights, which a per-user install does not have. `SetAsideLoadedTap` renames the
+; held file out of the way instead; Explorer runs the old image until it restarts.
+; `uninsrestartdelete` likewise only takes effect for an elevated (all-users) install;
+; per-user, a DLL Explorer still holds at uninstall is left behind.
+Source: "{#SourceTap}"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist uninsrestartdelete; BeforeInstall: SetAsideLoadedTap
 
 [Icons]
 Name: "{autoprograms}\{#AppName}"; Filename: "{app}\{#AppExeName}"
@@ -82,3 +85,33 @@ Name: "{userstartup}\{#AppName}"; Filename: "{app}\{#AppExeName}"; Tasks: autost
 ; Offer to launch right after an interactive install; skipped for silent
 ; (winget / CI) installs.
 Filename: "{app}\{#AppExeName}"; Description: "Launch {#AppName} now"; Flags: nowait postinstall skipifsilent
+
+[UninstallDelete]
+; TAPs set aside by `SetAsideLoadedTap` or the self-updater (`update::install_tap`).
+Type: files; Name: "{app}\audio_tray_tap.dll.old*"
+
+[Code]
+// An image Explorer has loaded cannot be overwritten or deleted, but it can be
+// renamed, unelevated. Move a held TAP to the first free `.old<n>` slot (the
+// names `update::install_tap` uses) so the new one lands under the real name.
+// A TAP nothing holds is simply deleted.
+procedure SetAsideLoadedTap();
+var
+  Tap, Aside: String;
+  Slot: Integer;
+begin
+  Tap := ExpandConstant('{app}\audio_tray_tap.dll');
+  if not FileExists(Tap) or DeleteFile(Tap) then
+    Exit;
+  for Slot := 0 to 3 do
+  begin
+    Aside := Tap + '.old' + IntToStr(Slot);
+    if FileExists(Aside) and not DeleteFile(Aside) then
+      Continue;
+    if RenameFile(Tap, Aside) then
+      Log('Set aside the loaded TAP as ' + Aside)
+    else
+      Log('Could not set aside the loaded TAP; the copy will report it in use');
+    Exit;
+  end;
+end;

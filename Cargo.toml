@@ -34,15 +34,19 @@ directories = "6.0.0"
 # In-app GitHub-releases self-updater (see src/update.rs). Uses the `ureq` client
 # with `native-tls` = Windows SChannel, so no tokio/reqwest, no ring/rustls, and
 # no OpenSSL to build on the MSVC toolchain. archive-zip matches the zipped
-# `audio-tray-x86_64-pc-windows-msvc.zip` release asset.
+# `audio-tray-x86_64-pc-windows-msvc.zip` release asset. checksums verifies every
+# download against the release's SHA256SUMS asset before anything is replaced.
 self_update = { version = "1.3", default-features = false, features = [
     "ureq",
     "native-tls",
     "github",
     "archive-zip",
     "compression-zip-deflate",
+    "checksums",
 ] }
 serde = { version = "1.0.228", features = ["derive"] }
+# Hashes the TAP's update archive (update.rs); same major as self_update's checksums feature.
+sha2 = "0.11"
 toml = "1.1.3"
 tray-icon = "0.26.0"
 windows-core = "0.61"
@@ -89,8 +93,8 @@ features = [
     "Win32_System_LibraryLoader",
     "Win32_System_Console",
     "Win32_UI_HiDpi",
-    # MoveFileExW, for handing the TAP's replacement to the next boot when
-    # Explorer has the DLL open (see update.rs).
+    # GetFileVersionInfoW (the TAP's version stamp, update.rs) and SYNCHRONIZE (waiting on
+    # the shell process, taskbar.rs).
     "Win32_Storage_FileSystem",
 ]
 

@@ -14,13 +14,16 @@ jobs:
   release:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        # Pinned to the `stable` branch head; pinned by SHA the toolchain must be named explicitly.
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
 
       - name: Cache cargo build
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: Resolve + verify version
         id: ver
@@ -42,10 +45,9 @@ jobs:
       - name: Build release
         run: cargo build --release --locked --workspace
 
-      # The zip is what the in-app self-updater downloads (src/update.rs). It
-      # replaces the exe only, so a release whose *TAP* changed needs the installer
-      # to land the new DLL — see RELEASING.md. The DLL is in here anyway so the
-      # asset is a complete copy of what was built.
+      # The zip is what the in-app self-updater downloads (src/update.rs): the exe
+      # through `self_update`, the TAP through `update::update_tap`, both from this
+      # one asset — see RELEASING.md.
       - name: Package self-update asset (zipped exe + TAP)
         shell: pwsh
         run: |
@@ -58,23 +60,43 @@ jobs:
       - name: Build Inno Setup installer
         shell: pwsh
         run: |
+          # Pinned so the installer does not change with the runner image. choco is a
+          # no-op when this exact version is already installed.
+          choco install innosetup --version=6.7.1 --allow-downgrade -y --no-progress
+          if ($LASTEXITCODE -ne 0) { throw "choco install innosetup failed with exit code $LASTEXITCODE" }
           $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
-          if (-not (Test-Path $iscc)) {
-            choco install innosetup -y --no-progress
-          }
           $exe = (Resolve-Path target/release/audio-tray.exe).Path
           $tap = (Resolve-Path target/release/audio_tray_tap.dll).Path
           & $iscc "/DAppVersion=${{ steps.ver.outputs.version }}" "/DSourceExe=$exe" "/DSourceTap=$tap" packaging/audio-tray.iss
           if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit code $LASTEXITCODE" }
 
+      # One `<sha256>  <name>` line per downloadable asset. The self-updater refuses
+      # any release without it, or any asset that does not match it (src/update.rs,
+      # SUMS_ASSET). LF line endings so `sha256sum -c` works anywhere.
+      - name: Write SHA256SUMS
+        shell: pwsh
+        run: |
+          Set-Location packaging/dist
+          $assets = "AudioTray-${{ steps.ver.outputs.version }}-Setup.exe", "audio-tray-x86_64-pc-windows-msvc.zip"
+          $lines = foreach ($a in $assets) { "{0}  {1}" -f (Get-FileHash $a -Algorithm SHA256).Hash.ToLowerInvariant(), $a }
+          [IO.File]::WriteAllText("$PWD/SHA256SUMS", ($lines -join "`n") + "`n")
+          Get-Content SHA256SUMS
+
+      - name: Check SHA256SUMS
+        shell: bash
+        working-directory: packaging/dist
+        run: sha256sum -c SHA256SUMS
+
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
-          # Both assets attach to the release for tag ${{ github.ref_name }}:
-          #  - Setup.exe  → humans + winget
-          #  - .zip       → the in-app self-updater (src/update.rs)
+          # All three attach to the release for tag ${{ github.ref_name }}:
+          #  - Setup.exe   → humans + winget
+          #  - .zip        → the in-app self-updater (src/update.rs)
+          #  - SHA256SUMS  → checksums of both; the self-updater refuses a .zip that does not match
           files: |
             packaging/dist/AudioTray-${{ steps.ver.outputs.version }}-Setup.exe
             packaging/dist/audio-tray-x86_64-pc-windows-msvc.zip
+            packaging/dist/SHA256SUMS
           generate_release_notes: true
           fail_on_unmatched_files: true

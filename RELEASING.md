@@ -51,14 +51,19 @@ git push origin v0.1.1
 
 The workflow builds `--release --workspace` — the workspace part matters, because it
 is what produces `audio_tray_tap.dll` from `crates/taskbar-tap` alongside the exe.
-It then publishes a GitHub Release with two assets:
+It then publishes a GitHub Release with three assets:
 
 - **`AudioTray-0.1.1-Setup.exe`** — the Inno installer (humans + winget). Ships the
   exe **and** the TAP.
 - **`audio-tray-x86_64-pc-windows-msvc.zip`** — zipped `audio-tray.exe` plus the
   TAP, consumed by the in-app updater.
+- **`SHA256SUMS`** — one `<sha256>  <name>` line for each of the two above. The
+  in-app updater refuses a release without it (see §2).
 
-Both asset names are load-bearing — see the regex in `winget.yml` and `TARGET` in `src/update.rs`.
+All three names are load-bearing — see the regex in `winget.yml`, and `TARGET` and
+`SUMS_ASSET` in `src/update.rs`. Do not publish per-asset `<name>.sha256` files
+instead: `audio-tray-x86_64-pc-windows-msvc.zip.sha256` contains `TARGET`, and
+`self_update` picks the first asset whose name contains it as the archive.
 
 ### If you changed the TAP
 
@@ -66,18 +71,29 @@ Both asset names are load-bearing — see the regex in `winget.yml` and `TARGET`
 gets its own pass in `update::update_tap`, which runs only when an update was
 actually applied. Where it lands depends on whether Explorer has the DLL open:
 
-| DLL state | when the new DLL takes effect |
+| DLL state | what happens |
 |---|---|
-| not loaded (the injection never landed) | immediately, alongside the exe |
-| loaded — the normal case | **next reboot** — handed to `MoveFileExW` with `MOVEFILE_DELAY_UNTIL_REBOOT` |
+| not loaded (the injection never landed) | copied over the old one, alongside the exe |
+| loaded — the normal case | the held file is **renamed** to `audio_tray_tap.dll.old<n>` and the new one copied in. Explorer keeps running the old image until it restarts |
+| loaded and cannot be renamed (not expected) | **staged** in `%TEMP%\audio-tray-tap-<version>\` for `update::place_staged_tap` |
 
-That second row is the same mechanism as the installer's `restartreplace`, and it is
-now the usual outcome: the strip is injected on every start. `--taskbar-revert` does
-not help — the revert deliberately leaves the DLL pinned in `explorer.exe` (see
-`src/taskbar.rs`), so the file stays locked. Restarting Explorer is what frees it.
+The second row is the usual one, since the strip is injected on every start. A loaded
+DLL cannot be overwritten or deleted, but it can be renamed, and that needs no
+elevation. `update::install_tap` does it, and the installer does the same thing
+(`SetAsideLoadedTap` in `packaging/audio-tray.iss`). The `.old<n>` files are deleted
+whenever nothing holds them any more (on the next update check, `place_staged_tap`, or
+uninstall).
 
-**Users do not usually wait for that reboot.** Taking the update applies the DLL too,
-without anyone asking for it:
+There is deliberately **no boot-time fallback**. `MoveFileExW(MOVEFILE_DELAY_UNTIL_REBOOT)`
+and Inno's `restartreplace` both record the rename under
+`HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\PendingFileRenameOperations`,
+which needs administrator rights. A per-user install in `%LocalAppData%\Programs\AudioTray`
+never has them, so the call failed with access denied and the DLL was never scheduled.
+`--taskbar-revert` does not free the file either: the revert deliberately leaves the DLL
+pinned in `explorer.exe` (see `src/taskbar.rs`). Restarting Explorer is what frees it.
+
+**Users do not have to restart Explorer themselves.** Taking the update gets the new DLL
+running without anyone asking for it:
 
 1. `restart_app` relaunches audio-tray into the new exe (with `--relaunched`, so it waits
    for the single-instance mutex instead of exiting), and hands the strip's ownership to the
@@ -91,20 +107,24 @@ without anyone asking for it:
 3. After an update the versions differ, so the TAP declines (an older TAP that predates the
    handover, or one that does not answer within 3 s, counts the same) and audio-tray calls
    `taskbar::restart_explorer`. That waits for the old shell to exit and, in the gap where
-   nothing holds the DLL, calls `update::place_staged_tap` — which finds the staging directory
-   for its *own* `CARGO_PKG_VERSION`, so it does not matter that a different process downloaded it.
+   nothing holds the DLL, calls `update::place_staged_tap`. Normally the new DLL is already in
+   place (set aside above) and that only deletes the `.old<n>` files. A *staged* DLL it finds
+   by the staging directory for its *own* `CARGO_PKG_VERSION`, so it does not matter that a
+   different process downloaded it.
 4. The fresh Explorer is injected into off `TaskbarCreated`, with the new DLL.
 
-The pending boot rename is left scheduled throughout, so a reboot remains the fallback if
-any of that does not happen. The restart in step 3 is also the general repair path — it is not
-update-specific — and it is budgeted to one restart per run.
+If none of that happens, a DLL that was set aside loads the next time Explorer starts
+(sign-in, reboot). A *staged* one does not: that Explorer gets the old file, and the new
+build's `repair_stale_tap` then places the staged copy (setting the loaded one aside), so it
+lands one Explorer start later. The restart in step 3 is also the general repair path — it is
+not update-specific — and it is budgeted to one restart per run.
 
 Failing to place the DLL is logged and otherwise ignored: the exe has already been
 replaced by then, and turning a good update into a bad one over the DLL would be the
 wrong trade.
 
 **Still keep the init-data protocol backwards compatible.** A stale DLL is always
-possible — the reboot may not have happened yet — and it degrades rather than breaks
+possible — Explorer may not have restarted yet — and it degrades rather than breaks
 because unknown `key=value` pairs are ignored and missing ones fall back to defaults.
 Do not add a key the DLL must have.
 
@@ -143,7 +163,8 @@ audio-tray --tap-version   # what is actually on disk, next to the exe
 audio-tray --update        # checks, then repairs the DLL if it is out of step
 ```
 
-A repair that cannot copy (Explorer has the file) is staged and reported, and the next
+A repair whose copy is blocked (Explorer has the file) sets the old file aside like an
+update does. Only if that fails too is the DLL staged and reported, and the next
 launch retries only the *copy* — it does not download 2 MB again per start. The one
 outcome that logs an error is a release whose own asset is unstamped, which would put the
 check back where it started; `build.rs` panics rather than emit an unstamped DLL, so that
@@ -163,6 +184,51 @@ running tray is never killed out from under you.
 
 - Force a check now: `audio-tray --update`
 - The updater is silent and failure-tolerant: no network / GitHub down = no-op, tray unaffected.
+
+### Integrity check
+
+Before anything on disk is replaced, the updater downloads the release's `SHA256SUMS` and
+checks the `.zip` against its line, for the exe (`self_update`'s `checksum_from_asset`) and
+for the TAP (`update::update_tap`, which downloads the same `.zip` again). A release without
+`SHA256SUMS`, without a line for the `.zip`, or whose `.zip` does not match is **refused**:
+the error is logged (or printed by `--update`) and the current install stays as it is. So
+never publish a release by hand without it. `self_update` also checks GitHub's own per-asset
+`digest` when the API reports one.
+
+This protects against a corrupted or truncated download, and against an asset swapped on
+its way to the user. It does **not** protect against someone who can write to the GitHub
+release itself (a leaked token or a compromised workflow): they can replace `SHA256SUMS`
+along with the `.zip`. That needs a signature, below.
+
+A change here takes effect one release later, like any `update_tap` fix: the update is run
+by the *old* build. Builds before the checksum check download unverified, including the
+update *to* the first build that has it.
+
+### Optional next step: signatures
+
+Real authenticity needs a private key that never leaves the maintainer's control (a GitHub
+secret). There is none yet, so none of this is implemented. Two complementary options:
+
+1. **Sign the update archive** — `self_update`'s `signatures` feature (zipsign, ed25519).
+   - Create a key pair once, locally: `cargo install zipsign`, then
+     `zipsign gen-key priv.key pub.key`. Store `priv.key` (base64) as the repo secret
+     `ZIPSIGN_PRIVATE_KEY`, and keep an offline backup. Losing it means a new key and
+     a release that ships the new public key.
+   - In `release.yml`, after packaging and before `SHA256SUMS`, decode the secret to a
+     file and sign the `.zip` with `zipsign sign zip …` (see `zipsign sign --help` for the
+     output flag). The signature is embedded in the zip, so the asset name does not change.
+   - In the app, enable the `signatures` feature on `self_update`, embed `pub.key` with
+     `include_bytes!`, pass it to `.verifying_keys([..])` in `check_and_apply`, and verify
+     the TAP's archive in `update_tap` with `self_update::verify_signature` before extracting.
+   - Roll out in two releases: first one whose CI signs (the app does not check yet), then
+     the one that requires it, or the first signed build would refuse every older release.
+   - [minisign](https://jedisct1.github.io/minisign/) over `SHA256SUMS`
+     (`SHA256SUMS.minisig`) works the same way and also covers `Setup.exe`, but the app would
+     need its own verifier crate (e.g. `minisign-verify`).
+2. **Authenticode** — sign `audio-tray.exe`, `audio_tray_tap.dll` and `Setup.exe` with a
+   code-signing certificate (§4). The updater could then also check
+   `WinVerifyTrust` on the extracted files before installing them. This is what removes the
+   SmartScreen prompt; option 1 is free and is what protects the updater.
 
 ---
 

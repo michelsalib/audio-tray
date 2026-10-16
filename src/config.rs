@@ -18,6 +18,36 @@ pub struct Config {
     pub icons: HashMap<String, IconId>,
     /// The YouTube Music half of the app — see [`crate::music`].
     pub music: Music,
+    /// What the taskbar buttons change in Windows' own tray — see [`crate::taskbar`]. Not called
+    /// `[taskbar]`: a legacy section of that name may still sit in old files with other keys.
+    pub strip: Strip,
+}
+
+/// Switches for each edit the taskbar integration makes to the shell. All on by default; turning
+/// one off is also the way to rule it out when the taskbar misbehaves.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Strip {
+    /// Move the notification icons (our buttons among them) between the keyboard-layout indicator
+    /// and wifi. Off: they stay where Windows puts them.
+    pub next_to_wifi: bool,
+    /// Hide Windows' volume icon, which the output button duplicates.
+    pub hide_windows_volume: bool,
+    /// Hide Windows' "microphone in use" icon, which the input button's red dot replaces.
+    pub hide_windows_mic: bool,
+    /// The mouse wheel changes the volume anywhere over the taskbar. Off: only over our buttons.
+    pub scroll_anywhere: bool,
+}
+
+impl Default for Strip {
+    fn default() -> Self {
+        Self {
+            next_to_wifi: true,
+            hide_windows_volume: true,
+            hide_windows_mic: true,
+            scroll_anywhere: true,
+        }
+    }
 }
 
 /// Following YouTube Music and drawing it into the taskbar. On by default: it does nothing

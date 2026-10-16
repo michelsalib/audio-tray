@@ -185,12 +185,16 @@ pub fn run(backend: WasapiBackend) -> Result<()> {
 
     // Before the tray icon exists: decorating inside the initial visual-tree replay, while the
     // shell is still building the icon's subtree, hangs `put_Content` (see FINDINGS.md).
+    // A TAP staged by an update that could not land it (the old one was loaded) is placed now:
+    // the set-aside rename works on a loaded DLL, so this needs no Explorer restart.
+    crate::update::place_staged_tap();
     taskbar::apply_at_startup(strip_icons(&backend, &config));
 
     // At logon audio-tray can start ahead of `explorer.exe`; `build_tray` retries until it takes.
     let icon = build_tray(&backend, &config)?;
     TrayIconEvent::set_event_handler(Some(on_tray_event));
     let _notifications = notify::register()?;
+    hook::set_scroll_anywhere(config.strip.scroll_anywhere);
     let _wheel = hook::WheelHook::spawn();
 
     let devices = backend.enumerate_flow(Flow::Output).map(|d| d.len()).unwrap_or(0);
@@ -245,6 +249,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
     if msg == taskbar::taskbar_created_message() {
         let _ = unsafe { PostMessageW(Some(hwnd), WM_TASKBAR_RESTARTED, WPARAM(0), LPARAM(0)) };
         return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
+    }
+    // A plain store, read when the flyout opens: nothing to queue.
+    if msg == tap_proto::WM_TASKBAR_STATUS {
+        taskbar::set_status(wparam.0);
+        return LRESULT(0);
     }
     if !is_ours(msg, wparam.0) {
         return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };

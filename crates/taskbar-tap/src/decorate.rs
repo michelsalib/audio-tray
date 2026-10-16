@@ -130,10 +130,8 @@ impl StripState {
     /// so the format can grow without breaking an older TAP.
     pub fn parse(data: &str) -> Self {
         let mut state = Self::default();
-        for pair in data.split(';') {
-            let Some((key, value)) = pair.split_once('=') else {
-                continue;
-            };
+        for (key, value) in tap_proto::init_pairs(data) {
+            let value = value.as_str();
             let glyph = || {
                 u32::from_str_radix(value.trim(), 16)
                     .ok()
@@ -200,14 +198,25 @@ fn vector_icon(glyph: char) -> Option<&'static [Vector]> {
     }
 }
 
-/// The icon inside a segment: a `FontIcon`, or hand-drawn shapes for the two icons Segoe
-/// Fluent lacks. Shapes cannot inherit `Foreground`, so they stroke `colour` or white.
-fn icon_markup(glyph: char, size: u32, colour: Option<&str>) -> String {
+/// `Visibility` attribute value.
+fn visibility(visible: bool) -> &'static str {
+    if visible {
+        "Visible"
+    } else {
+        "Collapsed"
+    }
+}
+
+/// One icon inside a segment, named so a restyle can find it: a `FontIcon`, or hand-drawn shapes
+/// for the two icons Segoe Fluent lacks. Shapes cannot inherit `Foreground`, so they stroke
+/// `colour` or white.
+fn icon_markup(glyph: char, size: u32, colour: Option<&str>, name: &str, visible: bool) -> String {
+    let shown = visibility(visible);
     let Some(shapes) = vector_icon(glyph) else {
         let fg = colour.map_or(String::new(), |c| format!(r#" Foreground="{c}""#));
         return format!(
-            r##"      <FontIcon FontFamily="Segoe Fluent Icons" Glyph="&#x{:04X};" FontSize="{size}"
-                VerticalAlignment="Center" HorizontalAlignment="Center"{fg}/>"##,
+            r##"      <FontIcon x:Name="{name}" FontFamily="Segoe Fluent Icons" Glyph="&#x{:04X};" FontSize="{size}"
+                VerticalAlignment="Center" HorizontalAlignment="Center" Visibility="{shown}"{fg}/>"##,
             glyph as u32
         );
     };
@@ -268,10 +277,42 @@ fn icon_markup(glyph: char, size: u32, colour: Option<&str>) -> String {
         drawn.push_str(&element);
     }
     format!(
-        r#"      <Canvas Width="{box_px}" Height="{box_px}"
+        r#"      <Canvas x:Name="{name}" Width="{box_px}" Height="{box_px}" Visibility="{shown}"
               VerticalAlignment="Center" HorizontalAlignment="Center">{drawn}
       </Canvas>"#
     )
+}
+
+/// Name suffixes of a segment's icon variants; see [`segment_icons`].
+const PART_GLYPH: &str = "Glyph";
+const PART_MUTED: &str = "Muted";
+const PART_WIRELESS: &str = "Wireless";
+const PART_ROUND: &str = "Round";
+const PART_REC: &str = "Rec";
+
+/// Placeholder for the font glyph while a hand-drawn icon is showing (it stays collapsed).
+const GLYPH_PLACEHOLDER: char = '\u{E767}';
+
+/// Which variants of a segment are visible, and the font glyph to show.
+#[derive(Debug, PartialEq, Eq)]
+struct Shown {
+    glyph: char,
+    font: bool,
+    muted: bool,
+    wireless: bool,
+    round: bool,
+    recording: bool,
+}
+
+fn shown(glyph: char, muted: bool, recording: bool) -> Shown {
+    Shown {
+        glyph: if vector_icon(glyph).is_some() { GLYPH_PLACEHOLDER } else { glyph },
+        font: !muted && vector_icon(glyph).is_none(),
+        muted,
+        wireless: !muted && glyph == EARBUDS_WIRELESS,
+        round: !muted && glyph == EARBUDS_ROUND,
+        recording,
+    }
 }
 
 /// Extra room beyond the badge's overhang so scale rounding cannot shave the ring.
@@ -329,6 +370,35 @@ mod tests {
         }
     }
 
+    /// Every part [`restyle_in_place`] looks up must be in the markup, for both segments and with
+    /// or without a pill — otherwise every restyle falls back to a rebuild.
+    #[test]
+    fn the_markup_names_every_part_a_restyle_needs() {
+        for accent in [None, Some([0x20, 0x40, 0x60])] {
+            let markup = strip_markup(StripState { accent, ..StripState::default() });
+            for segment in [SEGMENT_OUT, SEGMENT_IN] {
+                for part in [PART_GLYPH, PART_MUTED, PART_WIRELESS, PART_ROUND, PART_REC] {
+                    let name = format!(r#"x:Name="{segment}{part}""#);
+                    assert_eq!(markup.matches(&name).count(), 1, "{name} with accent {accent:?}");
+                }
+            }
+        }
+    }
+
+    /// Exactly one icon variant shows: the font glyph, the muted glyph, or one of the earbuds.
+    #[test]
+    fn exactly_one_icon_variant_shows() {
+        for glyph in ['\u{E7F6}', EARBUDS_WIRELESS, EARBUDS_ROUND] {
+            for muted in [false, true] {
+                let s = shown(glyph, muted, false);
+                let visible = [s.font, s.muted, s.wireless, s.round].iter().filter(|&&v| v).count();
+                assert_eq!(visible, 1, "glyph {:04X} muted {muted}", glyph as u32);
+                // A hand-drawn icon leaves a valid font glyph behind (it is set, then collapsed).
+                assert!(vector_icon(s.glyph).is_none());
+            }
+        }
+    }
+
     /// Equal padding must not shift the badge relative to the glyph centre.
     #[test]
     fn the_badge_keeps_its_offset_from_the_glyph_centre() {
@@ -347,27 +417,82 @@ mod tests {
     }
 }
 
-/// The icon, plus the recording dot when something has the microphone open.
+/// Every icon variant of a segment, with only the current one visible, plus the recording dot:
+/// a restyle then flips visibility and sets a glyph instead of rebuilding the strip
+/// ([`restyle_in_place`]). The variants are the device glyph (base colour), the muted glyph (warm
+/// tint, fixed), and the two hand-drawn earbuds.
 ///
 /// The dot is placed relative to the glyph box (as in the flyout), inside a centred `Grid`
 /// padded by the ring's overhang: an `Ellipse` outside its parent gets clipped by the tray,
-/// unlike font ink overshoot.
-fn badged_icon_markup(glyph: char, size: u32, colour: Option<&str>, recording: bool) -> String {
-    let icon = icon_markup(glyph, size, colour);
-    if !recording {
-        return icon;
-    }
+/// unlike font ink overshoot. The padding is equal on all sides, so the wrapper does not move
+/// the icons (tested by `the_badge_keeps_its_offset_from_the_glyph_centre`).
+fn segment_icons(
+    name: &str,
+    glyph: char,
+    muted_glyph: char,
+    size: u32,
+    base: Option<&str>,
+    muted: bool,
+    recording: bool,
+) -> String {
+    let show = shown(glyph, muted, recording);
+    let icons = [
+        icon_markup(show.glyph, size, base, &format!("{name}{PART_GLYPH}"), show.font),
+        icon_markup(muted_glyph, size, Some(MUTED_TINT), &format!("{name}{PART_MUTED}"), show.muted),
+        icon_markup(EARBUDS_WIRELESS, size, base, &format!("{name}{PART_WIRELESS}"), show.wireless),
+        icon_markup(EARBUDS_ROUND, size, base, &format!("{name}{PART_ROUND}"), show.round),
+    ]
+    .join("\n");
     let Badge { grid, width, thickness, left, top } = badge_geometry(f64::from(size));
+    let rec = visibility(show.recording);
     format!(
         r##"      <Grid Width="{grid:.2}" Height="{grid:.2}"
             VerticalAlignment="Center" HorizontalAlignment="Center">
-{icon}
-        <Ellipse Width="{width:.2}" Height="{width:.2}" Fill="{RECORDING_FILL}"
+{icons}
+        <Ellipse x:Name="{name}{PART_REC}" Visibility="{rec}"
+                 Width="{width:.2}" Height="{width:.2}" Fill="{RECORDING_FILL}"
                  Stroke="{RECORDING_RING}" StrokeThickness="{thickness:.2}"
                  HorizontalAlignment="Left" VerticalAlignment="Top"
                  Margin="{left:.2},{top:.2},0,0"/>
       </Grid>"##
     )
+}
+
+/// Updates the strip that is up to `state` with property sets alone: glyph, mute and recording
+/// changes. Returns false if any part is missing or refused (the caller then rebuilds). Accent
+/// and hide flags are not covered: those come with a rebuild.
+///
+/// # Safety
+/// XAML UI thread only, behind the sweep's quiet gate.
+pub unsafe fn restyle_in_place(diagnostics: &IXamlDiagnostics, state: StripState) -> bool {
+    let segments = [
+        (SEGMENT_OUT, state.output_glyph, state.output_muted, false),
+        (SEGMENT_IN, state.input_glyph, state.input_muted, state.input_recording),
+    ];
+    let mut ok = true;
+    for (name, glyph, muted, recording) in segments {
+        let show = shown(glyph, muted, recording);
+        let part = |suffix: &str| crate::tree::newest(crate::tree::find_by_name(&format!("{name}{suffix}")));
+        let (Some(font), Some(muted_icon), Some(wireless), Some(round), Some(rec)) = (
+            part(PART_GLYPH),
+            part(PART_MUTED),
+            part(PART_WIRELESS),
+            part(PART_ROUND),
+            part(PART_REC),
+        ) else {
+            return false;
+        };
+        ok &= set_glyph(diagnostics, font, show.glyph);
+        ok &= set_visible(diagnostics, font, show.font);
+        ok &= set_visible(diagnostics, muted_icon, show.muted);
+        ok &= set_visible(diagnostics, wireless, show.wireless);
+        ok &= set_visible(diagnostics, round, show.round);
+        ok &= set_visible(diagnostics, rec, show.recording);
+    }
+    if ok {
+        logf!("restyle: updated in place");
+    }
+    ok
 }
 
 /// The strip markup: two equal segments, output glyph then input glyph.
@@ -380,12 +505,12 @@ fn strip_markup(state: StripState) -> String {
     // `leading` is the left half; the plates are mirrored (outer corners rounded).
     let segment = |name: &str,
                    glyph: char,
+                   muted_glyph: char,
                    size: u32,
                    width: u32,
                    muted: bool,
                    recording: bool,
                    leading: bool| {
-        let colour = if muted { Some(MUTED_TINT) } else { base };
         // CornerRadius order: top-left, top-right, bottom-right, bottom-left.
         let corners = if leading {
             format!("{PILL_RADIUS},{HOVER_INNER_RADIUS},{HOVER_INNER_RADIUS},{PILL_RADIUS}")
@@ -400,19 +525,8 @@ fn strip_markup(state: StripState) -> String {
               CornerRadius="{corners}"/>
 {}
     </Grid>"##,
-            badged_icon_markup(glyph, size, colour, recording)
+            segment_icons(name, glyph, muted_glyph, size, base, muted, recording)
         )
-    };
-
-    let output = if state.output_muted {
-        GLYPH_MUTE
-    } else {
-        state.output_glyph
-    };
-    let input = if state.input_muted {
-        GLYPH_MIC_OFF
-    } else {
-        state.input_glyph
     };
 
     let strip = format!(
@@ -422,10 +536,20 @@ fn strip_markup(state: StripState) -> String {
 {}
 {}
   </StackPanel>"#,
-        segment(SEGMENT_OUT, output, GLYPH_PX, SEGMENT_W, state.output_muted, false, true),
+        segment(
+            SEGMENT_OUT,
+            state.output_glyph,
+            GLYPH_MUTE,
+            GLYPH_PX,
+            SEGMENT_W,
+            state.output_muted,
+            false,
+            true,
+        ),
         segment(
             SEGMENT_IN,
-            input,
+            state.input_glyph,
+            GLYPH_MIC_OFF,
             GLYPH_PX,
             SEGMENT_W,
             state.input_muted,
@@ -1002,6 +1126,30 @@ pub(crate) unsafe fn load_xaml(markup: &str) -> Option<IInspectable> {
         return None;
     }
     Some(core::mem::transmute::<*mut c_void, IInspectable>(created))
+}
+
+/// Set a `FontIcon`'s `Glyph` in place.
+///
+/// # Safety
+/// XAML UI thread only.
+pub unsafe fn set_glyph(diagnostics: &IXamlDiagnostics, handle: InstanceHandle, glyph: char) -> bool {
+    let Some(icon) = element::<crate::winrt::IFontIcon>(diagnostics, handle) else {
+        return false;
+    };
+    let value = HSTRING::from(glyph.to_string());
+    icon.put_Glyph(hstring_abi(&value)) == S_OK
+}
+
+/// Show or collapse an element.
+///
+/// # Safety
+/// XAML UI thread only.
+pub unsafe fn set_visible(diagnostics: &IXamlDiagnostics, handle: InstanceHandle, visible: bool) -> bool {
+    let Some(element) = element::<IUIElement>(diagnostics, handle) else {
+        return false;
+    };
+    let value = if visible { crate::winrt::VISIBILITY_VISIBLE } else { VISIBILITY_COLLAPSED };
+    element.put_Visibility(value) == S_OK
 }
 
 /// Set a `TextBlock`'s `Text`: updates text in place without rebuilding (and re-wiring) the tile.

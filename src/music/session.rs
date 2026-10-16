@@ -17,8 +17,7 @@ const CERTAIN: &[&str] = &[
     "ytmdesktop",
 ];
 
-/// Browsers whose bare id could be a YouTube Music tab, or anything else. Also the executable
-/// list for [`is_browser_process`].
+/// Browsers whose bare id could be a YouTube Music tab, or anything else.
 const BROWSERS: &[&str] = &["chrome", "msedge", "firefox", "brave", "opera", "vivaldi"];
 
 /// How confident we are that a given app id is YouTube Music.
@@ -46,22 +45,19 @@ pub fn classify(app_id: &str) -> Match {
     Match::No
 }
 
-/// Whether an executable name is a browser's (`msedge.exe`, …); the fallback of [`window_is_player`].
-pub fn is_browser_process(exe: &str) -> bool {
-    let exe = exe.to_ascii_lowercase();
-    BROWSERS
-        .iter()
-        .any(|browser| exe == format!("{browser}.exe"))
-}
 
 /// Whether a window (already matched on title) is the player's own rather than a browser window
 /// showing the same title. `app_id` is the window's `PKEY_AppUserModel_ID` and must be
-/// [`Match::Certain`]; with none published (Win32/Electron players) any non-browser process passes.
+/// [`Match::Certain`]; with none published (Win32/Electron players) the executable must name the
+/// player (`YouTube Music.exe`, `YouTube Music Desktop App.exe`) — any other app can carry the
+/// words in its title (an editor with a file or chat of that name). Only an unreadable process
+/// falls back to the title alone.
 /// A pinned `music.app_id` deliberately has no say: it names a session, not a window.
 pub fn window_is_player(app_id: Option<&str>, process: Option<&str>) -> bool {
-    match app_id {
-        Some(app_id) => classify(app_id) == Match::Certain,
-        None => !process.is_some_and(is_browser_process),
+    match (app_id, process) {
+        (Some(app_id), _) => classify(app_id) == Match::Certain,
+        (None, Some(process)) => classify(process) == Match::Certain,
+        (None, None) => true,
     }
 }
 
@@ -152,8 +148,18 @@ mod tests {
     }
 
     #[test]
-    fn a_window_with_no_identity_falls_back_to_the_title() {
+    fn a_window_with_no_identity_falls_back_to_the_process() {
         assert!(window_is_player(None, Some("youtube-music.exe")));
+        assert!(window_is_player(None, Some("YouTube Music.exe")));
+        assert!(window_is_player(None, Some("YouTube Music Desktop App.exe")));
+    }
+
+    /// Measured: VS Code (Electron, no window app id) titled after a chat about YouTube Music got
+    /// the player's taskbar progress bar.
+    #[test]
+    fn another_app_titled_youtube_music_is_not_the_player() {
+        assert!(!window_is_player(None, Some("Code.exe")));
+        assert!(!window_is_player(None, Some("notepad.exe")));
     }
 
     #[test]

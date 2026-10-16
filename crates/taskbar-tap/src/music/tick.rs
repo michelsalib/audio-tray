@@ -13,9 +13,14 @@ const SWEEPS_PER_CHARACTER: u32 = 4;
 
 static SWEEP: AtomicU32 = AtomicU32::new(0);
 
+/// The step last written (`u32::MAX`: none since the last restart), so the three sweeps between
+/// advances write nothing.
+static WRITTEN_STEP: AtomicU32 = AtomicU32::new(u32::MAX);
+
 /// Start the scroll over from the first character — for a new title or a freshly placed strip.
 pub fn restart() {
     SWEEP.store(0, Ordering::SeqCst);
+    WRITTEN_STEP.store(u32::MAX, Ordering::SeqCst);
 }
 
 /// Move the ticker on one step, if anything needs it.
@@ -24,6 +29,9 @@ pub fn restart() {
 /// XAML UI thread only.
 pub unsafe fn scroll(diagnostics: &IXamlDiagnostics, strip: &state::Strip) {
     let step = SWEEP.fetch_add(1, Ordering::SeqCst) / SWEEPS_PER_CHARACTER;
+    if WRITTEN_STEP.swap(step, Ordering::SeqCst) == step {
+        return;
+    }
     let l = layout::layout();
     for (name, full, width) in [
         ("MusicTileTitle", strip.display_title(), l.title_chars),

@@ -94,7 +94,7 @@ static UNKNOWN_LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::Atomic
 /// # Safety
 /// XAML UI thread only.
 unsafe fn flyout_is_ours(diagnostics: &IXamlDiagnostics, host: &tile::Host) -> bool {
-    let Some(content) = crate::tree::find_by_name("HoverFlyoutContent").into_iter().next() else {
+    let Some(content) = crate::tree::newest(crate::tree::find_by_name("HoverFlyoutContent")) else {
         return false;
     };
     let wanted = host.name.to_lowercase();

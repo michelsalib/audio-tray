@@ -75,6 +75,7 @@ impl Publisher {
 
         write_atomically(&state_path(), body.as_bytes()).context("publishing the strip state")?;
         self.last = Some(body);
+        crate::taskbar::notify_music_changed();
         Ok(true)
     }
 
@@ -86,6 +87,7 @@ impl Publisher {
         }
         self.last = None;
         self.current_cover_fingerprint = None;
+        crate::taskbar::notify_music_changed();
     }
 
     /// Write new cover bytes to a fresh filename and drop the previous one. On failure the previous

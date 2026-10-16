@@ -106,14 +106,23 @@ audio-tray --music-thumbbar [playing|paused]
 ```
 
 Configuration is stored at `%APPDATA%\AudioTray\config\config.toml`: per-device icon
-overrides, and the music tile —
+overrides, the music tile, and what the taskbar buttons change in Windows' own tray —
 
 ```toml
 [music]
 enabled = true            # false turns the whole music half off, progress bar included
 tile = "YouTube Music"    # the taskbar button to draw into; "" = feed only, no strip
 # app_id = "..."          # pin the SMTC app id: a miss, or YouTube Music as a plain tab
+
+[strip]
+next_to_wifi = true         # move the tray icons between the language indicator and wifi
+hide_windows_volume = true  # hide Windows' volume icon (the output button replaces it)
+hide_windows_mic = true     # hide Windows' "microphone in use" icon (the red dot replaces it)
+scroll_anywhere = true      # wheel over the whole taskbar sets the volume; false = our buttons only
 ```
+
+Each switch also rules one shell edit out when the taskbar misbehaves. They are read when
+the buttons are placed, so restart Audio Tray after changing them.
 
 ## Taskbar controls
 
@@ -143,16 +152,22 @@ things worth knowing:
 - **One consumer at a time.** If TranslucentTB, Windhawk or a similar taskbar tool
   is running, the injection may fail — they share the one diagnostics endpoint. You
   keep the plain tray icon.
-- **It repairs itself by restarting Explorer.** Two situations need a fresh shell, and
-  audio-tray handles both on startup without asking: an injection that fails (after a
-  couple of retries, which is usually all a shell that is merely slow to be ready
-  needs), and a TAP from a *different build* of audio-tray still loaded in Explorer —
-  injecting alongside that one is what leaves you with a taskbar that looks untouched. A
-  TAP from the same build is simply handed over to the new process, so quitting and
-  starting again, or a second launch (which exits — only one tray runs at a time), never
-  restarts Explorer. At most
-  one restart per run, so a machine where the injection can never succeed is not
-  restarted round and round. `audio-tray --taskbar-restart` does the same by hand.
+- **It can repair itself by restarting Explorer — after asking.** Two situations need a
+  fresh shell: an injection that fails (after a couple of retries, which is usually all a
+  shell that is merely slow to be ready needs), and a TAP loaded in Explorer that this
+  audio-tray cannot adopt — one from another install location, or speaking an older
+  protocol. Injecting alongside that one is what leaves you with a taskbar that looks
+  untouched. audio-tray asks first, since a restart closes File Explorer windows; *No*
+  keeps the plain tray icon until you next sign in. A loaded TAP that speaks the same
+  protocol is simply handed over to the new process, so quitting and starting again, a
+  second launch (which exits — only one tray runs at a time), and a routine update never
+  restart Explorer; an updated TAP takes over with the next Explorer start. At most one
+  restart per run, so a machine where the injection can never succeed is not asked round
+  and round. `audio-tray --taskbar-restart` restarts it by hand.
+- **Trouble shows in the panel.** If the buttons cannot be placed, moving the icons is
+  given up, or a Windows update changed the taskbar under it, a one-line note appears above
+  the panel's footer. The details are in `%TEMP%\xaml-tap.log` (timestamped; rotated to
+  `xaml-tap.log.1` at 4 MB).
 - **Your icon must be on the taskbar, not in the overflow.** Nothing is drawn if it
   is hidden behind the chevron.
 

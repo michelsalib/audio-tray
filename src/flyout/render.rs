@@ -58,6 +58,15 @@ pub(super) fn render_page(ctx: &Ctx, elems: &[LaidElem], out: &mut [u8]) {
                     cv.draw_text(f, hdr_px, (d(HEADER_X) as f32, base), TEXT, 1.0, text);
                 }
             }
+            Elem::Note => {
+                if let (Some(f), Some(text)) = (font, ctx.model.notice) {
+                    let px = NOTE_TEXT_PX * scale;
+                    let base = (le.top + le.height / 2) as f32 + px * 0.34;
+                    let max_w = w as f32 - d(HEADER_X) as f32 - RIGHT_PAD * scale;
+                    let line = fit_label(f, px, text, max_w);
+                    cv.draw_text(f, px, (d(HEADER_X) as f32, base), TEXT, NOTE_A, &line);
+                }
+            }
             Elem::Slider { group } => {
                 let g = &groups[group];
                 let cy_i = le.top + le.height / 2;

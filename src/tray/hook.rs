@@ -63,6 +63,13 @@ impl Drop for WheelHook {
 /// which splits it into the two buttons.
 static ICON_RECT: Mutex<Option<RECT>> = Mutex::new(None);
 
+/// `[strip] scroll_anywhere`, read at startup.
+static SCROLL_ANYWHERE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+pub fn set_scroll_anywhere(on: bool) {
+    SCROLL_ANYWHERE.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Record the icon's slot; returns whether it moved.
 pub(super) fn set_icon_rect(rect: Option<RECT>) -> bool {
     let mut held = ICON_RECT.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -111,14 +118,18 @@ unsafe fn point_over_tray(pt: POINT) -> bool {
         return false;
     }
     let root: HWND = unsafe { GetAncestor(hwnd, GA_ROOT) };
-    wheel_belongs_to_tray(&crate::win::class_name(root), crate::taskbar::strip_is_up(), in_slot(pt))
+    let anywhere = SCROLL_ANYWHERE.load(std::sync::atomic::Ordering::Relaxed);
+    wheel_belongs_to_tray(&crate::win::class_name(root), crate::taskbar::strip_is_up(), in_slot(pt), anywhere)
 }
 
 /// Whether a wheel over a window of `class` is ours. A `Xaml_WindowedPopupClass` is any XAML
-/// popup in any app; it only counts over our own strip (whose hover tooltip is one).
-fn wheel_belongs_to_tray(class: &str, strip_up: bool, over_slot: bool) -> bool {
+/// popup in any app; it only counts over our own strip (whose hover tooltip is one). Without
+/// `anywhere` (`[strip] scroll_anywhere = false`) the taskbar counts only over our icon slot.
+fn wheel_belongs_to_tray(class: &str, strip_up: bool, over_slot: bool, anywhere: bool) -> bool {
     match class {
-        "Shell_TrayWnd" | "Shell_SecondaryTrayWnd" | "NotifyIconOverflowWindow" | "TopLevelWindowForOverflowXamlIsland" => true,
+        "Shell_TrayWnd" | "Shell_SecondaryTrayWnd" | "NotifyIconOverflowWindow" | "TopLevelWindowForOverflowXamlIsland" => {
+            anywhere || over_slot
+        }
         "Xaml_WindowedPopupClass" => strip_up && over_slot,
         _ => false,
     }
@@ -134,10 +145,17 @@ mod tests {
 
     #[test]
     fn only_our_strip_claims_a_xaml_popup() {
-        assert!(wheel_belongs_to_tray("Shell_TrayWnd", false, false));
-        assert!(wheel_belongs_to_tray("Xaml_WindowedPopupClass", true, true));
-        assert!(!wheel_belongs_to_tray("Xaml_WindowedPopupClass", true, false), "another app's popup");
-        assert!(!wheel_belongs_to_tray("Xaml_WindowedPopupClass", false, true), "no strip up");
-        assert!(!wheel_belongs_to_tray("Chrome_WidgetWin_1", true, true));
+        assert!(wheel_belongs_to_tray("Shell_TrayWnd", false, false, true));
+        assert!(wheel_belongs_to_tray("Xaml_WindowedPopupClass", true, true, true));
+        assert!(!wheel_belongs_to_tray("Xaml_WindowedPopupClass", true, false, true), "another app's popup");
+        assert!(!wheel_belongs_to_tray("Xaml_WindowedPopupClass", false, true, true), "no strip up");
+        assert!(!wheel_belongs_to_tray("Chrome_WidgetWin_1", true, true, true));
+    }
+
+    #[test]
+    fn without_anywhere_only_our_slot_takes_the_wheel() {
+        assert!(!wheel_belongs_to_tray("Shell_TrayWnd", true, false, false));
+        assert!(wheel_belongs_to_tray("Shell_TrayWnd", true, true, false));
+        assert!(wheel_belongs_to_tray("Shell_TrayWnd", false, true, false), "plain icon");
     }
 }

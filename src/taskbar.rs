@@ -99,12 +99,79 @@ pub fn revert(owner_pid: u32) {
 
     // Unconditionally: the plain icon's clicks matter again from here on.
     STRIP_UP.store(false, std::sync::atomic::Ordering::SeqCst);
+    *PROGRESS_REPORTED.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = (0, 0);
     // Posted, not sent: never block on Explorer's UI thread.
     for control in crate::win::windows_by_class(TAP_CONTROL_CLASS) {
         if let Err(e) = unsafe { PostMessageW(Some(control), WM_TAP_REVERT, WPARAM(owner_pid as usize), LPARAM(0)) } {
             eprintln!("taskbar: could not ask for a revert ({e})");
         }
     }
+}
+
+/// (control window, reported window) last posted by [`report_progress_window`]. Cleared by
+/// [`revert`]: the TAP forgets the window when it reverts, so it must be told again.
+static PROGRESS_REPORTED: std::sync::Mutex<(isize, isize)> = std::sync::Mutex::new((0, 0));
+
+/// Tell the TAP which window carries our taskbar progress bar (`None`: none), so its revert can
+/// clear exactly that window when this process dies. Posted only on change (per TAP instance).
+/// Best-effort.
+pub fn report_progress_window(hwnd: Option<windows::Win32::Foundation::HWND>) {
+    use windows::Win32::Foundation::{LPARAM, WPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
+
+    let Some(control) = control_window() else {
+        return;
+    };
+    let reported = hwnd.map_or(0, |hwnd| hwnd.0 as isize);
+    let mut last = PROGRESS_REPORTED.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if *last == (control.0 as isize, reported) {
+        return;
+    }
+    let posted = unsafe {
+        PostMessageW(Some(control), tap_proto::WM_TAP_PROGRESS_WINDOW, WPARAM(reported as usize), LPARAM(0))
+    };
+    if posted.is_ok() {
+        *last = (control.0 as isize, reported);
+    }
+}
+
+/// Tell the TAP the now-playing state file changed, so it re-reads it instead of polling the
+/// file. Best-effort: the TAP still re-checks the file on a slow timer.
+pub fn notify_music_changed() {
+    use windows::Win32::Foundation::{LPARAM, WPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
+
+    for control in crate::win::windows_by_class(TAP_CONTROL_CLASS) {
+        let _ = unsafe { PostMessageW(Some(control), tap_proto::WM_TAP_MUSIC_CHANGED, WPARAM(0), LPARAM(0)) };
+    }
+}
+
+/// The TAP's last `WM_TASKBAR_STATUS` (`tap_proto::STATUS_*` bits).
+static STATUS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+pub fn set_status(bits: usize) {
+    if STATUS.swap(bits, std::sync::atomic::Ordering::SeqCst) != bits {
+        eprintln!("taskbar: TAP status 0x{bits:x}");
+    }
+}
+
+/// A one-line note for the flyout when part of the taskbar integration is not working; `None`
+/// when all is well. Pure on the status bits, for testing.
+pub fn status_notice(bits: usize) -> Option<&'static str> {
+    if bits & tap_proto::STATUS_SHAPE_CHANGED != 0 {
+        Some("Taskbar buttons partly unavailable on this Windows build")
+    } else if bits & tap_proto::STATUS_NO_STRIP != 0 {
+        Some("Taskbar buttons could not be placed")
+    } else if bits & tap_proto::STATUS_REORDER_FAILED != 0 {
+        Some("Could not move the tray icons next to wifi")
+    } else {
+        None
+    }
+}
+
+/// [`status_notice`] for the current status.
+pub fn current_notice() -> Option<&'static str> {
+    status_notice(STATUS.load(std::sync::atomic::Ordering::SeqCst))
 }
 
 /// The injected TAP's control window, if there is one.
@@ -223,22 +290,29 @@ const PILL_ALPHA: &str = "80";
 /// `ver`/`tap`/`hwnd` identify the build and receiver for [`offer_handover`].
 fn init_data(icons: StripIcons, owner_pid: u32) -> String {
     let [r, g, b] = crate::flyout::theme::accent_rgb();
-    let music = crate::config::Config::load().music;
-    let tile = if music.enabled { music.tile } else { String::new() };
+    let config = crate::config::Config::load();
+    let tile = if config.music.enabled { config.music.tile } else { String::new() };
     let tap = tap_path().map(|path| path.display().to_string()).unwrap_or_default();
-    format!(
-        "tooltip={};out={:04X};in={:04X};\
-         outmuted={};inmuted={};inrec={};accent={r:02X}{g:02X}{b:02X};alpha={PILL_ALPHA};\
-         hidevolume=1;hidemic=1;tile={tile};pid={owner_pid};ver={};tap={tap};hwnd={}",
-        crate::tray::TRAY_MARKER,
-        icons.output as u32,
-        icons.input as u32,
-        u8::from(icons.output_muted),
-        u8::from(icons.input_muted),
-        u8::from(icons.input_recording),
-        env!("CARGO_PKG_VERSION"),
-        RECEIVER.load(std::sync::atomic::Ordering::SeqCst),
-    )
+    let flag = |on: bool| u8::from(on).to_string();
+    tap_proto::encode_init([
+        ("tooltip", crate::tray::TRAY_MARKER.to_string()),
+        ("out", format!("{:04X}", icons.output as u32)),
+        ("in", format!("{:04X}", icons.input as u32)),
+        ("outmuted", flag(icons.output_muted)),
+        ("inmuted", flag(icons.input_muted)),
+        ("inrec", flag(icons.input_recording)),
+        ("accent", format!("{r:02X}{g:02X}{b:02X}")),
+        ("alpha", PILL_ALPHA.to_string()),
+        ("hidevolume", flag(config.strip.hide_windows_volume)),
+        ("hidemic", flag(config.strip.hide_windows_mic)),
+        ("reorder", flag(config.strip.next_to_wifi)),
+        ("tile", tile),
+        ("pid", owner_pid.to_string()),
+        ("ver", env!("CARGO_PKG_VERSION").to_string()),
+        ("proto", tap_proto::PROTOCOL.to_string()),
+        ("tap", tap),
+        ("hwnd", RECEIVER.load(std::sync::atomic::Ordering::SeqCst).to_string()),
+    ])
 }
 
 /// Our receiver window, for the `hwnd=` key. Set by [`create_receiver`].
@@ -518,13 +592,39 @@ fn heal_explorer(reason: &str) -> bool {
         eprintln!("taskbar: {reason}, but Explorer has been restarted once already — leaving it");
         return false;
     }
-    eprintln!("taskbar: {reason} — restarting Explorer for a clean injection");
+    eprintln!("taskbar: {reason} — asking to restart Explorer for a clean injection");
     std::thread::spawn(|| {
+        if !confirm_explorer_restart() {
+            eprintln!("taskbar: Explorer restart declined — using the plain tray icon until the next sign-in");
+            return;
+        }
         if let Err(e) = restart_explorer() {
             eprintln!("taskbar: could not restart Explorer ({e:#})");
         }
     });
     true
+}
+
+/// Asks before restarting Explorer: it closes every File Explorer window. Blocks (its own thread).
+fn confirm_explorer_restart() -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        MessageBoxW, IDYES, MB_ICONQUESTION, MB_SETFOREGROUND, MB_TOPMOST, MB_YESNO,
+    };
+    let text = crate::win::wide(
+        "Audio Tray needs to restart Windows Explorer to put its buttons on the taskbar.\n\n\
+         Open File Explorer windows will close. Restart Explorer now?\n\n\
+         (No keeps the plain tray icon until you next sign in.)",
+    );
+    let title = crate::win::wide("Audio Tray");
+    let answer = unsafe {
+        MessageBoxW(
+            None,
+            windows_core::PCWSTR(text.as_ptr()),
+            windows_core::PCWSTR(title.as_ptr()),
+            MB_YESNO | MB_ICONQUESTION | MB_SETFOREGROUND | MB_TOPMOST,
+        )
+    };
+    answer == IDYES
 }
 
 /// Whether a TAP from an earlier audio-tray is already loaded in this Explorer, detected by its
@@ -688,5 +788,18 @@ fn wait_for_shell(budget: std::time::Duration) -> bool {
             return false;
         }
         std::thread::sleep(POLL);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::status_notice;
+
+    #[test]
+    fn a_healthy_tap_shows_no_notice_and_the_worst_problem_wins() {
+        assert_eq!(status_notice(0), None);
+        assert!(status_notice(tap_proto::STATUS_REORDER_FAILED).is_some());
+        let all = tap_proto::STATUS_NO_STRIP | tap_proto::STATUS_REORDER_FAILED | tap_proto::STATUS_SHAPE_CHANGED;
+        assert_eq!(status_notice(all), status_notice(tap_proto::STATUS_SHAPE_CHANGED));
     }
 }

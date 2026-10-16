@@ -9,11 +9,13 @@ use windows_core::IInspectable;
 use crate::decorate::{self, Layout};
 use crate::log::logf;
 use crate::reorder;
+use crate::winrt::Thickness;
 use crate::xamlom::{IXamlDiagnostics, InstanceHandle};
 
 #[derive(Default)]
 struct Original {
     columns: Vec<(InstanceHandle, i32)>,
+    margins: Vec<(InstanceHandle, Thickness)>,
     layouts: Vec<(InstanceHandle, Layout)>,
     /// The presenter we took over and the content we displaced: an owned reference, so the shell's
     /// visual is not collected while out of the tree. Null is a legitimate value.
@@ -23,6 +25,7 @@ struct Original {
 /// A leaf lock, only taken on the tray thread.
 static ORIGINAL: Mutex<Original> = Mutex::new(Original {
     columns: Vec::new(),
+    margins: Vec::new(),
     layouts: Vec::new(),
     content: None,
 });
@@ -39,6 +42,32 @@ pub fn remember_column(handle: InstanceHandle, column: i32) {
         return;
     }
     original.columns.push((handle, column));
+}
+
+/// Records a section's margin before the reorder first changes it. First-wins, like columns.
+pub fn remember_margin(handle: InstanceHandle, margin: Thickness) {
+    let mut original = lock();
+    if original.margins.iter().any(|&(known, _)| known == handle) {
+        return;
+    }
+    original.margins.push((handle, margin));
+}
+
+/// Replaces a recorded margin: the shell set a new one of its own after our edit, and that is
+/// what a revert must put back.
+pub fn replace_margin(handle: InstanceHandle, margin: Thickness) {
+    let mut original = lock();
+    original.margins.retain(|&(known, _)| known != handle);
+    original.margins.push((handle, margin));
+}
+
+/// The margin recorded for a section, if the reorder has changed it.
+pub fn original_margin(handle: InstanceHandle) -> Option<Thickness> {
+    lock()
+        .margins
+        .iter()
+        .find(|&&(known, _)| known == handle)
+        .map(|&(_, margin)| margin)
 }
 
 /// Records an element's visibility and width. First-wins: the collapse is re-applied, and later
@@ -81,7 +110,11 @@ pub unsafe fn remember_content(diagnostics: &IXamlDiagnostics, presenter: Instan
 /// XAML UI thread only.
 pub unsafe fn revert(diagnostics: &IXamlDiagnostics) {
     let original = std::mem::take(&mut *lock());
-    if original.columns.is_empty() && original.layouts.is_empty() && original.content.is_none() {
+    if original.columns.is_empty()
+        && original.margins.is_empty()
+        && original.layouts.is_empty()
+        && original.content.is_none()
+    {
         logf!("revert: nothing was changed");
         return;
     }
@@ -101,6 +134,31 @@ pub unsafe fn revert(diagnostics: &IXamlDiagnostics) {
     for (handle, column) in original.columns {
         let ok = reorder::restore_column(diagnostics, handle, column);
         logf!("revert: 0x{handle:x} back to column {column} = {ok}");
+    }
+
+    for (handle, margin) in original.margins {
+        let ok = reorder::restore_margin(diagnostics, handle, margin);
+        logf!("revert: 0x{handle:x} margin restored = {ok}");
+    }
+}
+
+/// Puts back only the reorder's edits (columns and margins) and forgets them; the strip and the
+/// hidden indicators stay. For a reorder that gives up after it had moved things.
+///
+/// # Safety
+/// XAML UI thread only.
+pub unsafe fn revert_reorder(diagnostics: &IXamlDiagnostics) {
+    let (columns, margins) = {
+        let mut original = lock();
+        (std::mem::take(&mut original.columns), std::mem::take(&mut original.margins))
+    };
+    for (handle, column) in columns {
+        let ok = reorder::restore_column(diagnostics, handle, column);
+        logf!("reorder undone: 0x{handle:x} back to column {column} = {ok}");
+    }
+    for (handle, margin) in margins {
+        let ok = reorder::restore_margin(diagnostics, handle, margin);
+        logf!("reorder undone: 0x{handle:x} margin restored = {ok}");
     }
 }
 

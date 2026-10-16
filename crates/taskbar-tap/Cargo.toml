@@ -39,6 +39,7 @@ features = [
     "Win32_System_Ole",             # IObjectWithSite (the TAP site contract)
     "Win32_System_LibraryLoader",   # GetProcAddress / GetModuleFileNameW
     "Win32_System_Threading",
+    "Win32_System_SystemInformation",     # GetLocalTime, for log timestamps
     "Win32_System_Registry",              # accent colour
     "Win32_System_Diagnostics_ToolHelp", # explorer.exe PID lookup
     "Win32_System_Diagnostics_Debug",    # OutputDebugStringW

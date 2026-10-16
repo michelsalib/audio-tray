@@ -34,6 +34,7 @@ pub(super) struct Model {
     pub groups: Vec<Group>,
     pub view: View, // which screen is shown (main panel / an icon picker)
     pub update: Option<String>, // staged update's version, if any → the footer's restart button
+    pub notice: Option<&'static str>, // taskbar integration trouble, one line above the footer
     // outcome, accumulated while the flyout is open
     pub config_changed: bool,
     pub quit: bool,
@@ -46,6 +47,7 @@ impl Model {
             groups,
             view: View::Main,
             update,
+            notice: None,
             config_changed: false,
             quit: false,
             restart: false,

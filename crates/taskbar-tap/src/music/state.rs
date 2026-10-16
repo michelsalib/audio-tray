@@ -10,6 +10,19 @@ pub fn state_path() -> std::path::PathBuf {
     std::env::temp_dir().join(STATE_FILE)
 }
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Set by audio-tray's `WM_TAP_MUSIC_CHANGED`; starts set so the first read goes to the file.
+static CHANGED: AtomicBool = AtomicBool::new(true);
+
+/// Fallback re-check interval for an app that never sends `WM_TAP_MUSIC_CHANGED`.
+const RECHECK: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The state file was rewritten: the next [`Strip::read`] goes to disk.
+pub fn mark_changed() {
+    CHANGED.store(true, Ordering::SeqCst);
+}
+
 /// Playback state, reduced to what the strip draws.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Playback {
@@ -65,10 +78,26 @@ impl Strip {
     }
 
     /// Read the published state, or `None` if the app has not written one yet. Cached on mtime
-    /// and length so an unchanged file costs only a stat on the shell's UI thread.
+    /// and length; between [`mark_changed`] notices the file is not even stat'ed, except every
+    /// [`RECHECK`] for an app that does not send them.
     pub fn read() -> Option<Self> {
         use std::sync::Mutex;
+        use std::time::Instant;
         static CACHED: Mutex<Option<(u64, u64, Strip)>> = Mutex::new(None);
+        static LAST_STAT: Mutex<Option<Instant>> = Mutex::new(None);
+
+        {
+            let mut last_stat = crate::lock(&LAST_STAT);
+            let fresh = last_stat.is_some_and(|at| at.elapsed() < RECHECK);
+            // Cleared before the read, so a change landing during it is caught next time.
+            let changed = CHANGED.swap(false, Ordering::SeqCst);
+            if fresh && !changed {
+                if let Some((_, _, strip)) = crate::lock(&CACHED).as_ref() {
+                    return Some(strip.clone());
+                }
+            }
+            *last_stat = Some(Instant::now());
+        }
 
         let path = state_path();
         let stamp = std::fs::metadata(&path).ok().and_then(|meta| {

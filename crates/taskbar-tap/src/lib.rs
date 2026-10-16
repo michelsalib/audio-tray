@@ -5,6 +5,7 @@
 //! `Add` mutations and then streams deltas. The callback only records the tree ([`tree`]); every
 //! edit is made from the timer-driven [`sweep`], which holds the rules for when a XAML call is safe.
 
+mod budget;
 mod decorate;
 mod interact;
 mod ipc;
@@ -14,6 +15,7 @@ pub mod music;
 mod reorder;
 mod restore;
 mod tree;
+mod watch;
 mod winrt;
 pub mod xamlom;
 
@@ -110,9 +112,6 @@ unsafe fn already_decorated(diagnostics: &xamlom::IXamlDiagnostics) -> bool {
     decorate::holds_our_strip(diagnostics, presenter)
 }
 
-/// Set once the tray sections have been reordered.
-static REORDERED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
 /// Segment elements that already have their pointer handlers, so a tray rebuild
 /// wires the new ones without double-wiring the old.
 static WIRED: Mutex<Vec<u64>> = Mutex::new(Vec::new());
@@ -186,9 +185,6 @@ fn indicators() -> [&'static Indicator; 2] {
 /// Set once the tray icons' automation names have been logged.
 static PROBED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Set once the section map has been logged (it only needs saying once).
-static REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
 /// Whether the strip is wanted at all. [`GENERATION`] says which instance may act; this says
 /// whether anything may, for the timer-driven sweep, which has no instance to compare.
 static ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -232,13 +228,9 @@ fn strip_state() -> Option<decorate::StripState> {
     *lock(&STRIP)
 }
 
-/// Pulls one `key=value` out of the `key=value;` initialization payload.
+/// Pulls one value out of the init payload (format: [`tap_proto::encode_init`]).
 fn value_from(data: &str, wanted: &str) -> Option<String> {
-    data.split(';')
-        .filter_map(|pair| pair.split_once('='))
-        .find(|(key, _)| key.trim() == wanted)
-        .map(|(_, value)| value.trim().to_string())
-        .filter(|value| !value.is_empty())
+    tap_proto::init_value(data, wanted)
 }
 
 /// Apply a `key=value;` init payload: what to decorate, what to draw, and whom to report to.
@@ -257,6 +249,11 @@ fn configure(data: &str) {
     }
     // Whoever asked for the strip is also who we put it away for.
     lifecycle::watch_owner(value_from(data, "pid"));
+    // Absent (an older app) means on, as before the switch existed.
+    reorder::set_enabled(value_from(data, "reorder").as_deref() != Some("0"));
+    // A new owner gets a fresh grace period and its own copy of the status.
+    *lock(&STOOD_UP) = Some(std::time::Instant::now());
+    LAST_STATUS.store(usize::MAX, Ordering::SeqCst);
 }
 
 /// The app version this DLL shipped with (stamped by build.rs from the root manifest).
@@ -264,12 +261,20 @@ pub const APP_VERSION: &str = env!("AUDIO_TRAY_VERSION");
 
 pub use tap_proto::{HANDOVER_ACCEPTED, HANDOVER_DECLINED};
 
-/// Whether a new audio-tray may adopt this already-loaded TAP: the same app version, and the
-/// same DLL file it would have injected. Anything else needs a fresh Explorer.
+/// Whether a new audio-tray may adopt this already-loaded TAP: the same app/TAP protocol (or, from
+/// an app that predates it, the same app version), and the same DLL file it would have injected.
+/// A routine update keeps the protocol, so it does not restart Explorer: the updated TAP loads
+/// with the next Explorer. Anything else needs a fresh Explorer.
 fn compatible(data: &str, own_path: Option<&str>) -> core::result::Result<(), String> {
-    match value_from(data, "ver") {
-        Some(version) if version == APP_VERSION => {}
-        other => return Err(format!("exe is v{}, TAP is v{APP_VERSION}", other.unwrap_or_default())),
+    let protocol = value_from(data, "proto").and_then(|p| p.parse::<u32>().ok());
+    let version = value_from(data, "ver");
+    if protocol != Some(tap_proto::PROTOCOL) && version.as_deref() != Some(APP_VERSION) {
+        return Err(format!(
+            "exe is v{} (protocol {}), TAP is v{APP_VERSION} (protocol {})",
+            version.unwrap_or_default(),
+            protocol.map_or_else(|| "none".to_string(), |p| p.to_string()),
+            tap_proto::PROTOCOL
+        ));
     }
     if let (Some(wanted), Some(own)) = (value_from(data, "tap"), own_path) {
         if !wanted.eq_ignore_ascii_case(own) {
@@ -290,19 +295,53 @@ pub(crate) fn hand_over(data: &str) -> isize {
         return HANDOVER_DECLINED;
     }
     let before = strip_state();
+    let reorder_before = reorder::enabled();
     configure(data);
     // A revert still pending from the old owner is superseded: the new owner wants the strip.
     STAND_DOWN_PENDING.store(false, Ordering::SeqCst);
     let was_active = ACTIVE.swap(true, Ordering::SeqCst);
     CURRENT.store(GENERATION.load(Ordering::SeqCst), Ordering::SeqCst);
-    if was_active && strip_state() != before {
-        // The strip is up but shows the old owner's state: redraw it, as a restyle would.
+    let after = strip_state();
+    if after != before {
+        STRIP_REVISION.fetch_add(1, Ordering::SeqCst);
+    }
+    // A switch that removes a shell edit (reorder, hiding an indicator) must undo what is already
+    // applied, and only a full revert knows how: the sweep reverts and re-applies.
+    let edits_changed = reorder::enabled() != reorder_before
+        || after.map(|s| (s.hide_system_volume, s.hide_system_mic))
+            != before.map(|s| (s.hide_system_volume, s.hide_system_mic));
+    if was_active && edits_changed {
+        REAPPLY_PENDING.store(true, Ordering::SeqCst);
+    } else if was_active && after != before {
+        // The strip is up but shows the old owner's state: redraw it (an accent change is not
+        // covered by an in-place restyle).
         *lock(&DECORATED) = None;
         lock(&WIRED).clear();
     }
+    requeue_tray_glyphs();
     logf!("handover accepted (strip was {}): init data = {data:?}", if was_active { "up" } else { "reverted" });
     unsafe { lifecycle::set_sweep_pace(false) };
     HANDOVER_ACCEPTED
+}
+
+/// Set by a handover whose switches remove an edit already applied; the next gated sweep reverts
+/// everything and applies the new configuration from scratch.
+static REAPPLY_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The indicators are only ever found from an *add* event, which this Explorer will not replay
+/// (and a stand-down forgot them): offer the recorded tray-icon glyphs to the sweep again. Tray
+/// icons only: the queue is the tray island's, and other islands also have `InnerTextBlock`s.
+fn requeue_tray_glyphs() {
+    let candidates: Vec<_> = tree::find_by_name("InnerTextBlock")
+        .into_iter()
+        .filter(|&text_block| ancestor_of_type(text_block, ICON_VIEW, 8).is_some())
+        .collect();
+    let mut queue = lock(&PENDING_GLYPHS);
+    for text_block in candidates {
+        if !queue.contains(&text_block) {
+            queue.push(text_block);
+        }
+    }
 }
 
 /// A raw COM pointer handed to the advise thread, used only for the one `AdviseVisualTreeChange`
@@ -310,12 +349,41 @@ pub(crate) fn hand_over(data: &str) -> isize {
 struct SendPtr(*mut c_void);
 unsafe impl Send for SendPtr {}
 
+/// Runs `job` on a fresh thread, but strictly after every job requested before it: an unadvise of
+/// the previous site and the advise that follows must not reach the UI thread out of order, or the
+/// late unadvise could remove the new subscription (same service re-sited).
+fn off_thread_in_order(job: impl FnOnce() + Send + 'static) {
+    static ISSUED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static TURN: Mutex<u64> = Mutex::new(0);
+    static NEXT: std::sync::Condvar = std::sync::Condvar::new();
+
+    let ticket = ISSUED.fetch_add(1, Ordering::SeqCst);
+    std::thread::spawn(move || {
+        {
+            let mut turn = lock(&TURN);
+            while *turn != ticket {
+                turn = NEXT.wait(turn).unwrap_or_else(|poisoned| poisoned.into_inner());
+            }
+        }
+        // Whatever happens in the job, the next one gets its turn.
+        struct Pass;
+        impl Drop for Pass {
+            fn drop(&mut self) {
+                *lock(&TURN) += 1;
+                NEXT.notify_all();
+            }
+        }
+        let _pass = Pass;
+        job();
+    });
+}
+
 /// Call `AdviseVisualTreeChange` off-thread, taking a reference on both objects
 /// for the duration so neither can die under the call.
 fn advise_on_new_thread(service: &IVisualTreeService3, callback: &IVisualTreeServiceCallback2) {
     let service_ref = SendPtr(service.clone().into_raw());
     let callback_ref = SendPtr(callback.clone().into_raw());
-    std::thread::spawn(move || {
+    off_thread_in_order(move || {
         logf!("advise thread {}", tid());
         let service = service_ref;
         let callback = callback_ref;
@@ -330,6 +398,25 @@ fn advise_on_new_thread(service: &IVisualTreeService3, callback: &IVisualTreeSer
             // Drop the callback reference too; nothing will call us.
             drop(unsafe { core::mem::transmute::<*mut c_void, IVisualTreeServiceCallback2>(callback.0) });
         }
+    });
+}
+
+/// `UnadviseVisualTreeChange` off the `SetSite` thread, for the same reason as the advise: the
+/// call marshals to the UI thread and can hang when made from the thread that is serving `SetSite`.
+fn unadvise_on_new_thread(service: &IVisualTreeService3, callback: &IVisualTreeServiceCallback2) {
+    let service_ref = SendPtr(service.clone().into_raw());
+    let callback_ref = SendPtr(callback.clone().into_raw());
+    off_thread_in_order(move || {
+        let service = service_ref;
+        let callback = callback_ref;
+        let hr = unsafe {
+            let svc = core::mem::transmute::<*mut c_void, IVisualTreeService3>(service.0);
+            let cb = core::mem::transmute::<*mut c_void, IVisualTreeServiceCallback2>(callback.0);
+            let hr = svc.UnadviseVisualTreeChange(cb.as_raw());
+            drop((svc, cb)); // releases both references taken above
+            hr
+        };
+        logf!("SetSite: detached from previous site -> 0x{:08x}", hr.0);
     });
 }
 
@@ -387,8 +474,7 @@ impl Tap_Impl {
         };
         if let Some(previous) = previous {
             let callback: IVisualTreeServiceCallback2 = self.to_interface();
-            let _ = unsafe { previous.UnadviseVisualTreeChange(callback.as_raw()) };
-            logf!("SetSite: detached from previous site");
+            unadvise_on_new_thread(&previous, &callback);
         }
 
         let Ok(site) = punksite.ok() else {
@@ -418,6 +504,7 @@ impl Tap_Impl {
         }
 
         tree::start_watchdog();
+        watch::start();
 
         // Publish the site state BEFORE subscribing: the replay can start as soon as the advise
         // thread runs, and anything the callback needs must already be visible.
@@ -551,6 +638,7 @@ impl IVisualTreeServiceCallback_Impl for Tap_Impl {
 /// # Safety
 /// XAML UI thread only.
 pub(crate) unsafe fn stand_down() {
+    let _phase = watch::enter("stand down");
     // First, so neither a callback nor the sweep re-applies behind the revert.
     ACTIVE.store(false, Ordering::SeqCst);
     CURRENT.store(0, Ordering::SeqCst);
@@ -571,9 +659,12 @@ pub(crate) unsafe fn stand_down() {
         indicator.forget();
     }
     lock(&WIRED).clear();
-    REORDERED.store(false, Ordering::SeqCst);
+    reorder::forget();
     PROBED.store(false, Ordering::SeqCst);
-    REPORTED.store(false, Ordering::SeqCst);
+    SLOT_METRICS_REPORTED.store(false, Ordering::SeqCst);
+    lock(&UNKNOWN_GLYPHS).clear();
+    DECORATE_BUDGET.reset();
+    *lock(&STOOD_UP) = None;
     logf!("stood down — the taskbar is as we found it");
 }
 
@@ -665,6 +756,7 @@ unsafe fn sweep_claimed() {
 
     // Ahead of the mutation gate on purpose: attaching handlers writes nothing (see [`wire_transport`]).
     if tree::quiet_for(QUIET_BEFORE_WIRING) {
+        let _phase = watch::enter("sweep: wire transport");
         wire_transport_now(&diagnostics);
     }
 
@@ -678,25 +770,63 @@ unsafe fn sweep_claimed() {
     // Order matters: record indicator slots (ungated), then decorate, then the edits gated on
     // `strip_placed()`.
     for text_block in drain(&PENDING_GLYPHS) {
+        let _phase = watch::enter("sweep: note indicator");
         note_system_indicator(&diagnostics, text_block);
     }
 
-    try_decorate(&diagnostics);
+    if REAPPLY_PENDING.swap(false, Ordering::SeqCst) {
+        let _phase = watch::enter("sweep: re-apply after a handover");
+        logf!("handover changed the shell edits — reverting and applying them again");
+        stand_down();
+        // Back up for the same owner: `stand_down` cleared the active flags and the status clock.
+        ACTIVE.store(true, Ordering::SeqCst);
+        CURRENT.store(GENERATION.load(Ordering::SeqCst), Ordering::SeqCst);
+        *lock(&STOOD_UP) = Some(std::time::Instant::now());
+        LAST_STATUS.store(usize::MAX, Ordering::SeqCst);
+        requeue_tray_glyphs();
+        lifecycle::set_sweep_pace(false);
+        return;
+    }
+
+    if RESTYLE_IN_PLACE.swap(false, Ordering::SeqCst) && strip_placed() {
+        let _phase = watch::enter("sweep: restyle in place");
+        let state = strip_state().unwrap_or_default();
+        if !decorate::restyle_in_place(&diagnostics, state) {
+            logf!("restyle: in-place update incomplete — drawing the strip again");
+            *lock(&DECORATED) = None;
+            lock(&WIRED).clear();
+        }
+    }
+
+    // A revert deferred during the pass above must not be followed by a fresh `put_Content`.
+    if !live() {
+        return;
+    }
+    {
+        let _phase = watch::enter("sweep: decorate");
+        try_decorate(&diagnostics);
+    }
     if !live() {
         return;
     }
 
-    enforce_hidden(&diagnostics);
+    {
+        let _phase = watch::enter("sweep: hide indicators");
+        enforce_hidden(&diagnostics);
+    }
     if !live() {
         return;
     }
 
-    if strip_placed() && !REORDERED.load(Ordering::SeqCst) && reorder::sections_ready() {
-        reorder_now(&diagnostics);
+    // A `StackPanel` frame (26300) is re-measured every sweep: its margins follow live widths.
+    if strip_placed() && reorder::wanted() {
+        let _phase = watch::enter("sweep: reorder");
+        reorder::apply(&diagnostics);
     }
 
     // After `try_decorate`: the segments only exist once the strip is placed.
     for (segment, name, element) in drain(&PENDING_SEGMENTS) {
+        let _phase = watch::enter("sweep: wire segment");
         attach_segment(&diagnostics, segment, &name, element);
     }
 
@@ -706,7 +836,10 @@ unsafe fn sweep_claimed() {
     }
 
     // The music tile: independent of the above, but relies on the same two guards.
-    music::sweep(&diagnostics);
+    {
+        let _phase = watch::enter("sweep: music");
+        music::sweep(&diagnostics);
+    }
     if !live() {
         return;
     }
@@ -715,10 +848,11 @@ unsafe fn sweep_claimed() {
     // the strip is drawn, hence `segments_wired`. With a music tile the sweep never settles: the
     // hover preview's buttons are rebuilt per hover and must be wired within it.
     let settled = strip_placed()
-        && REORDERED.load(Ordering::SeqCst)
+        && reorder::settled()
         && segments_wired()
         && music::tile::host().is_none();
     lifecycle::set_sweep_pace(settled);
+    report_status();
 }
 
 /// Redraws the strip with a new device state: marks it stale and runs [`sweep`] at once (which
@@ -752,15 +886,21 @@ pub(crate) unsafe fn restyle(
         }
         *state = wanted;
     }
+    STRIP_REVISION.fetch_add(1, Ordering::SeqCst);
     logf!(
         "restyle: out={:?} (muted {output_muted}) in={:?} (muted {input_muted}, recording {input_recording})",
         output,
         input
     );
 
-    // Forces the redraw and re-wiring (the segments are replaced wholesale).
-    *lock(&DECORATED) = None;
-    lock(&WIRED).clear();
+    // Only icon fields change here, so a strip that is up is updated in place by the next sweep
+    // (behind its quiet gate); otherwise it is drawn from scratch.
+    if strip_placed() {
+        RESTYLE_IN_PLACE.store(true, Ordering::SeqCst);
+    } else {
+        *lock(&DECORATED) = None;
+        lock(&WIRED).clear();
+    }
     // Fast pace first, so a declined sweep is retried soon.
     lifecycle::set_sweep_pace(false);
     unsafe { sweep() };
@@ -792,6 +932,7 @@ pub(crate) unsafe fn wire_transport() {
     let Some(diagnostics) = diagnostics() else {
         return;
     };
+    let _phase = watch::enter("message: wire transport");
     wire_transport_now(&diagnostics);
 }
 
@@ -831,6 +972,7 @@ pub(crate) unsafe fn repin() -> bool {
         return false;
     }
     if let Some(diagnostics) = diagnostics() {
+        let _phase = watch::enter("message: re-pin");
         music::repin(&diagnostics);
     }
     true
@@ -866,14 +1008,16 @@ const SWEEP_REPORT_FIRST: u32 = 120;
 /// Silence required before mutating XAML: longer than the gaps within a replay burst.
 const QUIET_BEFORE_MUTATING: std::time::Duration = std::time::Duration::from_millis(400);
 
+/// Set once [`report_slot_metrics`] has logged.
+static SLOT_METRICS_REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Logs, once, the shell's icon slot and hover plate sizes against our pill (diagnostic for how
 /// evenly the shell's hover plate surrounds the strip). Retries each tick until layout has run.
 ///
 /// # Safety
 /// XAML UI thread only.
 unsafe fn report_slot_metrics(diagnostics: &xamlom::IXamlDiagnostics) {
-    static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if DONE.load(Ordering::SeqCst) {
+    if SLOT_METRICS_REPORTED.load(Ordering::SeqCst) {
         return;
     }
     let Some((icon, presenter)) = decorated_pair() else {
@@ -912,8 +1056,11 @@ unsafe fn report_slot_metrics(diagnostics: &xamlom::IXamlDiagnostics) {
         ),
         None => logf!("hover plate: no Border found under the icon"),
     }
-    DONE.store(true, Ordering::SeqCst);
+    SLOT_METRICS_REPORTED.store(true, Ordering::SeqCst);
 }
+
+/// The shell's own tray icons (volume, mic, wifi…), as opposed to notify icons and our strip.
+const ICON_VIEW: &str = "SystemTray.IconView";
 
 /// Climbs the recorded tree looking for an ancestor of a given XAML type.
 fn ancestor_of_type(start: xamlom::InstanceHandle, wanted: &str, max_up: usize) -> Option<u64> {
@@ -925,20 +1072,6 @@ fn ancestor_of_type(start: xamlom::InstanceHandle, wanted: &str, max_up: usize) 
         }
     }
     None
-}
-
-/// Move the notification area next to the wifi/battery button. Retried until it succeeds (the
-/// sections trickle in).
-///
-/// # Safety
-/// XAML UI thread only, and only once the event stream is quiet — see [`sweep`].
-unsafe fn reorder_now(diagnostics: &xamlom::IXamlDiagnostics) {
-    if !REPORTED.swap(true, Ordering::SeqCst) {
-        reorder::report(diagnostics);
-    }
-    if reorder::move_after_language(diagnostics) {
-        REORDERED.store(true, Ordering::SeqCst);
-    }
 }
 
 /// Wires pointer handlers onto one of our segments, once per element handle (a tray rebuild
@@ -961,7 +1094,7 @@ unsafe fn attach_segment(
     }
     // The plate is named after the segment plus "Hover" (a contract with the markup).
     let plate_name = format!("{name}Hover");
-    let Some(&plate) = tree::find_by_name(&plate_name).first() else {
+    let Some(plate) = tree::newest(tree::find_by_name(&plate_name)) else {
         logf!("no hover plate {plate_name:?} recorded yet for 0x{element:x}");
         return;
     };
@@ -982,6 +1115,11 @@ unsafe fn note_system_indicator(
     let Some(state) = strip_state() else {
         return;
     };
+    // Only the shell's glyphs sit in a `SystemTray.IconView`; our own strip's, and other islands',
+    // fall out here — before the XAML read, which is only valid on this island's elements.
+    let Some(icon) = ancestor_of_type(text_block, ICON_VIEW, 8) else {
+        return;
+    };
     let Some(text) = decorate::text_of(diagnostics, text_block) else {
         return;
     };
@@ -993,11 +1131,6 @@ unsafe fn note_system_indicator(
         .find(|i| (i.wanted)(&state) && i.glyphs.contains(&glyph));
     let Some(wanted) = found else {
         note_unknown_glyph(glyph);
-        return;
-    };
-
-    // Only the shell's glyphs sit in a `SystemTray.IconView`; our own strip's fall out here.
-    let Some(icon) = ancestor_of_type(text_block, "SystemTray.IconView", 8) else {
         return;
     };
 
@@ -1128,6 +1261,10 @@ unsafe fn try_decorate(diagnostics: &xamlom::IXamlDiagnostics) {
         }
     }
 
+    if !DECORATE_BUDGET.allowed() {
+        why("gave up drawing the strip until the next stand-down");
+        return;
+    }
     for (icon, presenter) in candidates {
         let tooltip = decorate::automation_name(diagnostics, icon).unwrap_or_default();
         // Substring: the tooltip mostly names the current device; only the app's marker is stable.
@@ -1152,6 +1289,8 @@ unsafe fn decorate_icon(
     logf!("decorating icon 0x{icon:x} (tooltip {tooltip:?}) via presenter 0x{presenter:x}");
     // The shell's own visual for this icon, kept alive so it can go back.
     restore::remember_content(diagnostics, presenter);
+    // Read before the state: a restyle pumped during `put_Content` bumps it, and must not be lost.
+    let revision = STRIP_REVISION.load(Ordering::SeqCst);
     let state = strip_state().unwrap_or_default();
     logf!(
         "strip state: accent={:?} hidevolume={} hidemic={} out={:04X} in={:04X}",
@@ -1161,10 +1300,80 @@ unsafe fn decorate_icon(
         state.output_glyph as u32,
         state.input_glyph as u32
     );
-    if decorate::set_chevron_content(diagnostics, presenter, state) {
-        *lock(&DECORATED) = Some((icon, presenter));
+    let drawn = decorate::set_chevron_content(diagnostics, presenter, state);
+    DECORATE_BUDGET.record(drawn);
+    if drawn {
+        if STRIP_REVISION.load(Ordering::SeqCst) == revision {
+            *lock(&DECORATED) = Some((icon, presenter));
+        } else {
+            logf!("strip state changed during the redraw — drawing it again");
+        }
     }
 }
+
+/// Drawing the strip is retried every sweep; one the shell keeps refusing gives up (and is
+/// reported to the app as [`tap_proto::STATUS_NO_STRIP`]).
+static DECORATE_BUDGET: budget::Budget = budget::Budget::new("decorate");
+
+/// When the current owner took over (`SetSite` or a handover): status is only reported after
+/// [`STATUS_GRACE`], so a tray still being built is not called broken.
+static STOOD_UP: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+
+const STATUS_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The status last posted to the app (`usize::MAX`: none yet for this owner).
+static LAST_STATUS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(usize::MAX);
+
+/// The `STATUS_*` bits for what is not working. Tree-only.
+fn status_bits() -> usize {
+    let mut bits = 0;
+    if !DECORATE_BUDGET.allowed() {
+        bits |= tap_proto::STATUS_NO_STRIP;
+    }
+    if reorder::gave_up() {
+        bits |= tap_proto::STATUS_REORDER_FAILED;
+    }
+    let tray_missing = tree::find_by_name("SystemTrayFrameGrid").is_empty()
+        || tree::find_by_type("SystemTray.NotificationAreaIcons").is_empty();
+    let buttons_missing = music::tile::host().is_some() && tree::find_by_type(music::tile::Host::TYPE).is_empty();
+    if tray_missing || buttons_missing {
+        bits |= tap_proto::STATUS_SHAPE_CHANGED;
+    }
+    bits
+}
+
+/// Posts the status to the app when it changed, once the grace period is over; logs the shape
+/// check's verdict with it.
+fn report_status() {
+    let Some(since) = *lock(&STOOD_UP) else {
+        return;
+    };
+    if since.elapsed() < STATUS_GRACE {
+        return;
+    }
+    let bits = status_bits();
+    if LAST_STATUS.load(Ordering::SeqCst) == bits {
+        return;
+    }
+    // Recorded only once delivered, so a post with no receiver yet is retried next sweep.
+    if !ipc::send_status(bits) {
+        return;
+    }
+    LAST_STATUS.store(bits, Ordering::SeqCst);
+    logf!("status: 0x{bits:x} (no strip {}, reorder failed {}, shape changed {})",
+        bits & tap_proto::STATUS_NO_STRIP != 0,
+        bits & tap_proto::STATUS_REORDER_FAILED != 0,
+        bits & tap_proto::STATUS_SHAPE_CHANGED != 0
+    );
+}
+
+/// Bumped on every strip state change. [`decorate_icon`] only records the strip as drawn if no
+/// change landed while it was drawing (an STA pumps messages inside the `put_Content` call).
+static STRIP_REVISION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A restyle that only changes glyphs, mute or recording, for the next sweep to apply to the
+/// existing strip with property sets instead of a rebuild.
+static RESTYLE_IN_PLACE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 impl xamlom::IVisualTreeServiceCallback2_Impl for Tap_Impl {
     unsafe fn OnElementStateChanged(
@@ -1262,5 +1471,19 @@ mod tests {
         assert!(compatible("pid=1", Some(own)).is_err());
         let other = format!(r"ver={APP_VERSION};tap=D:\dev\audio_tray_tap.dll");
         assert!(compatible(&other, Some(own)).is_err());
+    }
+
+    /// An update keeps the protocol: another version is adopted without an Explorer restart, but
+    /// still only from the same DLL path, and never across a protocol change.
+    #[test]
+    fn handover_across_versions_needs_the_same_protocol() {
+        let own = r"C:\App\audio_tray_tap.dll";
+        let proto = tap_proto::PROTOCOL;
+        let newer = format!(r"ver=99.0.0;proto={proto};tap=C:\App\audio_tray_tap.dll");
+        assert!(compatible(&newer, Some(own)).is_ok());
+        let changed = format!(r"ver=99.0.0;proto={};tap=C:\App\audio_tray_tap.dll", proto + 1);
+        assert!(compatible(&changed, Some(own)).is_err());
+        let elsewhere = format!(r"ver=99.0.0;proto={proto};tap=D:\dev\audio_tray_tap.dll");
+        assert!(compatible(&elsewhere, Some(own)).is_err());
     }
 }

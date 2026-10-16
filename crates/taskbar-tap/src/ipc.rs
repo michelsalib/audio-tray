@@ -100,21 +100,23 @@ pub fn set_receiver(hwnd: isize) {
 
 /// Posts one message to audio-tray if it is running; otherwise only logs (the strip can outlive
 /// the app briefly, until `lifecycle::watch_owner` reverts it).
-fn post(message: u32, wparam: usize, lparam: isize) {
+fn post(message: u32, wparam: usize, lparam: isize) -> bool {
     let Some(hwnd) = receiver() else {
-        logf!("no audio-tray receiver window — dropping the gesture");
-        return;
+        logf!("no audio-tray receiver window — dropping the message");
+        return false;
     };
     let posted = unsafe { PostMessageW(Some(hwnd), message, WPARAM(wparam), LPARAM(lparam)) };
     if let Err(err) = posted {
         RECEIVER.store(0, Ordering::Relaxed);
         logf!("PostMessage to audio-tray failed: {err}");
+        return false;
     }
+    true
 }
 
 /// Reports a click: which segment, and which button — nothing about what it should mean.
 pub fn send(action: Action) {
-    post(WM_TASKBAR_ACTION, action.code(), 0);
+    let _ = post(WM_TASKBAR_ACTION, action.code(), 0);
 }
 
 /// Reports a scroll over one segment: `delta` in signed `WHEEL_DELTA` units, as the pointer
@@ -124,11 +126,16 @@ pub fn send_scroll(segment: Segment, delta: i32) {
         Segment::Output => tap_proto::FLOW_OUTPUT,
         Segment::Input => tap_proto::FLOW_INPUT,
     };
-    post(WM_TASKBAR_SCROLL, flow, delta as isize);
+    let _ = post(WM_TASKBAR_SCROLL, flow, delta as isize);
+}
+
+/// Reports which parts of the integration are not working (`tap_proto::STATUS_*` bits).
+pub fn send_status(bits: usize) -> bool {
+    post(tap_proto::WM_TASKBAR_STATUS, bits, 0)
 }
 
 /// Post a raw action code, for the music tile (its codes are unrelated to [`Action`]'s, so they
 /// are kept out of that enum).
 pub fn send_code(code: usize) {
-    post(WM_TASKBAR_ACTION, code, 0);
+    let _ = post(WM_TASKBAR_ACTION, code, 0);
 }

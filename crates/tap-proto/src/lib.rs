@@ -32,6 +32,21 @@ pub const WM_MUSIC_PROGRESS: u32 = WM_APP + 25;
 pub const WM_TAP_WIRE_TRANSPORT: u32 = WM_APP + 26;
 /// TAP-internal: re-pin the music tile's indicators now.
 pub const WM_TAP_REPIN: u32 = WM_APP + 27;
+/// App → TAP: the window the app last put a taskbar progress bar on (`wParam`, 0 = none), so a
+/// revert after the app dies clears exactly that window.
+pub const WM_TAP_PROGRESS_WINDOW: u32 = WM_APP + 28;
+/// App → TAP: the now-playing state file was rewritten; re-read it.
+pub const WM_TAP_MUSIC_CHANGED: u32 = WM_APP + 29;
+/// TAP → app: which parts of the taskbar integration are not working (`wParam`, `STATUS_*` bits;
+/// 0 = all well). Posted when it changes, after a start-up grace period.
+pub const WM_TASKBAR_STATUS: u32 = WM_APP + 30;
+
+/// Our buttons are not on the taskbar (the notification icon was not found or not decorated).
+pub const STATUS_NO_STRIP: usize = 1 << 0;
+/// Moving the icons next to wifi failed and was given up.
+pub const STATUS_REORDER_FAILED: usize = 1 << 1;
+/// Taskbar elements the TAP relies on are missing on this Windows build.
+pub const STATUS_SHAPE_CHANGED: usize = 1 << 2;
 
 /// Restyle packing: the codepoint in the low 24 bits, then these flags.
 pub const RESTYLE_GLYPH_MASK: usize = 0x00FF_FFFF;
@@ -62,15 +77,107 @@ pub const GLYPH_ROUND_EARBUDS: char = '\u{F0002}';
 /// The now-playing state file in `%TEMP%`, written by the app and re-read by the TAP.
 pub const MUSIC_STATE_FILE: &str = "audio-tray-music.txt";
 
+/// Version of the app ↔ TAP contract (init-data keys, messages, state file). A loaded TAP adopts a
+/// new app on a handover when this matches and the DLL file is the same, instead of requiring the
+/// identical app version. Bump it on any change an older TAP or app would misread.
+pub const PROTOCOL: u32 = 2;
+
+/// Encodes init data: `key=value` pairs joined by `;`. Values escape `%`, `;` and `=` as `%25`,
+/// `%3B` and `%3D`, so a tile name or install path containing them survives; anything else is
+/// written as is (so ordinary payloads read the same to an older parser).
+pub fn encode_init<'a>(pairs: impl IntoIterator<Item = (&'a str, String)>) -> String {
+    pairs
+        .into_iter()
+        .map(|(key, value)| format!("{key}={}", escape_value(&value)))
+        .collect::<Vec<_>>()
+        .join(";")
+}
+
+fn escape_value(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for c in value.chars() {
+        match c {
+            '%' => out.push_str("%25"),
+            ';' => out.push_str("%3B"),
+            '=' => out.push_str("%3D"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+fn unescape_value(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(at) = rest.find('%') {
+        out.push_str(&rest[..at]);
+        let code = rest.get(at + 1..at + 3);
+        match code {
+            Some("25") => out.push('%'),
+            Some("3B") | Some("3b") => out.push(';'),
+            Some("3D") | Some("3d") => out.push('='),
+            // Not one of ours: keep it verbatim.
+            _ => {
+                out.push('%');
+                rest = &rest[at + 1..];
+                continue;
+            }
+        }
+        rest = &rest[at + 3..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Every `(key, value)` in init data, keys and values trimmed and values unescaped.
+pub fn init_pairs(data: &str) -> impl Iterator<Item = (&str, String)> {
+    data.split(';')
+        .filter_map(|pair| pair.split_once('='))
+        .map(|(key, value)| (key.trim(), unescape_value(value.trim())))
+}
+
+/// One value out of init data; `None` when absent or empty.
+pub fn init_value(data: &str, wanted: &str) -> Option<String> {
+    init_pairs(data)
+        .find(|(key, _)| *key == wanted)
+        .map(|(_, value)| value)
+        .filter(|value| !value.is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
+    fn init_data_round_trips_awkward_values() {
+        let tile = "Rock; Roll = 100%".to_string();
+        let path = r"C:\Users\a=b;c\audio_tray_tap.dll".to_string();
+        let data = encode_init([("tile", tile.clone()), ("tap", path.clone()), ("pid", "7".into())]);
+        assert_eq!(init_value(&data, "tile"), Some(tile));
+        assert_eq!(init_value(&data, "tap"), Some(path));
+        assert_eq!(init_value(&data, "pid").as_deref(), Some("7"));
+        assert_eq!(init_value(&data, "missing"), None);
+    }
+
+    /// An ordinary payload is byte-identical to the old unescaped format, so an older TAP reads it.
+    #[test]
+    fn plain_values_are_not_escaped() {
+        let data = encode_init([("tooltip", "Audio Tray".into()), ("out", "E767".into())]);
+        assert_eq!(data, "tooltip=Audio Tray;out=E767");
+    }
+
+    #[test]
+    fn empty_values_read_as_absent_and_stray_percents_survive() {
+        assert_eq!(init_value("tile=;pid=1", "tile"), None);
+        assert_eq!(init_value("tile=50%off", "tile").as_deref(), Some("50%off"));
+    }
+
+    #[test]
     fn message_ids_are_distinct() {
         let ids = [
             WM_TASKBAR_ACTION, WM_TAP_REVERT, WM_TASKBAR_RESTARTED, WM_TAP_RESTYLE, WM_TASKBAR_SCROLL,
-            WM_MUSIC_PROGRESS, WM_TAP_WIRE_TRANSPORT, WM_TAP_REPIN,
+            WM_MUSIC_PROGRESS, WM_TAP_WIRE_TRANSPORT, WM_TAP_REPIN, WM_TAP_PROGRESS_WINDOW,
+            WM_TAP_MUSIC_CHANGED, WM_TASKBAR_STATUS,
         ];
         for (i, a) in ids.iter().enumerate() {
             assert!(ids[i + 1..].iter().all(|b| a != b));

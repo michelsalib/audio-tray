@@ -160,7 +160,7 @@ unsafe fn show_inner(
         config,
         scale,
         accent,
-        model: Model::new(groups, update),
+        model: Model { notice: crate::taskbar::current_notice(), ..Model::new(groups, update) },
         hit: Interaction::default(),
         surface: Surface::new((8.0 * scale) as i32),
         watches: Vec::new(),

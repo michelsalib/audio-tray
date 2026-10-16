@@ -245,52 +245,66 @@ pub fn start_watchdog() {
     });
 }
 
+/// Renders the recorded tree under the lock, then logs it after releasing it: the UI-thread
+/// callback (`record`) waits on this lock, so it is never held across output.
 fn dump() {
-    let mut tree = lock();
-    tree.dirty = false;
-    tree.dumps += 1;
+    let mut out = Vec::new();
+    {
+        let mut tree = lock();
+        tree.dirty = false;
+        tree.dumps += 1;
 
-    logf!(
-        "===== visual tree dump #{} — {} nodes live ({} adds, {} removes) =====",
-        tree.dumps,
-        tree.nodes.len(),
-        tree.adds,
-        tree.removes
-    );
+        out.push(format!(
+            "===== visual tree dump #{} — {} nodes live ({} adds, {} removes) =====",
+            tree.dumps,
+            tree.nodes.len(),
+            tree.adds,
+            tree.removes
+        ));
 
-    // Children bucketed by parent, ordered by the index XAML reported.
-    let mut children: HashMap<u64, Vec<u64>> = HashMap::new();
-    for (&handle, node) in &tree.nodes {
-        children.entry(node.parent).or_default().push(handle);
+        // Children bucketed by parent, ordered by the index XAML reported.
+        let mut children: HashMap<u64, Vec<u64>> = HashMap::new();
+        for (&handle, node) in &tree.nodes {
+            children.entry(node.parent).or_default().push(handle);
+        }
+        for bucket in children.values_mut() {
+            bucket.sort_by_key(|h| {
+                let node = &tree.nodes[h];
+                (node.child_index, node.seq)
+            });
+        }
+
+        // A root is any node whose parent we never saw (usually parent == 0).
+        let mut roots: Vec<u64> = tree
+            .nodes
+            .iter()
+            .filter(|(_, node)| !tree.nodes.contains_key(&node.parent))
+            .map(|(&handle, _)| handle)
+            .collect();
+        roots.sort_by_key(|h| tree.nodes[h].seq);
+
+        for root in roots {
+            render_subtree(&tree, &children, root, 0, &mut out);
+        }
+        out.push(format!("===== end of dump #{} =====", tree.dumps));
     }
-    for bucket in children.values_mut() {
-        bucket.sort_by_key(|h| {
-            let node = &tree.nodes[h];
-            (node.child_index, node.seq)
-        });
+    for text in out {
+        logf!("{text}");
     }
-
-    // A root is any node whose parent we never saw (usually parent == 0).
-    let mut roots: Vec<u64> = tree
-        .nodes
-        .iter()
-        .filter(|(_, node)| !tree.nodes.contains_key(&node.parent))
-        .map(|(&handle, _)| handle)
-        .collect();
-    roots.sort_by_key(|h| tree.nodes[h].seq);
-
-    for root in roots {
-        write_subtree(&tree, &children, root, 0);
-    }
-    logf!("===== end of dump #{} =====", tree.dumps);
     logf!("log file: {}", crate::log::path().display());
 }
 
-fn write_subtree(tree: &Tree, children: &HashMap<u64, Vec<u64>>, handle: u64, depth: usize) {
+fn render_subtree(
+    tree: &Tree,
+    children: &HashMap<u64, Vec<u64>>,
+    handle: u64,
+    depth: usize,
+    out: &mut Vec<String>,
+) {
     // Explorer's tree is nowhere near this deep; the guard is purely so a cycle
     // introduced by a bad handle can't spin forever inside the shell.
     if depth > 64 {
-        logf!("{}… depth limit", "  ".repeat(depth));
+        out.push(format!("{}… depth limit", "  ".repeat(depth)));
         return;
     }
     let Some(node) = tree.nodes.get(&handle) else {
@@ -301,16 +315,16 @@ fn write_subtree(tree: &Tree, children: &HashMap<u64, Vec<u64>>, handle: u64, de
     } else {
         format!("#{}", node.name)
     };
-    logf!(
+    out.push(format!(
         "{}{}{}  [0x{:x}]",
         "  ".repeat(depth),
         node.type_name,
         named,
         handle
-    );
+    ));
     if let Some(bucket) = children.get(&handle) {
         for &child in bucket {
-            write_subtree(tree, children, child, depth + 1);
+            render_subtree(tree, children, child, depth + 1, out);
         }
     }
 }

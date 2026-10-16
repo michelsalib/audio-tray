@@ -209,50 +209,85 @@ pub unsafe fn revert(diagnostics: &IXamlDiagnostics) {
     clear_progress_bar();
 }
 
-/// Take the taskbar progress bar off the player's window: the first visible top-level window whose
-/// title contains the host's name (as audio-tray finds it). Silent on failure (teardown path).
+/// The window audio-tray last put a progress bar on (0: none or not reported).
+static PROGRESS_WINDOW: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+
+/// Whether audio-tray has ever reported its progress window (an older app never does).
+static PROGRESS_REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Records the window audio-tray reported with `WM_TAP_PROGRESS_WINDOW`.
+pub fn set_progress_window(hwnd: isize) {
+    use std::sync::atomic::Ordering;
+    PROGRESS_WINDOW.store(hwnd, Ordering::SeqCst);
+    PROGRESS_REPORTED.store(true, Ordering::SeqCst);
+}
+
+/// Take the taskbar progress bar off the player's window: the one audio-tray reported, or, from an
+/// app that never reports, the first visible top-level window of another process whose title
+/// contains the host's name. Silent on failure (teardown path).
+///
+/// Titles are read with `InternalGetWindowText`, which never sends `WM_GETTEXT`: a hung window
+/// (Explorer's own File Explorer windows run on other threads of this process) cannot stall the
+/// revert.
 fn clear_progress_bar() {
+    use std::sync::atomic::Ordering;
     use windows::Win32::Foundation::{HWND, LPARAM};
     use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_ALL};
     use windows::Win32::UI::Shell::{ITaskbarList3, TaskbarList, TBPF_NOPROGRESS};
-    use windows::Win32::UI::WindowsAndMessaging::{EnumWindows, GetWindowTextW, IsWindowVisible};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        EnumWindows, GetWindowThreadProcessId, InternalGetWindowText, IsWindow, IsWindowVisible,
+    };
     use windows_core::BOOL;
 
-    let Some(host) = tile::host() else {
-        return;
-    };
-
-    unsafe extern "system" fn visit(hwnd: HWND, lparam: LPARAM) -> BOOL {
-        // A panic must not unwind into user32: treat it as "stop".
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { visit_inner(hwnd, lparam) })).unwrap_or(BOOL(0))
-    }
-
-    unsafe fn visit_inner(hwnd: HWND, lparam: LPARAM) -> BOOL {
-        let search = unsafe { &mut *(lparam.0 as *mut (String, Option<HWND>)) };
-        if !unsafe { IsWindowVisible(hwnd) }.as_bool() {
-            return BOOL(1);
+    let hwnd = if PROGRESS_REPORTED.load(Ordering::SeqCst) {
+        let reported = HWND(PROGRESS_WINDOW.swap(0, Ordering::SeqCst) as *mut core::ffi::c_void);
+        if reported.0.is_null() || !unsafe { IsWindow(Some(reported)) }.as_bool() {
+            return;
         }
-        let mut title = [0u16; 512];
-        let len = unsafe { GetWindowTextW(hwnd, &mut title) };
-        if len > 0 {
-            let title = String::from_utf16_lossy(&title[..len as usize]).to_lowercase();
-            if title.contains(&search.0) {
-                search.1 = Some(hwnd);
-                return BOOL(0);
+        reported
+    } else {
+        let Some(host) = tile::host() else {
+            return;
+        };
+
+        unsafe extern "system" fn visit(hwnd: HWND, lparam: LPARAM) -> BOOL {
+            // A panic must not unwind into user32: treat it as "stop".
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { visit_inner(hwnd, lparam) })).unwrap_or(BOOL(0))
+        }
+
+        unsafe fn visit_inner(hwnd: HWND, lparam: LPARAM) -> BOOL {
+            let search = unsafe { &mut *(lparam.0 as *mut (String, Option<HWND>)) };
+            if !unsafe { IsWindowVisible(hwnd) }.as_bool() {
+                return BOOL(1);
             }
+            let mut pid = 0u32;
+            unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
+            if pid == std::process::id() {
+                return BOOL(1);
+            }
+            let mut title = [0u16; 512];
+            let len = unsafe { InternalGetWindowText(hwnd, &mut title) };
+            if len > 0 {
+                let title = String::from_utf16_lossy(&title[..len as usize]).to_lowercase();
+                if title.contains(&search.0) {
+                    search.1 = Some(hwnd);
+                    return BOOL(0);
+                }
+            }
+            BOOL(1)
         }
-        BOOL(1)
-    }
 
-    let mut search = (host.name.to_lowercase(), None);
-    let _ = unsafe {
-        EnumWindows(
-            Some(visit),
-            LPARAM(&mut search as *mut (String, Option<HWND>) as isize),
-        )
-    };
-    let Some(hwnd) = search.1 else {
-        return;
+        let mut search = (host.name.to_lowercase(), None);
+        let _ = unsafe {
+            EnumWindows(
+                Some(visit),
+                LPARAM(&mut search as *mut (String, Option<HWND>) as isize),
+            )
+        };
+        let Some(hwnd) = search.1 else {
+            return;
+        };
+        hwnd
     };
     unsafe {
         let Ok(taskbar) = CoCreateInstance::<_, ITaskbarList3>(&TaskbarList, None, CLSCTX_ALL)

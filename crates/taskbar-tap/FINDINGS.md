@@ -231,6 +231,27 @@ Two caveats that are properties of the approach, not bugs:
 - Like hiding the system volume icon, it is a shell-wide edit with **no undo**
   short of restarting Explorer — the TAP pins itself.
 
+### 26300: the frame is a `StackPanel` now
+
+KB5127648 (26300.9711) kept the `x:Name` `SystemTrayFrameGrid` but made it a
+horizontal `Windows.UI.Xaml.Controls.StackPanel`, same eight children in the
+same order. `Grid.Column` is inert there (every section reads 0), so the old
+plan computed column -1, `SetColumn` returned `E_INVALIDARG`, and the sweep
+retried it every 250 ms for the life of the shell — tens of thousands of log
+lines, the strip left of the language indicator.
+
+The move is now done with margins when the frame is a `StackPanel`: the notify
+icons get `left +B, right -B-W` (a zero-wide slot, drawn `B` to the right), the
+sections they step over close up, and `ControlCenterButton` gets `left +W`.
+`B` is the stepped-over sections' width, `W` the icons', both with the shell's
+own margins. It is real layout, so `Shell_NotifyIconGetRect` follows it —
+verified: the tray read its slot as 1497..1605 px with the pill drawn at
+1503..1598. Widths change (language, icon count, our strip widening the slot),
+so the margins are recomputed every sweep and rewritten only when off by
+≥ 0.5 epx; the first application can read the slot before the strip widens it,
+the next sweeps correct it. Originals are recorded and restored on revert like
+columns.
+
 ## Registering the tray icon (audio-tray's side, but it decides whether any of this runs)
 
 Two traps, both of which silently disable the whole feature — the TAP only
@@ -1443,3 +1464,46 @@ A XAML element left at `HorizontalAlignment=Stretch` and then given an explicit 
 
 ### music/mod.rs: the ItemsRepeater recycles task buttons
 `find_buttons` reads every `TaskListButton`'s accessible name on every sweep and caches no verdict, because the taskbar's `ItemsRepeater` recycles button elements: a handle named "YouTube Music" on one sweep can be another app's button on the next, and a remembered match would put the strip on that app.
+
+## Hardening after the 2026-10 review
+
+Prompted by two Explorer AppHangs with the TAP loaded (2026-09-30, 2026-10-16 14:25) whose cause
+the log could not show: it had no timestamps, and the last lines before the 14:25 hang were an
+ordinary, completed restyle.
+
+- **Log.** Every line is stamped with local time and thread id (AppHang times in the Event Log are
+  local), and written by a background thread: callers only send on a channel, so a slow disk or a
+  reader holding the file cannot stall Explorer's UI thread. Runs of identical lines collapse into
+  "… repeated N more time(s)" (the 26300 `SetColumn` loop wrote 11k pairs); the file rotates to
+  `xaml-tap.log.1` at 4 MB during the session too. Tree dumps are rendered before the tree lock is
+  released, not while holding it.
+- **Hang watch.** Each XAML-calling step on the tray thread runs inside a named phase; a watcher
+  thread logs `hang watch: tray thread inside <phase> for Ns` once a phase passes 2 s, and again
+  when it returns. Phases that finish in time log nothing. After the next hang, the last lines name
+  the step.
+- **Restyle in place.** The strip markup carries every icon variant per segment (device glyph,
+  muted glyph, both earbuds, recording dot), named and with visibility set. A device, mute or
+  recording change is now `put_Glyph` + `put_Visibility` on the live strip, still behind the 400 ms
+  quiet gate; `put_Content` is left for the first draw and for accent changes. Verified on 26300:
+  the recording dot and a mute flip both logged `restyle: updated in place`. `IFontIcon` is
+  `d4d61391-39ac-4950-9166-3606c264418b`, `get_Glyph`/`put_Glyph` first (26100 SDK header).
+  A restyle pumped while `put_Content` is in flight bumps a revision, and the draw that was in
+  flight is not recorded as current.
+- **Failure budgets.** Reorder and decorate give up after 40 consecutive failures (10 s at the fast
+  pace) with one log line, instead of retrying for Explorer's lifetime. A layout the reorder cannot
+  express (all columns 0) gives up at once.
+- **Status to the app.** After a 10 s grace period the TAP posts `WM_TASKBAR_STATUS` when what is
+  broken changes: no strip (decorate gave up), reorder gave up, or expected elements missing (no
+  `SystemTrayFrameGrid`/`NotificationAreaIcons`, or a music tile with no `TaskListButton`). The
+  flyout shows one line above its footer. An icon left in the overflow is not reported: that is a
+  user choice the TAP deliberately leaves alone.
+- **Handover by protocol.** `tap_proto::PROTOCOL` is sent as `proto=`; a loaded TAP adopts any app
+  with the same protocol and DLL path, so an update no longer restarts Explorer — the updated TAP
+  loads with the next Explorer. Any restart that is still needed is asked for first.
+- **Smaller items.** Name lookups pick the newest node (the main taskbar's tray frame: newest frame
+  holding the notify icons), handover re-queues only tray-icon glyphs and checks the tray ancestor
+  before any XAML read, `UnadviseVisualTreeChange` runs off the `SetSite` thread like the advise,
+  the revert clears the progress bar only on the window the app reported (`WM_TAP_PROGRESS_WINDOW`;
+  the title fallback uses `InternalGetWindowText`, which never sends `WM_GETTEXT`), the music state
+  file is re-read on `WM_TAP_MUSIC_CHANGED` instead of stat'ed every 250 ms, and the ticker writes
+  text only when it advances.

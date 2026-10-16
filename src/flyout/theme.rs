@@ -39,6 +39,9 @@ pub(super) const THUMB_R: f32 = 7.0;
 // footer bar: hairline, a labelled action on the left, round icon buttons on the right
 pub(super) const FOOTER_TOP_GAP: f32 = 6.0; // standoff above the hairline (the panel's old closing pad)
 pub(super) const FOOTER_H: f32 = 52.0; // the strip itself: hairline down to the panel's bottom edge
+pub(super) const NOTE_H: f32 = 26.0; // the one-line integration notice above the footer
+pub(super) const NOTE_TEXT_PX: f32 = 12.0;
+pub(super) const NOTE_A: f32 = 0.62; // secondary text
 pub(super) const FOOTER_ICON_X: f32 = 16.0; // left inset of the footer item's glyph
 pub(super) const FOOTER_ICON_PX: f32 = 16.0; // footer glyph size (smaller than a row's)
 pub(super) const FOOTER_TEXT_X: f32 = 44.0; // left inset of the footer item's label

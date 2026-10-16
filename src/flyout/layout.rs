@@ -59,6 +59,8 @@ pub(super) enum Elem {
     /// The panel's closing strip: a hairline, [`ActionKind::LEFT`] as a labelled item on
     /// the left and [`footer_buttons`] as round icon buttons on the right.
     Footer,
+    /// One line of secondary text above the footer: [`Model::notice`].
+    Note,
 }
 
 pub(super) struct LaidElem {
@@ -119,6 +121,9 @@ pub(super) fn build_view(model: &Model, scale: f32, width: i32, view: View, fill
                     kinds.push(Elem::Device { group: gi, dev: di });
                 }
             }
+            if model.notice.is_some() {
+                kinds.push(Elem::Note);
+            }
             // The closing strip (settings, quit, and a staged update; see [`footer_buttons`]).
             kinds.push(Elem::Footer);
         }
@@ -143,6 +148,7 @@ pub(super) fn build_view(model: &Model, scale: f32, width: i32, view: View, fill
             Elem::PickerHeader { .. } => d(PICKER_HEADER_H),
             Elem::IconGrid { .. } => grid_px_height(width, scale),
             Elem::Footer => d(FOOTER_H),
+            Elem::Note => d(NOTE_H),
         };
         elems.push(LaidElem { elem, top: y, height });
         y += height;
@@ -158,7 +164,8 @@ pub(super) fn build_view(model: &Model, scale: f32, width: i32, view: View, fill
         for le in &mut elems {
             match le.elem {
                 Elem::IconGrid { .. } => le.top += slack / 2,
-                Elem::Footer => le.top += slack,
+                // The notice stays attached to the footer it sits on.
+                Elem::Footer | Elem::Note => le.top += slack,
                 _ => {}
             }
         }
@@ -376,6 +383,22 @@ mod tests {
         assert_eq!(total, natural + 120);
         assert_eq!(last.top, natural_top + 120);
         assert_eq!(last.top + last.height, total);
+    }
+
+    /// The integration notice sits right above the footer, moves with it, and is not clickable.
+    #[test]
+    fn a_notice_sits_on_the_footer_and_follows_it() {
+        let mut m = model(vec![output_group(vec![dev("Speakers", None)])], None);
+        let (plain, plain_h) = build_view(&m, 1.0, 400, View::Main, 0);
+        m.notice = Some("Taskbar buttons could not be placed");
+        let (elems, total) = build_view(&m, 1.0, 400, View::Main, plain_h + 80);
+        assert_eq!(elems.len(), plain.len() + 1);
+        let n = elems.len();
+        let (note, footer) = (&elems[n - 2], &elems[n - 1]);
+        assert!(matches!(note.elem, Elem::Note) && matches!(footer.elem, Elem::Footer));
+        assert!(note.top + note.height <= footer.top);
+        assert_eq!(footer.top + footer.height, total);
+        assert_eq!(elem_at(&elems, note.top + 1), None);
     }
 
     #[test]

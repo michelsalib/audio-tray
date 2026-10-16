@@ -274,7 +274,9 @@ pub fn set_player_progress(fraction: Option<f64>, playing: bool) -> Result<()> {
         }
         let borrowed = cell.borrow();
         let taskbar = borrowed.as_ref().context("caching ITaskbarList3")?;
-        set_progress(taskbar, hwnd, fraction, playing)
+        set_progress(taskbar, hwnd, fraction, playing)?;
+        crate::taskbar::report_progress_window(fraction.map(|_| hwnd));
+        Ok(())
     })
 }
 

@@ -123,6 +123,14 @@ unsafe extern "system" fn control_proc(
         }
         return LRESULT(0);
     }
+    if msg == tap_proto::WM_TAP_PROGRESS_WINDOW {
+        crate::music::set_progress_window(wparam.0 as isize);
+        return LRESULT(0);
+    }
+    if msg == tap_proto::WM_TAP_MUSIC_CHANGED {
+        crate::music::state::mark_changed();
+        return LRESULT(0);
+    }
     if msg == WM_TAP_WIRE_TRANSPORT {
         // Cleared before the work, so buttons announced meanwhile get another pass.
         WIRE_PENDING.store(false, Ordering::SeqCst);

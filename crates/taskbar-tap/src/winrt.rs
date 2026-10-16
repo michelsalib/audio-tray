@@ -294,6 +294,20 @@ pub unsafe trait ITextBlock: IUnknown {
     pub fn put_Text(&self, value: *mut c_void) -> HRESULT;
 }
 
+/// `Windows.UI.Xaml.Controls.IFontIcon` (IID and order from the 26100 SDK's
+/// `windows.ui.xaml.controls.h`). `Glyph` is the first property, so no placeholders.
+#[interface("d4d61391-39ac-4950-9166-3606c264418b")]
+pub unsafe trait IFontIcon: IUnknown {
+    pub fn GetIids(&self, count: *mut u32, iids: *mut *mut windows_core::GUID) -> HRESULT;
+    pub fn GetRuntimeClassName(&self, name: *mut *mut c_void) -> HRESULT;
+    pub fn GetTrustLevel(&self, level: *mut i32) -> HRESULT;
+    pub fn get_Glyph(&self, value: *mut *mut c_void) -> HRESULT;
+    pub fn put_Glyph(&self, value: *mut c_void) -> HRESULT;
+}
+
+/// `Windows.UI.Xaml.Visibility`.
+pub const VISIBILITY_VISIBLE: i32 = 0;
+
 /// `Windows.UI.Xaml.Markup.IXamlReaderStatics`. `Load` is how elements get created
 /// (`IVisualTreeService::CreateInstance` is `E_NOTIMPL` in Explorer).
 #[interface("9891c6bd-534f-4955-b85a-8a8dc0dca602")]

@@ -445,7 +445,8 @@ pub unsafe trait IBorder: IUnknown {
     pub fn put_Child(&self, value: *mut c_void) -> HRESULT;
 }
 
-/// `Windows.UI.Xaml.Controls.IGridStatics`: `Grid.Column` (which orders the tray's sections) as a
+/// `Windows.UI.Xaml.Controls.IGridStatics`: `Grid.Column` (which orders the tray's sections) and
+/// `Grid.ColumnSpan` (the music tile's progress bar cell) as a
 /// plain `i32`, without `DependencyProperty` boxing.
 #[interface("64fe2e9f-f951-42b6-a9ce-bb179af11595")]
 pub unsafe trait IGridStatics: IUnknown {
@@ -458,6 +459,12 @@ pub unsafe trait IGridStatics: IUnknown {
     pub fn get_ColumnProperty(&self, value: *mut *mut c_void) -> HRESULT;
     pub fn GetColumn(&self, element: *mut c_void, value: *mut i32) -> HRESULT;
     pub fn SetColumn(&self, element: *mut c_void, value: i32) -> HRESULT;
+    pub fn get_RowSpanProperty(&self, value: *mut *mut c_void) -> HRESULT;
+    pub fn GetRowSpan(&self, element: *mut c_void, value: *mut i32) -> HRESULT;
+    pub fn SetRowSpan(&self, element: *mut c_void, value: i32) -> HRESULT;
+    pub fn get_ColumnSpanProperty(&self, value: *mut *mut c_void) -> HRESULT;
+    pub fn GetColumnSpan(&self, element: *mut c_void, value: *mut i32) -> HRESULT;
+    pub fn SetColumnSpan(&self, element: *mut c_void, value: i32) -> HRESULT;
 }
 
 // Deliberately no `ICoreDispatcher`: `GetDispatcher` returns another island's dispatcher

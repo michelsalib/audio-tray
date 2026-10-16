@@ -1507,3 +1507,24 @@ ordinary, completed restyle.
   the title fallback uses `InternalGetWindowText`, which never sends `WM_GETTEXT`), the music state
   file is re-read on `WM_TAP_MUSIC_CHANGED` instead of stat'ed every 250 ms, and the ticker writes
   text only when it advances.
+
+### 26300: the progress bar was cut at 39 epx, then its track blinked
+
+On 26300 the fill on the widened YouTube Music tile stopped at ~39 epx whatever the position (56%
+of a song drew as 26%), with its right end square. Everything XAML reported was right — the bar,
+its template parts and the fill all 150 epx wide, the template's `RectangleGeometry` clip 150 wide,
+no scale anywhere — and a composition `InsetClip` on the template's inner `Border` (set and re-set
+by the shell) turned out to be irrelevant: taking it off changed nothing.
+
+The decisive test was moving the bar 40 epx right: it **vanished**, so the visible window was fixed
+in the parent's coordinates. That is a layout-slot clip. `Grid#IconPanel` now has two columns;
+`BackgroundElement` (our plate) spans both, `ProgressIndicator` sits in column 0 alone — the icon's
+column, ~39 epx — and an element wider than its cell is clipped to it. `span_like_plate` gives the
+bar the plate's `Grid.ColumnSpan` (recorded, restored on revert). Measured after: 30% → 30% of the
+tile, live 91% against the feed's 91.2%.
+
+With the bar full width, its grey `ProgressBarTrack` blinked: on every new value the control sets
+the track's `Width` to about the fill's length and back within ~70 ms (filmed at 16 ms/frame; the
+stock 39-epx bar shows nothing). `hold_track` sets the track's `MinWidth` to the bar's width, which
+outranks the transient `Width`; filmed after, 437 frames over 8 manual updates and 200 frames of
+playback, the track never shortened.

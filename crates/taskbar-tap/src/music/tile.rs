@@ -14,7 +14,7 @@ use windows_core::{IInspectable, Interface};
 use crate::decorate::{element, object_from_handle};
 use crate::log::logf;
 use crate::winrt::{
-    IBorder, IFrameworkElement, Thickness, HORIZONTAL_ALIGNMENT_LEFT,
+    IBorder, IFrameworkElement, IGridStatics, Thickness, GRID, HORIZONTAL_ALIGNMENT_LEFT,
 };
 use crate::xamlom::{InstanceHandle, IXamlDiagnostics};
 
@@ -108,6 +108,15 @@ unsafe fn remember(diagnostics: &IXamlDiagnostics, handle: InstanceHandle) {
 /// # Safety
 /// XAML UI thread only.
 pub unsafe fn restore(diagnostics: &IXamlDiagnostics) {
+    let spans = std::mem::take(&mut *crate::lock(&SPANS));
+    if let Some(grid) = crate::decorate::factory::<IGridStatics>(GRID) {
+        for (handle, span) in spans {
+            if let Some(framework) = element::<IFrameworkElement>(diagnostics, handle) {
+                let ok = grid.SetColumnSpan(framework.as_raw(), span) == S_OK;
+                logf!("music: restored 0x{handle:x} — column span {span} {ok}");
+            }
+        }
+    }
     let originals = std::mem::take(&mut *crate::lock(&ORIGINALS));
     for (handle, original) in originals {
         let Some(framework) = element::<IFrameworkElement>(diagnostics, handle) else {
@@ -251,6 +260,7 @@ unsafe fn set_margin_left(diagnostics: &IXamlDiagnostics, handle: InstanceHandle
 /// Forget originals of elements the shell has since destroyed (every indicator rebuild leaves one).
 pub fn prune_originals() {
     crate::lock(&ORIGINALS).retain(|(handle, _)| crate::tree::type_of(*handle).is_some());
+    crate::lock(&SPANS).retain(|(handle, _)| crate::tree::type_of(*handle).is_some());
 }
 
 /// Bring a strip already on screen in line with a new track, without replacing it. Returns
@@ -349,12 +359,87 @@ pub unsafe fn place_button_state(diagnostics: &IXamlDiagnostics, button: Instanc
             // Width first, then position: a frame can render between these writes, and this order
             // looks least wrong.
             if let Some(width) = fixed_width {
+                span_like_plate(diagnostics, panel, child);
                 set_width(diagnostics, child, width);
+                hold_track(diagnostics, child, width);
             }
             pin_left(diagnostics, child);
             set_margin_left(diagnostics, child, left);
         }
     }
+}
+
+/// Gives the bar's grey `ProgressBarTrack` a `MinWidth` of the full bar. On each new value the
+/// control briefly sets the track's `Width` to about the fill's length before setting it back; at
+/// the stock 39 epx that cannot be seen, across the widened tile the track blinked off for ~70 ms
+/// per update. `MinWidth` outranks `Width` in layout, so the transient never shows.
+///
+/// # Safety
+/// XAML UI thread only.
+unsafe fn hold_track(diagnostics: &IXamlDiagnostics, bar: InstanceHandle, width: f64) {
+    let mut stack = vec![(bar, 0usize)];
+    while let Some((handle, depth)) = stack.pop() {
+        if crate::tree::name_of(handle).as_deref() == Some("ProgressBarTrack") {
+            let Some(framework) = element::<IFrameworkElement>(diagnostics, handle) else {
+                return;
+            };
+            let mut live = f64::NAN;
+            if framework.get_MinWidth(&mut live) == S_OK && (live - width).abs() < 0.5 {
+                return;
+            }
+            remember(diagnostics, handle);
+            let _ = framework.put_MinWidth(width);
+            return;
+        }
+        if depth < 6 {
+            stack.extend(crate::tree::children_of(handle).into_iter().map(|child| (child, depth + 1)));
+        }
+    }
+}
+
+/// `Grid.ColumnSpan`s we widened, with the shell's value to put back.
+static SPANS: Mutex<Vec<(InstanceHandle, i32)>> = Mutex::new(Vec::new());
+
+/// Gives the progress bar the plate's column span. From 26300 the button's `Grid#IconPanel` has
+/// two columns and the bar sits in the first (the icon's, ~39 epx) while `BackgroundElement` spans
+/// both: a bar widened past its cell is clipped to it by layout, so the fill stopped at 39 epx
+/// whatever the position (measured: a bar moved 40 epx right disappeared entirely).
+///
+/// # Safety
+/// XAML UI thread only.
+unsafe fn span_like_plate(diagnostics: &IXamlDiagnostics, panel: InstanceHandle, bar: InstanceHandle) {
+    let Some(grid) = crate::decorate::factory::<IGridStatics>(GRID) else {
+        return;
+    };
+    let span_of = |handle: InstanceHandle| {
+        let framework = element::<IFrameworkElement>(diagnostics, handle)?;
+        let mut span = 0i32;
+        (grid.GetColumnSpan(framework.as_raw(), &mut span) == S_OK).then_some(span)
+    };
+    let Some(plate) = crate::tree::newest(
+        crate::tree::children_of(panel)
+            .into_iter()
+            .filter(|&child| crate::tree::name_of(child).as_deref() == Some("BackgroundElement")),
+    ) else {
+        return;
+    };
+    let (Some(wanted), Some(live)) = (span_of(plate), span_of(bar)) else {
+        return;
+    };
+    if live >= wanted {
+        return;
+    }
+    {
+        let mut spans = crate::lock(&SPANS);
+        if !spans.iter().any(|&(known, _)| known == bar) {
+            spans.push((bar, live));
+        }
+    }
+    let Some(framework) = element::<IFrameworkElement>(diagnostics, bar) else {
+        return;
+    };
+    let hr = grid.SetColumnSpan(framework.as_raw(), wanted);
+    logf!("music: progress bar column span {live} -> {wanted} -> 0x{:08x}", hr.0);
 }
 
 /// Collapse the app's own icon, matched by name (never by position) so we cannot hit our strip.

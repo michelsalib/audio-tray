@@ -252,6 +252,18 @@ so the margins are recomputed every sweep and rewritten only when off by
 the next sweeps correct it. Originals are recorded and restored on revert like
 columns.
 
+### 26300: secondary taskbars
+
+Each secondary taskbar's `SystemTrayFrameGrid` also holds a
+`SystemTray.NotificationAreaIcons`, empty. The reorder picked "the newest frame
+holding the notify icons", so once external displays came up (2026-10-19, 10:04,
+"button on 3 taskbar(s)") it followed a secondary frame: every sweep logged
+`drawn 0 epx right, ControlCenterButton +0` and the main frame kept the margins
+from 09:00, never corrected again. When widths changed, the control centre drew
+over the pill (wifi glyph on top of the mic segment). The frame is now the one
+above our decorated icon, with "newest" kept only as the fallback before the
+strip is placed.
+
 ## Registering the tray icon (audio-tray's side, but it decides whether any of this runs)
 
 Two traps, both of which silently disable the whole feature — the TAP only

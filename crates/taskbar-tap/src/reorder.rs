@@ -50,15 +50,31 @@ fn needs_upkeep() -> bool {
     frame().is_some_and(|frame| tree::type_of(frame).as_deref() == Some(STACK_PANEL))
 }
 
-/// The main taskbar's tray frame: the newest recorded one holding the notify icons. Secondary
-/// taskbars have a frame of the same name, and a stale one may linger when its `Remove` never
-/// arrived; an arbitrary pick would flip the margins between them.
+/// The main taskbar's tray frame: the one holding our decorated icon, else the newest recorded one
+/// holding the notify icons. Secondary taskbars have a frame of the same name, on 26300 with an
+/// empty `NotificationAreaIcons` of their own, so "newest" alone picks one once a display is
+/// plugged in (see FINDINGS "26300: secondary taskbars").
 fn frame() -> Option<InstanceHandle> {
+    if let Some(frame) = crate::decorated_pair().and_then(|(icon, _)| frame_above(icon)) {
+        return Some(frame);
+    }
     tree::newest(tree::find_by_name(FRAME_GRID).into_iter().filter(|&frame| {
         tree::children_of(frame)
             .iter()
             .any(|&child| tree::type_of(child).as_deref() == Some(ICONS_TYPE))
     }))
+}
+
+/// The tray frame a recorded element sits in.
+fn frame_above(start: InstanceHandle) -> Option<InstanceHandle> {
+    let mut handle = start;
+    for _ in 0..40 {
+        handle = tree::parent_of(handle)?;
+        if tree::name_of(handle).as_deref() == Some(FRAME_GRID) {
+            return Some(handle);
+        }
+    }
+    None
 }
 
 /// Cheap, tree-only precondition: both sections we need to reorder are recorded.

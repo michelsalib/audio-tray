@@ -60,7 +60,28 @@ playing ("updated 19 s ago"), so interpolation is required, not an optimisation.
 - **Playing: `main` wakes about four times per bar step.** It is the cross-process
   `SetProgressValue` into Explorer. Fewer steps would mean a coarser bar; the edge pill's progress
   ring (a DirectComposition animation) will not need steps at all.
-- **The microphone watcher: 0.55 wakeups/s, ~0.75 M cycles/s, with no session at all.** Its
-  `RegNotifyChangeKeyValue` on the consent store fires more often than the 5 s recheck, though no
-  `LastUsedTime*` value changed over 20 s (something rewrites identical values), and every wake
-  re-sweeps the whole store (~1.4 M cycles). For Phase 2, when mic becomes a source.
+- **The microphone watcher's 5 s safety recheck** (the brief's allowed exception). An earlier
+  reading here blamed spurious registry notifications; logging the wait showed the loop only
+  ever wakes on its 5 s timeout. The "wakeups" are context switches inside each sweep of the
+  consent store (about eight per sweep, ~3.4 M cycles in release), which is now the whole of
+  the idle cost. Making the sweep cheaper (re-reading only the keys that hold the mic) is the
+  next lever if that matters.
+
+## After the redesign (2026-11-01)
+
+Release build, strip off (the new default), pill on, Discord pipe listening, 60 s window,
+nothing playing and no call:
+
+| Thread | Wakeups/s | Cycles/s |
+| --- | --- | --- |
+| `mic` (5 s safety recheck) | 0.67 | 0.69 M |
+| WinRT and COM pool | 0.08 | 0.02 M |
+| `main` (tray, pill, pipe) | 0 | 0 |
+| `music` | 0 | 0 |
+| GPU driver threads (the pill's D3D device) | 0 | 0 |
+| **Process** | **0.75** | **0.80 M** |
+
+Down from 3.27 wakeups/s and 2.41 M cycles/s before the redesign. While a track plays, `main`
+and `music` wake only for SMTC events (about 0.3/s each, measured on a debug build): the pill's
+progress ring is a DirectComposition animation, and with the strip off nothing steps the
+taskbar progress bar.

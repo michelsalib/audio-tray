@@ -4,7 +4,7 @@
 [![Release](https://github.com/michelsalib/audio-tray/actions/workflows/release.yml/badge.svg)](https://github.com/michelsalib/audio-tray/releases/latest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-A tiny Windows system-tray app for **controlling your audio without digging through Settings** — switch the default output/input device, set volume, and mute, all from one native-feeling flyout. It also turns the YouTube Music PWA's taskbar icon into a now-playing strip.
+A tiny Windows app for **audio awareness without opening anything** — a pill on the edge of your screen shows what is playing, who is talking and whether your mic is live — and for **controlling your audio without digging through Settings**: switch the default output/input device, set volume per device and per app, and mute, all from one native-feeling flyout.
 
 <p align="center">
   <img src="assets/app.ico" width="96" alt="Audio Tray icon">
@@ -12,15 +12,32 @@ A tiny Windows system-tray app for **controlling your audio without digging thro
 
 ## Features
 
-- **Taskbar controls** — a pair of buttons drawn into the notification area, one for
-  output and one for input, each showing that device's own icon. Windows' own volume and
-  "microphone in use" icons are hidden, since the buttons say the same thing. See
-  [taskbar controls](#taskbar-controls).
+- **The edge pill** — a discreet shape on the left edge of the primary screen that only gets
+  louder when something needs you:
+  - a grey sliver when nothing happens; the playing track's cover in a progress ring (from any
+    app: YouTube Music, Spotify, a browser…), with title and transport controls when you point
+    at the edge;
+  - in a call, the faces in it with the speaker lit green, and your mic with its live dot; click
+    it to mute;
+  - amber when you talk while muted, or when audio moved because a device disconnected; red when
+    an app starts listening outside a known call (click to mute, right-click to dismiss).
+
+  It never takes focus, lets clicks through while quiet, hides behind fullscreen apps (except
+  red), and costs nothing while still: it is drawn with DirectComposition and the progress ring
+  is animated by the compositor, not the app.
+- **Integrations** (optional, each can be off): Discord through a
+  [Vencord plugin](integrations/vencord/README.md) (who is in the call, who is talking, your
+  mute), Teams through its local API (meeting and mute), and Twitch went-live notices.
+- **Taskbar controls** (opt-in, `[strip] enabled = true`) — a pair of buttons drawn into the
+  notification area, one for output and one for input, each showing that device's own icon.
+  Windows' own volume and "microphone in use" icons are hidden, since the buttons say the same
+  thing. Without them, Audio Tray is a plain tray icon. See [taskbar controls](#taskbar-controls).
 - **Left-click** either button to switch that endpoint to the next device;
   **right-click** for a compact acrylic flyout that replaces the native sound flyout:
-  set output **and** input volume, mute/unmute, switch the default output and input
-  device, pick a per-device icon, and see the battery level of Bluetooth devices that
-  report one.
+  what is playing (with transport controls), your call, output **and** input volume,
+  mute/unmute, the default output and input device (the other devices fold away until you
+  click the section), a per-app volume mixer, a per-device icon, and the battery level of
+  Bluetooth devices that report one.
 - **Scroll** over a button — mouse wheel or touchpad — to change *that* endpoint's
   volume: the output button for playback, the input button for the microphone. A level
   bar appears next to the buttons while you scroll and fades away three seconds after
@@ -114,15 +131,34 @@ enabled = true            # false turns the whole music half off, progress bar i
 tile = "YouTube Music"    # the taskbar button to draw into; "" = feed only, no strip
 # app_id = "..."          # pin the SMTC app id: a miss, or YouTube Music as a plain tab
 
+[pill]
+enabled = true              # the edge pill
+listening_alerts = true     # the red alert when an app records outside a known call
+
+[discord]
+enabled = true              # host \\.\pipe\audio-tray for the Vencord plugin
+
+[teams]
+enabled = false             # Teams' local API; turn it on in Teams too (Settings > Privacy > Manage API)
+# token = "..."             # kept here once you allow Audio Tray inside Teams
+
+[twitch]
+enabled = false             # went-live notices
+client_id = ""              # a Twitch application's client id
+token = ""                  # a user token with user:read:follows
+every_minutes = 3
+
 [strip]
+enabled = false             # draw the taskbar buttons by injecting into Explorer (opt-in)
 next_to_wifi = true         # move the tray icons between the language indicator and wifi
 hide_windows_volume = true  # hide Windows' volume icon (the output button replaces it)
 hide_windows_mic = true     # hide Windows' "microphone in use" icon (the red dot replaces it)
 scroll_anywhere = true      # wheel over the whole taskbar sets the volume; false = our buttons only
 ```
 
-Each switch also rules one shell edit out when the taskbar misbehaves. They are read when
-the buttons are placed, so restart Audio Tray after changing them.
+Each `[strip]` switch also rules one shell edit out when the taskbar misbehaves. They are
+read when the buttons are placed, so restart Audio Tray after changing them; the same goes
+for the integrations.
 
 ## Taskbar controls
 

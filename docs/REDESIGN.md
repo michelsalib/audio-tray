@@ -114,34 +114,46 @@ the app working at every step.
 
 **Phase 2: source abstraction**
 
-- [ ] Define one internal event enum (media, mic users, app sessions, voice state, self mute)
-- [ ] Wrap existing audio, mic and SMTC code as sources emitting those events
-- [ ] Check: existing taskbar buttons and flyout behave exactly as before
+- [x] Define one internal event enum (media, mic users, app sessions, voice state, self mute):
+      `src/hub`
+- [x] Wrap existing audio, mic and SMTC code as sources emitting those events
+- [x] Check: existing taskbar buttons and flyout behave exactly as before (their code paths are
+      unchanged; the hub is fed alongside them)
 
 **Phase 3: edge pill**
 
-- [ ] DirectComposition window, edge hit strip, quiet and normal states for music and mic
-- [ ] Warn and alert states, fullscreen suppression
-- [ ] Check: idle budget met; pill never takes focus; text and icons pass 4.5:1 contrast
+- [x] DirectComposition window, edge hit strip, quiet and normal states for music and mic:
+      `src/pill`
+- [x] Warn and alert states, fullscreen suppression (an appbar registered only for
+      `ABN_FULLSCREENAPP`, no space reserved)
+- [x] Check: idle budget met (see PERF.md); pill never takes focus (`NOACTIVATE` plus
+      `MA_NOACTIVATE`); text and icons pass 4.5:1 contrast (white on the dark pill, near-black on
+      amber 10.9:1, white on red 5.9:1, white on the notice purple 6.5:1)
 
 **Phase 4: integrations**
 
-- [ ] Named-pipe server plus Vencord user plugin (TypeScript) for Discord
-- [ ] Teams local API client
-- [ ] Twitch went-live notices, off by default
-- [ ] Check: each integration can be disabled, and the app works without it
+- [x] Named-pipe server plus Vencord user plugin (TypeScript) for Discord: `src/integrations/discord.rs`,
+      `integrations/vencord`. Tested against a scripted pipe client, not against Discord itself.
+- [x] Teams local API client: `src/integrations/teams.rs`, off by default. Not tested against
+      Teams (it needs the API turned on and a pairing click in Teams).
+- [x] Twitch went-live notices, off by default: `src/integrations/twitch.rs`. Not tested (needs
+      a Twitch application and token).
+- [x] Check: each integration can be disabled, and the app works without it
 
 **Phase 5: flyout refresh**
 
-- [ ] Collapsed device lists, Now Playing card, per-app mixer, voice panel
+- [x] Collapsed device lists, Now Playing card, per-app mixer, voice panel
 
-## Open questions
+## Decisions on the open questions
 
-- Which monitor gets the pill on multi-monitor setups: primary, or the one with the cursor?
-- Does the SMTC timeline for Twitch and YouTube live report a usable end time? Verify with
-  `--music-timeline`.
-- Does the current Teams client still accept the community-documented message format?
-- Keep the injected taskbar buttons as an opt-in mode, or remove `taskbar-tap` entirely?
+- **Monitor:** the primary one. It is where the taskbar's tray lives, and the pill never moves
+  under the user. Revisit if it should follow the cursor.
+- **Live end times:** a session without an end time shows "LIVE" instead of the ring; not yet
+  checked against a live Twitch or YouTube stream.
+- **Teams format:** unverified; the client follows the community-documented protocol 2.0.0 and
+  stays off until enabled.
+- **Taskbar buttons:** kept, as an opt-in mode (`[strip] enabled = true`); `taskbar-tap` stays.
+  With them off, a strip left by an earlier run is reverted at start-up.
 
 ## References
 

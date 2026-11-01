@@ -24,7 +24,7 @@ use windows::Win32::Graphics::DirectComposition::{
 };
 use windows::Win32::Graphics::DirectWrite::{
     DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat, DWRITE_FACTORY_TYPE_SHARED,
-    DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT, DWRITE_FONT_WEIGHT_NORMAL,
+    DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT, DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_WEIGHT_NORMAL,
     DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_MEASURING_MODE_NATURAL, DWRITE_PARAGRAPH_ALIGNMENT_CENTER,
     DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_TEXT_METRICS, DWRITE_TRIMMING, DWRITE_TRIMMING_GRANULARITY_CHARACTER,
     DWRITE_WORD_WRAPPING_NO_WRAP,
@@ -63,6 +63,8 @@ pub enum Font {
     IconsSmall,
     /// One centred letter in a face without a picture.
     Initial,
+    /// The LIVE badge: tiny, bold, centred.
+    Badge,
 }
 
 pub struct Gfx {
@@ -116,6 +118,7 @@ impl Gfx {
                 gfx.format(w!("Segoe Fluent Icons"), DWRITE_FONT_WEIGHT_NORMAL, 16.0, true)?,
                 gfx.format(w!("Segoe Fluent Icons"), DWRITE_FONT_WEIGHT_NORMAL, 12.0, true)?,
                 gfx.format(w!("Segoe UI Variable Text"), DWRITE_FONT_WEIGHT_SEMI_BOLD, 15.0, true)?,
+                gfx.format(w!("Segoe UI Variable Text"), DWRITE_FONT_WEIGHT_BOLD, 8.0, true)?,
             ];
             Ok(gfx)
         }

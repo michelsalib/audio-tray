@@ -103,11 +103,16 @@ pub(super) fn render_page(ctx: &Ctx, elems: &[LaidElem], out: &mut [u8]) {
                     }
                     if let Some(f) = font {
                         let px = 12.5 * scale;
-                        let line = fit_label(f, px, &format!("{} · {}", np.artist, np.app), max_w);
+                        let live = if np.live { " · LIVE" } else { "" };
+                        let line = fit_label(f, px, &format!("{} · {}{live}", np.artist, np.app), max_w);
                         cv.draw_text(f, px, (tx, cy + 13.0 * scale), TEXT, 0.68, &line);
                     }
                     let bpx = (16.0 * scale).round() as u32;
                     for (i, glyph) in [GLYPH_PREVIOUS, if np.playing { GLYPH_PAUSE } else { GLYPH_PLAY }, GLYPH_NEXT].into_iter().enumerate() {
+                        // A live stream has nothing before or after it.
+                        if np.live && i != 1 {
+                            continue;
+                        }
                         if let Ok((rgba, gw, gh)) = icons::render_glyph(glyph, bpx, TEXT) {
                             let bx = super::layout::media_button_center_x(w, scale, i) - gw as f32 / 2.0;
                             cv.blit(bx.round() as i32, cy as i32 - gh as i32 / 2, &rgba, gw, gh, 1.0);

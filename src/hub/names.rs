@@ -54,6 +54,46 @@ pub fn app_name(id: &str) -> String {
     }
 }
 
+/// Browsers, whose media session names the browser rather than the site playing in it.
+const BROWSERS: &[&str] = &["Edge", "Chrome", "Firefox", "Brave", "Opera", "Vivaldi"];
+
+/// Sites recognised by name in a browser window's title.
+const SITES: &[&str] = &[
+    "Twitch", "YouTube", "Kick", "Netflix", "Prime Video", "Disney+", "SoundCloud", "Deezer", "Spotify",
+    "Vimeo", "Dailymotion", "Bandcamp", "Apple Music", "Tidal", "Crunchyroll",
+];
+
+pub fn is_browser(name: &str) -> bool {
+    BROWSERS.contains(&name)
+}
+
+/// The site a browser session plays from, read from the title of the browser window showing it
+/// (`(3) Nynyhon - Twitch et 1 page supplémentaire - Personnel – Microsoft Edge`). `None` when
+/// no window mentions the session's title or artist (the tab is not the active one).
+pub fn site_in_window(window_title: &str, title: &str, artist: &str) -> Option<String> {
+    let lower = window_title.to_lowercase();
+    let mentions = |needle: &str| !needle.trim().is_empty() && lower.contains(&needle.to_lowercase());
+    if !mentions(title) && !mentions(artist) {
+        return None;
+    }
+    if let Some(site) = SITES.iter().find(|site| lower.contains(&site.to_lowercase())) {
+        return Some(site.to_string());
+    }
+    // Otherwise the segment after the one naming the session, without Edge's localised
+    // "and N more pages" ("et 1 page supplémentaire", "und 2 weitere Seiten"…).
+    let segments: Vec<&str> = window_title.split(" - ").collect();
+    let at = segments.iter().position(|s| mentions_in(s, title) || mentions_in(s, artist))?;
+    let next = segments.get(at + 1)?.trim();
+    let words: Vec<&str> = next.split_whitespace().collect();
+    let cut = words.windows(2).position(|w| w[1].chars().all(|c| c.is_ascii_digit())).unwrap_or(words.len());
+    let site = words[..cut].join(" ");
+    (!site.is_empty() && site.chars().count() <= 24 && !site.contains("Microsoft")).then_some(site)
+}
+
+fn mentions_in(segment: &str, needle: &str) -> bool {
+    !needle.trim().is_empty() && segment.to_lowercase().contains(&needle.to_lowercase())
+}
+
 pub fn is_meeting_app(name: &str) -> bool {
     MEETING_APPS.contains(&name)
 }
@@ -75,5 +115,17 @@ mod tests {
         assert_eq!(app_name("Microsoft.WindowsSoundRecorder_8wekyb3d8bbwe"), "Sound Recorder");
         assert_eq!(app_name("Contoso.Notes_abc123"), "Contoso.Notes");
         assert_eq!(app_name("MSEdge"), "Edge");
+    }
+
+    #[test]
+    fn a_browser_sessions_site_comes_from_its_window_title() {
+        let edge = "(3) Nynyhon - Twitch et 1 page supplémentaire - Personnel – Microsoft\u{200b} Edge";
+        assert_eq!(site_in_window(edge, "On continue la percé avec les Viking", "Nynyhon").as_deref(), Some("Twitch"));
+        assert_eq!(site_in_window("(2) Lofi beats - YouTube - Microsoft Edge", "Lofi beats", "").as_deref(), Some("YouTube"));
+        assert_eq!(
+            site_in_window("Some talk - Conf TV and 2 more pages - Work - Microsoft Edge", "Some talk", "Ana").as_deref(),
+            Some("Conf TV")
+        );
+        assert_eq!(site_in_window("Mail - Outlook", "Some talk", "Ana"), None, "a window not showing it");
     }
 }

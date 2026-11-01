@@ -125,8 +125,6 @@ pub enum Event {
     Call { app: VoiceApp, call: Option<Call> },
     /// The user muted or unmuted themselves in a voice app.
     SelfMuted { app: VoiceApp, muted: bool },
-    /// A followed channel went live (Twitch).
-    WentLive { channel: String, title: String, url: String },
     /// An integration connected (`true`) or went away (`false`), for the flyout's status.
     Integration { name: &'static str, connected: bool },
 }
@@ -138,7 +136,6 @@ pub enum Notice {
     AudioMoved { to: String, from: String },
     /// An app started recording outside a known call; stays until acknowledged.
     Listening { app: String, user: String },
-    WentLive { channel: String, title: String, url: String },
 }
 
 impl Notice {
@@ -147,7 +144,6 @@ impl Notice {
         match self {
             Notice::AudioMoved { .. } => Some(std::time::Duration::from_secs(5)),
             Notice::Listening { .. } => None,
-            Notice::WentLive { .. } => Some(std::time::Duration::from_secs(8)),
         }
     }
 }
@@ -228,10 +224,6 @@ impl State {
                 }
                 None => false,
             },
-            Event::WentLive { channel, title, url } => {
-                self.push_notice(Notice::WentLive { channel, title, url });
-                true
-            }
             Event::Integration { name, connected } => {
                 let entry = self.integrations.iter_mut().find(|(n, _)| *n == name);
                 match entry {

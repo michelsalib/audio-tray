@@ -85,8 +85,9 @@ pub fn scene(gfx: &Gfx, view: &View) -> Result<Option<Scene>> {
                 p.round_rect(-TUCK, 0.0, w + TUCK, h, h / 2.0, QUIET_BG)?;
                 art(p, media.cover.as_deref().map(|c| c.as_slice()), cx - 15.0, cy - 15.0, 30.0, None)?;
                 if live {
-                    p.round_rect(cx - 15.0, cy + 9.0, 30.0, 12.0, 6.0, LIVE_DOT)?;
-                    p.text("LIVE", Font::Initial, (cx - 15.0, cy + 8.0, 30.0, 14.0), WHITE)?;
+                    // A stream has no end to fill a ring towards: a badge on the art instead.
+                    p.round_rect(cx - 12.0, cy + 9.0, 24.0, 11.0, 3.0, LIVE_DOT)?;
+                    p.text("LIVE", Font::Badge, (cx - 12.0, cy + 9.0, 24.0, 11.0), WHITE)?;
                     Ok(())
                 } else {
                     p.ring(cx, cy, 19.5, 3.0, TRACK)
@@ -106,22 +107,36 @@ pub fn scene(gfx: &Gfx, view: &View) -> Result<Option<Scene>> {
             let (w, h) = (300.0, 100.0);
             let text_x = 84.0;
             let text_w = w - text_x - 16.0;
+            let play = if media.playing { GLYPH_PAUSE } else { GLYPH_PLAY };
+            // A live stream has nothing before or after it: play/pause only.
+            let live = media.length_seconds().is_none();
+            let buttons: Vec<(char, Hit)> = if live {
+                vec![(play, Hit::PlayPause)]
+            } else {
+                vec![(GLYPH_PREVIOUS, Hit::Previous), (play, Hit::PlayPause), (GLYPH_NEXT, Hit::Next)]
+            };
             let (content, _) = gfx.painted(w, h, |p| {
                 p.round_rect(-TUCK, 0.0, w + TUCK, h, 18.0, NORMAL_BG)?;
                 art(p, media.cover.as_deref().map(|c| c.as_slice()), 14.0, 14.0, 60.0, Some(8.0))?;
                 p.text(&media.title, Font::Title, (text_x, 12.0, text_w, 20.0), WHITE)?;
                 p.text(&media.artist, Font::Body, (text_x, 32.0, text_w, 18.0), DIM_WHITE)?;
-                p.text(&media.app, Font::Small, (text_x, 50.0, text_w, 14.0), Rgba::hex(0xFFFFFF, 0.55))?;
-                for (i, glyph) in [GLYPH_PREVIOUS, if media.playing { GLYPH_PAUSE } else { GLYPH_PLAY }, GLYPH_NEXT].into_iter().enumerate() {
+                let app_w = gfx.measure(Font::Small, &media.app).min(text_w - 40.0);
+                p.text(&media.app, Font::Small, (text_x, 50.0, app_w + 2.0, 14.0), Rgba::hex(0xFFFFFF, 0.55))?;
+                if live {
+                    let x = text_x + app_w + 8.0;
+                    p.round_rect(x, 51.5, 26.0, 11.0, 3.0, LIVE_DOT)?;
+                    p.text("LIVE", Font::Badge, (x, 51.5, 26.0, 11.0), WHITE)?;
+                }
+                for (i, (glyph, _)) in buttons.iter().enumerate() {
                     let x = text_x - 6.0 + i as f32 * 40.0;
                     p.text(&glyph.to_string(), Font::Icons, (x, 66.0, 32.0, 28.0), WHITE)?;
                 }
                 Ok(())
             })?;
-            let hits = [Hit::Previous, Hit::PlayPause, Hit::Next]
-                .into_iter()
+            let hits = buttons
+                .iter()
                 .enumerate()
-                .map(|(i, hit)| ([text_x - 6.0 + i as f32 * 40.0, 64.0, 32.0, 32.0], hit))
+                .map(|(i, (_, hit))| ([text_x - 6.0 + i as f32 * 40.0, 64.0, 32.0, 32.0], *hit))
                 .collect();
             Scene { w, h, content, ring: None, hits }
         }

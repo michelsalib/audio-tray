@@ -1,11 +1,10 @@
 //! Optional per-app integrations. Each reports through [`crate::hub`] and takes commands back
 //! (mute toggles); each can be off in config without touching the rest, and the app works with
 //! none of them. Discord and Teams live on the tray thread, their handles served by
-//! [`crate::wait`]; Twitch asks every few minutes from a thread of its own.
+//! [`crate::wait`].
 
 pub mod discord;
 pub mod teams;
-pub mod twitch;
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -38,7 +37,6 @@ pub fn start(config: &Config) {
         TEAMS_TOKEN.with(|t| *t.borrow_mut() = Some(config.teams.token.clone()));
         connect_teams();
     }
-    twitch::spawn(&config.twitch);
 }
 
 pub fn stop() {

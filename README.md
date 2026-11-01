@@ -14,9 +14,9 @@ A tiny Windows app for **audio awareness without opening anything** — a pill o
 
 - **The edge pill** — a discreet shape on the left edge of the primary screen that only gets
   louder when something needs you:
-  - a grey sliver when nothing happens; the playing track's cover in a progress ring (from any
-    app: YouTube Music, Spotify, a browser…), with title and transport controls when you point
-    at the edge;
+  - a grey sliver when nothing happens; whatever is playing in a progress ring (from any
+    app: YouTube Music, Spotify, a YouTube video, a Twitch stream with a LIVE badge…), with title,
+    site and transport controls when you point at the edge;
   - in a call, the faces in it with the speaker lit green, and your mic with its live dot; click
     it to mute;
   - amber when you talk while muted, or when audio moved because a device disconnected; red when
@@ -27,7 +27,7 @@ A tiny Windows app for **audio awareness without opening anything** — a pill o
   is animated by the compositor, not the app.
 - **Integrations** (optional, each can be off): Discord through a
   [Vencord plugin](integrations/vencord/README.md) (who is in the call, who is talking, your
-  mute), Teams through its local API (meeting and mute), and Twitch went-live notices.
+  mute), and Teams through its local API (meeting and mute).
 - **Taskbar controls** (opt-in, `[strip] enabled = true`) — a pair of buttons drawn into the
   notification area, one for output and one for input, each showing that device's own icon.
   Windows' own volume and "microphone in use" icons are hidden, since the buttons say the same
@@ -141,12 +141,6 @@ enabled = true              # host \\.\pipe\audio-tray for the Vencord plugin
 [teams]
 enabled = false             # Teams' local API; turn it on in Teams too (Settings > Privacy > Manage API)
 # token = "..."             # kept here once you allow Audio Tray inside Teams
-
-[twitch]
-enabled = false             # went-live notices
-client_id = ""              # a Twitch application's client id
-token = ""                  # a user token with user:read:follows
-every_minutes = 3
 
 [strip]
 enabled = false             # draw the taskbar buttons by injecting into Explorer (opt-in)

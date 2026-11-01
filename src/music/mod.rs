@@ -162,6 +162,8 @@ pub struct Music {
     dirty: bool,
     /// The media last reported to the hub (`Some(None)`: reported as nothing).
     reported: Option<Option<crate::hub::Media>>,
+    /// The site found for a browser session, by (title, artist).
+    site: Option<((String, String), Option<String>)>,
 }
 
 impl Music {
@@ -178,6 +180,7 @@ impl Music {
             toolbar: thumbbar::Toolbar::new(),
             dirty: false,
             reported: None,
+            site: None,
         })
     }
 
@@ -217,6 +220,7 @@ impl Music {
     /// Tell the hub about the session to show anywhere, when it changed. A session with no title
     /// yet (a track change in flight) is held back rather than shown empty.
     fn report(&mut self, any: Option<smtc::Reading>) {
+        let site = any.as_ref().filter(|r| r.snapshot.has_track()).map(|r| self.site(&r.snapshot));
         let media = any.filter(|r| r.snapshot.has_track()).map(|r| {
             let cover = match (&self.reported, &r.snapshot.cover) {
                 // Same bytes: share the old allocation rather than make another.
@@ -224,7 +228,7 @@ impl Music {
                 (_, cover) => cover.clone().map(Arc::new),
             };
             crate::hub::Media {
-                app: crate::hub::names::app_name(&r.snapshot.app_id),
+                app: site.flatten().unwrap_or_else(|| crate::hub::names::app_name(&r.snapshot.app_id)),
                 app_id: r.snapshot.app_id,
                 title: r.snapshot.title,
                 artist: r.snapshot.artist,
@@ -237,6 +241,27 @@ impl Music {
             crate::hub::emit(crate::hub::Event::Media(media.clone()));
             self.reported = Some(media);
         }
+    }
+
+    /// For a browser's session, the site playing in it ("Twitch", "YouTube"), from the browser's
+    /// window titles; looked up once per track.
+    fn site(&mut self, snapshot: &smtc::Snapshot) -> Option<String> {
+        if !crate::hub::names::is_browser(&crate::hub::names::app_name(&snapshot.app_id)) {
+            return None;
+        }
+        let key = (snapshot.title.clone(), snapshot.artist.clone());
+        if let Some((cached, site)) = &self.site {
+            if *cached == key {
+                return site.clone();
+            }
+        }
+        let mut found = None;
+        crate::win::enum_windows(|hwnd| {
+            found = crate::hub::names::site_in_window(&crate::win::window_title(hwnd), &key.0, &key.1);
+            found.is_none()
+        });
+        self.site = Some((key, found.clone()));
+        found
     }
 
     /// A transport command for the session shown anywhere (the pill), whatever the app.

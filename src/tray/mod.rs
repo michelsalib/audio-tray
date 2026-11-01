@@ -650,7 +650,6 @@ impl Tray {
                 self.hub.acknowledge(&notice);
                 self.hub_changed();
             }
-            Action::Open(url) => open_url(&url),
         }
     }
 
@@ -1079,19 +1078,6 @@ pub(crate) fn set_teams_token(token: String) {
     });
 }
 
-/// Open a link in the default browser.
-fn open_url(url: &str) {
-    use windows::Win32::UI::Shell::ShellExecuteW;
-    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
-    // Only web links: the URL came from an integration.
-    if !url.starts_with("https://") {
-        return;
-    }
-    let url = crate::win::wide(url);
-    unsafe {
-        ShellExecuteW(None, windows::core::w!("open"), windows::core::PCWSTR(url.as_ptr()), None, None, SW_SHOWNORMAL);
-    }
-}
 
 /// The defaults and the active outputs, for the hub.
 fn read_endpoints(backend: &WasapiBackend) -> crate::hub::Endpoints {

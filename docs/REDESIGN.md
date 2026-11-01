@@ -87,7 +87,7 @@ gracefully when absent.
 | Per-app volume | Volume, mute, peak per app | [`IAudioSessionManager2`](https://learn.microsoft.com/en-us/windows/win32/api/audiopolicy/nn-audiopolicy-iaudiosessionmanager2) | Per-app device routing is undocumented (`IAudioPolicyConfigFactory`, as in [EarTrumpet](https://github.com/File-New-Project/EarTrumpet)) |
 | Discord | Channel, members, who is talking, self mute and deafen, mute toggle | Vencord user plugin; its `native.ts` ([docs](https://docs.vencord.dev/plugins/native/)) writes JSON events to a named pipe hosted by Audio Tray, e.g. `\\.\pipe\audio-tray` | Uses internal Discord stores (can break on updates); client mods violate Discord's terms. Fallback: [Discord RPC](https://docs.discord.com/developers/topics/rpc), limited to the app owner and up to 50 testers |
 | Teams | In meeting, self mute, mute toggle | Local third-party app API, enabled by the user in Settings > Privacy > Manage API ([Microsoft support](https://support.microsoft.com/office/connect-to-third-party-devices-in-microsoft-teams-aabca9f2-47bb-407f-9f9b-81a104a883d6)); WebSocket on `localhost:8124` | Admin can disable it; wire format only [community-documented](https://lostdomain.notion.site/Microsoft-Teams-WebSocket-API-5c042838bc3e4731bdfe679e864ab52a); no participants or active speaker |
-| Twitch | Followed channel went live | [EventSub WebSocket](https://dev.twitch.tv/docs/eventsub/handling-websocket-events/) `stream.online`, or [Get Followed Streams](https://dev.twitch.tv/docs/api/reference/#get-followed-streams) every few minutes | Needs a Twitch app registration and `user:read:follows`; check EventSub subscription limits |
+| Twitch, YouTube and other sites in a browser | The stream or video watched: title, channel, art, LIVE | The same SMTC session as any media (Chromium publishes one per browser for the audible tab); the site name ("Twitch") is read from the browser window's title, which SMTC does not carry | Only the audible tab, and only one per browser; the site is found while that tab is the active one in its window |
 
 All sources feed one internal event type so the UI never depends on which integration produced a
 fact (for example, `SelfMuted { app, muted }` comes from Discord or Teams alike).
@@ -136,8 +136,9 @@ the app working at every step.
       `integrations/vencord`. Tested against a scripted pipe client, not against Discord itself.
 - [x] Teams local API client: `src/integrations/teams.rs`, off by default. Not tested against
       Teams (it needs the API turned on and a pairing click in Teams).
-- [x] Twitch went-live notices, off by default: `src/integrations/twitch.rs`. Not tested (needs
-      a Twitch application and token).
+- [x] Twitch: the stream being watched shows like any media (art, channel, LIVE badge, play/pause
+      only), named from the browser window. Verified with a live stream in Edge. (A first take built
+      went-live notices through the Helix API; that was a misreading and was removed.)
 - [x] Check: each integration can be disabled, and the app works without it
 
 **Phase 5: flyout refresh**
@@ -148,8 +149,8 @@ the app working at every step.
 
 - **Monitor:** the primary one. It is where the taskbar's tray lives, and the pill never moves
   under the user. Revisit if it should follow the cursor.
-- **Live end times:** a session without an end time shows "LIVE" instead of the ring; not yet
-  checked against a live Twitch or YouTube stream.
+- **Live end times:** Twitch in Edge reports no end time, so the pill shows a LIVE badge instead of
+  the ring. YouTube live is not checked yet.
 - **Teams format:** unverified; the client follows the community-documented protocol 2.0.0 and
   stays off until enabled.
 - **Taskbar buttons:** kept, as an opt-in mode (`[strip] enabled = true`); `taskbar-tap` stays.

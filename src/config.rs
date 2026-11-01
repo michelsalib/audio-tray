@@ -27,8 +27,6 @@ pub struct Config {
     pub discord: Discord,
     /// The Teams integration: Teams' local third-party app API.
     pub teams: Teams,
-    /// Twitch went-live notices.
-    pub twitch: Twitch,
 }
 
 /// The floating pill on the screen's left edge.
@@ -66,23 +64,6 @@ impl Default for Discord {
 pub struct Teams {
     pub enabled: bool,
     pub token: Option<String>,
-}
-
-/// Needs a Twitch app's client id and a user token with `user:read:follows`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct Twitch {
-    pub enabled: bool,
-    pub client_id: String,
-    pub token: String,
-    /// How often to ask which followed channels are live.
-    pub every_minutes: u64,
-}
-
-impl Default for Twitch {
-    fn default() -> Self {
-        Self { enabled: false, client_id: String::new(), token: String::new(), every_minutes: 3 }
-    }
 }
 
 /// Switches for each edit the taskbar integration makes to the shell. Injecting at all is opt-in

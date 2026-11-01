@@ -35,6 +35,8 @@ pub(super) struct NowPlaying {
     pub artist: String,
     pub app: String,
     pub playing: bool,
+    /// A stream with no end: no previous/next.
+    pub live: bool,
     /// The cover as a ready sprite, [`ART_DIP`] square at the panel's scale.
     pub art: Option<Vec<u8>>,
 }
@@ -108,7 +110,7 @@ pub(super) fn from_hub(state: &crate::hub::State, art_px: u32, old: Option<&NowP
                 .as_ref()
                 .and_then(|bytes| crate::image::sprite(bytes, art_px, art_px as f32 * 0.15).ok()),
         };
-        NowPlaying { title: m.title.clone(), artist: m.artist.clone(), app: m.app.clone(), playing: m.playing, art }
+        NowPlaying { title: m.title.clone(), artist: m.artist.clone(), app: m.app.clone(), playing: m.playing, live: m.length_seconds().is_none(), art }
     });
     let apps = state
         .sessions

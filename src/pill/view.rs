@@ -40,8 +40,6 @@ pub enum Action {
     Unmute(Option<VoiceApp>),
     /// Mute the default microphone and acknowledge the alert.
     MuteAndAcknowledge(Notice),
-    /// Acknowledge, and open the link.
-    Open(Notice, String),
     /// Acknowledge only.
     Dismiss(Notice),
 }
@@ -72,7 +70,6 @@ impl View {
 pub const GLYPH_MIC_OFF: char = '\u{F781}';
 pub const GLYPH_MIC: char = '\u{E720}';
 pub const GLYPH_SPEAKERS: char = '\u{E7F5}';
-pub const GLYPH_LIVE: char = '\u{E714}';
 
 /// Everything besides the hub state that the view depends on.
 #[derive(Clone, Copy, Default)]
@@ -133,10 +130,6 @@ fn loudest(state: &State, inputs: Inputs) -> View {
     }
     if let Some(view) = call_view(state) {
         return view;
-    }
-    if let Some(notice @ Notice::WentLive { channel, title, url }) = newest(state, |n| matches!(n, Notice::WentLive { .. })) {
-        let text = if title.is_empty() { format!("{channel} is live") } else { format!("{channel} is live · {title}") };
-        return View::Banner { level: Level::Normal, glyph: GLYPH_LIVE, text, action: Action::Open(notice.clone(), url.clone()) };
     }
     match &state.media {
         // Paused media still opens on hover (from the sliver), so it can be resumed from here.

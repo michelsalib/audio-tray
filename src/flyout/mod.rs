@@ -599,9 +599,12 @@ impl Flyout<'_> {
             }
             Elem::NowPlaying => {
                 use crate::music::smtc::Command;
+                let live = self.model.now_playing.as_ref().is_some_and(|np| np.live);
                 let command = match layout::media_button_at(self.surface.width, self.scale, mx) {
-                    Some(0) => Command::Previous,
                     Some(1) => Command::TogglePlayPause,
+                    // A live stream shows no previous/next.
+                    _ if live => return false,
+                    Some(0) => Command::Previous,
                     Some(_) => Command::Next,
                     None => return false,
                 };
@@ -781,7 +784,10 @@ impl Flyout<'_> {
             _ => None,
         };
         let on_media = match kind {
-            Some(Elem::NowPlaying) => layout::media_button_at(self.surface.width, self.scale, mx),
+            Some(Elem::NowPlaying) => {
+                let live = self.model.now_playing.as_ref().is_some_and(|np| np.live);
+                layout::media_button_at(self.surface.width, self.scale, mx).filter(|&i| !live || i == 1)
+            }
             _ => None,
         };
         let on_voice = matches!(kind, Some(Elem::Voice)) && layout::over_voice_button(self.surface.width, self.scale, mx);

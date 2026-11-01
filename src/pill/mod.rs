@@ -54,7 +54,6 @@ pub enum Action {
     /// Mute the default microphone (the "is listening" alert).
     MuteMicrophone,
     Acknowledge(crate::hub::Notice),
-    Open(String),
 }
 
 /// Posted to the tray's message window when [`take_actions`] has something.
@@ -357,15 +356,11 @@ impl Pill {
             (View::Call { app, .. }, Some(_)) => act(Action::ToggleMute(*app)),
             (View::Banner { action, .. }, Some(_)) => match (action, right) {
                 // Right click only dismisses.
-                (view::Action::MuteAndAcknowledge(notice) | view::Action::Open(notice, _) | view::Action::Dismiss(notice), true) => {
+                (view::Action::MuteAndAcknowledge(notice) | view::Action::Dismiss(notice), true) => {
                     act(Action::Acknowledge(notice.clone()))
                 }
                 (view::Action::MuteAndAcknowledge(notice), false) => {
                     act(Action::MuteMicrophone);
-                    act(Action::Acknowledge(notice.clone()));
-                }
-                (view::Action::Open(notice, url), false) => {
-                    act(Action::Open(url.clone()));
                     act(Action::Acknowledge(notice.clone()));
                 }
                 (view::Action::Dismiss(notice), false) => act(Action::Acknowledge(notice.clone())),

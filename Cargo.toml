@@ -56,8 +56,6 @@ windows-numerics = "0.2"
 serde_json = "1"
 # Teams' local API is a plain ws:// socket on localhost: no TLS, no async runtime.
 tungstenite = { version = "0.26", default-features = false, features = ["handshake"] }
-# Twitch's Helix API (off by default); the same ureq and SChannel TLS self_update already uses.
-ureq = { version = "3", default-features = false, features = ["native-tls"] }
 
 [dependencies.windows]
 version = "0.61"

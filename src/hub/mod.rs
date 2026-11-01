@@ -180,6 +180,9 @@ pub struct State {
     pub integrations: Vec<(&'static str, bool)>,
     /// Integrations that cannot connect, and why.
     pub problems: Vec<(&'static str, &'static str)>,
+    /// The title last announced as a new song: a player reporting through two sources (YouTube
+    /// Music's own session and its browser tab) changes song once, not twice.
+    announced: Option<String>,
     /// Shown newest last; each with when it started.
     pub notices: Vec<(Notice, std::time::Instant)>,
 }
@@ -202,7 +205,7 @@ impl State {
                     }
                 }
                 if let Some(notice) = new_track(&self.media, &media) {
-                    self.push_notice(notice);
+                    self.announce(notice);
                 }
                 replace(&mut self.media, media)
             }
@@ -214,7 +217,7 @@ impl State {
                 };
                 next.extend(media);
                 if let Some(notice) = new_track(&self.browser, &next) {
-                    self.push_notice(notice);
+                    self.announce(notice);
                 }
                 replace(&mut self.browser, next)
             }
@@ -295,6 +298,16 @@ impl State {
                 before != problem
             }
         }
+    }
+
+    /// A new song's notice, unless that title was just announced (through another source).
+    fn announce(&mut self, notice: Notice) {
+        let Notice::NewTrack { title, .. } = &notice else { return };
+        if self.announced.as_ref() == Some(title) {
+            return;
+        }
+        self.announced = Some(title.clone());
+        self.push_notice(notice);
     }
 
     fn push_notice(&mut self, notice: Notice) {
@@ -509,6 +522,12 @@ mod tests {
         assert!(state.notices.is_empty(), "a resume is not a new song");
         state.apply(Event::Media(vec![song("Two", true)]));
         assert!(matches!(&state.notices[..], [(Notice::NewTrack { title, .. }, _)] if title == "Two"));
+        // The same song through the player's browser tab is not a second one.
+        let at = state.notices[0].1;
+        state.apply(Event::BrowserMedia { host: Some(1), media: vec![Media { playing: true, ..media("browser:1:2:0", "One") }] });
+        state.apply(Event::BrowserMedia { host: Some(1), media: vec![Media { playing: true, ..media("browser:1:2:0", "Two") }] });
+        assert_eq!(state.notices.len(), 1);
+        assert_eq!(state.notices[0].1, at, "not raised again");
     }
 
     #[test]

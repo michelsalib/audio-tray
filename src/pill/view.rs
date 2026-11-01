@@ -22,7 +22,7 @@ pub enum View {
     /// A column of pills: the art of each playing session in its progress ring, then the call,
     /// then the devices, each shown when there is one. On hover (`card`), a card with a row per
     /// session (and the call's).
-    Music { media: Vec<Media>, card: bool, call: Option<CallPill>, devices: Option<Devices> },
+    Music { media: Vec<Media>, card: bool, call: Option<CallPill>, devices: Option<Devices>, song: Option<SongNote> },
     /// A one-line banner: warnings, alerts and notices.
     Banner { level: Level, glyph: char, text: String, action: Action },
 }
@@ -68,6 +68,16 @@ impl Devices {
     }
 }
 
+/// A new song, shown for a moment above the pills.
+#[derive(Clone, PartialEq, Debug)]
+pub struct SongNote {
+    /// "Title · Artist".
+    pub text: String,
+    /// The player, brought to the front by a click.
+    pub app_id: String,
+    pub notice: Notice,
+}
+
 /// What clicking a state does.
 #[derive(Clone, PartialEq, Debug)]
 pub enum Action {
@@ -77,8 +87,6 @@ pub enum Action {
     MuteAndAcknowledge(Notice),
     /// Acknowledge only.
     Dismiss(Notice),
-    /// Bring the player (its app id) to the front, and acknowledge.
-    Open(String, Notice),
 }
 
 impl View {
@@ -100,8 +108,9 @@ impl View {
     /// Whether clicks pass through to whatever is underneath: quiet states, unless they carry the
     /// devices (which are buttons).
     pub fn click_through(&self) -> bool {
-        let devices = matches!(self, View::Idle { devices: Some(_), .. } | View::Music { devices: Some(_), .. });
-        self.level() == Level::Quiet && !devices
+        // The devices and a song's note are buttons.
+        let buttons = matches!(self, View::Idle { devices: Some(_), .. } | View::Music { devices: Some(_), .. } | View::Music { song: Some(_), .. });
+        self.level() == Level::Quiet && !buttons
     }
 }
 
@@ -178,13 +187,7 @@ fn loudest(state: &State, inputs: Inputs) -> View {
             action: Action::Dismiss(notice.clone()),
         };
     }
-    // A new song, for a moment: its title, and the player a click away.
-    if inputs.announce_tracks && !inputs.hover {
-        if let Some(notice @ Notice::NewTrack { app_id, title, artist }) = newest(state, |n| matches!(n, Notice::NewTrack { .. })) {
-            let text = if artist.trim().is_empty() { title.clone() } else { format!("{title} · {artist}") };
-            return View::Banner { level: Level::Normal, glyph: GLYPH_SONG, text, action: Action::Open(app_id.clone(), notice.clone()) };
-        }
-    }
+
 
     // On hover the card lists every session (paused ones too, to resume them from here); quiet,
     // the pill shows the playing ones.
@@ -198,7 +201,16 @@ fn loudest(state: &State, inputs: Inputs) -> View {
     if media.is_empty() {
         View::Idle { call, devices }
     } else {
-        View::Music { media, card: inputs.hover, call, devices }
+        // A new song, for a moment: a note above the pills, which stay as they are.
+        let song = newest(state, |n| matches!(n, Notice::NewTrack { .. })).filter(|_| inputs.announce_tracks && !inputs.hover).and_then(|notice| match notice {
+            Notice::NewTrack { app_id, title, artist } => Some(SongNote {
+                text: if artist.trim().is_empty() { title.clone() } else { format!("{title} · {artist}") },
+                app_id: app_id.clone(),
+                notice: notice.clone(),
+            }),
+            _ => None,
+        });
+        View::Music { media, card: inputs.hover, call, devices, song }
     }
 }
 
@@ -379,7 +391,10 @@ mod tests {
         assert!(matches!(decide(&state, on()), View::Music { .. }), "off by default");
         let asked = Inputs { announce_tracks: true, ..on() };
         match decide(&state, asked) {
-            View::Banner { level: Level::Normal, text, action: Action::Open(..), .. } => assert_eq!(text, "Two · Band"),
+            View::Music { song: Some(song), media, .. } => {
+                assert_eq!(song.text, "Two · Band");
+                assert_eq!(media.len(), 1, "the pills stay");
+            }
             other => panic!("{other:?}"),
         }
         assert!(matches!(decide(&state, Inputs { hover: true, ..asked }), View::Music { card: true, .. }), "the card wins on hover");
@@ -389,7 +404,7 @@ mod tests {
     fn quiet_states_let_clicks_through() {
         assert!(View::Idle { call: None, devices: None }.click_through());
         assert!(!View::Idle { call: None, devices: Some(Devices::default()) }.click_through(), "the devices are buttons");
-        assert!(View::Music { media: vec![media(true)], card: false, call: None, devices: None }.click_through());
-        assert!(!View::Music { media: vec![media(true)], card: true, call: None, devices: None }.click_through());
+        assert!(View::Music { media: vec![media(true)], card: false, call: None, devices: None, song: None }.click_through());
+        assert!(!View::Music { media: vec![media(true)], card: true, call: None, devices: None, song: None }.click_through());
     }
 }

@@ -113,7 +113,7 @@ fn entrance(shown: &View, next: &View) -> Entrance {
     }
     let shape = |view: &View| match view {
         View::Idle { call, devices } => (0, call.as_ref().map(|c| c.members.len() + 1), devices.is_some(), false),
-        View::Music { media, card, call, devices } => (media.len(), call.as_ref().map(|c| c.members.len() + 1), devices.is_some(), *card),
+        View::Music { media, card, call, devices, .. } => (media.len(), call.as_ref().map(|c| c.members.len() + 1), devices.is_some(), *card),
         _ => (0, None, false, false),
     };
     if shape(shown) != shape(next) {
@@ -361,7 +361,10 @@ impl Pill {
         let px = |v: f32| (v * scale).round() as i32;
         let (w, h) = (px(scene.w), px(scene.h));
         let x = work.left;
-        let y = work.top + (work.bottom - work.top - h) / 2;
+        // Centred on what stays (the pills), whatever sits above it (a song's note): the pills
+        // never move for it.
+        let lead = px(scene.lead);
+        let y = work.top + (work.bottom - work.top - (h - lead)) / 2 - lead;
         unsafe {
             set_click_through(self.hwnd, view.click_through());
             SetWindowPos(self.hwnd, Some(HWND_TOPMOST), x, y, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW)?;
@@ -672,17 +675,20 @@ impl Pill {
                     act(Action::Media(m.app_id.clone(), command));
                 }
             }
+            // A song's note: the player to the front (a right click only dismisses).
+            (View::Music { song: Some(song), .. }, Some(Hit::Song)) => {
+                if !right {
+                    act(Action::Focus(song.app_id.clone()));
+                }
+                act(Action::Acknowledge(song.notice.clone()));
+            }
             (View::Idle { call: Some(call), .. } | View::Music { call: Some(call), .. }, Some(Hit::CallMute)) => {
                 act(Action::ToggleMute(call.app))
             }
             (View::Banner { action, .. }, Some(_)) => match (action, right) {
                 // Right click only dismisses.
-                (view::Action::MuteAndAcknowledge(notice) | view::Action::Dismiss(notice) | view::Action::Open(_, notice), true) => {
+                (view::Action::MuteAndAcknowledge(notice) | view::Action::Dismiss(notice), true) => {
                     act(Action::Acknowledge(notice.clone()))
-                }
-                (view::Action::Open(app_id, notice), false) => {
-                    act(Action::Focus(app_id.clone()));
-                    act(Action::Acknowledge(notice.clone()));
                 }
                 (view::Action::MuteAndAcknowledge(notice), false) => {
                     act(Action::MuteMicrophone);

@@ -167,8 +167,8 @@ fn connect_teams() {
         }
         Err(e) => {
             println!("teams: not connected ({e:#})");
-            // Nothing listening while Teams runs: its API is off.
-            let problem = teams::running().then_some("Turn on the API in Teams");
+            // Nothing listening while Teams runs: its API is off, or an admin removed the switch.
+            let problem = teams::running().then_some("API off or blocked by admin");
             crate::hub::emit(crate::hub::Event::IntegrationProblem { name: "Teams", problem });
         }
     }

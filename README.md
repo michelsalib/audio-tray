@@ -27,7 +27,9 @@ A tiny Windows app for **audio awareness without opening anything** — a pill o
   is animated by the compositor, not the app.
 - **Integrations** (optional, each can be off): Discord through its own local RPC with your own
   Discord application, no client mod (who is in the call with their avatars, who is talking, your
-  mute, click to mute; or through a [Vencord plugin](integrations/vencord/README.md)), Teams through its local API (meeting and mute), and a
+  mute, click to mute; or through a [Vencord plugin](integrations/vencord/README.md)), Teams
+  (meeting and mute: through its local API, or, where an admin turned that off, by reading the
+  meeting window's mic button through UI Automation), and a
   [browser extension](integrations/browser/README.md) that shows every tab playing media (two
   Twitch streams, a YouTube video…), not just the one Windows' media controls know about.
 - **Taskbar controls** (opt-in, `[strip] enabled = true`) — a pair of buttons drawn into the
@@ -143,17 +145,19 @@ size = "big"                # at rest: "hidden" (the sliver), "small" or "big"; 
 [discord]
 enabled = true              # Discord: RPC when client_id/client_secret are set, and the Vencord pipe
 # client_id = "..."         # your app at discord.com/developers (OAuth2 > Redirects: http://localhost)
-# client_secret = "..."     # Discord asks once to authorise it; the token is kept beside this file
+# The client secret is pasted in Settings > Connectors and kept in the Windows Credential
+# Manager, with Discord's token; Discord asks once to authorise the app.
 
 [browser]
 enabled = true              # register the browser extension's native messaging host
 
 [teams]
-enabled = false             # Teams' local API; turn it on in Teams too (Settings > Privacy > Manage API)
-# token = "..."             # kept here once you allow Audio Tray inside Teams
+enabled = false             # Teams: its local API (Teams > Settings > Privacy > Third-party app API),
+                            # else the meeting window; its token goes to the Credential Manager
 
 [strip]
-enabled = false             # the audio buttons in the tray, drawn by injecting into Explorer (opt-in)
+enabled = false             # the audio buttons in the tray, drawn by injecting into Explorer (opt-in;
+                            # kept on for a config from before this switch)
 next_to_wifi = true         # move the tray icons between the language indicator and wifi
 hide_windows_volume = true  # hide Windows' volume icon (the output button replaces it)
 hide_windows_mic = true     # hide Windows' "microphone in use" icon (the red dot replaces it)

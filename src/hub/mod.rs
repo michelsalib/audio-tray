@@ -160,6 +160,9 @@ pub struct State {
     pub media: Vec<Media>,
     /// Every tab playing media, from the browser extension; see [`State::all_media`].
     pub browser: Vec<Media>,
+    /// Apps whose SMTC session just went away, and when: a player drops its session for about a
+    /// second on a track change, and its tab must not show alone meanwhile.
+    pub gone: Vec<(String, std::time::Instant)>,
     pub mic_users: Vec<String>,
     pub endpoints: Endpoints,
     pub sessions: Vec<AppSession>,
@@ -173,7 +176,16 @@ impl State {
     /// Fold one event in. Returns whether anything a surface shows changed.
     pub fn apply(&mut self, event: Event) -> bool {
         match event {
-            Event::Media(media) => replace(&mut self.media, media),
+            Event::Media(media) => {
+                let now = std::time::Instant::now();
+                self.gone.retain(|(_, at)| now.duration_since(*at) < APP_GRACE);
+                for old in &self.media {
+                    if !media.iter().any(|m| m.app_id == old.app_id) {
+                        self.gone.push((old.app.clone(), now));
+                    }
+                }
+                replace(&mut self.media, media)
+            }
             Event::BrowserMedia(media) => replace(&mut self.browser, media),
             Event::MicUsers(users) => {
                 let started: Vec<String> =
@@ -285,20 +297,26 @@ impl State {
         self.all_media().into_iter().filter(|m| m.playing).take(MAX_SHOWN)
     }
 
-    /// Every media session, SMTC's and the browser extension's, in a stable order, each once. A
-    /// tab and an SMTC session with the same title are the same media: a browser's own session
-    /// gives way to the tab (one per tab, where SMTC has one per browser), while an installed web
-    /// app's (YouTube Music runs in Edge) wins over its tab, since it takes previous/next.
+    /// Every media session, SMTC's and the browser extension's, in a stable order, each once.
+    ///
+    /// A browser's own SMTC session gives way to the extension's tab with the same title (one per
+    /// tab, where SMTC has one per browser). An installed web app's session (YouTube Music runs in
+    /// Edge) wins over its tab, since it takes previous/next; they are matched by app, not title,
+    /// because titles differ for a moment on a track change, and the tab stays hidden for
+    /// [APP_GRACE] after the app's session goes, since players drop it during a track change.
     pub fn all_media(&self) -> Vec<&Media> {
         let is_browser_session = |m: &Media| names::is_browser(&names::app_name(&m.app_id));
+        let now = std::time::Instant::now();
+        let app_has_session = |tab: &Media| {
+            let same_app = |app: &str| !app.is_empty() && app == tab.app;
+            self.media.iter().any(|m| !is_browser_session(m) && (same_app(&m.app) || m.title == tab.title))
+                || self.gone.iter().any(|(app, at)| same_app(app) && now.duration_since(*at) < APP_GRACE)
+        };
         let smtc = self
             .media
             .iter()
             .filter(|m| !(is_browser_session(m) && self.browser.iter().any(|b| b.title == m.title)));
-        let tabs = self
-            .browser
-            .iter()
-            .filter(|b| !self.media.iter().any(|m| !is_browser_session(m) && m.title == b.title));
+        let tabs = self.browser.iter().filter(|b| !app_has_session(b));
         smtc.chain(tabs).collect()
     }
 
@@ -315,6 +333,9 @@ fn replace<T: PartialEq>(slot: &mut T, value: T) -> bool {
     *slot = value;
     true
 }
+
+/// How long a tab stays hidden after its app's SMTC session went (a track change drops it ~1 s).
+pub const APP_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// How many media sessions the surfaces show at once.
 pub const MAX_SHOWN: usize = 4;
@@ -423,6 +444,21 @@ mod tests {
         ]));
         let ids: Vec<&str> = state.all_media().iter().map(|m| m.app_id.as_str()).collect();
         assert_eq!(ids, ["music.youtube.com-5929F88E_vezhnr0wkvrcy!App", "browser:2:0", "browser:3:0"]);
+    }
+
+    #[test]
+    fn an_apps_tab_stays_hidden_through_a_track_change() {
+        let app = |id: &str, title: &str| Media { app: "YouTube Music".into(), ..media(id, title) };
+        let mut state = State::default();
+        state.apply(Event::Media(vec![app("ytm!App", "Old song")]));
+        // The tab already has the new title while the app still shows the old one…
+        state.apply(Event::BrowserMedia(vec![app("browser:1:0", "New song")]));
+        assert_eq!(state.all_media().len(), 1, "matched by app, not title");
+        // …then the app's session drops for a moment.
+        state.apply(Event::Media(vec![]));
+        assert!(state.all_media().is_empty(), "the tab does not show alone in the gap");
+        state.apply(Event::Media(vec![app("ytm!App", "New song")]));
+        assert_eq!(state.all_media()[0].app_id, "ytm!App");
     }
 
     #[test]

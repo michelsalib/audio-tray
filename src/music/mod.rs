@@ -91,6 +91,9 @@ impl Handle {
 // No `activate` on purpose: body clicks belong to the shell (activate/minimise, drag-to-reorder);
 // only the no-session fallback in [`Music::command`] raises the player.
 
+/// How long a vanished session is still reported: Chromium's track-change gap is about a second.
+const GAP: Duration = Duration::from_millis(1500);
+
 /// How long Quit waits for the feed thread to tidy up.
 const SHUTDOWN_WAIT: Duration = Duration::from_secs(2);
 
@@ -164,6 +167,8 @@ pub struct Music {
     reported: Option<Vec<crate::hub::Media>>,
     /// The site found for browser sessions, by (title, artist).
     sites: std::collections::HashMap<(String, String), String>,
+    /// Sessions that went away, still reported until [`GAP`] has passed (see [`Music::bridge_gaps`]).
+    vanished: Vec<(crate::hub::Media, std::time::Instant)>,
 }
 
 impl Music {
@@ -181,6 +186,7 @@ impl Music {
             dirty: false,
             reported: None,
             sites: Default::default(),
+            vanished: Vec::new(),
         })
     }
 
@@ -242,10 +248,44 @@ impl Music {
                 }
             })
             .collect();
+        let media = self.bridge_gaps(media);
         if self.reported.as_ref() != Some(&media) {
             crate::hub::emit(crate::hub::Event::Media(media.clone()));
             self.reported = Some(media);
         }
+    }
+
+    /// Keep reporting a session that just went away, as it was, for [GAP]: Chromium drops a
+    /// player's session for about a second on every track change, which would blink it out of
+    /// the pill. [Music::serve] wakes once when the oldest is due, to let it go for good.
+    fn bridge_gaps(&mut self, mut media: Vec<crate::hub::Media>) -> Vec<crate::hub::Media> {
+        let now = std::time::Instant::now();
+        // Gaps that ran out: those sessions are gone for good, not newly vanished.
+        let let_go: Vec<String> = self
+            .vanished
+            .iter()
+            .filter(|(_, at)| now.duration_since(*at) >= GAP)
+            .map(|(m, _)| m.app_id.clone())
+            .collect();
+        self.vanished.retain(|(m, at)| now.duration_since(*at) < GAP && !media.iter().any(|n| n.app_id == m.app_id));
+        for (index, old) in self.reported.iter().flatten().enumerate() {
+            let back = media.iter().any(|m| m.app_id == old.app_id);
+            if back || let_go.contains(&old.app_id) {
+                continue;
+            }
+            if !self.vanished.iter().any(|(m, _)| m.app_id == old.app_id) {
+                self.vanished.push((old.clone(), now));
+            }
+            // Where it was, so nothing moves meanwhile.
+            media.insert(index.min(media.len()), old.clone());
+        }
+        media
+    }
+
+    /// When the oldest session in a gap is to be let go.
+    fn gap_due(&self) -> Option<Duration> {
+        let now = std::time::Instant::now();
+        self.vanished.iter().map(|(_, at)| (*at + GAP).saturating_duration_since(now)).min()
     }
 
     /// For a browser's session, the site playing in it ("Twitch", "YouTube"), from the browser's
@@ -307,11 +347,19 @@ impl Music {
     fn serve(&mut self, inbox: Receiver<Request>) {
         self.poll();
         loop {
-            let request = match self.progress.due() {
+            let wait = match (self.progress.due(), self.gap_due()) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            };
+            let request = match wait {
                 Some(wait) => match inbox.recv_timeout(wait) {
                     Ok(request) => request,
                     Err(RecvTimeoutError::Timeout) => {
                         self.progress.tick();
+                        if self.gap_due().is_some_and(|d| d.is_zero()) {
+                            // A gap ran out: read again, which lets the session go if still absent.
+                            self.poll();
+                        }
                         continue;
                     }
                     Err(RecvTimeoutError::Disconnected) => break,

@@ -32,8 +32,9 @@ use windows::Win32::Graphics::DirectWrite::{
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_ALPHA_MODE_PREMULTIPLIED, DXGI_FORMAT_B8G8R8A8_UNORM};
 use windows::Win32::Graphics::Dxgi::IDXGIDevice;
 use windows::Win32::Graphics::Imaging::{
-    CLSID_WICImagingFactory, GUID_WICPixelFormat32bppPBGRA, IWICImagingFactory, WICBitmapDitherTypeNone,
-    WICBitmapPaletteTypeMedianCut, WICDecodeMetadataCacheOnDemand,
+    CLSID_WICImagingFactory, GUID_WICPixelFormat32bppPBGRA, IWICBitmap, IWICImagingFactory, WICBitmapCacheOnLoad,
+    WICBitmapDitherTypeNone, WICBitmapInterpolationModeHighQualityCubic, WICBitmapPaletteTypeMedianCut,
+    WICDecodeMetadataCacheOnDemand,
 };
 use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
 use windows_numerics::{Matrix3x2, Vector2};
@@ -79,7 +80,15 @@ pub struct Gfx {
     formats: Vec<IDWriteTextFormat>,
     /// Pixels per DIP.
     pub scale: f32,
+    /// Images decoded and scaled down once, by a hash of their bytes: a repaint (a speaker
+    /// change, a tab update) uploads these instead of decoding every full-size cover again.
+    decoded: std::cell::RefCell<Vec<(u64, IWICBitmap)>>,
 }
+
+/// How many decoded images are kept: the covers and faces on screen, with room to spare.
+const DECODED_KEPT: usize = 24;
+/// The largest an image is ever drawn, in DIPs (the hover card's cover): decoded no bigger.
+const LARGEST_IMAGE: f32 = 64.0;
 
 impl Gfx {
     pub fn new(hwnd: HWND, scale: f32) -> Result<Self> {
@@ -110,7 +119,7 @@ impl Gfx {
             let dwrite: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED).context("DWriteCreateFactory")?;
             let wic: IWICImagingFactory =
                 CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER).context("WIC factory")?;
-            let mut gfx = Self { _d2d_factory: d2d_factory, _d2d_device: d2d_device, dcomp, _target: target, root, dwrite, wic, formats: Vec::new(), scale };
+            let mut gfx = Self { _d2d_factory: d2d_factory, _d2d_device: d2d_device, dcomp, _target: target, root, dwrite, wic, formats: Vec::new(), scale, decoded: Default::default() };
             gfx.formats = vec![
                 gfx.format(w!("Segoe UI Variable Text"), DWRITE_FONT_WEIGHT_SEMI_BOLD, 13.0, false)?,
                 gfx.format(w!("Segoe UI Variable Text"), DWRITE_FONT_WEIGHT_NORMAL, 12.0, false)?,
@@ -191,16 +200,49 @@ impl Gfx {
         }
     }
 
-    /// Decode PNG or JPEG bytes into a bitmap for `dc`.
+    /// PNG or JPEG bytes as a bitmap for `dc`, decoded once (see [`Gfx::decoded`]).
     fn bitmap(&self, dc: &ID2D1DeviceContext, bytes: &[u8]) -> Result<ID2D1Bitmap1> {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        bytes.hash(&mut hasher);
+        let key = hasher.finish();
+        let cached = self.decoded.borrow().iter().find(|(k, _)| *k == key).map(|(_, b)| b.clone());
+        let decoded = match cached {
+            Some(decoded) => decoded,
+            None => {
+                let decoded = self.decode(bytes)?;
+                let mut kept = self.decoded.borrow_mut();
+                if kept.len() >= DECODED_KEPT {
+                    kept.remove(0);
+                }
+                kept.push((key, decoded.clone()));
+                decoded
+            }
+        };
+        unsafe { Ok(dc.CreateBitmapFromWicBitmap(&decoded, None)?) }
+    }
+
+    /// Decode, scaled down to the largest size the pill draws, in premultiplied BGRA.
+    fn decode(&self, bytes: &[u8]) -> Result<IWICBitmap> {
         unsafe {
             let stream = self.wic.CreateStream()?;
             stream.InitializeFromMemory(bytes)?;
             let decoder = self.wic.CreateDecoderFromStream(&stream, std::ptr::null(), WICDecodeMetadataCacheOnDemand)?;
             let frame = decoder.GetFrame(0)?;
+            let (mut w, mut h) = (0u32, 0u32);
+            frame.GetSize(&mut w, &mut h)?;
+            let most = (LARGEST_IMAGE * self.scale).ceil() as u32;
+            let shrink = (most as f32 / w.min(h).max(1) as f32).min(1.0);
             let converter = self.wic.CreateFormatConverter()?;
-            converter.Initialize(&frame, &GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, None, 0.0, WICBitmapPaletteTypeMedianCut)?;
-            Ok(dc.CreateBitmapFromWicBitmap(&converter, None)?)
+            if shrink < 1.0 {
+                let scaler = self.wic.CreateBitmapScaler()?;
+                let (sw, sh) = (((w as f32 * shrink).round() as u32).max(1), ((h as f32 * shrink).round() as u32).max(1));
+                scaler.Initialize(&frame, sw, sh, WICBitmapInterpolationModeHighQualityCubic)?;
+                converter.Initialize(&scaler, &GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, None, 0.0, WICBitmapPaletteTypeMedianCut)?;
+            } else {
+                converter.Initialize(&frame, &GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, None, 0.0, WICBitmapPaletteTypeMedianCut)?;
+            }
+            Ok(self.wic.CreateBitmapFromSource(&converter, WICBitmapCacheOnLoad)?)
         }
     }
 

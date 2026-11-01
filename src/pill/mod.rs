@@ -254,6 +254,15 @@ pub fn destroy() {
     });
 }
 
+/// A point on the desktop's left edge, for the monitor the pill lives on: the primary, unless a
+/// monitor sits to its left. Its edge would then be mid-desktop, and the hover strip would open
+/// the card whenever the pointer crossed from one screen to the other.
+fn edge_point() -> POINT {
+    use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_XVIRTUALSCREEN};
+    let left = unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) };
+    POINT { x: left.min(0), y: 0 }
+}
+
 fn with_pill<R>(f: impl FnOnce(&mut Pill) -> R) -> Option<R> {
     PILL.with(|cell| cell.try_borrow_mut().ok().and_then(|mut pill| pill.as_mut().map(f)))
 }
@@ -330,7 +339,7 @@ impl Pill {
 
     /// Paint and place `view`; `slide` animates it in from the edge.
     fn show(&mut self, view: &View, entrance: Entrance) -> Result<()> {
-        let (scale, work) = crate::win::monitor_at(POINT { x: 0, y: 0 });
+        let (scale, work) = crate::win::monitor_at(edge_point());
         if self.gfx.as_ref().is_none_or(|gfx| gfx.scale != scale) {
             self.gfx = Some(Gfx::new(self.hwnd, scale)?);
         }
@@ -590,7 +599,9 @@ impl Pill {
 
     /// Start or stop the 10 Hz microphone meter: it runs only while muted in a call.
     fn follow_meter(&mut self, state: &State) {
-        let wanted = view::call_mute(state).is_some_and(|(_, muted)| muted);
+        // Only for the "you're muted" banner: no pill, or a fullscreen app hiding it, no meter.
+        let shown = self.inputs.enabled && !self.inputs.fullscreen;
+        let wanted = shown && view::call_mute(state).is_some_and(|(_, muted)| muted);
         if wanted && self.meter.is_none() {
             match capture_meter() {
                 Ok(meter) => {

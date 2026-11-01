@@ -87,6 +87,18 @@ impl super::pipe::Handler for Tabs {
                     (_, art) => art.and_then(super::discord::base64_decode).map(Arc::new),
                 };
                 let ticks = |seconds: f64| (seconds.max(0.0) * 1e7) as i64;
+                let fresh = crate::music::smtc::Timeline { start: 0, end: ticks(t.duration), position: ticks(t.position), last_updated: now };
+                // A tab's reading that agrees with its last one (within a second, same state) keeps
+                // the old timeline: re-stamping every tab on every message made all of them differ,
+                // and the pill repainted on any tab's change.
+                let timeline = old
+                    .filter(|old| old.playing == t.playing)
+                    .and_then(|old| old.timeline)
+                    .filter(|kept| {
+                        let moved = if t.playing { now - kept.last_updated } else { 0 };
+                        kept.end == fresh.end && (kept.position + moved - fresh.position).abs() < 10_000_000
+                    })
+                    .unwrap_or(fresh);
                 Media {
                     app: crate::hub::names::site_name(&t.site),
                     app_id,
@@ -94,12 +106,7 @@ impl super::pipe::Handler for Tabs {
                     artist: t.artist,
                     playing: t.playing,
                     cover,
-                    timeline: Some(crate::music::smtc::Timeline {
-                        start: 0,
-                        end: ticks(t.duration),
-                        position: ticks(t.position),
-                        last_updated: now,
-                    }),
+                    timeline: Some(timeline),
                     // The page's own previous/next handlers are out of a content script's reach.
                     skip: false,
                 }

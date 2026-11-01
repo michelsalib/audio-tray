@@ -38,6 +38,7 @@ mod pill;
 mod taskbar;
 mod tray;
 mod update;
+mod wait;
 mod win;
 
 use audio::wasapi::WasapiBackend;

@@ -9,7 +9,7 @@ pub mod names;
 
 use std::sync::{Arc, Mutex};
 
-use crate::audio::{DeviceId, Flow};
+use crate::audio::DeviceId;
 
 /// Posted (coalesced) to the tray's message window when events are queued.
 pub const WM_HUB_EVENTS: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 34;
@@ -282,14 +282,6 @@ impl State {
     /// Whether the microphone is live for the user: an app holds it.
     pub fn mic_live(&self) -> bool {
         !self.mic_users.is_empty()
-    }
-
-    /// Which flow's default the given device is, for convenience in tests and surfaces.
-    pub fn default_of(&self, flow: Flow) -> Option<&Endpoint> {
-        match flow {
-            Flow::Output => self.endpoints.output.as_ref(),
-            Flow::Input => self.endpoints.input.as_ref(),
-        }
     }
 }
 

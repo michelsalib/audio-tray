@@ -29,8 +29,8 @@ use anyhow::Result;
 use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{
-    DefWindowProcW, DispatchMessageW, GetMessageW, KillTimer, PostMessageW, PostQuitMessage, SetTimer,
-    TranslateMessage, MSG, WHEEL_DELTA, WM_APP, WM_TIMER,
+    DefWindowProcW, KillTimer, PostMessageW, PostQuitMessage, SetTimer,
+    WHEEL_DELTA, WM_APP, WM_TIMER,
 };
 
 use crate::audio::wasapi::WasapiBackend;
@@ -279,13 +279,10 @@ pub fn run(backend: WasapiBackend) -> Result<()> {
     });
     with_tray(Tray::refresh);
 
-    let mut msg = MSG::default();
-    while unsafe { GetMessageW(&mut msg, None, 0, 0) }.0 > 0 {
-        unsafe {
-            let _ = TranslateMessage(&msg);
-            DispatchMessageW(&msg);
-        }
-    }
+    // The integrations' handles are waited on beside the message queue (see `wait`).
+    crate::integrations::start(&with_tray(|tray| tray.config.clone()).unwrap_or_default());
+    crate::wait::run();
+    crate::integrations::stop();
 
     crate::pill::destroy();
     // The progress bar sits on *another app's* button, so it has to come off here, while this
@@ -589,6 +586,12 @@ impl Tray {
     fn fold_events(&mut self) {
         let mut changed = false;
         for event in crate::hub::take() {
+            // Teams on the microphone means a meeting: the moment to (re)connect its integration.
+            if let crate::hub::Event::MicUsers(users) = &event {
+                if users.iter().any(|u| crate::hub::names::app_name(u) == "Teams") {
+                    crate::integrations::poke_teams();
+                }
+            }
             changed |= self.hub.apply(event);
         }
         if changed {
@@ -1039,6 +1042,17 @@ impl Current {
             input_recording: mic::in_use(),
         }
     }
+}
+
+/// Keep the token Teams handed over when the user allowed Audio Tray. Tray thread.
+pub(crate) fn set_teams_token(token: String) {
+    crate::integrations::teams_token(token.clone());
+    with_tray(|tray| {
+        tray.config.teams.token = Some(token);
+        if let Err(e) = tray.config.save() {
+            eprintln!("teams: could not save the token ({e:#})");
+        }
+    });
 }
 
 /// Open a link in the default browser.

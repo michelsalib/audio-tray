@@ -264,19 +264,9 @@ impl Smtc {
         Ok(out)
     }
 
-    /// One poll's reading: one `GetSessions`, a cheap [`Brief`] per session, and a full read only of
-    /// the session whose index `choose` returns.
-    #[cfg(feature = "dev")]
-    pub fn read_current<F>(&self, choose: F) -> Result<Option<Reading>>
-    where
-        F: FnOnce(&[Brief]) -> Option<usize>,
-    {
-        let [reading, _] = self.read_pair(|briefs| [choose(briefs), None])?;
-        Ok(reading)
-    }
-
-    /// Like [`Smtc::read_current`] for two choices from one enumeration (the followed player, and
-    /// the session to show anywhere); a session chosen twice is read once. Each slot keeps its own
+    /// One poll's reading for two choices (the followed player, and the session to show anywhere):
+    /// one `GetSessions`, a cheap [`Brief`] per session, and a full read only of the chosen
+    /// sessions; a session chosen twice is read once. Each slot keeps its own
     /// cover cache.
     pub fn read_pair<F>(&self, choose: F) -> Result<[Option<Reading>; 2]>
     where

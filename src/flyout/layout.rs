@@ -34,6 +34,8 @@ pub(super) enum SettingKind {
     PillDevices,
     /// How much the edge pill shows at rest: hidden, small or big.
     PillSize,
+    /// A new song's title on the pill for a moment.
+    AnnounceTracks,
     ListeningAlerts,
     /// Windows' own sound settings (a link).
     SoundSettings,
@@ -64,6 +66,7 @@ impl SettingKind {
             SettingKind::Pill => "Show the edge pill",
             SettingKind::PillDevices => "Audio devices on the pill",
             SettingKind::PillSize => "Pill size at rest",
+            SettingKind::AnnounceTracks => "Show each new song",
             SettingKind::ListeningAlerts => "Alert when an app listens",
             SettingKind::SoundSettings => "Windows sound settings",
             SettingKind::Connectors => "Browser, Discord and Teams",
@@ -255,7 +258,7 @@ pub(super) fn build_view(model: &Model, scale: f32, width: i32, view: View, fill
             kinds.push(Elem::Setting { kind: SettingKind::TileStyle });
             kinds.push(Elem::Setting { kind: SettingKind::AudioButtons });
             kinds.push(Elem::Header("Edge pill"));
-            for kind in [SettingKind::Pill, SettingKind::PillSize, SettingKind::PillDevices, SettingKind::ListeningAlerts] {
+            for kind in [SettingKind::Pill, SettingKind::PillSize, SettingKind::PillDevices, SettingKind::AnnounceTracks, SettingKind::ListeningAlerts] {
                 kinds.push(Elem::Setting { kind });
             }
             kinds.push(Elem::Header("Connectors"));

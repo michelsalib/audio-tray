@@ -225,6 +225,7 @@ pub fn configure(config: &crate::config::Pill) {
         pill.inputs.listening_alerts = config.listening_alerts;
         pill.inputs.devices = config.devices;
         pill.inputs.size = config.size;
+        pill.inputs.announce_tracks = config.announce_tracks;
         pill.refresh();
     });
 }
@@ -676,8 +677,12 @@ impl Pill {
             }
             (View::Banner { action, .. }, Some(_)) => match (action, right) {
                 // Right click only dismisses.
-                (view::Action::MuteAndAcknowledge(notice) | view::Action::Dismiss(notice), true) => {
+                (view::Action::MuteAndAcknowledge(notice) | view::Action::Dismiss(notice) | view::Action::Open(_, notice), true) => {
                     act(Action::Acknowledge(notice.clone()))
+                }
+                (view::Action::Open(app_id, notice), false) => {
+                    act(Action::Focus(app_id.clone()));
+                    act(Action::Acknowledge(notice.clone()));
                 }
                 (view::Action::MuteAndAcknowledge(notice), false) => {
                     act(Action::MuteMicrophone);

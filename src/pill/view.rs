@@ -77,6 +77,8 @@ pub enum Action {
     MuteAndAcknowledge(Notice),
     /// Acknowledge only.
     Dismiss(Notice),
+    /// Bring the player (its app id) to the front, and acknowledge.
+    Open(String, Notice),
 }
 
 impl View {
@@ -107,6 +109,7 @@ impl View {
 pub const GLYPH_MIC_OFF: char = '\u{F781}';
 pub const GLYPH_MIC: char = '\u{E720}';
 pub const GLYPH_SPEAKERS: char = '\u{E7F5}';
+pub const GLYPH_SONG: char = '\u{E8D6}';
 
 /// Everything besides the hub state that the view depends on.
 #[derive(Clone, Copy, Default)]
@@ -122,6 +125,8 @@ pub struct Inputs {
     pub devices: bool,
     /// How much shows at rest (`Hidden`: everything short of a warning collapses to the sliver).
     pub size: crate::config::PillSize,
+    /// Show a new song's title for a moment.
+    pub announce_tracks: bool,
 }
 
 /// The state to show.
@@ -172,6 +177,13 @@ fn loudest(state: &State, inputs: Inputs) -> View {
             text: format!("Now on {to} · {from} disconnected"),
             action: Action::Dismiss(notice.clone()),
         };
+    }
+    // A new song, for a moment: its title, and the player a click away.
+    if inputs.announce_tracks && !inputs.hover {
+        if let Some(notice @ Notice::NewTrack { app_id, title, artist }) = newest(state, |n| matches!(n, Notice::NewTrack { .. })) {
+            let text = if artist.trim().is_empty() { title.clone() } else { format!("{title} · {artist}") };
+            return View::Banner { level: Level::Normal, glyph: GLYPH_SONG, text, action: Action::Open(app_id.clone(), notice.clone()) };
+        }
     }
 
     // On hover the card lists every session (paused ones too, to resume them from here); quiet,
@@ -357,6 +369,20 @@ mod tests {
             View::Idle { devices: Some(devices), .. } => assert!(devices.input.is_some_and(|d| d.muted)),
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn a_new_song_shows_its_title_only_when_asked() {
+        let mut state = State::default();
+        state.apply(Event::Media(vec![Media { title: "One".into(), ..media(true) }]));
+        state.apply(Event::Media(vec![Media { title: "Two".into(), ..media(true) }]));
+        assert!(matches!(decide(&state, on()), View::Music { .. }), "off by default");
+        let asked = Inputs { announce_tracks: true, ..on() };
+        match decide(&state, asked) {
+            View::Banner { level: Level::Normal, text, action: Action::Open(..), .. } => assert_eq!(text, "Two · Band"),
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(decide(&state, Inputs { hover: true, ..asked }), View::Music { card: true, .. }), "the card wins on hover");
     }
 
     #[test]

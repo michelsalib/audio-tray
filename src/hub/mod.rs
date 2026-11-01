@@ -148,6 +148,8 @@ pub enum Notice {
     AudioMoved { to: String, from: String },
     /// An app started recording outside a known call; stays until acknowledged.
     Listening { app: String, user: String },
+    /// A playing session moved on to a new track (the pill shows it when asked to).
+    NewTrack { app_id: String, title: String, artist: String },
 }
 
 impl Notice {
@@ -156,6 +158,7 @@ impl Notice {
         match self {
             Notice::AudioMoved { .. } => Some(std::time::Duration::from_secs(5)),
             Notice::Listening { .. } => None,
+            Notice::NewTrack { .. } => Some(std::time::Duration::from_secs(4)),
         }
     }
 }
@@ -198,6 +201,9 @@ impl State {
                         self.gone.push((old.app.clone(), now));
                     }
                 }
+                if let Some(notice) = new_track(&self.media, &media) {
+                    self.push_notice(notice);
+                }
                 replace(&mut self.media, media)
             }
             Event::BrowserMedia { host, media } => {
@@ -207,6 +213,9 @@ impl State {
                     None => Vec::new(),
                 };
                 next.extend(media);
+                if let Some(notice) = new_track(&self.browser, &next) {
+                    self.push_notice(notice);
+                }
                 replace(&mut self.browser, next)
             }
             Event::MicUsers(users) => {
@@ -390,6 +399,15 @@ pub fn take() -> Vec<Event> {
     std::mem::take(&mut *QUEUE.lock().unwrap_or_else(|p| p.into_inner()))
 }
 
+/// A session already there and playing that moved on to another title: a new song (not a player
+/// opening, nor a resume, nor the app starting).
+fn new_track(old: &[Media], new: &[Media]) -> Option<Notice> {
+    new.iter().filter(|m| m.playing && !m.title.trim().is_empty()).find_map(|m| {
+        let before = old.iter().find(|o| o.app_id == m.app_id)?;
+        (before.title != m.title).then(|| Notice::NewTrack { app_id: m.app_id.clone(), title: m.title.clone(), artist: m.artist.clone() })
+    })
+}
+
 /// The browser (messaging host id) a tab's app id names: `browser:<host>:<tab>:<frame>`.
 pub fn browser_host(app_id: &str) -> Option<u32> {
     app_id.strip_prefix(crate::integrations::browser::APP_ID_PREFIX)?.split(':').next()?.parse().ok()
@@ -478,6 +496,19 @@ mod tests {
         });
         let ids: Vec<&str> = state.all_media().iter().map(|m| m.app_id.as_str()).collect();
         assert_eq!(ids, ["music.youtube.com-5929F88E_vezhnr0wkvrcy!App", "browser:7:2:0", "browser:7:3:0"]);
+    }
+
+    #[test]
+    fn a_new_song_is_noticed_but_not_a_resume_or_a_player_opening() {
+        let song = |title: &str, playing: bool| Media { playing, ..media("ytm", title) };
+        let mut state = State::default();
+        state.apply(Event::Media(vec![song("One", true)]));
+        assert!(state.notices.is_empty(), "a player opening is not a new song");
+        state.apply(Event::Media(vec![song("One", false)]));
+        state.apply(Event::Media(vec![song("One", true)]));
+        assert!(state.notices.is_empty(), "a resume is not a new song");
+        state.apply(Event::Media(vec![song("Two", true)]));
+        assert!(matches!(&state.notices[..], [(Notice::NewTrack { title, .. }, _)] if title == "Two"));
     }
 
     #[test]

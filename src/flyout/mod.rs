@@ -420,6 +420,7 @@ impl Flyout<'_> {
                 config.pill.size = [PillSize::Hidden, PillSize::Small, PillSize::Big][segment];
             }
             SettingKind::ListeningAlerts => config.pill.listening_alerts = !config.pill.listening_alerts,
+            SettingKind::AnnounceTracks => config.pill.announce_tracks = !config.pill.announce_tracks,
             SettingKind::SoundSettings => {
                 open_sound_settings();
                 return true;

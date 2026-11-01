@@ -221,7 +221,8 @@ pub fn scene(gfx: &Gfx, view: &View, small: bool) -> Result<Option<Scene>> {
                 Ok(())
             })?;
             Scene { w, h, content, rings: Vec::new(), pulses: Vec::new(), hits }
-        }        View::Banner { level, glyph, text, .. } => {
+        }
+        View::Banner { level, glyph, text, .. } => {
             let (bg, fg) = match level {
                 Level::Alert => (ALERT_BG, WHITE),
                 Level::Warn => (WARN_BG, WARN_TEXT),

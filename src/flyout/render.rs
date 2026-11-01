@@ -85,6 +85,7 @@ pub(super) fn render_page(ctx: &Ctx, elems: &[LaidElem], out: &mut [u8]) {
                     SettingKind::PillDevices => Some(s.devices),
 
                     SettingKind::ListeningAlerts => Some(s.alerts),
+                    SettingKind::AnnounceTracks => Some(s.songs),
                     SettingKind::BrowserTabs => Some(s.browser),
                     SettingKind::Discord => Some(s.discord),
                     SettingKind::Teams => Some(s.teams),
@@ -92,7 +93,7 @@ pub(super) fn render_page(ctx: &Ctx, elems: &[LaidElem], out: &mut [u8]) {
                 };
                 // The pill's own options are moot while it is off, the Discord keys while Discord
                 // is: drawn dimmed.
-                let dim = matches!(kind, SettingKind::PillDevices | SettingKind::PillSize | SettingKind::ListeningAlerts) && !s.pill
+                let dim = matches!(kind, SettingKind::PillDevices | SettingKind::PillSize | SettingKind::AnnounceTracks | SettingKind::ListeningAlerts) && !s.pill
                     || matches!(kind, SettingKind::DiscordId | SettingKind::DiscordSecret) && !s.discord;
                 // What sits left of the switch or in place of a value: a status, a key, a hint.
                 let connected = |name: &str| ctx.model.integrations.iter().any(|(n, on)| *n == name && *on);

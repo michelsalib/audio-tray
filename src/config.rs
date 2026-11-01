@@ -44,6 +44,8 @@ pub struct Pill {
     /// How much the pill shows at rest; hovering the edge always opens the full card, and warnings
     /// and alerts always show in full.
     pub size: PillSize,
+    /// A new song shows its title for a moment, as a device change does.
+    pub announce_tracks: bool,
 }
 
 /// How much the pill shows at rest.
@@ -61,7 +63,7 @@ pub enum PillSize {
 
 impl Default for Pill {
     fn default() -> Self {
-        Self { enabled: true, listening_alerts: true, devices: true, size: PillSize::Big }
+        Self { enabled: true, listening_alerts: true, devices: true, size: PillSize::Big, announce_tracks: false }
     }
 }
 

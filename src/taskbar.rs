@@ -296,8 +296,8 @@ fn init_data(icons: StripIcons, owner_pid: u32, payload: Payload) -> String {
     let tile = if config.tile_shown() { config.music.tile.clone() } else { String::new() };
     // A cover-only tile: just the cover's width (the TAP drops the text column and its gap).
     let strip = match config.music.tile_style {
-        crate::config::TileStyle::Cover => COVER_ONLY_WIDTH.to_string(),
-        _ => String::new(),
+        crate::config::TileStyle::Cover => COVER_ONLY_WIDTH,
+        _ => FULL_WIDTH,
     };
     let tap = tap_path().map(|path| path.display().to_string()).unwrap_or_default();
     let flag = |on: bool| u8::from(on).to_string();
@@ -331,8 +331,10 @@ fn init_data(icons: StripIcons, owner_pid: u32, payload: Payload) -> String {
     if payload == Payload::Handover {
         pairs.push(("tap", tap));
     }
-    if !strip.is_empty() {
-        pairs.push(("strip", strip));
+    // A fresh TAP starts at the full width, so an injection names only the cover width; a TAP
+    // taking a handover keeps the width it last had, so a handover always names it.
+    if strip != FULL_WIDTH || payload == Payload::Handover {
+        pairs.push(("strip", strip.to_string()));
     }
     let data = tap_proto::encode_init(pairs);
     if payload == Payload::Injection && data.len() > INIT_DATA_BUDGET {
@@ -355,6 +357,8 @@ const INIT_DATA_BUDGET: usize = 256;
 
 /// The music tile's content width for [`crate::config::TileStyle::Cover`]: the cover and its pad.
 const COVER_ONLY_WIDTH: u32 = 28;
+/// The full tile's content width: the TAP's own default (`music::layout::STRIP_WIDTH`).
+const FULL_WIDTH: u32 = 150;
 
 /// Whether the last injection asked for the audio buttons (`buttons=`).
 static BUTTONS_WANTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);

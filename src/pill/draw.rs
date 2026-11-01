@@ -391,8 +391,13 @@ impl CallLayout {
 
     fn of(gfx: &Gfx, call: &CallPill, m: Metrics) -> Self {
         let shown = call.members.len().min(Self::MAX_FACES);
-        let faces_h = if shown == 0 { 0.0 } else { m.face + m.face_step * (shown as f32 - 1.0) + 8.0 };
-        let label_h = if shown == 0 && m.words { 16.0 } else { 0.0 };
+        // No faces: the app's icon says whose call it is, else its name's first letters.
+        let faces_h = match shown {
+            0 if call.icon.is_some() => m.face + 8.0,
+            0 => 0.0,
+            _ => m.face + m.face_step * (shown as f32 - 1.0) + 8.0,
+        };
+        let label_h = if shown == 0 && call.icon.is_none() && m.words { 16.0 } else { 0.0 };
         let speaker = call.members.iter().take(shown).position(|member| member.speaking);
         // Small has no room for the name: the lit face and its pulse say who.
         let tag_w = speaker.filter(|_| m.words).map_or(0.0, |i| gfx.measure(Font::Small, &call.members[i].name).min(160.0) + 20.0);
@@ -422,7 +427,9 @@ fn paint_call(p: &mut Painter, call: &CallPill, layout: &CallLayout, m: Metrics,
             let y = top + 8.0 + m.face + m.face_step * (layout.shown as f32 - 1.0);
             p.text(&format!("+{extra}"), Font::Small, (0.0, y - 2.0, col, 12.0), DIM_WHITE)?;
         }
-        if layout.shown == 0 && m.words {
+        if let (0, Some(icon)) = (layout.shown, &call.icon) {
+            p.image(icon, cx - m.face / 2.0, top + 8.0, m.face, Some(0.0))?;
+        } else if layout.shown == 0 && m.words {
             if let Some(app) = call.app.map(|a| a.label()).or(call.holder.as_deref()) {
                 p.text(&app.chars().take(2).collect::<String>(), Font::Small, (0.0, top + 8.0, col, 16.0), DIM_WHITE)?;
             }
@@ -450,7 +457,12 @@ fn call_row(p: &mut Painter, call: &CallPill, w: f32) -> Result<()> {
         x += FACE * 0.7;
     }
     if call.members.is_empty() {
-        p.text(&GLYPH_MIC.to_string(), Font::Icons, (14.0, 16.0, FACE, FACE), WHITE)?;
+        match &call.icon {
+            Some(icon) => {
+                p.image(icon, 14.0, 16.0, FACE, Some(0.0))?;
+            }
+            None => p.text(&GLYPH_MIC.to_string(), Font::Icons, (14.0, 16.0, FACE, FACE), WHITE)?,
+        }
         x += FACE;
     }
     let text_x = x + FACE * 0.3 + 8.0;

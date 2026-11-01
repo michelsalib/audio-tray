@@ -86,7 +86,7 @@ impl super::pipe::Handler for Discord {
             Message::Call { channel, self_mute, self_deaf, members } => {
                 let old = self.call.take();
                 let members = members.into_iter().map(|m| member(m, old.as_ref())).collect();
-                let call = Call { channel, members, self_muted: self_mute, self_deafened: self_deaf };
+                let call = Call { channel, members, self_muted: self_mute, self_deafened: self_deaf, icon: None };
                 self.call = Some(call.clone());
                 crate::hub::emit(Event::Call { app: VoiceApp::Discord, call: Some(call) });
             }

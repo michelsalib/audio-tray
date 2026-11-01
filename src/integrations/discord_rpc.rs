@@ -403,6 +403,7 @@ impl Session {
             members,
             self_muted,
             self_deafened: false,
+            icon: None,
         });
         if let Some(call) = &self.call {
             println!("discord: in {:?} with {} member(s)", call.channel.as_deref().unwrap_or("a call"), call.members.len());

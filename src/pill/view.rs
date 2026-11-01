@@ -36,6 +36,8 @@ pub struct CallPill {
     pub channel: Option<String>,
     pub members: Vec<Member>,
     pub muted: bool,
+    /// The app's icon (PNG), for a call without faces.
+    pub icon: Option<std::sync::Arc<Vec<u8>>>,
 }
 
 /// One default device on the pill.
@@ -217,11 +219,11 @@ fn meeting_holder(state: &State) -> Option<String> {
 /// meeting app holding the microphone.
 fn call_pill(state: &State) -> Option<CallPill> {
     let (app, muted) = call_mute(state)?;
-    let (voice, channel, members) = match state.call() {
-        Some((voice, Call { channel, members, .. })) => (Some(voice), channel.clone(), members.clone()),
-        None => (None, None, Vec::new()),
+    let (voice, channel, members, icon) = match state.call() {
+        Some((voice, Call { channel, members, icon, .. })) => (Some(voice), channel.clone(), members.clone(), icon.clone()),
+        None => (None, None, Vec::new(), None),
     };
-    Some(CallPill { app: voice.or(app), holder: meeting_holder(state), channel, members, muted })
+    Some(CallPill { app: voice.or(app), holder: meeting_holder(state), channel, members, muted, icon })
 }
 
 #[cfg(test)]

@@ -35,6 +35,45 @@ pub fn sprite(bytes: &[u8], size: u32, radius: f32) -> Result<Vec<u8>> {
     }
 }
 
+/// The icon of the program at `exe`, `px` pixels square, as PNG (what the pill decodes).
+pub fn exe_icon_png(exe: &str, px: u32) -> Result<Vec<u8>> {
+    use windows::core::PCWSTR;
+    use windows::Win32::Graphics::Imaging::{GUID_ContainerFormatPng, WICBitmapEncoderNoCache};
+    use windows::Win32::System::Com::StructuredStorage::{CreateStreamOnHGlobal, GetHGlobalFromStream};
+    use windows::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
+    use windows::Win32::UI::Shell::SHDefExtractIconW;
+    use windows::Win32::UI::WindowsAndMessaging::{DestroyIcon, HICON};
+
+    let path = crate::win::wide(exe);
+    let mut icon = HICON::default();
+    unsafe { SHDefExtractIconW(PCWSTR(path.as_ptr()), 0, 0, Some(&mut icon), None, px) }.ok().context("no icon")?;
+    let png = (|| unsafe {
+        let wic: IWICImagingFactory = CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER).context("WIC factory")?;
+        let bitmap = wic.CreateBitmapFromHICON(icon)?;
+        let stream = CreateStreamOnHGlobal(Default::default(), true)?;
+        let encoder = wic.CreateEncoder(&GUID_ContainerFormatPng, std::ptr::null())?;
+        encoder.Initialize(&stream, WICBitmapEncoderNoCache)?;
+        let mut frame = None;
+        encoder.CreateNewFrame(&mut frame, std::ptr::null_mut())?;
+        let frame = frame.context("no PNG frame")?;
+        frame.Initialize(None)?;
+        frame.WriteSource(&bitmap, std::ptr::null())?;
+        frame.Commit()?;
+        encoder.Commit()?;
+        let global = GetHGlobalFromStream(&stream)?;
+        let len = GlobalSize(global);
+        let ptr = GlobalLock(global) as *const u8;
+        anyhow::ensure!(!ptr.is_null(), "GlobalLock");
+        let bytes = std::slice::from_raw_parts(ptr, len).to_vec();
+        let _ = GlobalUnlock(global);
+        Ok(bytes)
+    })();
+    unsafe {
+        let _ = DestroyIcon(icon);
+    }
+    png
+}
+
 /// Fade the alpha outside a rounded square, anti-aliased over one pixel.
 fn mask_corners(rgba: &mut [u8], size: u32, radius: f32) {
     let half = size as f32 / 2.0;

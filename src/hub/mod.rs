@@ -113,6 +113,8 @@ pub struct Call {
     pub members: Vec<Member>,
     pub self_muted: bool,
     pub self_deafened: bool,
+    /// The app's icon (PNG), shown where there are no faces to say whose call it is.
+    pub icon: Option<std::sync::Arc<Vec<u8>>>,
 }
 
 /// Every fact any source can report.

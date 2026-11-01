@@ -175,7 +175,7 @@ fn run(commands: Receiver<Command>) {
 }
 
 fn emit(found: &Attached) {
-    let call = Call { channel: found.channel.clone(), self_muted: found.muted, ..Default::default() };
+    let call = Call { channel: found.channel.clone(), self_muted: found.muted, icon: icon(), ..Default::default() };
     crate::hub::emit(Event::Call { app: VoiceApp::Teams, call: Some(call) });
 }
 
@@ -225,6 +225,36 @@ fn attach(automation: &IUIAutomation, sender: &Sender<Command>) -> Result<Attach
         }
     }
     anyhow::bail!("no mic button in {} Teams window(s)", windows.len())
+}
+
+/// Teams' icon, from its exe (read once): the call pill has no faces to say whose call it is.
+fn icon() -> Option<std::sync::Arc<Vec<u8>>> {
+    static ICON: OnceLock<Option<std::sync::Arc<Vec<u8>>>> = OnceLock::new();
+    ICON.get_or_init(|| {
+        let exe = teams_windows().first().and_then(|(hwnd, _)| exe_of(*hwnd))?;
+        crate::image::exe_icon_png(&exe, 64).map(std::sync::Arc::new).map_err(|e| eprintln!("teams: no icon ({e:#})")).ok()
+    })
+    .clone()
+}
+
+/// The full path of the program owning `hwnd`.
+fn exe_of(hwnd: HWND) -> Option<String> {
+    use windows::core::PWSTR;
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION};
+    use windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
+
+    unsafe {
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+        let mut buf = [0u16; 1024];
+        let mut len = buf.len() as u32;
+        let ok = QueryFullProcessImageNameW(process, PROCESS_NAME_WIN32, PWSTR(buf.as_mut_ptr()), &mut len);
+        let _ = CloseHandle(process);
+        ok.ok()?;
+        Some(String::from_utf16_lossy(&buf[..len as usize]))
+    }
 }
 
 /// Teams' top-level web views, with their titles.

@@ -24,7 +24,8 @@ use serde::Deserialize;
 use crate::hub::{Call, Event, Member, VoiceApp};
 
 pub const PIPE: &str = "audio-tray";
-const NAME: &str = "Discord";
+/// Its own name in the hub: Discord's RPC client reports as "Discord", and Settings reads both.
+pub const NAME: &str = "Vencord";
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 enum Message {
@@ -70,7 +71,7 @@ impl super::pipe::Handler for Discord {
 
     fn disconnected(&mut self) {
         println!("discord: plugin went away");
-        if self.call.take().is_some() {
+        if self.call.take().is_some() && !super::discord_rpc::connected() {
             crate::hub::emit(Event::Call { app: VoiceApp::Discord, call: None });
         }
         crate::hub::emit(Event::Integration { name: NAME, connected: false });
@@ -79,6 +80,8 @@ impl super::pipe::Handler for Discord {
     fn line(&mut self, text: &str) -> Result<()> {
         match serde_json::from_str::<Message>(text).context("not a message")? {
             Message::Hello {} => {}
+            // The RPC client, when connected, owns Discord's call: two sources overwrote each other.
+            _ if super::discord_rpc::connected() => {}
             Message::Call { channel: None, .. } => {
                 self.call = None;
                 crate::hub::emit(Event::Call { app: VoiceApp::Discord, call: None });

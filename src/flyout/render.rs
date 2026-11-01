@@ -101,7 +101,7 @@ pub(super) fn render_page(ctx: &Ctx, elems: &[LaidElem], out: &mut [u8]) {
                     _ if hint.is_some() => hint.map(|h| (h, 0.9)),
                     SettingKind::BrowserTabs if s.browser => Some((if connected("Browser") { "Connected" } else { "Not connected" }.to_string(), 0.6)),
                     SettingKind::Discord if s.discord => Some((
-                        if connected("Discord") {
+                        if connected("Discord") || connected(crate::integrations::discord::NAME) {
                             "Connected"
                         } else if s.discord_id.is_none() || s.discord_secret.is_none() {
                             "Needs the app keys"

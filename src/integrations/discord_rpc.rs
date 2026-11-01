@@ -28,13 +28,15 @@ use crate::hub::{Call, Event, Member, VoiceApp};
 
 const NAME: &str = "Discord";
 const SCOPES: [&str; 3] = ["rpc", "rpc.voice.read", "rpc.voice.write"];
-/// The redirect registered on the application; the code exchange must name it.
-/// The redirect the application must register (Discord insists on one, even over IPC).
+/// The redirect the application must register (Discord insists on one, even over IPC); the code
+/// exchange names it.
 pub const REDIRECT: &str = "http://localhost";
 
 /// The open pipe, shared with the tray thread for commands (overlapped, so a write never waits
 /// behind the reader's pending read).
-struct Pipe(HANDLE);
+/// The flag says the session is being closed from outside (Discord turned off, new keys): no new
+/// I/O starts, and the pending one was cancelled.
+struct Pipe(HANDLE, std::sync::atomic::AtomicBool);
 // The handle is a kernel object; overlapped I/O on it from two threads is supported.
 unsafe impl Send for Pipe {}
 unsafe impl Sync for Pipe {}
@@ -54,12 +56,28 @@ impl Pipe {
                     None,
                 )
             };
-            handle.ok().map(Pipe)
+            handle.ok().map(|handle| Pipe(handle, std::sync::atomic::AtomicBool::new(false)))
         })
+    }
+
+    /// Close the session from another thread: its blocked read returns, and nothing new starts.
+    fn cancel(&self) {
+        use windows::Win32::System::IO::CancelIoEx;
+        self.1.store(true, std::sync::atomic::Ordering::SeqCst);
+        unsafe {
+            let _ = CancelIoEx(self.0, None);
+        }
+    }
+
+    fn cancelled(&self) -> bool {
+        self.1.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// One overlapped read or write, waited for.
     fn io(&self, read: Option<&mut [u8]>, write: Option<&[u8]>) -> Result<usize> {
+        if self.cancelled() {
+            bail!("the session was closed");
+        }
         unsafe {
             let event = CreateEventW(None, true, false, None).context("CreateEvent")?;
             let mut overlapped = OVERLAPPED { hEvent: event, ..Default::default() };
@@ -130,6 +148,12 @@ struct Shared {
     muted: bool,
     /// The application's id and secret, when Discord is on and both are set.
     app: Option<(String, String)>,
+    /// The open session's pipe from the moment it opens (authorising included), to close it when
+    /// the application changes.
+    live: Option<Arc<Pipe>>,
+    /// The last attempt failed on something only the user can fix (consent refused, bad keys, no
+    /// redirect): automatic attempts stop until [`retry`] or new keys.
+    blocked: bool,
 }
 
 fn shared() -> &'static Mutex<Shared> {
@@ -147,7 +171,18 @@ pub fn configure(settings: &crate::config::Discord) {
         (true, Some(id), Some(secret)) => Some((id.clone(), secret.clone())),
         _ => None,
     };
-    let old = std::mem::replace(&mut shared().lock().unwrap_or_else(|p| p.into_inner()).app, app.clone());
+    let old = {
+        let mut shared = shared().lock().unwrap_or_else(|p| p.into_inner());
+        let old = std::mem::replace(&mut shared.app, app.clone());
+        if old != app {
+            shared.blocked = false;
+            // A session as the old application (or with Discord now off) ends here.
+            if let Some(live) = &shared.live {
+                live.cancel();
+            }
+        }
+        old
+    };
     if old != app {
         crate::hub::emit(Event::IntegrationProblem { name: NAME, problem: None });
     }
@@ -167,10 +202,20 @@ pub fn configure(settings: &crate::config::Discord) {
     let _ = poke.send(());
 }
 
+/// The user asked (Settings opened its connectors): try again even after a refusal.
+pub fn retry() {
+    shared().lock().unwrap_or_else(|p| p.into_inner()).blocked = false;
+    poke();
+}
+
 /// Try to connect now (Discord took the microphone or opened an audio session). Free when
-/// connected or off.
+/// connected, off, or stopped on a refusal (Discord would ask for consent again and again).
 pub fn poke() {
-    if shared().lock().unwrap_or_else(|p| p.into_inner()).pipe.is_none() {
+    let idle = {
+        let shared = shared().lock().unwrap_or_else(|p| p.into_inner());
+        shared.live.is_none() && !shared.blocked
+    };
+    if idle {
         if let Some(poke) = POKE.get() {
             let _ = poke.send(());
         }
@@ -226,6 +271,7 @@ fn run(pokes: Receiver<()>) {
         let Some((id, secret)) = shared().lock().unwrap_or_else(|p| p.into_inner()).app.clone() else { continue };
         let Some(pipe) = Pipe::open() else { continue };
         let pipe = Arc::new(pipe);
+        shared().lock().unwrap_or_else(|p| p.into_inner()).live = Some(Arc::clone(&pipe));
         let mut session = Session {
             pipe: Arc::clone(&pipe),
             id,
@@ -238,13 +284,16 @@ fn run(pokes: Receiver<()>) {
         if let Err(e) = session.serve() {
             eprintln!("discord: {e:#}");
             // Only a failure before connecting says something about the setup.
-            if !connected() {
-                crate::hub::emit(Event::IntegrationProblem { name: NAME, problem: problem_of(&format!("{e:#}")) });
+            if !connected() && !pipe.cancelled() {
+                let problem = problem_of(&format!("{e:#}"));
+                shared().lock().unwrap_or_else(|p| p.into_inner()).blocked = problem.is_some();
+                crate::hub::emit(Event::IntegrationProblem { name: NAME, problem });
             }
         }
         {
             let mut shared = shared().lock().unwrap_or_else(|p| p.into_inner());
             shared.pipe = None;
+            shared.live = None;
         }
         if session.call.is_some() {
             crate::hub::emit(Event::Call { app: VoiceApp::Discord, call: None });
@@ -396,7 +445,9 @@ impl Session {
         for evt in ["VOICE_STATE_CREATE", "VOICE_STATE_UPDATE", "VOICE_STATE_DELETE", "SPEAKING_START", "SPEAKING_STOP"] {
             self.request("SUBSCRIBE", json!({ "channel_id": id }), Some(evt))?;
         }
-        let members = channel["voice_states"].as_array().cloned().unwrap_or_default().iter().map(|state| self.member(state)).collect();
+        let states = channel["voice_states"].as_array().cloned().unwrap_or_default();
+        self.fetch_faces(&states);
+        let members = states.iter().map(|state| self.member(state)).collect();
         let self_muted = shared().lock().unwrap_or_else(|p| p.into_inner()).muted;
         self.call = Some(Call {
             channel: channel["name"].as_str().map(str::to_string),
@@ -411,6 +462,25 @@ impl Session {
         self.channel = Some(id);
         self.emit();
         Ok(())
+    }
+
+    /// Fetch the faces of `states` not fetched yet, all at once: one after the other, a full
+    /// channel took seconds before the call showed, and Discord's pings waited.
+    fn fetch_faces(&mut self, states: &[Value]) {
+        let missing: Vec<(String, String)> = states
+            .iter()
+            .filter_map(|state| Some((state["user"]["id"].as_str()?.to_string(), state["user"]["avatar"].as_str()?.to_string())))
+            .filter(|key| !self.avatars.contains_key(key))
+            .take(16)
+            .collect();
+        let fetched: Vec<_> = std::thread::scope(|scope| {
+            let handles: Vec<_> = missing
+                .iter()
+                .map(|(id, hash)| scope.spawn(move || fetch(&format!("https://cdn.discordapp.com/avatars/{id}/{hash}.png?size=64")).ok().map(Arc::new)))
+                .collect();
+            handles.into_iter().map(|h| h.join().ok().flatten()).collect()
+        });
+        self.avatars.extend(missing.into_iter().zip(fetched));
     }
 
     /// A member from a voice state, with their face (fetched once per avatar).
@@ -530,7 +600,13 @@ fn now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
 
+/// One agent for the process: its connections (and their TLS sessions) are kept and reused.
 fn agent() -> ureq::Agent {
+    static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
+    AGENT.get_or_init(new_agent).clone()
+}
+
+fn new_agent() -> ureq::Agent {
     ureq::Agent::config_builder()
         // SChannel with Windows' own certificate store (ureq's default roots are webpki's, not built).
         .tls_config(

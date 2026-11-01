@@ -428,7 +428,7 @@ impl Flyout<'_> {
             }
             SettingKind::Connectors => {
                 // A redirect added since the last failure: try again now, not at the next call.
-                crate::integrations::discord_rpc::poke();
+                crate::integrations::discord_rpc::retry();
                 crate::integrations::poke_teams();
                 self.navigate(View::Connectors, true);
                 return false;

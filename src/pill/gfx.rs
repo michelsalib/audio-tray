@@ -255,10 +255,10 @@ impl Painter<'_> {
             return Ok(false);
         };
         unsafe {
-            let px = bitmap.GetPixelSize();
-            let (bw, bh) = (px.width.max(1) as f32, px.height.max(1) as f32);
-            // Bitmaps load at the context's DPI: their DIP size is pixels / scale.
-            let (bw, bh) = (bw / self.gfx.scale, bh / self.gfx.scale);
+            // In DIPs at the bitmap's own DPI, which is the image file's (an icon rendered to PNG
+            // is not at the screen's): what the brush below is laid out in.
+            let dips = bitmap.GetSize();
+            let (bw, bh) = (dips.width.max(0.01), dips.height.max(0.01));
             let fit = size / bw.min(bh);
             let props = D2D1_BITMAP_BRUSH_PROPERTIES1 {
                 extendModeX: D2D1_EXTEND_MODE_CLAMP,

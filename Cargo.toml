@@ -125,6 +125,8 @@ features = [
     "Win32_System_IO",
     # The Teams socket, signalled through WSAEventSelect.
     "Win32_Networking_WinSock",
+    # Teams' meeting window (its mic button), where an admin turned Teams' local API off.
+    "Win32_UI_Accessibility",
 ]
 
 [build-dependencies]

@@ -114,6 +114,7 @@ pub(super) fn render_page(ctx: &Ctx, elems: &[LaidElem], out: &mut [u8]) {
                     SettingKind::Teams if s.teams => Some(match (connected("Teams"), ctx.model.teams_problem) {
                         (true, _) if s.teams_paired => ("Connected".to_string(), 0.6),
                         (true, _) => ("Allow it in your next meeting".to_string(), 0.9),
+                        (false, _) if connected(crate::integrations::teams_ui::NAME) => ("Following the meeting".to_string(), 0.6),
                         (false, Some(problem)) => (problem.to_string(), 0.9),
                         (false, None) => ("Waiting for Teams".to_string(), 0.6),
                     }),

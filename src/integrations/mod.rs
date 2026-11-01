@@ -8,6 +8,7 @@ pub mod discord;
 pub mod discord_rpc;
 pub mod pipe;
 pub mod teams;
+pub mod teams_ui;
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -99,6 +100,7 @@ pub fn reconfigure(old: &Config, new: &Config) {
             crate::hub::emit(crate::hub::Event::Call { app: VoiceApp::Teams, call: None });
             crate::hub::emit(crate::hub::Event::Integration { name: "Teams", connected: false });
             crate::hub::emit(crate::hub::Event::IntegrationProblem { name: "Teams", problem: None });
+            teams_ui::meeting(false);
         }
     }
     if old.browser.enabled != new.browser.enabled {
@@ -143,6 +145,14 @@ pub fn poke_teams() {
     }
 }
 
+/// Teams took the microphone (`true`) or let it go: without its local API, follow the meeting
+/// window instead (when Teams is on in config).
+pub fn teams_meeting(in_meeting: bool) {
+    let enabled = TEAMS_TOKEN.with(|t| t.borrow().is_some());
+    let api = TEAMS.with(|t| t.borrow().is_some());
+    teams_ui::meeting(in_meeting && enabled && !api);
+}
+
 /// Teams handed over a new token.
 pub fn teams_token(token: String) {
     TEAMS_TOKEN.with(|t| *t.borrow_mut() = Some(Some(token)));
@@ -168,7 +178,7 @@ fn connect_teams() {
         Err(e) => {
             println!("teams: not connected ({e:#})");
             // Nothing listening while Teams runs: its API is off, or an admin removed the switch.
-            let problem = teams::running().then_some("API off or blocked by admin");
+            let problem = teams::running().then_some("API blocked: follows meetings");
             crate::hub::emit(crate::hub::Event::IntegrationProblem { name: "Teams", problem });
         }
     }
@@ -179,6 +189,7 @@ pub fn toggle_mute(app: VoiceApp) {
     match app {
         VoiceApp::Discord if discord_rpc::connected() => discord_rpc::set_mute(None),
         VoiceApp::Discord => discord(|server| server.send(r#"{"type":"toggleMute"}"#)),
+        VoiceApp::Teams if TEAMS.with(|t| t.borrow().is_none()) && teams_ui::attached() => teams_ui::set_mute(None),
         VoiceApp::Teams => teams(|client| client.action("toggle-mute")),
     }
 }
@@ -188,6 +199,7 @@ pub fn set_muted(app: VoiceApp, muted: bool) {
     match app {
         VoiceApp::Discord if discord_rpc::connected() => discord_rpc::set_mute(Some(muted)),
         VoiceApp::Discord => discord(|server| server.send(&format!(r#"{{"type":"setMute","muted":{muted}}}"#))),
+        VoiceApp::Teams if TEAMS.with(|t| t.borrow().is_none()) && teams_ui::attached() => teams_ui::set_mute(Some(muted)),
         VoiceApp::Teams => teams(|client| client.action(if muted { "mute" } else { "unmute" })),
     }
 }

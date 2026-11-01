@@ -3,7 +3,8 @@
 //! Read from the Capability Access Manager's consent store (`HKCU` and `HKLM`), the record the
 //! shell's own indicator uses, so it covers every app and every endpoint. A watcher thread
 //! blocks in `RegNotifyChangeKeyValue`, recomputes, and posts [`WM_MIC_CHANGED`] to the tray;
-//! [`in_use`] is a cached atomic, cheap enough to sample per frame.
+//! [`in_use`] is a cached atomic, cheap enough to sample per frame. Who holds the microphone is
+//! also reported to the hub as [`crate::hub::Event::MicUsers`].
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -112,6 +113,7 @@ fn watch() {
         return;
     }
 
+    let mut reported: Option<Vec<String>> = None;
     loop {
         // Arm before the sweep so a change during it re-signals. A root that will not arm
         // falls back to polling.
@@ -122,6 +124,10 @@ fn watch() {
             .count();
 
         let users = users();
+        if reported.as_ref() != Some(&users) {
+            crate::hub::emit(crate::hub::Event::MicUsers(users.clone()));
+            reported = Some(users.clone());
+        }
         let now = !users.is_empty();
         if now != IN_USE.swap(now, Ordering::SeqCst) {
             if now {

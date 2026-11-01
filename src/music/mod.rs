@@ -55,6 +55,8 @@ enum Request {
     /// Reported by an SMTC event handler.
     Changed(smtc::Change),
     Command(smtc::Command),
+    /// A transport command for the session shown anywhere (the pill), whatever the app.
+    CommandShown(smtc::Command),
     /// Explorer restarted (tray saw `WM_TASKBAR_RESTARTED`): shell-side state is gone.
     TaskbarRestarted,
     /// Clear the published state and toolbar, then stop. Sent by [`Handle::drop`].
@@ -73,6 +75,11 @@ impl Handle {
     /// A transport command from the strip. Best-effort if the music thread is dead.
     pub fn command(&self, command: smtc::Command) {
         let _ = self.requests.send(Request::Command(command));
+    }
+
+    /// A transport command for the session the pill shows (any app).
+    pub fn command_shown(&self, command: smtc::Command) {
+        let _ = self.requests.send(Request::CommandShown(command));
     }
 
     /// Tell the feed Explorer restarted, so it re-asserts the progress bar and toolbar (their caches
@@ -151,6 +158,8 @@ pub struct Music {
     toolbar: thumbbar::Toolbar,
     /// An SMTC change arrived since the last reading.
     dirty: bool,
+    /// The media last reported to the hub (`Some(None)`: reported as nothing).
+    reported: Option<Option<crate::hub::Media>>,
 }
 
 impl Music {
@@ -165,6 +174,7 @@ impl Music {
             progress: progress::Progress::new(),
             toolbar: thumbbar::Toolbar::new(),
             dirty: false,
+            reported: None,
         })
     }
 
@@ -172,13 +182,14 @@ impl Music {
     /// state kept (a session dying mid-enumeration is routine).
     pub fn poll(&mut self) {
         self.dirty = false;
-        let (state, timeline) = match self.feed.read() {
+        let (state, timeline, any) = match self.feed.read_with_any() {
             Ok(read) => read,
             Err(err) => {
                 eprintln!("music: could not read the session: {err:#}");
                 return;
             }
         };
+        self.report(any);
         // Remember the player while visible, so a click after it closes launches the app.
         if let Some(app_id) = self.feed.current_app_id() {
             player::remember_player(app_id);
@@ -192,6 +203,38 @@ impl Music {
             .is_some_and(|snapshot| snapshot.status.is_playing());
         self.progress.update(timeline, playing);
         self.toolbar.update(playing);
+    }
+
+    /// Tell the hub about the session to show anywhere, when it changed. A session with no title
+    /// yet (a track change in flight) is held back rather than shown empty.
+    fn report(&mut self, any: Option<smtc::Reading>) {
+        let media = any.filter(|r| r.snapshot.has_track()).map(|r| {
+            let cover = match (&self.reported, &r.snapshot.cover) {
+                // Same bytes: share the old allocation rather than make another.
+                (Some(Some(old)), Some(bytes)) if old.cover.as_deref().map(|c| c.as_slice()) == Some(bytes.as_slice()) => old.cover.clone(),
+                (_, cover) => cover.clone().map(Arc::new),
+            };
+            crate::hub::Media {
+                app: crate::hub::names::app_name(&r.snapshot.app_id),
+                app_id: r.snapshot.app_id,
+                title: r.snapshot.title,
+                artist: r.snapshot.artist,
+                playing: r.snapshot.status.is_playing(),
+                cover,
+                timeline: r.timeline,
+            }
+        });
+        if self.reported.as_ref() != Some(&media) {
+            crate::hub::emit(crate::hub::Event::Media(media.clone()));
+            self.reported = Some(media);
+        }
+    }
+
+    /// A transport command for the session shown anywhere (the pill), whatever the app.
+    fn command_shown(&mut self, command: smtc::Command) {
+        if let Err(err) = self.feed.send_to_shown(command) {
+            eprintln!("music: {command:?} on the shown session failed: {err:#}");
+        }
     }
 
     /// Send a transport command and republish immediately. With no session the player is raised
@@ -261,6 +304,7 @@ impl Music {
                 self.dirty = true;
             }
             Request::Command(command) => self.command(command),
+            Request::CommandShown(command) => self.command_shown(command),
             Request::TaskbarRestarted => {
                 self.progress.taskbar_restarted();
                 self.toolbar.taskbar_restarted();

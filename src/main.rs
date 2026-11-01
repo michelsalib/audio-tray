@@ -27,6 +27,7 @@ mod config;
 #[cfg(feature = "dev")]
 mod dev;
 mod flyout;
+mod hub;
 mod icons;
 mod instance;
 mod layered;

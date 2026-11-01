@@ -3,6 +3,7 @@
 pub mod battery;
 pub mod mic;
 pub mod notify;
+pub mod sessions;
 pub mod switch;
 pub mod wasapi;
 

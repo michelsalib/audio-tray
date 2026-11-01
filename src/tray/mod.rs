@@ -34,7 +34,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::audio::wasapi::WasapiBackend;
-use crate::audio::{mic, notify, Flow};
+use crate::audio::{mic, notify, sessions, Flow};
 use crate::config::Config;
 use crate::flyout;
 use crate::icons::IconId;
@@ -107,7 +107,7 @@ pub(crate) struct Wake {
 }
 
 impl Wake {
-    const fn new(message: u32) -> Self {
+    pub(crate) const fn new(message: u32) -> Self {
         Self { message, queued: AtomicBool::new(false) }
     }
 
@@ -123,7 +123,7 @@ impl Wake {
     }
 
     /// Called by the handler, before it reads the state.
-    fn take(&self) {
+    pub(crate) fn take(&self) {
         self.queued.store(false, Ordering::SeqCst);
     }
 }
@@ -176,6 +176,10 @@ struct Tray {
     mute_watches: Vec<MuteWatch>,
     /// Coalesces [`WM_ENDPOINT_VOLUME`]: a slider drag or mic auto-gain fires tens per second.
     mute_pending: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// What every source has reported, folded; the surfaces render it.
+    hub: crate::hub::State,
+    /// Session-created notifications on the default output, and which output that is.
+    sessions: Option<(crate::audio::DeviceId, sessions::Watch)>,
 }
 
 struct MuteWatch {
@@ -218,13 +222,19 @@ pub fn run(backend: WasapiBackend) -> Result<()> {
     // A TAP staged by an update that could not land it (the old one was loaded) is placed now:
     // the set-aside rename works on a loaded DLL, so this needs no Explorer restart.
     crate::update::place_staged_tap();
-    taskbar::apply_at_startup(strip_icons(&backend, &config));
+    if config.strip.enabled {
+        taskbar::apply_at_startup(strip_icons(&backend, &config));
+    } else {
+        // Opt-in: a strip left by an earlier run (or another build) comes off.
+        taskbar::revert(0);
+    }
 
     // At logon audio-tray can start ahead of `explorer.exe`; `build_tray` retries until it takes.
     let icon = build_tray(&backend, &config)?;
     TrayIconEvent::set_event_handler(Some(on_tray_event));
     let _notifications = notify::register()?;
-    hook::set_scroll_anywhere(config.strip.scroll_anywhere);
+    // Without the strip the wheel works over our icon only: the taskbar is Windows' again.
+    hook::set_scroll_anywhere(config.strip.enabled && config.strip.scroll_anywhere);
     let _wheel = hook::WheelHook::spawn();
 
     let devices = backend.enumerate_flow(Flow::Output).map(|d| d.len()).unwrap_or(0);
@@ -255,6 +265,8 @@ pub fn run(backend: WasapiBackend) -> Result<()> {
             scroll: ScrollTotals::default(),
             mute_watches: Vec::new(),
             mute_pending: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            hub: crate::hub::State::default(),
+            sessions: None,
         })
     });
     with_tray(Tray::refresh);
@@ -312,6 +324,8 @@ fn is_ours(msg: u32, wparam: usize) -> bool {
             | WM_TRAY_CLICK
             | WM_ENDPOINT_VOLUME
             | WM_ICON_CHECK
+            | crate::hub::WM_HUB_EVENTS
+            | sessions::WM_SESSIONS_CHANGED
     ) || (msg == WM_TIMER && wparam == crate::osd::TIMER_ID)
 }
 
@@ -350,6 +364,13 @@ fn handle(msg: Queued) {
         }
         WM_ENDPOINT_VOLUME => {
             with_tray(Tray::check_mutes);
+        }
+        crate::hub::WM_HUB_EVENTS => {
+            with_tray(Tray::fold_events);
+        }
+        sessions::WM_SESSIONS_CHANGED => {
+            sessions::CHANGED.take();
+            with_tray(Tray::report_sessions);
         }
         WM_ICON_CHECK => {
             with_tray(|tray| tray.ensure_icon(msg.wparam));
@@ -519,6 +540,56 @@ impl Tray {
         if let Err(e) = state.output.apply_to(&self.icon) {
             eprintln!("tray: could not update the icon, will retry when the taskbar is back ({e:#})");
         }
+        self.report_endpoints();
+    }
+
+    /// The endpoint source: tell the hub the defaults, and follow the default output with the
+    /// session watch (a session manager belongs to one endpoint).
+    fn report_endpoints(&mut self) {
+        let endpoints = read_endpoints(&self.backend);
+        let output = endpoints.output.as_ref().map(|e| e.id.clone());
+        if self.sessions.as_ref().map(|(id, _)| id) != output.as_ref() {
+            self.sessions = output.and_then(|id| match sessions::Watch::new() {
+                Ok(watch) => Some((id, watch)),
+                Err(e) => {
+                    eprintln!("tray: cannot watch app sessions ({e:#})");
+                    None
+                }
+            });
+            self.report_sessions();
+        }
+        crate::hub::emit(crate::hub::Event::Endpoints(endpoints));
+    }
+
+    /// The app-session source: list the default output's sessions for the hub.
+    fn report_sessions(&mut self) {
+        match sessions::list() {
+            Ok(list) => crate::hub::emit(crate::hub::Event::AppSessions(list)),
+            Err(e) => eprintln!("tray: cannot list app sessions ({e:#})"),
+        }
+    }
+
+    /// Fold every queued hub event into the state the surfaces render.
+    fn fold_events(&mut self) {
+        let mut changed = false;
+        for event in crate::hub::take() {
+            changed |= self.hub.apply(event);
+        }
+        if changed {
+            self.hub_changed();
+        }
+    }
+
+    /// The hub state changed: bring the surfaces in line.
+    fn hub_changed(&mut self) {
+        let media = self.hub.media.as_ref().map(|m| format!("{} — {} ({}{})", m.title, m.artist, m.app, if m.playing { "" } else { ", paused" }));
+        println!(
+            "hub: media {}; mic {:?}; calls {}; notices {}",
+            media.as_deref().unwrap_or("none"),
+            self.hub.mic_users,
+            self.hub.calls.len(),
+            self.hub.notices.len()
+        );
     }
 
     /// Watch the current defaults' volume and mute, keeping existing subscriptions whose endpoint
@@ -644,7 +715,9 @@ impl Tray {
     /// Explorer restarted: the strip, the progress bar and the thumbnail toolbar died with it.
     fn taskbar_restarted(&mut self) {
         self.strip = None;
-        taskbar::apply_at_restart(Current::read(&self.backend, &self.config).strip_icons());
+        if self.config.strip.enabled {
+            taskbar::apply_at_restart(Current::read(&self.backend, &self.config).strip_icons());
+        }
         if let Some(music) = self.music.as_ref() {
             music.taskbar_restarted();
         }
@@ -902,6 +975,29 @@ impl Current {
     }
 }
 
+/// The defaults and the active outputs, for the hub.
+fn read_endpoints(backend: &WasapiBackend) -> crate::hub::Endpoints {
+    let endpoint = |flow: Flow| -> Option<crate::hub::Endpoint> {
+        let id = backend.default_of(flow).ok().flatten()?;
+        let name = backend
+            .enumerate_flow(flow)
+            .ok()?
+            .into_iter()
+            .find(|d| d.id == id)
+            .map(|d| d.friendly_name)?;
+        let muted = backend.is_muted(&id).unwrap_or(false);
+        Some(crate::hub::Endpoint { id, name, muted })
+    };
+    crate::hub::Endpoints {
+        output: endpoint(Flow::Output),
+        input: endpoint(Flow::Input),
+        active_outputs: backend
+            .enumerate_flow(Flow::Output)
+            .map(|devices| devices.into_iter().map(|d| d.id).collect())
+            .unwrap_or_default(),
+    }
+}
+
 /// The glyphs for the current defaults.
 pub(crate) fn strip_icons(backend: &WasapiBackend, config: &Config) -> StripIcons {
     Current::read(backend, config).strip_icons()
@@ -939,6 +1035,8 @@ mod tests {
             WM_TRAY_CLICK,
             WM_ENDPOINT_VOLUME,
             WM_ICON_CHECK,
+            crate::hub::WM_HUB_EVENTS,
+            sessions::WM_SESSIONS_CHANGED,
             tap_proto::WM_TASKBAR_ACTION,
             tap_proto::WM_TASKBAR_RESTARTED,
             tap_proto::WM_TASKBAR_SCROLL,

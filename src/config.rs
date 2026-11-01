@@ -21,13 +21,78 @@ pub struct Config {
     /// What the taskbar buttons change in Windows' own tray — see [`crate::taskbar`]. Not called
     /// `[taskbar]`: a legacy section of that name may still sit in old files with other keys.
     pub strip: Strip,
+    /// The floating edge pill — see [`crate::pill`].
+    pub pill: Pill,
+    /// The Discord integration: a named pipe a Vencord plugin writes to.
+    pub discord: Discord,
+    /// The Teams integration: Teams' local third-party app API.
+    pub teams: Teams,
+    /// Twitch went-live notices.
+    pub twitch: Twitch,
 }
 
-/// Switches for each edit the taskbar integration makes to the shell. All on by default; turning
-/// one off is also the way to rule it out when the taskbar misbehaves.
+/// The floating pill on the screen's left edge.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Pill {
+    pub enabled: bool,
+    /// The red "is listening" alert when an app records outside a known call.
+    pub listening_alerts: bool,
+}
+
+impl Default for Pill {
+    fn default() -> Self {
+        Self { enabled: true, listening_alerts: true }
+    }
+}
+
+/// Audio Tray hosts `\\.\pipe\audio-tray`; the Vencord plugin in `integrations/vencord` connects.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Discord {
+    pub enabled: bool,
+}
+
+impl Default for Discord {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
+/// Teams' local API must also be turned on in Teams (Settings > Privacy > Manage API); the first
+/// connection asks for approval inside Teams, which then hands over the `token` kept here.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Teams {
+    pub enabled: bool,
+    pub token: Option<String>,
+}
+
+/// Needs a Twitch app's client id and a user token with `user:read:follows`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Twitch {
+    pub enabled: bool,
+    pub client_id: String,
+    pub token: String,
+    /// How often to ask which followed channels are live.
+    pub every_minutes: u64,
+}
+
+impl Default for Twitch {
+    fn default() -> Self {
+        Self { enabled: false, client_id: String::new(), token: String::new(), every_minutes: 3 }
+    }
+}
+
+/// Switches for each edit the taskbar integration makes to the shell. Injecting at all is opt-in
+/// (`enabled`); once on, every edit is on by default, and turning one off is also the way to rule
+/// it out when the taskbar misbehaves.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Strip {
+    /// Draw the buttons into the taskbar by injecting into Explorer. Off: a plain tray icon.
+    pub enabled: bool,
     /// Move the notification icons (our buttons among them) between the keyboard-layout indicator
     /// and wifi. Off: they stay where Windows puts them.
     pub next_to_wifi: bool,
@@ -42,6 +107,7 @@ pub struct Strip {
 impl Default for Strip {
     fn default() -> Self {
         Self {
+            enabled: false,
             next_to_wifi: true,
             hide_windows_volume: true,
             hide_windows_mic: true,

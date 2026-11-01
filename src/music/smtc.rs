@@ -192,7 +192,7 @@ impl Drop for Subscription {
 /// The SMTC session manager, requested once (it brokers to the shell) and held open.
 pub struct Smtc {
     manager: SessionManager,
-    covers: RefCell<CoverCache>,
+    covers: RefCell<[CoverCache; 2]>,
     /// Set by [`Smtc::watch`]; `None` for the one-shot dev readers.
     notify: Option<Notify>,
     sessions_changed: Option<i64>,
@@ -245,7 +245,9 @@ impl Smtc {
 
     /// The followed track's title, artist or cover changed: read the cover again next time.
     pub fn properties_changed(&self) {
-        self.covers.borrow_mut().stale = true;
+        for cache in self.covers.borrow_mut().iter_mut() {
+            cache.stale = true;
+        }
     }
 
     /// Every session, read in full. Expensive (a round-trip and artwork read each): `--music-probe` only.
@@ -264,9 +266,21 @@ impl Smtc {
 
     /// One poll's reading: one `GetSessions`, a cheap [`Brief`] per session, and a full read only of
     /// the session whose index `choose` returns.
+    #[cfg(feature = "dev")]
     pub fn read_current<F>(&self, choose: F) -> Result<Option<Reading>>
     where
         F: FnOnce(&[Brief]) -> Option<usize>,
+    {
+        let [reading, _] = self.read_pair(|briefs| [choose(briefs), None])?;
+        Ok(reading)
+    }
+
+    /// Like [`Smtc::read_current`] for two choices from one enumeration (the followed player, and
+    /// the session to show anywhere); a session chosen twice is read once. Each slot keeps its own
+    /// cover cache.
+    pub fn read_pair<F>(&self, choose: F) -> Result<[Option<Reading>; 2]>
+    where
+        F: FnOnce(&[Brief]) -> [Option<usize>; 2],
     {
         let sessions: Vec<Session> = self
             .manager
@@ -275,21 +289,25 @@ impl Smtc {
             .into_iter()
             .collect();
         let briefs: Vec<Brief> = sessions.iter().map(read_brief).collect();
-        let Some(index) = choose(&briefs) else {
-            return Ok(None);
+        let chosen = choose(&briefs);
+        let mut covers = self.covers.borrow_mut();
+        let mut read = |slot: usize, index: usize| -> Result<Reading> {
+            let session = sessions.get(index).context("chosen session is out of range")?;
+            let mut snapshot = Snapshot {
+                app_id: briefs[index].app_id.clone(),
+                status: briefs[index].status,
+                ..Default::default()
+            };
+            read_properties_into(session, &mut snapshot, Some(&mut covers[slot]));
+            Ok(Reading { snapshot, timeline: read_timeline(session) })
         };
-        let session = sessions.get(index).context("chosen session is out of range")?;
-
-        let mut snapshot = Snapshot {
-            app_id: briefs[index].app_id.clone(),
-            status: briefs[index].status,
-            ..Default::default()
+        let first = chosen[0].map(|index| read(0, index)).transpose()?;
+        let second = match (chosen[1], &first) {
+            (Some(index), Some(first)) if chosen[0] == Some(index) => Some(first.clone()),
+            (Some(index), _) => Some(read(1, index)?),
+            (None, _) => None,
         };
-        read_properties_into(session, &mut snapshot, Some(&mut self.covers.borrow_mut()));
-        Ok(Some(Reading {
-            snapshot,
-            timeline: read_timeline(session),
-        }))
+        Ok([first, second])
     }
 
     /// Send `command` to the session owned by `app_id` (never "the current session", which may be

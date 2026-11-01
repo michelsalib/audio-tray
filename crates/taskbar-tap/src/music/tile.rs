@@ -185,11 +185,13 @@ pub unsafe fn widen(diagnostics: &IXamlDiagnostics, border: InstanceHandle, host
     let layout = layout::layout();
     let content = layout.strip;
     // The Border gets the content width, pinned left; its ancestors get the ask (corner clearance).
-    // A cover alone stays centred, as an icon is, over the shell's own indicators.
+    // A cover alone is an icon: centred, in a button of the shell's own width (narrowed to the
+    // cover, the button clipped the panel that centres it, and the cover's right edge with it).
     set_width(diagnostics, border, f64::from(content));
-    if layout.shows_text() {
-        pin_left(diagnostics, border);
+    if !layout.shows_text() {
+        return;
     }
+    pin_left(diagnostics, border);
 
     let ask = host.ask(content);
     let mut handle = border;

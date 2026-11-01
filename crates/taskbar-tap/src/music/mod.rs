@@ -80,6 +80,14 @@ pub unsafe fn sweep(diagnostics: &IXamlDiagnostics) {
     // The thumbnail-toolbar buttons are wired by `crate::wire_transport`, not here (this runs behind
     // the mutation gate, too late for the first press).
 
+    // A new width (cover only <-> cover and text): the other layout's pins go, and the strip is
+    // drawn afresh, since the markup is laid out for one width (a cover-only tile kept the wide
+    // row, centred in its narrow box, and lost the cover's right edge).
+    if layout::take_resized() {
+        logf!("music: strip width now {}; drawing it afresh", layout::layout().strip);
+        tile::restore(diagnostics);
+        crate::lock(&PLACED).clear();
+    }
     // Drop records whose button XAML has removed.
     crate::lock(&PLACED).retain(|placed| crate::tree::type_of(placed.button).is_some());
     tile::prune_originals();
@@ -145,11 +153,7 @@ pub unsafe fn sweep(diagnostics: &IXamlDiagnostics) {
         return;
     }
 
-    // The other layout's pins (a bar spanning the plate, a cover pinned left) go first.
-    if layout::take_resized() {
-        logf!("music: strip width now {}; putting the old layout back", layout::layout().strip);
-        tile::restore(diagnostics);
-    }
+
     // Re-applied every sweep (the shell undoes them); each is a no-op when already ours.
     for (button, border) in drawn {
         if !crate::live() {

@@ -55,8 +55,10 @@ fn send(command: Command) {
 }
 
 /// Follow the meeting window while Teams holds the microphone (`in_meeting`), let it go after.
+/// An end is always delivered once the thread runs, even while a start is still looking for the
+/// window: queued behind it, it lets go of what that finds.
 pub fn meeting(in_meeting: bool) {
-    if in_meeting || ATTACHED.load(Ordering::SeqCst) {
+    if in_meeting || COMMANDS.get().is_some() {
         send(Command::Meeting(in_meeting));
     }
 }
@@ -71,11 +73,17 @@ pub fn set_mute(mute: Option<bool>) {
     send(Command::Mute(mute));
 }
 
-/// Whether the mic button's name means muted. Its id is fixed, its name localised: the names
-/// asking to unmute, in English, French and German.
-fn muted_from(name: &str) -> bool {
+/// What the mic button's name says: `Some(true)` muted, `Some(false)` heard, `None` a language we
+/// cannot read (English, French and German are known). Its id is fixed, its name localised.
+fn muted_from(name: &str) -> Option<bool> {
     let name = name.to_lowercase();
-    ["unmute", "réactiver", "rétablir", "aufheben"].iter().any(|word| name.contains(word))
+    if ["unmute", "réactiver", "rétablir", "aufheben"].iter().any(|word| name.contains(word)) {
+        Some(true)
+    } else if ["mute", "couper", "stumm"].iter().any(|word| name.contains(word)) {
+        Some(false)
+    } else {
+        None
+    }
 }
 
 /// The meeting's name, from the window title (`"Réunion avec … | Microsoft Teams"`).
@@ -106,7 +114,8 @@ struct Attached {
     button: IUIAutomationElement,
     handler: IUIAutomationPropertyChangedEventHandler,
     channel: Option<String>,
-    muted: bool,
+    /// `None` while the button's language is unknown: shown as heard, and only toggled.
+    muted: Option<bool>,
 }
 
 fn run(commands: Receiver<Command>) {
@@ -127,7 +136,7 @@ fn run(commands: Receiver<Command>) {
         match command {
             Command::Meeting(true) if attached.is_none() => match attach(&automation, &sender) {
                 Ok(found) => {
-                    println!("teams: following the meeting window's mic button ({})", if found.muted { "muted" } else { "live" });
+                    println!("teams: following the meeting window's mic button ({:?})", found.muted);
                     ATTACHED.store(true, Ordering::SeqCst);
                     crate::hub::emit(Event::Integration { name: NAME, connected: true });
                     emit(&found);
@@ -146,6 +155,9 @@ fn run(commands: Receiver<Command>) {
                 match unsafe { found.button.CurrentName() } {
                     Ok(name) => {
                         let muted = muted_from(&name.to_string());
+                        if muted.is_none() {
+                            println!("teams: the mic button says {name:?}, a language not known here");
+                        }
                         if muted != found.muted {
                             found.muted = muted;
                             emit(found);
@@ -161,8 +173,11 @@ fn run(commands: Receiver<Command>) {
             }
             Command::Mute(mute) => {
                 let Some(found) = attached.as_ref() else { continue };
-                if mute.is_some_and(|m| m == found.muted) {
-                    continue;
+                // Pressing toggles: an explicit mute needs the state read, else it could unmute.
+                match (mute, found.muted) {
+                    (Some(wanted), Some(now)) if wanted == now => continue,
+                    (Some(_), None) => continue,
+                    _ => {}
                 }
                 let pressed = unsafe { found.button.GetCurrentPatternAs::<IUIAutomationInvokePattern>(UIA_InvokePatternId) }
                     .and_then(|invoke| unsafe { invoke.Invoke() });
@@ -175,7 +190,7 @@ fn run(commands: Receiver<Command>) {
 }
 
 fn emit(found: &Attached) {
-    let call = Call { channel: found.channel.clone(), self_muted: found.muted, icon: icon(), ..Default::default() };
+    let call = Call { channel: found.channel.clone(), self_muted: found.muted == Some(true), icon: icon(), ..Default::default() };
     crate::hub::emit(Event::Call { app: VoiceApp::Teams, call: Some(call) });
 }
 
@@ -279,10 +294,11 @@ mod tests {
 
     #[test]
     fn the_mic_buttons_name_says_whether_muted() {
-        assert!(!muted_from("Couper le micro"));
-        assert!(muted_from("Réactiver le micro"));
-        assert!(!muted_from("Mute mic"));
-        assert!(muted_from("Unmute mic"));
+        assert_eq!(muted_from("Couper le micro"), Some(false));
+        assert_eq!(muted_from("Réactiver le micro"), Some(true));
+        assert_eq!(muted_from("Mute mic"), Some(false));
+        assert_eq!(muted_from("Unmute mic"), Some(true));
+        assert_eq!(muted_from("Silenciar micrófono"), None, "unknown: never acted on");
     }
 
     #[test]

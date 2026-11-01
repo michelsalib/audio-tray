@@ -608,14 +608,9 @@ impl Tray {
     fn fold_events(&mut self) {
         let mut changed = false;
         for event in crate::hub::take() {
-            // Teams on the microphone means a meeting: the moment to (re)connect its integration.
+            // Teams on the microphone means a meeting: the moment to connect its integration.
             if let crate::hub::Event::MicUsers(users) = &event {
-                let teams = users.iter().any(|u| crate::hub::names::app_name(u) == "Teams");
-                if teams {
-                    crate::integrations::poke_teams();
-                }
-                // Without its API, Teams is followed through the meeting window while it has the mic.
-                crate::integrations::teams_meeting(teams);
+                crate::integrations::teams_on_mic(users.iter().any(|u| crate::hub::names::app_name(u) == "Teams"));
                 if users.iter().any(|u| crate::hub::names::app_name(u) == "Discord") {
                     crate::integrations::discord_rpc::poke();
                 }

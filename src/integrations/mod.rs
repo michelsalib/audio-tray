@@ -10,8 +10,9 @@ pub mod pipe;
 pub mod teams;
 pub mod teams_ui;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::sync::Mutex;
 
 use crate::config::Config;
 use crate::hub::VoiceApp;
@@ -22,7 +23,16 @@ thread_local! {
     static BROWSER_COMMANDS: RefCell<Option<Rc<RefCell<pipe::Server<browser::Commands>>>>> = const { RefCell::new(None) };
     static TEAMS: RefCell<Option<Rc<RefCell<teams::Client>>>> = const { RefCell::new(None) };
     static TEAMS_TOKEN: RefCell<Option<Option<String>>> = const { RefCell::new(None) };
+    /// Whether Teams holds the microphone (a meeting), as the tray last said.
+    static TEAMS_ON_MIC: Cell<bool> = const { Cell::new(false) };
+    /// A connection attempt is out on its worker thread.
+    static TEAMS_CONNECTING: Cell<bool> = const { Cell::new(false) };
+    /// Signalled by the worker when its attempt is done (created and registered once).
+    static TEAMS_DONE: Cell<Option<isize>> = const { Cell::new(None) };
 }
+
+/// The worker's outcome, collected on the tray thread when [`TEAMS_DONE`] fires.
+static TEAMS_ATTEMPT: Mutex<Option<tungstenite::WebSocket<std::net::TcpStream>>> = Mutex::new(None);
 
 /// Start what config turns on. Tray thread, before [`crate::wait::run`].
 pub fn start(config: &Config) {
@@ -90,6 +100,7 @@ pub fn reconfigure(old: &Config, new: &Config) {
         if new.teams.enabled {
             TEAMS_TOKEN.with(|t| *t.borrow_mut() = Some(new.teams.token.clone()));
             connect_teams();
+            follow_teams_window();
         } else {
             TEAMS_TOKEN.with(|t| *t.borrow_mut() = None);
             TEAMS.with(|t| {
@@ -100,7 +111,7 @@ pub fn reconfigure(old: &Config, new: &Config) {
             crate::hub::emit(crate::hub::Event::Call { app: VoiceApp::Teams, call: None });
             crate::hub::emit(crate::hub::Event::Integration { name: "Teams", connected: false });
             crate::hub::emit(crate::hub::Event::IntegrationProblem { name: "Teams", problem: None });
-            teams_ui::meeting(false);
+            follow_teams_window();
         }
     }
     if old.browser.enabled != new.browser.enabled {
@@ -136,8 +147,8 @@ pub fn stop() {
         }
     });
 }
-/// Try Teams again: called when Teams takes the microphone, since a meeting is starting. A no-op
-/// when it is off or already connected.
+/// Try Teams again (Settings opened its connectors): a no-op when it is off, connected, or an
+/// attempt is already out.
 pub fn poke_teams() {
     let enabled = TEAMS_TOKEN.with(|t| t.borrow().is_some());
     if enabled && TEAMS.with(|t| t.borrow().is_none()) {
@@ -145,12 +156,25 @@ pub fn poke_teams() {
     }
 }
 
-/// Teams took the microphone (`true`) or let it go: without its local API, follow the meeting
-/// window instead (when Teams is on in config).
-pub fn teams_meeting(in_meeting: bool) {
+/// Whether Teams holds the microphone, on each change of the microphone's users. Taking it starts
+/// a meeting: the moment to connect to its API; either way, the meeting window is followed while
+/// there is no API.
+pub fn teams_on_mic(on: bool) {
+    let was = TEAMS_ON_MIC.with(|m| m.replace(on));
+    if on && !was {
+        poke_teams();
+    }
+    if on != was {
+        follow_teams_window();
+    }
+}
+
+/// Follow Teams' meeting window exactly while Teams has the microphone, is on in config, and its
+/// API is not connected. Re-checked whenever one of those changes.
+fn follow_teams_window() {
     let enabled = TEAMS_TOKEN.with(|t| t.borrow().is_some());
     let api = TEAMS.with(|t| t.borrow().is_some());
-    teams_ui::meeting(in_meeting && enabled && !api);
+    teams_ui::meeting(TEAMS_ON_MIC.with(Cell::get) && enabled && !api);
 }
 
 /// Teams handed over a new token.
@@ -158,30 +182,76 @@ pub fn teams_token(token: String) {
     TEAMS_TOKEN.with(|t| *t.borrow_mut() = Some(Some(token)));
 }
 
+/// Start a connection attempt on a worker thread; [`teams_attempted`] picks it up on the tray
+/// thread. Connecting blocks (a refused or filtered port costs the whole timeout), which the tray
+/// thread, pumping the pill and the flyout, must never do.
 fn connect_teams() {
-    let token = TEAMS_TOKEN.with(|t| t.borrow().clone().flatten());
-    match teams::connect(token.as_deref()) {
-        Ok(client) => {
-            let event = client.event();
-            let client = Rc::new(RefCell::new(client));
-            let served = Rc::clone(&client);
-            crate::hub::emit(crate::hub::Event::IntegrationProblem { name: "Teams", problem: None });
-            crate::wait::register(event, move || {
-                if !served.borrow_mut().signalled() {
-                    let event = served.borrow().event();
-                    crate::wait::unregister(event);
-                    TEAMS.with(|t| *t.borrow_mut() = None);
-                }
-            });
-            TEAMS.with(|t| *t.borrow_mut() = Some(client));
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::System::Threading::{CreateEventW, SetEvent};
+
+    if TEAMS_CONNECTING.with(|c| c.replace(true)) {
+        return;
+    }
+    let done = match TEAMS_DONE.with(Cell::get) {
+        Some(done) => done,
+        None => {
+            let Ok(event) = (unsafe { CreateEventW(None, false, false, None) }) else {
+                TEAMS_CONNECTING.with(|c| c.set(false));
+                return;
+            };
+            crate::wait::register(event, teams_attempted);
+            TEAMS_DONE.with(|d| d.set(Some(event.0 as isize)));
+            event.0 as isize
         }
-        Err(e) => {
-            println!("teams: not connected ({e:#})");
-            // Nothing listening while Teams runs: its API is off, or an admin removed the switch.
-            let problem = teams::running().then_some("API blocked: follows meetings");
-            crate::hub::emit(crate::hub::Event::IntegrationProblem { name: "Teams", problem });
+    };
+    let token = TEAMS_TOKEN.with(|t| t.borrow().clone().flatten());
+    let _ = std::thread::Builder::new().name("teams-connect".into()).spawn(move || {
+        match teams::handshake(token.as_deref()) {
+            Ok(socket) => *TEAMS_ATTEMPT.lock().unwrap_or_else(|p| p.into_inner()) = Some(socket),
+            Err(e) => {
+                println!("teams: not connected ({e:#})");
+                // Nothing listening while Teams runs: its API is off, or an admin removed the switch.
+                let problem = teams::running().then_some(TEAMS_API_BLOCKED);
+                crate::hub::emit(crate::hub::Event::IntegrationProblem { name: "Teams", problem });
+            }
+        }
+        unsafe {
+            let _ = SetEvent(HANDLE(done as *mut core::ffi::c_void));
+        }
+    });
+}
+
+/// Settings' status when Teams runs but its API does not answer.
+const TEAMS_API_BLOCKED: &str = "API off: uses the meeting window";
+
+/// A connection attempt finished (tray thread): serve the socket it opened, if Teams is still
+/// wanted, and settle whether the meeting window is followed instead.
+fn teams_attempted() {
+    TEAMS_CONNECTING.with(|c| c.set(false));
+    let socket = TEAMS_ATTEMPT.lock().unwrap_or_else(|p| p.into_inner()).take();
+    let token = TEAMS_TOKEN.with(|t| t.borrow().clone());
+    if let (Some(socket), Some(token)) = (socket, token) {
+        match teams::client(socket, token.is_some()) {
+            Ok(client) => {
+                let event = client.event();
+                let client = Rc::new(RefCell::new(client));
+                let served = Rc::clone(&client);
+                crate::hub::emit(crate::hub::Event::IntegrationProblem { name: "Teams", problem: None });
+                crate::wait::register(event, move || {
+                    if !served.borrow_mut().signalled() {
+                        let event = served.borrow().event();
+                        crate::wait::unregister(event);
+                        TEAMS.with(|t| *t.borrow_mut() = None);
+                        // Mid-meeting, the meeting window takes over.
+                        follow_teams_window();
+                    }
+                });
+                TEAMS.with(|t| *t.borrow_mut() = Some(client));
+            }
+            Err(e) => eprintln!("teams: could not serve the connection ({e:#})"),
         }
     }
+    follow_teams_window();
 }
 
 /// Toggle the user's mute in a voice app.

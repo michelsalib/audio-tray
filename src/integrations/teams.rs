@@ -70,8 +70,9 @@ pub struct Client {
     asked: bool,
 }
 
-/// Connect, with the saved token when there is one. Fails fast when Teams is not listening.
-pub fn connect(token: Option<&str>) -> Result<Client> {
+/// The blocking half of connecting: TCP and the WebSocket handshake, with the saved token when
+/// there is one. Off the tray thread (a refused or filtered port costs the whole timeout).
+pub fn handshake(token: Option<&str>) -> Result<WebSocket<TcpStream>> {
     let address = std::net::SocketAddr::from(([127, 0, 0, 1], PORT));
     let stream = TcpStream::connect_timeout(&address, Duration::from_millis(300)).context("Teams is not listening")?;
     stream.set_read_timeout(Some(Duration::from_secs(2)))?;
@@ -81,6 +82,12 @@ pub fn connect(token: Option<&str>) -> Result<Client> {
         token.unwrap_or("")
     );
     let (socket, _) = tungstenite::client(url.as_str(), stream).map_err(|e| anyhow::anyhow!("WebSocket handshake: {e}"))?;
+    Ok(socket)
+}
+
+/// The tray-thread half: drive a handshaken `socket` from an event the tray waits on. `paired`:
+/// it was opened with a token.
+pub fn client(socket: WebSocket<TcpStream>, paired: bool) -> Result<Client> {
     // From here every read is driven by the event; WSAEventSelect makes the socket non-blocking.
     let event = unsafe { WSACreateEvent() }.context("WSACreateEvent")?;
     let raw = SOCKET(socket.get_ref().as_raw_socket() as usize);
@@ -92,7 +99,7 @@ pub fn connect(token: Option<&str>) -> Result<Client> {
     }
     println!("teams: connected");
     crate::hub::emit(Event::Integration { name: NAME, connected: true });
-    let mut client = Client { socket, event, in_meeting: false, request: 0, paired: token.is_some(), asked: false };
+    let mut client = Client { socket, event, in_meeting: false, request: 0, paired, asked: false };
     // The meeting as it is now; unpaired and in a meeting, this also asks to pair.
     client.action("query-meeting-state");
     client.asked = !client.paired;

@@ -304,7 +304,7 @@ pub unsafe fn update_in_place(
     }
 
     if shown.cover != next.cover {
-        let markup = layout::cover_markup(next, l.cover, l.gap);
+        let markup = layout::cover_markup(next, l.cover, l.cover_gap());
         let mut wrote = false;
         for node in crate::tree::find_by_name(layout::COVER_HOST) {
             wrote |= set_child(diagnostics, node, &markup);

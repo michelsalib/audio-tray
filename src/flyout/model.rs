@@ -63,6 +63,30 @@ pub(super) struct Voice {
     pub muted: bool,
 }
 
+/// The settings screen's values, copied from the config when the panel opens.
+#[derive(Clone, Copy, Default)]
+pub(super) struct Settings {
+    pub tile: crate::config::TileStyle,
+    pub buttons: bool,
+    pub pill: bool,
+    pub devices: bool,
+    pub compact: bool,
+    pub alerts: bool,
+}
+
+impl Settings {
+    pub(super) fn of(config: &Config) -> Self {
+        Self {
+            tile: config.music.tile_style,
+            buttons: config.strip.enabled,
+            pill: config.pill.enabled,
+            devices: config.pill.devices,
+            compact: config.pill.compact,
+            alerts: config.pill.listening_alerts,
+        }
+    }
+}
+
 /// Everything the flyout paints, plus the outcome flags the caller reads back when it
 /// closes. No live audio handles — see the module docs.
 pub(super) struct Model {
@@ -72,6 +96,7 @@ pub(super) struct Model {
     pub now_playing: Vec<NowPlaying>,
     pub apps: Vec<AppRow>,
     pub voice: Option<Voice>,
+    pub settings: Settings,
     pub view: View, // which screen is shown (main panel / an icon picker)
     pub update: Option<String>, // staged update's version, if any → the footer's restart button
     pub notice: Option<&'static str>, // taskbar integration trouble, one line above the footer
@@ -79,6 +104,7 @@ pub(super) struct Model {
     pub config_changed: bool,
     pub quit: bool,
     pub restart: bool,
+    pub taskbar_changed: bool,
 }
 
 impl Model {
@@ -88,6 +114,7 @@ impl Model {
             now_playing: Vec::new(),
             apps: Vec::new(),
             voice: None,
+            settings: Settings::default(),
             groups,
             view: View::Main,
             update,
@@ -95,6 +122,7 @@ impl Model {
             config_changed: false,
             quit: false,
             restart: false,
+            taskbar_changed: false,
         }
     }
 }

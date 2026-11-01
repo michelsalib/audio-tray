@@ -41,6 +41,21 @@ pub struct Layout {
 }
 
 impl Layout {
+    /// Whether there is room for the title and artist at all: the app asks for a cover-only tile
+    /// (`strip=` just wider than the cover), and then the text column and its gap go.
+    pub fn shows_text(&self) -> bool {
+        self.text >= 16
+    }
+
+    /// The gap after the cover: none without text.
+    pub fn cover_gap(&self) -> u32 {
+        if self.shows_text() {
+            self.gap
+        } else {
+            0
+        }
+    }
+
     /// Fit the strip's parts into `strip` epx: fixed parts sized by the room available, the rest
     /// to the text column (the one part that degrades gracefully, by scrolling).
     pub fn for_width(strip: u32) -> Self {
@@ -131,13 +146,14 @@ pub fn now_playing_markup(strip: &super::state::Strip) -> String {
     // Own `Border` so a track change replaces just this (`super::tile::update_cover`).
     let cover = format!(
         r#"<Border x:Name="{COVER_HOST}">{}</Border>"#,
-        cover_markup(strip, l.cover, l.gap)
+        cover_markup(strip, l.cover, l.cover_gap())
     );
 
     // Fixed width (not `MaxWidth`) so the layout never moves with the content. The `Clip` is
     // needed because XAML panels do not clip children; overflow is scrolled by `super::ticker`.
     let text = format!(
-        r#"<Border Width="{text_px}" Height="{TEXT_HEIGHT}" Margin="0,0,2,0" Background="Transparent">
+        r#"<Border Width="{text_px}" Height="{TEXT_HEIGHT}" Margin="0,0,2,0" Background="Transparent"
+                   Visibility="{text_visibility}">
              <Border.Clip>
                <RectangleGeometry Rect="0,0,{text_px},{TEXT_HEIGHT}"/>
              </Border.Clip>
@@ -152,6 +168,7 @@ pub fn now_playing_markup(strip: &super::state::Strip) -> String {
              </StackPanel>
            </Border>"#,
         text_px = l.text,
+        text_visibility = if l.shows_text() { "Visible" } else { "Collapsed" },
         title = escape(&super::ticker::window(strip.display_title(), l.title_chars, 0)),
         artist = escape(&super::ticker::window(strip.display_artist(), l.artist_chars, 0)),
     );
@@ -192,6 +209,15 @@ mod tests {
 
     /// A width too small for the roomy branch, which still has to lay out rather than underflow.
     const CRAMPED: u32 = 100;
+
+    #[test]
+    fn a_cover_only_width_drops_the_text_and_its_gap() {
+        let l = Layout::for_width(28);
+        assert!(!l.shows_text());
+        assert_eq!(l.cover_gap(), 0);
+        assert_eq!(2 * l.pad + l.cover, 28, "the cover fills the tile");
+        assert!(Layout::for_width(STRIP_WIDTH).shows_text());
+    }
 
     #[test]
     fn a_cramped_width_takes_the_smaller_fixed_parts() {

@@ -291,10 +291,17 @@ const PILL_ALPHA: &str = "80";
 fn init_data(icons: StripIcons, owner_pid: u32) -> String {
     let [r, g, b] = crate::flyout::theme::accent_rgb();
     let config = crate::config::Config::load();
-    let tile = if config.music.enabled { config.music.tile } else { String::new() };
+    let buttons = config.strip.enabled;
+    BUTTONS_WANTED.store(buttons, std::sync::atomic::Ordering::SeqCst);
+    let tile = if config.tile_shown() { config.music.tile.clone() } else { String::new() };
+    // A cover-only tile: just the cover's width (the TAP drops the text column and its gap).
+    let strip = match config.music.tile_style {
+        crate::config::TileStyle::Cover => COVER_ONLY_WIDTH.to_string(),
+        _ => String::new(),
+    };
     let tap = tap_path().map(|path| path.display().to_string()).unwrap_or_default();
     let flag = |on: bool| u8::from(on).to_string();
-    tap_proto::encode_init([
+    let pairs = [
         ("tooltip", crate::tray::TRAY_MARKER.to_string()),
         ("out", format!("{:04X}", icons.output as u32)),
         ("in", format!("{:04X}", icons.input as u32)),
@@ -303,16 +310,47 @@ fn init_data(icons: StripIcons, owner_pid: u32) -> String {
         ("inrec", flag(icons.input_recording)),
         ("accent", format!("{r:02X}{g:02X}{b:02X}")),
         ("alpha", PILL_ALPHA.to_string()),
-        ("hidevolume", flag(config.strip.hide_windows_volume)),
-        ("hidemic", flag(config.strip.hide_windows_mic)),
-        ("reorder", flag(config.strip.next_to_wifi)),
+        // Windows' own icons are only hidden, and the tray only reordered, for our buttons.
+        ("hidevolume", flag(buttons && config.strip.hide_windows_volume)),
+        ("hidemic", flag(buttons && config.strip.hide_windows_mic)),
+        ("reorder", flag(buttons && config.strip.next_to_wifi)),
         ("tile", tile),
         ("pid", owner_pid.to_string()),
         ("ver", env!("CARGO_PKG_VERSION").to_string()),
         ("proto", tap_proto::PROTOCOL.to_string()),
         ("tap", tap),
         ("hwnd", RECEIVER.load(std::sync::atomic::Ordering::SeqCst).to_string()),
-    ])
+    ];
+    // Only when they differ from the TAP's defaults (buttons on, the full tile width): the
+    // initialization data arrives empty past roughly 256 characters, so every key costs.
+    let mut pairs = pairs.to_vec();
+    if !buttons {
+        pairs.push(("buttons", "0".to_string()));
+    }
+    if !strip.is_empty() {
+        pairs.push(("strip", strip));
+    }
+    let data = tap_proto::encode_init(pairs);
+    if data.len() > INIT_DATA_BUDGET {
+        eprintln!("taskbar: the TAP's init data is {} characters; past {INIT_DATA_BUDGET} it may arrive empty", data.len());
+    }
+    data
+}
+
+/// Where `InitializeXamlDiagnosticsEx`'s initialization data stops arriving: measured on
+/// 26300, a 256-character payload came through and a 273-character one arrived as "".
+const INIT_DATA_BUDGET: usize = 256;
+
+/// The music tile's content width for [`crate::config::TileStyle::Cover`]: the cover and its pad.
+const COVER_ONLY_WIDTH: u32 = 28;
+
+/// Whether the last injection asked for the audio buttons (`buttons=`).
+static BUTTONS_WANTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Whether our audio buttons are on the taskbar: injected, and asked for. With only the music
+/// tile, the notification icon is the plain one and its clicks are ours again.
+pub fn buttons_up() -> bool {
+    strip_is_up() && BUTTONS_WANTED.load(std::sync::atomic::Ordering::SeqCst)
 }
 
 /// Our receiver window, for the `hwnd=` key. Set by [`create_receiver`].

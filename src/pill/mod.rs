@@ -24,6 +24,7 @@ use anyhow::{Context, Result};
 use windows::core::w;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::DirectComposition::{IDCompositionAnimation, IDCompositionVisual2};
+use windows::Win32::Graphics::Gdi::ScreenToClient;
 use windows::Win32::Media::Audio::Endpoints::IAudioMeterInformation;
 use windows::Win32::UI::Input::KeyboardAndMouse::{TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT};
 use windows::Win32::UI::Shell::{
@@ -34,7 +35,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     DefWindowProcW, GetCursorPos, GetWindowLongPtrW, GetWindowRect, KillTimer, SetLayeredWindowAttributes,
     SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, GWL_EXSTYLE, HWND_TOPMOST, LWA_ALPHA, MA_NOACTIVATE,
     SWP_NOACTIVATE, SWP_SHOWWINDOW, SW_HIDE, WM_APP, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_LBUTTONUP,
-    WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_RBUTTONUP, WM_SETTINGCHANGE, WM_TIMER, WS_EX_LAYERED,
+    WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_MOUSEWHEEL, WHEEL_DELTA, WM_RBUTTONUP, WM_SETTINGCHANGE, WM_TIMER, WS_EX_LAYERED,
     WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT,
 };
 
@@ -54,6 +55,10 @@ pub enum Action {
     Unmute(Option<VoiceApp>),
     /// Mute the default microphone (the "is listening" alert).
     MuteMicrophone,
+    /// Switch this flow to its next device, as the taskbar button's click does.
+    CycleDevice(crate::audio::Flow),
+    /// Change this flow's volume by so many wheel notches.
+    Volume(crate::audio::Flow, f32),
     Acknowledge(crate::hub::Notice),
 }
 
@@ -74,6 +79,38 @@ const QUIET_TICKS: u32 = 15;
 /// The hover strip's height, centred on the pill's place.
 const EDGE_H: f32 = 160.0;
 const SLIDE_SECONDS: f64 = 0.2;
+const GROW_SECONDS: f64 = 0.18;
+/// One beat of the speaking pulse.
+const PULSE_SECONDS: f64 = 1.1;
+
+/// How a new scene arrives.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Entrance {
+    /// Content changed in place (a track, a mute): no movement.
+    None,
+    /// Another state: slides in from the edge.
+    Slide,
+    /// The same state changed shape (the card opened, a disc or the devices came): unfolds.
+    Grow,
+}
+
+/// How `next` should arrive after `shown`.
+fn entrance(shown: &View, next: &View) -> Entrance {
+    if std::mem::discriminant(shown) != std::mem::discriminant(next) || matches!(next, View::Banner { .. }) {
+        return Entrance::Slide;
+    }
+    let shape = |view: &View| match view {
+        View::Idle { devices } => (0, devices.is_some(), false),
+        View::Music { media, card, devices } => (media.len(), devices.is_some(), *card),
+        View::Call { members, .. } => (members.len(), false, false),
+        _ => (0, false, false),
+    };
+    if shape(shown) != shape(next) {
+        Entrance::Grow
+    } else {
+        Entrance::None
+    }
+}
 
 thread_local! {
     static PILL: RefCell<Option<Pill>> = const { RefCell::new(None) };
@@ -123,7 +160,14 @@ pub fn create(config: &crate::config::Pill) -> Result<()> {
         edge,
         gfx: None,
         view: View::Hidden,
-        inputs: Inputs { enabled: config.enabled, listening_alerts: config.listening_alerts, fullscreen: fullscreen_now(), ..Default::default() },
+        inputs: Inputs {
+            enabled: config.enabled,
+            listening_alerts: config.listening_alerts,
+            devices: config.devices,
+            compact: config.compact,
+            fullscreen: fullscreen_now(),
+            ..Default::default()
+        },
         hits: Vec::new(),
         _visuals: Vec::new(),
         meter: None,
@@ -151,6 +195,8 @@ pub fn configure(config: &crate::config::Pill) {
     with_pill(|pill| {
         pill.inputs.enabled = config.enabled;
         pill.inputs.listening_alerts = config.listening_alerts;
+        pill.inputs.devices = config.devices;
+        pill.inputs.compact = config.compact;
         pill.refresh();
     });
 }
@@ -222,7 +268,7 @@ impl Pill {
         let mut next = view::decide(&state, self.inputs);
         // While the card is open its rows stay put: one whose session went away (a tab closed,
         // a player reset on pause) stays, paused, rather than slide the next under the pointer.
-        if let (View::Music { media: new, card: true }, View::Music { media: old, card: true }) = (&mut next, &self.view) {
+        if let (View::Music { media: new, card: true, .. }, View::Music { media: old, card: true, .. }) = (&mut next, &self.view) {
             let mut kept: Vec<crate::hub::Media> = old
                 .iter()
                 .map(|o| new.iter().find(|n| n.app_id == o.app_id).cloned().unwrap_or_else(|| crate::hub::Media { playing: false, ..o.clone() }))
@@ -234,8 +280,8 @@ impl Pill {
         if next == self.view && self.gfx.is_some() && self.hoverable(&next) == self.edge_up {
             return;
         }
-        let slide = std::mem::discriminant(&next) != std::mem::discriminant(&self.view) || matches!(next, View::Banner { .. });
-        if let Err(e) = self.show(&next, slide) {
+        let entrance = entrance(&self.view, &next);
+        if let Err(e) = self.show(&next, entrance) {
             eprintln!("pill: could not draw ({e:#}); rebuilding the graphics next time");
             self.gfx = None;
         }
@@ -243,7 +289,7 @@ impl Pill {
     }
 
     /// Paint and place `view`; `slide` animates it in from the edge.
-    fn show(&mut self, view: &View, slide: bool) -> Result<()> {
+    fn show(&mut self, view: &View, entrance: Entrance) -> Result<()> {
         let (scale, work) = crate::win::monitor_at(POINT { x: 0, y: 0 });
         if self.gfx.as_ref().is_none_or(|gfx| gfx.scale != scale) {
             self.gfx = Some(Gfx::new(self.hwnd, scale)?);
@@ -259,7 +305,7 @@ impl Pill {
             self.edge_up = false;
             return Ok(());
         };
-        let visuals = self.compose(gfx, &scene, slide)?;
+        let visuals = self.compose(gfx, &scene, entrance)?;
         let px = |v: f32| (v * scale).round() as i32;
         let (w, h) = (px(scene.w), px(scene.h));
         let x = work.left;
@@ -282,9 +328,10 @@ impl Pill {
         Ok(())
     }
 
-    /// Hang the scene under the root: its content, the ring's two rotating halves, and the
-    /// slide-in. Returns the visuals to keep alive.
-    fn compose(&self, gfx: &Gfx, scene: &Scene, slide: bool) -> Result<Vec<IDCompositionVisual2>> {
+    /// Hang the scene under the root: its content, the ring's two rotating halves, the speaking
+    /// pulses, and the entrance. Returns the visuals to keep alive. Every movement is a
+    /// compositor animation set here once.
+    fn compose(&self, gfx: &Gfx, scene: &Scene, entrance: Entrance) -> Result<Vec<IDCompositionVisual2>> {
         unsafe {
             gfx.root.RemoveAllVisuals()?;
             let holder = gfx.dcomp.CreateVisual()?;
@@ -293,28 +340,50 @@ impl Pill {
             for &ring in &scene.rings {
                 keep.extend(ring_visuals(gfx, &holder, ring)?);
             }
-            gfx.root.AddVisual(&holder, false, None)?;
-            if slide {
-                // From just off the edge to its place, easing out.
-                let offset = gfx.dcomp.CreateAnimation()?;
-                let from = -scene.w * gfx.scale;
-                ease_out(&offset, from, 0.0, SLIDE_SECONDS)?;
-                holder.SetOffsetX(&offset)?;
-                let fade = gfx.dcomp.CreateAnimation()?;
-                fade.AddCubic(0.0, 0.0, (1.0 / SLIDE_SECONDS) as f32, 0.0, 0.0)?;
-                fade.End(SLIDE_SECONDS, 1.0)?;
-                let effect = gfx.dcomp.CreateEffectGroup()?;
-                effect.SetOpacity(&fade)?;
-                holder.SetEffect(&effect)?;
+            for &pulse in &scene.pulses {
+                keep.push(pulse_visual(gfx, &holder, pulse)?);
             }
+            gfx.root.AddVisual(&holder, false, None)?;
+            let fade_from = match entrance {
+                Entrance::None => return Ok(keep),
+                Entrance::Slide => {
+                    // From just off the edge to its place, easing out.
+                    let offset = gfx.dcomp.CreateAnimation()?;
+                    ease_out(&offset, -scene.w * gfx.scale, 0.0, SLIDE_SECONDS)?;
+                    holder.SetOffsetX(&offset)?;
+                    0.0
+                }
+                Entrance::Grow => {
+                    // Unfolds from the edge: a slight scale up from the left middle.
+                    let scale = gfx.dcomp.CreateScaleTransform()?;
+                    scale.SetCenterX2(0.0)?;
+                    scale.SetCenterY2(scene.h * gfx.scale / 2.0)?;
+                    let grow = gfx.dcomp.CreateAnimation()?;
+                    ease_out(&grow, 0.9, 1.0, GROW_SECONDS)?;
+                    scale.SetScaleX(&grow)?;
+                    scale.SetScaleY(&grow)?;
+                    holder.SetTransform(&scale)?;
+                    0.35
+                }
+            };
+            let seconds = if entrance == Entrance::Slide { SLIDE_SECONDS } else { GROW_SECONDS };
+            let fade = gfx.dcomp.CreateAnimation()?;
+            ease_out(&fade, fade_from, 1.0, seconds)?;
+            let effect = gfx.dcomp.CreateEffectGroup()?;
+            effect.SetOpacity(&fade)?;
+            holder.SetEffect(&effect)?;
             Ok(keep)
         }
     }
 
-    /// Whether the hover strip is up: on the music pill, and on the sliver while some media is
-    /// paused (hovering opens its card to resume it).
+    /// Whether the hover strip is up: on the music pill, on the sliver while some media is paused
+    /// (hovering opens its card to resume it), and always in compact mode.
     fn hoverable(&self, view: &View) -> bool {
-        matches!(view, View::Music { .. }) || (matches!(view, View::Idle) && !self.last.all_media().is_empty())
+        match view {
+            View::Music { .. } => true,
+            View::Idle { .. } => self.inputs.compact || !self.last.all_media().is_empty(),
+            _ => false,
+        }
     }
 
     /// Start or stop the 10 Hz microphone meter: it runs only while muted in a call.
@@ -362,11 +431,17 @@ impl Pill {
         }
     }
 
-    fn click(&mut self, x: i32, y: i32, right: bool) {
+    /// What is under client pixel `(x, y)`.
+    fn hit_at(&self, x: i32, y: i32) -> Option<Hit> {
         let scale = self.gfx.as_ref().map_or(1.0, |g| g.scale);
         let (x, y) = (x as f32 / scale, y as f32 / scale);
-        let hit = self.hits.iter().find(|([hx, hy, hw, hh], _)| x >= *hx && x < hx + hw && y >= *hy && y < hy + hh).map(|(_, hit)| *hit);
+        self.hits.iter().find(|([hx, hy, hw, hh], _)| x >= *hx && x < hx + hw && y >= *hy && y < hy + hh).map(|(_, hit)| *hit)
+    }
+
+    fn click(&mut self, x: i32, y: i32, right: bool) {
+        let hit = self.hit_at(x, y);
         match (&self.view, hit) {
+            (_, Some(Hit::Device(flow))) => act(Action::CycleDevice(flow)),
             (View::Music { media, .. }, Some(Hit::Media(i, command))) => {
                 if let Some(m) = media.get(i) {
                     act(Action::Media(m.app_id.clone(), command));
@@ -432,6 +507,38 @@ fn ring_visuals(gfx: &Gfx, holder: &IDCompositionVisual2, ring: Ring) -> Result<
         keep.push(half);
     }
     Ok(keep)
+}
+
+/// A green ring around a speaking face that swells and fades, over and over: one animation set
+/// once, repeated by DWM forever.
+fn pulse_visual(gfx: &Gfx, holder: &IDCompositionVisual2, pulse: draw::Pulse) -> Result<IDCompositionVisual2> {
+    const SWELL: f32 = 1.45;
+    let reach = pulse.r * SWELL + 2.0;
+    let size = 2.0 * reach;
+    let (visual, _) = gfx.painted(size, size, |p| p.ring(reach, reach, pulse.r, 2.0, draw::PULSE))?;
+    let scale = gfx.scale;
+    unsafe {
+        visual.SetOffsetX2((pulse.cx - reach) * scale)?;
+        visual.SetOffsetY2((pulse.cy - reach) * scale)?;
+        let grow = gfx.dcomp.CreateScaleTransform()?;
+        grow.SetCenterX2(reach * scale)?;
+        grow.SetCenterY2(reach * scale)?;
+        let swell = gfx.dcomp.CreateAnimation()?;
+        swell.AddCubic(0.0, 1.0, ((SWELL - 1.0) as f64 / PULSE_SECONDS) as f32, 0.0, 0.0)?;
+        swell.AddRepeat(PULSE_SECONDS, PULSE_SECONDS)?;
+        grow.SetScaleX(&swell)?;
+        grow.SetScaleY(&swell)?;
+        visual.SetTransform(&grow)?;
+        let fade = gfx.dcomp.CreateAnimation()?;
+        fade.AddCubic(0.0, 0.9, (-0.9 / PULSE_SECONDS) as f32, 0.0, 0.0)?;
+        fade.AddRepeat(PULSE_SECONDS, PULSE_SECONDS)?;
+        let effect = gfx.dcomp.CreateEffectGroup()?;
+        effect.SetOpacity(&fade)?;
+        visual.SetEffect(&effect)?;
+        // On top: the call pill's background is opaque.
+        holder.AddVisual(&visual, false, None)?;
+    }
+    Ok(visual)
 }
 
 /// An angle that holds at `start` for `wait` seconds, then grows at `rate` per second until 180,
@@ -545,6 +652,20 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESUL
             });
             Some(LRESULT(0))
         }
+        WM_MOUSEWHEEL => {
+            // Screen coordinates, unlike the other mouse messages.
+            let mut point = POINT { x: (lparam.0 & 0xFFFF) as i16 as i32, y: ((lparam.0 >> 16) & 0xFFFF) as i16 as i32 };
+            let delta = ((wparam.0 >> 16) & 0xFFFF) as u16 as i16;
+            with_pill(|pill| {
+                if hwnd != pill.hwnd || unsafe { !ScreenToClient(pill.hwnd, &mut point).as_bool() } {
+                    return;
+                }
+                if let Some(Hit::Device(flow)) = pill.hit_at(point.x, point.y) {
+                    act(Action::Volume(flow, delta as f32 / WHEEL_DELTA as f32));
+                }
+            });
+            Some(LRESULT(0))
+        }
         WM_TIMER if wparam.0 == METER_TIMER => {
             with_pill(Pill::meter_tick);
             Some(LRESULT(0))
@@ -563,7 +684,7 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESUL
             with_pill(|pill| {
                 // Re-place (and re-scale) by repainting from scratch.
                 let view = std::mem::replace(&mut pill.view, View::Hidden);
-                if let Err(e) = pill.show(&view, false) {
+                if let Err(e) = pill.show(&view, Entrance::None) {
                     eprintln!("pill: could not re-place ({e:#})");
                     pill.gfx = None;
                 }

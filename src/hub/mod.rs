@@ -68,6 +68,8 @@ pub struct Endpoint {
     pub id: DeviceId,
     pub name: String,
     pub muted: bool,
+    /// The device's chosen icon, as a Segoe Fluent glyph.
+    pub glyph: char,
 }
 
 /// The default endpoints and which outputs exist, so a vanished default can be told from a switch.
@@ -365,7 +367,7 @@ mod tests {
     use super::*;
 
     fn endpoint(id: &str) -> Endpoint {
-        Endpoint { id: DeviceId(id.into()), name: id.into(), muted: false }
+        Endpoint { id: DeviceId(id.into()), name: id.into(), muted: false, glyph: ' ' }
     }
 
     fn endpoints(output: &str, active: &[&str]) -> Event {

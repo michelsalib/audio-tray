@@ -38,12 +38,29 @@ pub struct Pill {
     pub enabled: bool,
     /// The red "is listening" alert when an app records outside a known call.
     pub listening_alerts: bool,
+    /// The output and input devices on the pill, clicked to switch like the taskbar buttons.
+    pub devices: bool,
+    /// Only the sliver until the pointer reaches the edge (warnings and alerts still show).
+    pub compact: bool,
 }
 
 impl Default for Pill {
     fn default() -> Self {
-        Self { enabled: true, listening_alerts: true }
+        Self { enabled: true, listening_alerts: true, devices: true, compact: false }
     }
+}
+
+/// How the music tile draws into the player's taskbar button.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TileStyle {
+    /// The button stays the shell's.
+    #[default]
+    Off,
+    /// The cover, with the shell's progress bar under it.
+    Cover,
+    /// The cover, the title and artist, and the progress bar.
+    Full,
 }
 
 /// Audio Tray hosts `\\.\pipe\audio-tray`; the Vencord plugin in `integrations/vencord` connects.
@@ -122,6 +139,8 @@ pub struct Music {
     /// Draw the strip into this app's own taskbar button, matched on its name. Empty means no
     /// strip; the feed and the progress bar still work.
     pub tile: String,
+    /// What the tile shows. Drawing it injects into Explorer, so it is opt-in.
+    pub tile_style: TileStyle,
     /// Pin the SMTC app id instead of guessing it (`--music-probe` prints it). Required for a
     /// plain browser tab, which is never followed otherwise; see [`crate::music::session`].
     pub app_id: Option<String>,
@@ -132,12 +151,23 @@ impl Default for Music {
         Self {
             enabled: true,
             tile: "YouTube Music".to_string(),
+            tile_style: TileStyle::Off,
             app_id: None,
         }
     }
 }
 
 impl Config {
+    /// Whether anything is drawn into the taskbar (the audio buttons or the music tile), which is
+    /// what injecting into Explorer is for.
+    pub fn injects(&self) -> bool {
+        self.strip.enabled || self.tile_shown()
+    }
+
+    /// Whether the music tile is drawn.
+    pub fn tile_shown(&self) -> bool {
+        self.music.enabled && self.music.tile_style != TileStyle::Off && !self.music.tile.is_empty()
+    }
     /// `%APPDATA%\AudioTray\config.toml`.
     pub fn path() -> Result<PathBuf> {
         let dirs = directories::ProjectDirs::from("", "", "AudioTray")

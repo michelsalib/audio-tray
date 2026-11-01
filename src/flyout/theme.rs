@@ -204,3 +204,9 @@ pub(super) const GLYPH_MUSIC: char = '\u{EC4F}';
 pub(super) const GLYPH_APP: char = '\u{E7F5}';
 pub(super) const GLYPH_APP_MUTED: char = '\u{E74F}';
 pub(super) const SPEAKING: [u8; 3] = [0x3D, 0xD6, 0x8C]; // the speaking ring, as on the pill
+
+// The settings screen.
+pub(super) const SEGMENT_W: f32 = 54.0; // one segment of the tile style choice
+pub(super) const SWITCH_W: f32 = 40.0; // a toggle switch's track
+pub(super) const SWITCH_H: f32 = 20.0;
+pub(super) const GLYPH_CHEVRON: char = '\u{E76C}'; // a link row's trailing arrow

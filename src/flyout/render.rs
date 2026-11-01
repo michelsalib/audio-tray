@@ -58,6 +58,77 @@ pub(super) fn render_page(ctx: &Ctx, elems: &[LaidElem], out: &mut [u8]) {
                     cv.draw_text(f, hdr_px, (d(HEADER_X) as f32, base), TEXT, 1.0, text);
                 }
             }
+            Elem::SettingsHeader => {
+                let cy_i = le.top + le.height / 2;
+                let bpx = (BACK_GLYPH_PX * scale).round() as u32;
+                if let Ok((rgba, gw, gh)) = icons::render_glyph(GLYPH_BACK, bpx, TEXT) {
+                    let bx = ((BACK_LEFT + BACK_BTN / 2.0) * scale).round() as i32 - gw as i32 / 2;
+                    cv.blit(bx, cy_i - gh as i32 / 2, &rgba, gw, gh, 1.0);
+                }
+                if let Some(f) = font_sb {
+                    let title_px = TITLE_PX * scale;
+                    cv.draw_text(f, title_px, (d(TEXT_X) as f32, cy_i as f32 + title_px * 0.34), TEXT, 1.0, "Settings");
+                }
+            }
+            Elem::Setting { kind } => {
+                use super::layout::SettingKind;
+                let s = &ctx.model.settings;
+                let cy = (le.top + le.height / 2) as f32;
+                if let Some(f) = font {
+                    let px = 13.5 * scale;
+                    cv.draw_text(f, px, (d(HEADER_X) as f32, cy + px * 0.34), TEXT, 1.0, kind.label());
+                }
+                let right = w as f32 - RIGHT_PAD * scale;
+                let on = match kind {
+                    SettingKind::AudioButtons => Some(s.buttons),
+                    SettingKind::Pill => Some(s.pill),
+                    SettingKind::PillDevices => Some(s.devices),
+                    SettingKind::PillCompact => Some(s.compact),
+                    SettingKind::ListeningAlerts => Some(s.alerts),
+                    SettingKind::TileStyle | SettingKind::SoundSettings => None,
+                };
+                // The pill's own options are moot while it is off: drawn dimmed.
+                let dim = matches!(kind, SettingKind::PillDevices | SettingKind::PillCompact | SettingKind::ListeningAlerts) && !s.pill;
+                if let Some(on) = on {
+                    let (sw, sh) = (SWITCH_W * scale, SWITCH_H * scale);
+                    let x0 = right - sw;
+                    let a = if dim { 0.4 } else { 1.0 };
+                    if on {
+                        cv.fill_round_rect(Rect::new(x0, cy - sh / 2.0, right, cy + sh / 2.0), sh / 2.0, accent, a);
+                    } else {
+                        cv.fill_round_rect(Rect::new(x0, cy - sh / 2.0, right, cy + sh / 2.0), sh / 2.0, TEXT, 0.55 * a);
+                        let inset = 1.5 * scale;
+                        cv.fill_round_rect(Rect::new(x0 + inset, cy - sh / 2.0 + inset, right - inset, cy + sh / 2.0 - inset), sh / 2.0 - inset, TINT, a);
+                    }
+                    let knob = sh / 2.0 - 4.0 * scale;
+                    let kx = if on { right - sh / 2.0 } else { x0 + sh / 2.0 };
+                    let kcol = if on { DARK_GLYPH } else { TEXT };
+                    cv.fill_round_rect(Rect::new(kx - knob, cy - knob, kx + knob, cy + knob), knob, kcol, 0.9 * a);
+                }
+                if kind == SettingKind::TileStyle {
+                    let selected = s.tile as usize;
+                    let (left, _) = super::layout::segment_span(w, scale, 0);
+                    let sh = 26.0 * scale;
+                    cv.fill_round_rect(Rect::new(left, cy - sh / 2.0, right, cy + sh / 2.0), 4.0 * scale, TEXT, 0.08);
+                    for (i, label) in super::layout::TILE_SEGMENTS.iter().enumerate() {
+                        let (x0, x1) = super::layout::segment_span(w, scale, i);
+                        let is = i == selected;
+                        if is {
+                            cv.fill_round_rect(Rect::new(x0 + 2.0, cy - sh / 2.0 + 2.0, x1 - 2.0, cy + sh / 2.0 - 2.0), 3.0 * scale, accent, 1.0);
+                        }
+                        if let Some(f) = font {
+                            let px = 12.5 * scale;
+                            let tw = measure(f, px, label);
+                            cv.draw_text(f, px, ((x0 + x1 - tw) / 2.0, cy + px * 0.34), if is { DARK_GLYPH } else { TEXT }, 1.0, label);
+                        }
+                    }
+                }
+                if kind == SettingKind::SoundSettings {
+                    if let Ok((rgba, gw, gh)) = icons::render_glyph(GLYPH_CHEVRON, (12.0 * scale) as u32, TEXT) {
+                        cv.blit((right - gw as f32).round() as i32, cy as i32 - gh as i32 / 2, &rgba, gw, gh, 0.8);
+                    }
+                }
+            }
             Elem::GroupHeader { group } => {
                 let g = &groups[group];
                 let base = le.top as f32 + le.height as f32 - hdr_px * 0.55;
@@ -485,7 +556,12 @@ pub(super) fn compose(ctx: &Ctx, hit: &Interaction, elems: &[LaidElem], base: &[
                 let r = VOICE_BTN * scale / 2.0;
                 cv.fill_round_rect(Rect::new(cxb - r, cy - r, cxb + r, cy + r), r, TEXT, 0.08);
             }
-            Elem::PickerHeader { .. } if hovered && hover_back => {
+            Elem::Setting { .. } if hovered => {
+                let ry0 = le.top as f32 + 1.0;
+                let ry1 = (le.top + le.height) as f32 - 1.0;
+                cv.fill_round_rect(Rect::new(mx, ry0, w as f32 - mx, ry1), d(ROW_RADIUS) as f32, TEXT, HOVER_A);
+            }
+            Elem::PickerHeader { .. } | Elem::SettingsHeader if hovered && hover_back => {
                 // Round hover button behind the back arrow.
                 let cy = (le.top + le.height / 2) as f32;
                 let cxb = (BACK_LEFT + BACK_BTN / 2.0) * scale;

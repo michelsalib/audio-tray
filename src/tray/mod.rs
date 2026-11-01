@@ -225,7 +225,7 @@ pub fn run(backend: WasapiBackend) -> Result<()> {
     // A TAP staged by an update that could not land it (the old one was loaded) is placed now:
     // the set-aside rename works on a loaded DLL, so this needs no Explorer restart.
     crate::update::place_staged_tap();
-    if config.strip.enabled {
+    if config.injects() {
         taskbar::apply_at_startup(strip_icons(&backend, &config));
     } else {
         // Opt-in: a strip left by an earlier run (or another build) comes off.
@@ -241,7 +241,7 @@ pub fn run(backend: WasapiBackend) -> Result<()> {
     let _wheel = hook::WheelHook::spawn();
 
     let devices = backend.enumerate_flow(Flow::Output).map(|d| d.len()).unwrap_or(0);
-    let gestures = if taskbar::strip_is_up() {
+    let gestures = if taskbar::buttons_up() {
         "left click cycles a segment, right click opens the panel"
     } else {
         "no strip — either button opens the panel"
@@ -255,7 +255,7 @@ pub fn run(backend: WasapiBackend) -> Result<()> {
 
     // On a thread of its own: every SMTC call blocks on an async operation, which deadlocks this
     // STA (see `music::on_mta_thread`). `None` = off in config, or SMTC would not open.
-    let music = crate::music::spawn(&config.music, config.strip.enabled);
+    let music = crate::music::spawn(&config.music, config.tile_shown());
     if music.is_some() {
         println!("music: following YouTube Music");
     }
@@ -459,7 +459,7 @@ fn on_action(action: Action) {
 /// unless a strip is up — the shell invokes the icon under the strip, so a segment's click also
 /// arrives here, and the strip's own handler is the one that cycles.
 fn on_tray_click(button: usize, packed: isize) {
-    if button == 1 && taskbar::strip_is_up() {
+    if button == 1 && taskbar::buttons_up() {
         println!("tray: left click on the strip — cycling, not opening");
         return;
     }
@@ -526,6 +526,9 @@ fn open_flyout(anchor: Option<flyout::Anchor>) {
                 eprintln!("save config failed: {e:#}");
             }
             crate::pill::configure(&tray.config.pill);
+            if outcome.taskbar_changed {
+                tray.apply_taskbar();
+            }
             tray.refresh();
         }
         if outcome.restart {
@@ -557,10 +560,24 @@ impl Tray {
         self.report_endpoints();
     }
 
+    /// The taskbar settings changed: take the strip off and draw what is asked for now (a TAP
+    /// already loaded takes the new settings on the handover), and restart the music feed, whose
+    /// progress bar and state file follow the tile.
+    fn apply_taskbar(&mut self) {
+        taskbar::revert(0);
+        self.strip = None;
+        if self.config.injects() {
+            taskbar::apply_at_startup(Current::read(&self.backend, &self.config).strip_icons());
+        }
+        hook::set_scroll_anywhere(self.config.strip.enabled && self.config.strip.scroll_anywhere);
+        self.music = None;
+        self.music = crate::music::spawn(&self.config.music, self.config.tile_shown());
+    }
+
     /// The endpoint source: tell the hub the defaults, and follow the default output with the
     /// session watch (a session manager belongs to one endpoint).
     fn report_endpoints(&mut self) {
-        let endpoints = read_endpoints(&self.backend);
+        let endpoints = read_endpoints(&self.backend, &self.config);
         let output = endpoints.output.as_ref().map(|e| e.id.clone());
         if self.sessions.as_ref().map(|(id, _)| id) != output.as_ref() {
             self.sessions = output.and_then(|id| match sessions::Watch::new() {
@@ -649,6 +666,20 @@ impl Tray {
             Action::Unmute(Some(app)) => crate::integrations::set_muted(app, false),
             Action::Unmute(None) => self.set_microphone_muted(false),
             Action::MuteMicrophone => self.set_microphone_muted(true),
+            Action::CycleDevice(flow) => {
+                let action = match flow {
+                    Flow::Output => taskbar::Action::CycleOutput,
+                    Flow::Input => taskbar::Action::CycleInput,
+                };
+                if let Err(e) = self.taskbar_action(action) {
+                    eprintln!("pill: could not switch the {flow:?} device ({e:#})");
+                }
+            }
+            Action::Volume(flow, notches) => {
+                if let Err(e) = self.backend.nudge_volume(flow, notches * SCROLL_STEP) {
+                    eprintln!("pill: could not change the {flow:?} volume ({e:#})");
+                }
+            }
             Action::Acknowledge(notice) => {
                 self.hub.acknowledge(&notice);
                 self.hub_changed();
@@ -792,7 +823,7 @@ impl Tray {
     /// Explorer restarted: the strip, the progress bar and the thumbnail toolbar died with it.
     fn taskbar_restarted(&mut self) {
         self.strip = None;
-        if self.config.strip.enabled {
+        if self.config.injects() {
             taskbar::apply_at_restart(Current::read(&self.backend, &self.config).strip_icons());
         }
         if let Some(music) = self.music.as_ref() {
@@ -1083,17 +1114,13 @@ pub(crate) fn set_teams_token(token: String) {
 
 
 /// The defaults and the active outputs, for the hub.
-fn read_endpoints(backend: &WasapiBackend) -> crate::hub::Endpoints {
+fn read_endpoints(backend: &WasapiBackend, config: &Config) -> crate::hub::Endpoints {
     let endpoint = |flow: Flow| -> Option<crate::hub::Endpoint> {
         let id = backend.default_of(flow).ok().flatten()?;
-        let name = backend
-            .enumerate_flow(flow)
-            .ok()?
-            .into_iter()
-            .find(|d| d.id == id)
-            .map(|d| d.friendly_name)?;
+        let device = backend.enumerate_flow(flow).ok()?.into_iter().find(|d| d.id == id)?;
+        let glyph = config.icon_of(&device).glyph();
         let muted = backend.is_muted(&id).unwrap_or(false);
-        Some(crate::hub::Endpoint { id, name, muted })
+        Some(crate::hub::Endpoint { id, name: device.friendly_name, muted, glyph })
     };
     crate::hub::Endpoints {
         output: endpoint(Flow::Output),

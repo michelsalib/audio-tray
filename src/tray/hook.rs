@@ -102,7 +102,7 @@ unsafe extern "system" fn mouse_hook(code: i32, wparam: WPARAM, lparam: LPARAM) 
 /// icon slot at its midpoint (32 epx halves, see the TAP's `decorate`); anywhere else, and with
 /// no strip, the output.
 fn flow_at(pt: POINT) -> Flow {
-    if !crate::taskbar::strip_is_up() {
+    if !crate::taskbar::buttons_up() {
         return Flow::Output;
     }
     match icon_rect() {
@@ -119,7 +119,7 @@ unsafe fn point_over_tray(pt: POINT) -> bool {
     }
     let root: HWND = unsafe { GetAncestor(hwnd, GA_ROOT) };
     let anywhere = SCROLL_ANYWHERE.load(std::sync::atomic::Ordering::Relaxed);
-    wheel_belongs_to_tray(&crate::win::class_name(root), crate::taskbar::strip_is_up(), in_slot(pt), anywhere)
+    wheel_belongs_to_tray(&crate::win::class_name(root), crate::taskbar::buttons_up(), in_slot(pt), anywhere)
 }
 
 /// Whether a wheel over a window of `class` is ours. A `Xaml_WindowedPopupClass` is any XAML

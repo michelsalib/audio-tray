@@ -131,11 +131,14 @@ overrides, the music tile, and what the taskbar buttons change in Windows' own t
 [music]
 enabled = true            # false turns the whole music half off, progress bar included
 tile = "YouTube Music"    # the taskbar button to draw into; "" = feed only, no strip
+tile_style = "off"        # what it shows: "off", "cover" (cover + progress) or "full" (+ title)
 # app_id = "..."          # pin the SMTC app id: a miss, or YouTube Music as a plain tab
 
 [pill]
 enabled = true              # the edge pill
 listening_alerts = true     # the red alert when an app records outside a known call
+devices = true              # the output and input on the pill, clicked to switch
+compact = false             # only the sliver until the pointer reaches the edge
 
 [discord]
 enabled = true              # host \\.\pipe\audio-tray for the Vencord plugin
@@ -148,12 +151,15 @@ enabled = false             # Teams' local API; turn it on in Teams too (Setting
 # token = "..."             # kept here once you allow Audio Tray inside Teams
 
 [strip]
-enabled = false             # draw the taskbar buttons by injecting into Explorer (opt-in)
+enabled = false             # the audio buttons in the tray, drawn by injecting into Explorer (opt-in)
 next_to_wifi = true         # move the tray icons between the language indicator and wifi
 hide_windows_volume = true  # hide Windows' volume icon (the output button replaces it)
 hide_windows_mic = true     # hide Windows' "microphone in use" icon (the red dot replaces it)
 scroll_anywhere = true      # wheel over the whole taskbar sets the volume; false = our buttons only
 ```
+
+All of these except the integrations' details are also on the flyout's **Settings** screen (the
+gear in its footer), where they apply at once.
 
 Each `[strip]` switch also rules one shell edit out when the taskbar misbehaves. They are
 read when the buttons are placed, so restart Audio Tray after changing them; the same goes

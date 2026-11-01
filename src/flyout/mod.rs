@@ -48,6 +48,8 @@ pub struct Outcome {
     pub config_changed: bool,
     /// Relaunch the already-updated exe and exit.
     pub restart: bool,
+    /// A taskbar setting changed: the strip is to be drawn again.
+    pub taskbar_changed: bool,
 }
 
 /// Where to open the flyout: centred on `cx`, its bottom at `bottom` (the tray icon's top).
@@ -158,12 +160,17 @@ unsafe fn show_inner(
     let groups = build_groups(backend, config);
     let update = crate::update::pending_version();
 
+    let settings = model::Settings::of(config);
     let mut fly = Flyout {
         backend,
         config,
         scale,
         accent,
-        model: Model { notice: crate::taskbar::current_notice(), ..Model::new(groups, update) },
+        model: Model {
+            notice: crate::taskbar::current_notice(),
+            settings,
+            ..Model::new(groups, update)
+        },
         hit: Interaction::default(),
         surface: Surface::new((8.0 * scale) as i32),
         watches: Vec::new(),
@@ -315,6 +322,7 @@ unsafe fn show_inner(
         quit: fly.model.quit,
         config_changed: fly.model.config_changed,
         restart: fly.model.restart,
+        taskbar_changed: fly.model.taskbar_changed,
     }
 }
 
@@ -374,6 +382,46 @@ impl Flyout<'_> {
         self.render_base();
         self.compose();
         self.surface.flush();
+    }
+
+    /// A click on a settings row. Pill settings apply at once; taskbar ones when the panel closes
+    /// (the strip is drawn again). Returns whether the flyout should close.
+    fn change_setting(&mut self, kind: layout::SettingKind, mx: i32) -> bool {
+        use crate::config::TileStyle;
+        use layout::SettingKind;
+        let config = &mut *self.config;
+        match kind {
+            SettingKind::TileStyle => {
+                let Some(segment) = layout::segment_at(self.surface.width, self.scale, mx) else {
+                    return false;
+                };
+                let style = [TileStyle::Off, TileStyle::Cover, TileStyle::Full][segment];
+                if config.music.tile_style == style {
+                    return false;
+                }
+                config.music.tile_style = style;
+                self.model.taskbar_changed = true;
+            }
+            SettingKind::AudioButtons => {
+                config.strip.enabled = !config.strip.enabled;
+                self.model.taskbar_changed = true;
+            }
+            SettingKind::Pill => config.pill.enabled = !config.pill.enabled,
+            SettingKind::PillDevices => config.pill.devices = !config.pill.devices,
+            SettingKind::PillCompact => config.pill.compact = !config.pill.compact,
+            SettingKind::ListeningAlerts => config.pill.listening_alerts = !config.pill.listening_alerts,
+            SettingKind::SoundSettings => {
+                open_sound_settings();
+                return true;
+            }
+        }
+        crate::pill::configure(&config.pill);
+        self.model.settings = model::Settings::of(config);
+        self.model.config_changed = true;
+        self.render_base();
+        self.compose();
+        self.surface.flush();
+        false
     }
 
     fn set_app_level(&mut self, app: usize, level: f32) {
@@ -590,6 +638,12 @@ impl Flyout<'_> {
     /// Act on a click at button-up. Returns true if the flyout should close.
     fn activate(&mut self, i: usize, mx: i32, my: i32) -> bool {
         match self.surface.elems[i].elem {
+            Elem::Setting { kind } => {
+                if self.change_setting(kind, mx) {
+                    return true;
+                }
+                false
+            }
             Elem::GroupHeader { group } => {
                 if self.model.groups[group].devices.len() > 1 {
                     self.model.expanded[group] = !self.model.expanded[group];
@@ -662,8 +716,8 @@ impl Flyout<'_> {
                 }
                 false
             }
-            Elem::PickerHeader { .. } => {
-                // The back arrow cancels the picker and slides back to the main panel.
+            Elem::PickerHeader { .. } | Elem::SettingsHeader => {
+                // The back arrow slides back to the main panel (the picker's choice is cancelled).
                 if layout::over_back(self.scale, mx) {
                     self.navigate(View::Main, false);
                 }
@@ -684,9 +738,9 @@ impl Flyout<'_> {
             }
             // The inert gap between footer targets (`None`) leaves the flyout open.
             Elem::Footer => match layout::footer_hit(&self.model, self.surface.width, self.scale, mx) {
-                Some(ActionKind::SoundSettings) => {
-                    open_sound_settings();
-                    true
+                Some(ActionKind::Settings) => {
+                    self.navigate(View::Settings, true);
+                    false
                 }
                 Some(ActionKind::Quit) => {
                     self.model.quit = true;
@@ -774,8 +828,7 @@ impl Flyout<'_> {
         let kind = hover.map(|i| self.surface.elems[i].elem);
         let on_pencil = matches!(kind, Some(Elem::Device { .. }))
             && layout::over_pencil(self.surface.width, self.scale, mx);
-        let on_back =
-            matches!(kind, Some(Elem::PickerHeader { .. })) && layout::over_back(self.scale, mx);
+        let on_back = matches!(kind, Some(Elem::PickerHeader { .. } | Elem::SettingsHeader)) && layout::over_back(self.scale, mx);
         let on_chip = match (kind, hover) {
             (Some(Elem::IconGrid { .. }), Some(i)) => {
                 layout::grid_chip_at(self.surface.width, self.scale, mx, my, self.surface.elems[i].top)

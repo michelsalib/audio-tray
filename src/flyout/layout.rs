@@ -17,11 +17,46 @@ pub(super) enum View {
     Main,
     /// The per-device icon chooser: a back arrow, the device name as title, and a grid.
     IconPicker { group: usize, dev: usize },
+    /// Audio Tray's settings: the taskbar and the edge pill.
+    Settings,
 }
+
+/// One row of the settings screen.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum SettingKind {
+    /// The music tile in the player's taskbar button: off, cover, or cover and title.
+    TileStyle,
+    /// The audio buttons drawn over the notification icon.
+    AudioButtons,
+    Pill,
+    PillDevices,
+    PillCompact,
+    ListeningAlerts,
+    /// Windows' own sound settings (a link).
+    SoundSettings,
+}
+
+impl SettingKind {
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            SettingKind::TileStyle => "Music in the player's button",
+            SettingKind::AudioButtons => "Audio buttons in the tray",
+            SettingKind::Pill => "Show the edge pill",
+            SettingKind::PillDevices => "Audio devices on the pill",
+            SettingKind::PillCompact => "Compact until hovered",
+            SettingKind::ListeningAlerts => "Alert when an app listens",
+            SettingKind::SoundSettings => "Windows sound settings",
+        }
+    }
+}
+
+/// The tile style segments, in order, and their labels.
+pub(super) const TILE_SEGMENTS: [&str; 3] = ["Off", "Cover", "Full"];
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum ActionKind {
-    SoundSettings,
+    /// Audio Tray's own settings screen.
+    Settings,
     Quit,
     /// Relaunch into an update already staged on disk. Only offered while there is one.
     Restart,
@@ -33,14 +68,14 @@ impl ActionKind {
 
     pub(super) fn label(self) -> &'static str {
         match self {
-            ActionKind::SoundSettings => "Sound settings",
+            ActionKind::Settings => "Settings",
             ActionKind::Quit => "Quit Audio Tray",
             ActionKind::Restart => "Restart to update",
         }
     }
     pub(super) fn glyph(self) -> char {
         match self {
-            ActionKind::SoundSettings => GLYPH_SETTINGS,
+            ActionKind::Settings => GLYPH_SETTINGS,
             ActionKind::Quit => GLYPH_CANCEL,
             ActionKind::Restart => GLYPH_UPDATE,
         }
@@ -69,6 +104,10 @@ pub(super) enum Elem {
     Footer,
     /// One line of secondary text above the footer: [`Model::notice`].
     Note,
+    /// The settings screen's header: a back arrow and "Settings".
+    SettingsHeader,
+    /// One setting: a label, and a switch, a segmented choice or a link.
+    Setting { kind: SettingKind },
 }
 
 pub(super) struct LaidElem {
@@ -114,7 +153,8 @@ pub(super) fn panel_height(model: &Model, scale: f32, width: i32) -> i32 {
     } else {
         0
     };
-    main_h.max(picker_h)
+    let settings_h = build_view(model, scale, width, View::Settings, 0).1;
+    main_h.max(picker_h).max(settings_h)
 }
 
 /// Lay out the elements for `view` at `width`, returning them and the total height. The layout
@@ -155,6 +195,18 @@ pub(super) fn build_view(model: &Model, scale: f32, width: i32, view: View, fill
             kinds.push(Elem::PickerHeader { group, dev });
             kinds.push(Elem::IconGrid { group, dev });
         }
+        View::Settings => {
+            kinds.push(Elem::SettingsHeader);
+            kinds.push(Elem::Header("Taskbar"));
+            kinds.push(Elem::Setting { kind: SettingKind::TileStyle });
+            kinds.push(Elem::Setting { kind: SettingKind::AudioButtons });
+            kinds.push(Elem::Header("Edge pill"));
+            for kind in [SettingKind::Pill, SettingKind::PillDevices, SettingKind::PillCompact, SettingKind::ListeningAlerts] {
+                kinds.push(Elem::Setting { kind });
+            }
+            kinds.push(Elem::Header("Windows"));
+            kinds.push(Elem::Setting { kind: SettingKind::SoundSettings });
+        }
     }
 
     let mut elems = Vec::with_capacity(kinds.len());
@@ -172,7 +224,8 @@ pub(super) fn build_view(model: &Model, scale: f32, width: i32, view: View, fill
             Elem::AppSlider { .. } => d(APP_H),
             Elem::Slider { .. } => d(SLIDER_H),
             Elem::Device { .. } => d(ITEM_H),
-            Elem::PickerHeader { .. } => d(PICKER_HEADER_H),
+            Elem::PickerHeader { .. } | Elem::SettingsHeader => d(PICKER_HEADER_H),
+            Elem::Setting { .. } => d(ITEM_H),
             Elem::IconGrid { .. } => grid_px_height(width, scale),
             Elem::Footer => d(FOOTER_H),
             Elem::Note => d(NOTE_H),
@@ -229,7 +282,7 @@ pub(super) fn grid_px_height(width: i32, scale: f32) -> i32 {
 /// The footer's round icon buttons, rightmost first: the settings gear, then restart-to-update
 /// while an update is staged. No "restart Explorer" button by design (see docs/NOTES.md).
 pub(super) fn footer_buttons(model: &Model) -> Vec<ActionKind> {
-    let mut buttons = vec![ActionKind::SoundSettings];
+    let mut buttons = vec![ActionKind::Settings];
     if model.update.is_some() {
         buttons.push(ActionKind::Restart);
     }
@@ -284,6 +337,8 @@ pub(super) fn elem_at(elems: &[LaidElem], y: i32) -> Option<usize> {
                 | Elem::AppSlider { .. }
                 | Elem::Device { .. }
                 | Elem::PickerHeader { .. }
+                | Elem::SettingsHeader
+                | Elem::Setting { .. }
                 | Elem::IconGrid { .. }
                 | Elem::Footer
         );
@@ -319,6 +374,21 @@ pub(super) fn over_voice_button(width: i32, scale: f32, mx: i32) -> bool {
 
 pub(super) fn voice_button_center_x(width: i32, scale: f32) -> f32 {
     width as f32 - (RIGHT_PAD - 4.0 + VOICE_BTN / 2.0) * scale
+}
+
+/// The tile style segment under `mx` (an index into [`TILE_SEGMENTS`]), right-aligned in the row.
+pub(super) fn segment_at(width: i32, scale: f32, mx: i32) -> Option<usize> {
+    (0..TILE_SEGMENTS.len()).find(|&i| {
+        let (x0, x1) = segment_span(width, scale, i);
+        (mx as f32) >= x0 && (mx as f32) < x1
+    })
+}
+
+/// Left and right edges (px) of tile style segment `i`; shared by hit-test and paint.
+pub(super) fn segment_span(width: i32, scale: f32, i: usize) -> (f32, f32) {
+    let w = SEGMENT_W * scale;
+    let right = width as f32 - RIGHT_PAD * scale - (TILE_SEGMENTS.len() - 1 - i) as f32 * w;
+    (right - w, right)
 }
 
 /// An app slider's level at `mx`.
@@ -507,7 +577,7 @@ mod tests {
             let m = model(vec![], None);
             let width = content_width(&m, scale);
             let btn = footer_btn_center_x(width, scale, 0).round() as i32;
-            assert_eq!(footer_hit(&m, width, scale, btn), Some(ActionKind::SoundSettings));
+            assert_eq!(footer_hit(&m, width, scale, btn), Some(ActionKind::Settings));
             let item = ((FOOTER_TEXT_X + 2.0) * scale).round() as i32;
             assert_eq!(footer_hit(&m, width, scale, item), Some(ActionKind::LEFT));
             // The gap between the label and the buttons is inert.
@@ -525,10 +595,10 @@ mod tests {
         let scale = 1.5;
         let staged = model(vec![output_group(vec![dev("Speakers", None)])], Some("9.9.9"));
         let plain = model(vec![output_group(vec![dev("Speakers", None)])], None);
-        assert_eq!(footer_buttons(&plain), vec![ActionKind::SoundSettings]);
+        assert_eq!(footer_buttons(&plain), vec![ActionKind::Settings]);
         assert_eq!(
             footer_buttons(&staged),
-            vec![ActionKind::SoundSettings, ActionKind::Restart]
+            vec![ActionKind::Settings, ActionKind::Restart]
         );
 
         let width = content_width(&staged, scale);

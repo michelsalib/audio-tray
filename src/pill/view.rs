@@ -17,11 +17,11 @@ pub enum Level {
 pub enum View {
     /// A fullscreen app runs (and nothing is red), or the pill is off.
     Hidden,
-    /// The grey sliver.
-    Idle,
+    /// The grey sliver, or with `devices` a small pill of the output and input.
+    Idle { devices: Option<Devices> },
     /// The art of each playing session in its progress ring; on hover (`card`), a row with
-    /// controls per session.
-    Music { media: Vec<Media>, card: bool },
+    /// controls per session. `devices` follow underneath when shown.
+    Music { media: Vec<Media>, card: bool, devices: Option<Devices> },
     /// The microphone is live in a call: faces (when an integration sends them), a mic.
     Call {
         app: Option<VoiceApp>,
@@ -32,6 +32,34 @@ pub enum View {
     },
     /// A one-line banner: warnings, alerts and notices.
     Banner { level: Level, glyph: char, text: String, action: Action },
+}
+
+/// One default device on the pill.
+#[derive(Clone, PartialEq, Debug)]
+pub struct Device {
+    pub glyph: char,
+    pub name: String,
+    pub muted: bool,
+    /// An app has the microphone open (input only).
+    pub recording: bool,
+}
+
+/// The output and input on the pill, clicked to switch to the next device.
+#[derive(Clone, PartialEq, Debug, Default)]
+pub struct Devices {
+    pub output: Option<Device>,
+    pub input: Option<Device>,
+}
+
+impl Devices {
+    fn of(state: &State) -> Option<Self> {
+        let device = |e: &crate::hub::Endpoint, recording: bool| Device { glyph: e.glyph, name: e.name.clone(), muted: e.muted, recording };
+        let devices = Self {
+            output: state.endpoints.output.as_ref().map(|e| device(e, false)),
+            input: state.endpoints.input.as_ref().map(|e| device(e, state.mic_live())),
+        };
+        (devices.output.is_some() || devices.input.is_some()).then_some(devices)
+    }
 }
 
 /// What clicking a state does.
@@ -48,7 +76,7 @@ pub enum Action {
 impl View {
     pub fn level(&self) -> Level {
         match self {
-            View::Hidden | View::Idle => Level::Quiet,
+            View::Hidden | View::Idle { .. } => Level::Quiet,
             View::Music { card, .. } => {
                 if *card {
                     Level::Normal
@@ -61,9 +89,11 @@ impl View {
         }
     }
 
-    /// Whether clicks pass through to whatever is underneath.
+    /// Whether clicks pass through to whatever is underneath: quiet states, unless they carry the
+    /// devices (which are buttons).
     pub fn click_through(&self) -> bool {
-        self.level() == Level::Quiet
+        let devices = matches!(self, View::Idle { devices: Some(_) } | View::Music { devices: Some(_), .. });
+        self.level() == Level::Quiet && !devices
     }
 }
 
@@ -82,6 +112,10 @@ pub struct Inputs {
     /// The microphone picks up speech (only measured while muted in a call).
     pub talking: bool,
     pub listening_alerts: bool,
+    /// Show the output and input on the quiet states.
+    pub devices: bool,
+    /// Collapse everything short of a warning to the sliver until hovered.
+    pub compact: bool,
 }
 
 /// The state to show.
@@ -90,6 +124,10 @@ pub fn decide(state: &State, inputs: Inputs) -> View {
         return View::Hidden;
     }
     let view = loudest(state, inputs);
+    // Compact: the sliver until hovered; warnings and alerts still speak up.
+    if inputs.compact && !inputs.hover && matches!(view.level(), Level::Quiet | Level::Normal) {
+        return if inputs.fullscreen { View::Hidden } else { View::Idle { devices: None } };
+    }
     // A fullscreen app hides everything but red.
     if inputs.fullscreen && view.level() != Level::Alert {
         return View::Hidden;
@@ -139,10 +177,11 @@ fn loudest(state: &State, inputs: Inputs) -> View {
     } else {
         state.playing().cloned().collect()
     };
+    let devices = if inputs.devices { Devices::of(state) } else { None };
     if media.is_empty() {
-        View::Idle
+        View::Idle { devices }
     } else {
-        View::Music { media, card: inputs.hover }
+        View::Music { media, card: inputs.hover, devices }
     }
 }
 
@@ -211,7 +250,7 @@ mod tests {
     fn muted_input(state: &mut State, muted: bool) {
         state.apply(Event::Endpoints(Endpoints {
             output: None,
-            input: Some(Endpoint { id: DeviceId("mic".into()), name: "Mic".into(), muted }),
+            input: Some(Endpoint { id: DeviceId("mic".into()), name: "Mic".into(), muted, glyph: '\u{E720}' }),
             active_outputs: vec![],
         }));
     }
@@ -219,12 +258,12 @@ mod tests {
     #[test]
     fn music_shows_while_playing_and_the_sliver_otherwise() {
         let mut state = State::default();
-        assert_eq!(decide(&state, on()), View::Idle);
+        assert_eq!(decide(&state, on()), View::Idle { devices: None });
         state.apply(Event::Media(vec![media(true)]));
         assert!(matches!(decide(&state, on()), View::Music { card: false, .. }));
         assert!(matches!(decide(&state, Inputs { hover: true, ..on() }), View::Music { card: true, .. }));
         state.apply(Event::Media(vec![media(false)]));
-        assert_eq!(decide(&state, on()), View::Idle);
+        assert_eq!(decide(&state, on()), View::Idle { devices: None });
         assert!(
             matches!(decide(&state, Inputs { hover: true, ..on() }), View::Music { card: true, .. }),
             "paused music still opens on hover, to be resumed"
@@ -238,11 +277,11 @@ mod tests {
         let paused = Media { app_id: "Spotify.exe".into(), ..media(false) };
         state.apply(Event::Media(vec![media(true), twitch, paused]));
         match decide(&state, on()) {
-            View::Music { media, card: false } => assert_eq!(media.len(), 2, "both playing sessions"),
+            View::Music { media, card: false, .. } => assert_eq!(media.len(), 2, "both playing sessions"),
             other => panic!("{other:?}"),
         }
         match decide(&state, Inputs { hover: true, ..on() }) {
-            View::Music { media, card: true } => assert_eq!(media.len(), 3, "the paused one too, to resume it"),
+            View::Music { media, card: true, .. } => assert_eq!(media.len(), 3, "the paused one too, to resume it"),
             other => panic!("{other:?}"),
         }
     }
@@ -298,9 +337,31 @@ mod tests {
     }
 
     #[test]
+    fn compact_is_the_sliver_until_hovered_but_warnings_still_show() {
+        let mut state = State::default();
+        state.apply(Event::Media(vec![media(true)]));
+        let compact = Inputs { compact: true, devices: true, ..on() };
+        assert_eq!(decide(&state, compact), View::Idle { devices: None });
+        assert!(matches!(decide(&state, Inputs { hover: true, ..compact }), View::Music { card: true, .. }));
+        state.apply(Event::MicUsers(vec![r"C:\x\recorder.exe".into()]));
+        assert!(matches!(decide(&state, compact), View::Banner { level: Level::Alert, .. }));
+    }
+
+    #[test]
+    fn the_devices_ride_the_quiet_states() {
+        let mut state = State::default();
+        muted_input(&mut state, true);
+        match decide(&state, Inputs { devices: true, ..on() }) {
+            View::Idle { devices: Some(devices) } => assert!(devices.input.is_some_and(|d| d.muted)),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
     fn quiet_states_let_clicks_through() {
-        assert!(View::Idle.click_through());
-        assert!(View::Music { media: vec![media(true)], card: false }.click_through());
-        assert!(!View::Music { media: vec![media(true)], card: true }.click_through());
+        assert!(View::Idle { devices: None }.click_through());
+        assert!(!View::Idle { devices: Some(Devices::default()) }.click_through(), "the devices are buttons");
+        assert!(View::Music { media: vec![media(true)], card: false, devices: None }.click_through());
+        assert!(!View::Music { media: vec![media(true)], card: true, devices: None }.click_through());
     }
 }

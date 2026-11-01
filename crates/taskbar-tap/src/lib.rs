@@ -217,6 +217,10 @@ static CALLBACK_TID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32
 /// first icon. A mutex, not a `OnceLock`: every injection re-reads the init data.
 static TARGET_TOOLTIP: Mutex<String> = Mutex::new(String::new());
 
+/// Whether to draw the audio buttons over our icon (`buttons=0` turns them off, leaving only the
+/// music tile). Absent means on, as before the switch existed.
+static BUTTONS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
 /// What the strip renders, from the init data (re-read on every injection).
 static STRIP: Mutex<Option<decorate::StripState>> = Mutex::new(None);
 
@@ -251,6 +255,7 @@ fn configure(data: &str) {
     lifecycle::watch_owner(value_from(data, "pid"));
     // Absent (an older app) means on, as before the switch existed.
     reorder::set_enabled(value_from(data, "reorder").as_deref() != Some("0"));
+    BUTTONS.store(value_from(data, "buttons").as_deref() != Some("0"), Ordering::SeqCst);
     // A new owner gets a fresh grace period and its own copy of the status.
     *lock(&STOOD_UP) = Some(std::time::Instant::now());
     LAST_STATUS.store(usize::MAX, Ordering::SeqCst);
@@ -1223,6 +1228,12 @@ unsafe fn try_decorate(diagnostics: &xamlom::IXamlDiagnostics) {
         }
     };
 
+    // `buttons=0`: the app wants only the music tile; our icon stays the shell's.
+    if !BUTTONS.load(Ordering::SeqCst) {
+        why("the audio buttons are off");
+        return;
+    }
+
     // Cheap check before the expensive live walk below.
     if already_decorated(diagnostics) {
         why("already decorated");
@@ -1327,7 +1338,7 @@ static LAST_STATUS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUs
 /// The `STATUS_*` bits for what is not working. Tree-only.
 fn status_bits() -> usize {
     let mut bits = 0;
-    if !DECORATE_BUDGET.allowed() {
+    if BUTTONS.load(Ordering::SeqCst) && !DECORATE_BUDGET.allowed() {
         bits |= tap_proto::STATUS_NO_STRIP;
     }
     if reorder::gave_up() {

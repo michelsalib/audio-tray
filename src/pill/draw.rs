@@ -5,7 +5,8 @@
 use anyhow::Result;
 
 use super::gfx::{Font, Gfx, Painter, Rgba};
-use super::view::{Level, View};
+use super::view::{Device, Devices, Level, View};
+use crate::audio::Flow;
 use crate::hub::Member;
 use crate::music::smtc::Command;
 
@@ -14,8 +15,18 @@ use crate::music::smtc::Command;
 pub enum Hit {
     /// A transport button on the card's row for session `.0`.
     Media(usize, Command),
+    /// A device button: switch that flow to its next device.
+    Device(crate::audio::Flow),
     /// Anywhere on the scene: the view's [`super::view::Action`], or the call's mute.
     Whole,
+}
+
+/// A ring that pulses out from a face while its owner speaks, animated on repeat by DWM.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Pulse {
+    pub cx: f32,
+    pub cy: f32,
+    pub r: f32,
 }
 
 /// Where the progress ring sits, and how it moves.
@@ -36,6 +47,7 @@ pub struct Scene {
     pub h: f32,
     pub content: windows::Win32::Graphics::DirectComposition::IDCompositionVisual2,
     pub rings: Vec<Ring>,
+    pub pulses: Vec<Pulse>,
     pub hits: Vec<([f32; 4], Hit)>,
 }
 
@@ -55,6 +67,8 @@ const SPEAKING: Rgba = Rgba::hex(0x3DD68C, 1.0);
 const LIVE_DOT: Rgba = Rgba::hex(0xFF4D4D, 1.0);
 const TRACK: Rgba = Rgba::hex(0xFFFFFF, 0.22);
 pub const RING: Rgba = Rgba::hex(0xFFFFFF, 0.95);
+/// The speaking pulse: the speaking ring's green.
+pub const PULSE: Rgba = SPEAKING;
 
 /// The rounded end that sticks out from the left edge: shapes start left of 0 so only their
 /// right side shows rounded.
@@ -72,16 +86,30 @@ const GLYPH_MUSIC: char = '\u{EC4F}';
 pub fn scene(gfx: &Gfx, view: &View) -> Result<Option<Scene>> {
     Ok(Some(match view {
         View::Hidden => return Ok(None),
-        View::Idle => {
+        View::Idle { devices: None } => {
             let (w, h) = (6.0, 56.0);
             let (content, _) = gfx.painted(w, h, |p| p.round_rect(-TUCK, 0.0, w + TUCK, h, 3.0, SLIVER))?;
-            Scene { w, h, content, rings: Vec::new(), hits: Vec::new() }
+            Scene { w, h, content, rings: Vec::new(), pulses: Vec::new(), hits: Vec::new() }
         }
-        View::Music { media, card: false } => {
-            // One disc per playing session, stacked in the same pill.
+        View::Idle { devices: Some(devices) } => {
+            // Just the devices, in a small pill of their own.
+            let w = 52.0;
+            let h = 8.0 + DEVICE_STEP * device_count(devices) as f32;
+            let mut hits = Vec::new();
+            let (content, _) = gfx.painted(w, h, |p| {
+                p.round_rect(-TUCK, 0.0, w + TUCK, h, w / 2.0, QUIET_BG)?;
+                device_column(p, devices, 4.0, &mut hits)
+            })?;
+            Scene { w, h, content, rings: Vec::new(), pulses: Vec::new(), hits }
+        }
+        View::Music { media, card: false, devices } => {
+            // One disc per playing session, stacked in the same pill, the devices under them.
             const STEP: f32 = 44.0;
             let w = 52.0;
-            let h = 52.0 + STEP * (media.len() as f32 - 1.0);
+            let discs_h = 52.0 + STEP * (media.len() as f32 - 1.0);
+            let devices_h = devices.as_ref().map_or(0.0, |d| 6.0 + DEVICE_STEP * device_count(d) as f32);
+            let h = discs_h + devices_h;
+            let mut hits = Vec::new();
             let (content, _) = gfx.painted(w, h, |p| {
                 p.round_rect(-TUCK, 0.0, w + TUCK, h, w / 2.0, QUIET_BG)?;
                 for (i, m) in media.iter().enumerate() {
@@ -94,6 +122,10 @@ pub fn scene(gfx: &Gfx, view: &View) -> Result<Option<Scene>> {
                     } else {
                         p.ring(cx, cy, 19.5, 3.0, TRACK)?;
                     }
+                }
+                if let Some(devices) = devices {
+                    p.round_rect(14.0, discs_h + 1.0, w - 28.0, 1.0, 0.0, Rgba::hex(0xFFFFFF, 0.14))?;
+                    device_column(p, devices, discs_h + 4.0, &mut hits)?;
                 }
                 Ok(())
             })?;
@@ -110,13 +142,15 @@ pub fn scene(gfx: &Gfx, view: &View) -> Result<Option<Scene>> {
                     rate: m.length_seconds().filter(|_| m.playing).map_or(0.0, |len| (1.0 / len) as f32),
                 })
                 .collect();
-            Scene { w, h, content, rings, hits: Vec::new() }
+            Scene { w, h, content, rings, pulses: Vec::new(), hits }
         }
-        View::Music { media, card: true } => {
-            // One row per session, each with its own controls.
+        View::Music { media, card: true, devices } => {
+            // One row per session, each with its own controls; a row of devices closes the card.
             const ROW: f32 = 92.0;
+            const DEVICES_ROW: f32 = 48.0;
             let w = 300.0;
-            let h = ROW * media.len() as f32 + 8.0;
+            let rows_h = ROW * media.len() as f32 + 8.0;
+            let h = rows_h + devices.as_ref().map_or(0.0, |_| DEVICES_ROW);
             let text_x = 84.0;
             let text_w = w - text_x - 16.0;
             let rows: Vec<(f32, Vec<(char, Command)>)> = media
@@ -131,6 +165,16 @@ pub fn scene(gfx: &Gfx, view: &View) -> Result<Option<Scene>> {
                         vec![(GLYPH_PREVIOUS, Command::Previous), (play, Command::TogglePlayPause), (GLYPH_NEXT, Command::Next)]
                     };
                     (4.0 + i as f32 * ROW, buttons)
+                })
+                .collect();
+            let mut hits: Vec<([f32; 4], Hit)> = rows
+                .iter()
+                .enumerate()
+                .flat_map(|(i, (top, buttons))| {
+                    buttons
+                        .iter()
+                        .enumerate()
+                        .map(move |(b, (_, command))| ([text_x - 6.0 + b as f32 * 40.0, top + 58.0, 32.0, 32.0], Hit::Media(i, *command)))
                 })
                 .collect();
             let (content, _) = gfx.painted(w, h, |p| {
@@ -155,21 +199,14 @@ pub fn scene(gfx: &Gfx, view: &View) -> Result<Option<Scene>> {
                         p.text(&glyph.to_string(), Font::Icons, (x, top + 60.0, 32.0, 28.0), WHITE)?;
                     }
                 }
+                if let Some(devices) = devices {
+                    p.round_rect(14.0, rows_h - 3.0, w - 28.0, 1.0, 0.0, Rgba::hex(0xFFFFFF, 0.10))?;
+                    device_row(p, devices, rows_h, w, &mut hits)?;
+                }
                 Ok(())
             })?;
-            let hits = rows
-                .iter()
-                .enumerate()
-                .flat_map(|(i, (top, buttons))| {
-                    buttons
-                        .iter()
-                        .enumerate()
-                        .map(move |(b, (_, command))| ([text_x - 6.0 + b as f32 * 40.0, top + 58.0, 32.0, 32.0], Hit::Media(i, *command)))
-                })
-                .collect();
-            Scene { w, h, content, rings: Vec::new(), hits }
-        }
-        View::Call { app, holder, members, muted } => call(gfx, app.map(|a| a.label()).or(holder.as_deref()), members, *muted)?,
+            Scene { w, h, content, rings: Vec::new(), pulses: Vec::new(), hits }
+        }        View::Call { app, holder, members, muted } => call(gfx, app.map(|a| a.label()).or(holder.as_deref()), members, *muted)?,
         View::Banner { level, glyph, text, .. } => {
             let (bg, fg) = match level {
                 Level::Alert => (ALERT_BG, WHITE),
@@ -183,9 +220,58 @@ pub fn scene(gfx: &Gfx, view: &View) -> Result<Option<Scene>> {
                 p.text(&glyph.to_string(), Font::Icons, (14.0, 0.0, 22.0, h), fg)?;
                 p.text(text, Font::Title, (46.0, 0.0, text_w + 2.0, h), fg)
             })?;
-            Scene { w, h, content, rings: Vec::new(), hits: vec![([0.0, 0.0, w, h], Hit::Whole)] }
+            Scene { w, h, content, rings: Vec::new(), pulses: Vec::new(), hits: vec![([0.0, 0.0, w, h], Hit::Whole)] }
         }
     }))
+}
+
+/// Height of one device button in the pill's column.
+const DEVICE_STEP: f32 = 40.0;
+const GLYPH_VOLUME_MUTED: char = '\u{E74F}';
+
+fn device_count(devices: &Devices) -> usize {
+    usize::from(devices.output.is_some()) + usize::from(devices.input.is_some())
+}
+
+/// The output then the input, as round buttons down the pill's column from `top`.
+fn device_column(p: &mut Painter, devices: &Devices, top: f32, hits: &mut Vec<([f32; 4], Hit)>) -> Result<()> {
+    let mut y = top;
+    for (flow, device) in [(Flow::Output, &devices.output), (Flow::Input, &devices.input)] {
+        let Some(device) = device else { continue };
+        let (cx, cy) = (26.0, y + DEVICE_STEP / 2.0);
+        device_button(p, flow, device, cx, cy)?;
+        hits.push(([4.0, y, 44.0, DEVICE_STEP], Hit::Device(flow)));
+        y += DEVICE_STEP;
+    }
+    Ok(())
+}
+
+/// The output and input side by side, each with its name, along the card's bottom.
+fn device_row(p: &mut Painter, devices: &Devices, top: f32, w: f32, hits: &mut Vec<([f32; 4], Hit)>) -> Result<()> {
+    let half = (w - 16.0) / 2.0;
+    for (i, (flow, device)) in [(Flow::Output, &devices.output), (Flow::Input, &devices.input)].into_iter().enumerate() {
+        let Some(device) = device else { continue };
+        let x = 8.0 + i as f32 * half;
+        device_button(p, flow, device, x + 20.0, top + 22.0)?;
+        p.text(&device.name, Font::Small, (x + 42.0, top + 8.0, half - 48.0, 28.0), DIM_WHITE)?;
+        hits.push(([x, top, half, 44.0], Hit::Device(flow)));
+    }
+    Ok(())
+}
+
+/// One device: its glyph on a disc (the mute glyph when muted), and the recording dot.
+fn device_button(p: &mut Painter, flow: Flow, device: &Device, cx: f32, cy: f32) -> Result<()> {
+    p.circle(cx, cy, 16.0, if device.muted { Rgba::hex(0x5A5A5A, 1.0) } else { Rgba::hex(0x3A3A3A, 1.0) })?;
+    let glyph = match (flow, device.muted) {
+        (Flow::Output, true) => GLYPH_VOLUME_MUTED,
+        (Flow::Input, true) => GLYPH_MIC_OFF,
+        _ => device.glyph,
+    };
+    p.text(&glyph.to_string(), Font::Icons, (cx - 16.0, cy - 16.0, 32.0, 32.0), WHITE)?;
+    if device.recording {
+        p.circle(cx + 11.0, cy - 11.0, 4.5, LIVE_DOT)?;
+    }
+    Ok(())
 }
 
 /// Cover art, or a music glyph on a plain disc when there is none (or it will not decode).
@@ -247,7 +333,12 @@ fn call(gfx: &Gfx, app: Option<&str>, members: &[Member], muted: bool) -> Result
         }
         Ok(())
     })?;
-    Ok(Scene { w, h, content, rings: Vec::new(), hits: vec![([0.0, 0.0, col, h], Hit::Whole)] })
+    // The speaker's face pulses (see [`Pulse`]).
+    let pulses = speaker
+        .map(|i| Pulse { cx: col / 2.0, cy: 8.0 + i as f32 * STEP + FACE / 2.0, r: FACE / 2.0 + 1.0 })
+        .into_iter()
+        .collect();
+    Ok(Scene { w, h, content, rings: Vec::new(), pulses, hits: vec![([0.0, 0.0, col, h], Hit::Whole)] })
 }
 
 /// One face: the avatar, or an initial on a colour from the name; dimmed unless speaking.

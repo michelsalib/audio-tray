@@ -83,7 +83,7 @@ pub const MUSIC_STATE_FILE: &str = "audio-tray-music.txt";
 /// Version of the app ↔ TAP contract (init-data keys, messages, state file). A loaded TAP adopts a
 /// new app on a handover when this matches and the DLL file is the same, instead of requiring the
 /// identical app version. Bump it on any change an older TAP or app would misread.
-pub const PROTOCOL: u32 = 2;
+pub const PROTOCOL: u32 = 3;
 
 /// Encodes init data: `key=value` pairs joined by `;`. Values escape `%`, `;` and `=` as `%25`,
 /// `%3B` and `%3D`, so a tile name or install path containing them survives; anything else is

@@ -112,10 +112,9 @@ fn entrance(shown: &View, next: &View) -> Entrance {
         return Entrance::Slide;
     }
     let shape = |view: &View| match view {
-        View::Idle { devices } => (0, devices.is_some(), false),
-        View::Music { media, card, devices } => (media.len(), devices.is_some(), *card),
-        View::Call { members, .. } => (members.len(), false, false),
-        _ => (0, false, false),
+        View::Idle { call, devices } => (0, call.as_ref().map(|c| c.members.len() + 1), devices.is_some(), false),
+        View::Music { media, card, call, devices } => (media.len(), call.as_ref().map(|c| c.members.len() + 1), devices.is_some(), *card),
+        _ => (0, None, false, false),
     };
     if shape(shown) != shape(next) {
         Entrance::Grow
@@ -661,7 +660,9 @@ impl Pill {
                     act(Action::Media(m.app_id.clone(), command));
                 }
             }
-            (View::Call { app, .. }, Some(_)) => act(Action::ToggleMute(*app)),
+            (View::Idle { call: Some(call), .. } | View::Music { call: Some(call), .. }, Some(Hit::CallMute)) => {
+                act(Action::ToggleMute(call.app))
+            }
             (View::Banner { action, .. }, Some(_)) => match (action, right) {
                 // Right click only dismisses.
                 (view::Action::MuteAndAcknowledge(notice) | view::Action::Dismiss(notice), true) => {

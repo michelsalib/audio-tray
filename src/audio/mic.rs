@@ -43,7 +43,7 @@ static WATCHING: AtomicBool = AtomicBool::new(false);
 pub fn in_use() -> bool {
     if !WATCHING.swap(true, Ordering::SeqCst) {
         IN_USE.store(!users().is_empty(), Ordering::SeqCst);
-        std::thread::spawn(watch);
+        let _ = std::thread::Builder::new().name("mic".into()).spawn(watch);
     }
     IN_USE.load(Ordering::SeqCst)
 }

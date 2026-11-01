@@ -29,8 +29,8 @@ use anyhow::Result;
 use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{
-    DefWindowProcW, DispatchMessageW, GetMessageW, PostMessageW, PostQuitMessage, TranslateMessage,
-    MSG, WHEEL_DELTA, WM_APP, WM_TIMER,
+    DefWindowProcW, DispatchMessageW, GetMessageW, KillTimer, PostMessageW, PostQuitMessage, SetTimer,
+    TranslateMessage, MSG, WHEEL_DELTA, WM_APP, WM_TIMER,
 };
 
 use crate::audio::wasapi::WasapiBackend;
@@ -71,6 +71,9 @@ const WM_ENDPOINT_VOLUME: u32 = WM_APP + 32;
 /// Check that the icon survived an Explorer restart (`wParam`: attempt number); see
 /// [`Tray::ensure_icon`].
 const WM_ICON_CHECK: u32 = WM_APP + 33;
+
+/// The receiver window's timer for the next timed notice (`osd::TIMER_ID` is the other one).
+const NOTICE_TIMER: usize = 0x4E54;
 
 /// Re-registration checks after a restart, and the first gap (doubling): ~1 min in all.
 const ICON_CHECKS: usize = 6;
@@ -245,9 +248,14 @@ pub fn run(backend: WasapiBackend) -> Result<()> {
     };
     println!("tray: created ({devices} output device(s)); {gestures}.");
 
+    // The passive surface; the app works without it.
+    if let Err(e) = crate::pill::create(&config.pill) {
+        eprintln!("pill: unavailable ({e:#})");
+    }
+
     // On a thread of its own: every SMTC call blocks on an async operation, which deadlocks this
     // STA (see `music::on_mta_thread`). `None` = off in config, or SMTC would not open.
-    let music = crate::music::spawn(&config.music);
+    let music = crate::music::spawn(&config.music, config.strip.enabled);
     if music.is_some() {
         println!("music: following YouTube Music");
     }
@@ -279,6 +287,7 @@ pub fn run(backend: WasapiBackend) -> Result<()> {
         }
     }
 
+    crate::pill::destroy();
     // The progress bar sits on *another app's* button, so it has to come off here, while this
     // thread still pumps; dropping the music handle below is what stops the feed re-adding it.
     taskbar::clear_player_progress();
@@ -326,7 +335,8 @@ fn is_ours(msg: u32, wparam: usize) -> bool {
             | WM_ICON_CHECK
             | crate::hub::WM_HUB_EVENTS
             | sessions::WM_SESSIONS_CHANGED
-    ) || (msg == WM_TIMER && wparam == crate::osd::TIMER_ID)
+            | crate::pill::WM_PILL_ACTION
+    ) || (msg == WM_TIMER && (wparam == crate::osd::TIMER_ID || wparam == NOTICE_TIMER))
 }
 
 /// Handle queued messages, oldest first, unless a handler further up the stack already is.
@@ -367,6 +377,12 @@ fn handle(msg: Queued) {
         }
         crate::hub::WM_HUB_EVENTS => {
             with_tray(Tray::fold_events);
+        }
+        crate::pill::WM_PILL_ACTION => {
+            with_tray(Tray::pill_actions);
+        }
+        WM_TIMER if msg.wparam == NOTICE_TIMER => {
+            with_tray(Tray::expire_notices);
         }
         sessions::WM_SESSIONS_CHANGED => {
             sessions::CHANGED.take();
@@ -580,16 +596,65 @@ impl Tray {
         }
     }
 
-    /// The hub state changed: bring the surfaces in line.
+    /// The hub state changed: bring the surfaces in line, and arm the next notice's expiry.
     fn hub_changed(&mut self) {
-        let media = self.hub.media.as_ref().map(|m| format!("{} — {} ({}{})", m.title, m.artist, m.app, if m.playing { "" } else { ", paused" }));
-        println!(
-            "hub: media {}; mic {:?}; calls {}; notices {}",
-            media.as_deref().unwrap_or("none"),
-            self.hub.mic_users,
-            self.hub.calls.len(),
-            self.hub.notices.len()
-        );
+        let (_, next) = self.hub.expire(Instant::now());
+        crate::pill::update(&self.hub);
+        if let (Some(next), Some(window)) = (next, taskbar::receiver()) {
+            // One-shot: the handler re-arms for whatever is due next.
+            unsafe { SetTimer(Some(window), NOTICE_TIMER, next.as_millis() as u32 + 1, None) };
+        }
+    }
+
+    /// A notice's time is up.
+    fn expire_notices(&mut self) {
+        if let Some(window) = taskbar::receiver() {
+            unsafe {
+                let _ = KillTimer(Some(window), NOTICE_TIMER);
+            }
+        }
+        self.hub_changed();
+    }
+
+    /// Carry out what the pill was clicked for.
+    fn pill_actions(&mut self) {
+        use crate::pill::Action;
+        for action in crate::pill::take_actions() {
+            println!("pill: {action:?}");
+            match action {
+                Action::Media(command) => {
+                    if let Some(music) = self.music.as_ref() {
+                        music.command_shown(command);
+                    }
+                }
+                Action::ToggleMute(Some(app)) => crate::integrations::toggle_mute(app),
+                Action::ToggleMute(None) => {
+                    let muted = self.hub.endpoints.input.as_ref().is_some_and(|e| e.muted);
+                    self.set_microphone_muted(!muted);
+                }
+                Action::Unmute(Some(app)) => crate::integrations::set_muted(app, false),
+                Action::Unmute(None) => self.set_microphone_muted(false),
+                Action::MuteMicrophone => self.set_microphone_muted(true),
+                Action::Acknowledge(notice) => {
+                    self.hub.acknowledge(&notice);
+                    self.hub_changed();
+                }
+                Action::Open(url) => open_url(&url),
+            }
+        }
+    }
+
+    /// Mute or unmute the default microphone. Its volume watch brings the change back round.
+    fn set_microphone_muted(&mut self, muted: bool) {
+        match self.backend.default_of(Flow::Input) {
+            Ok(Some(id)) => {
+                if let Err(e) = self.backend.set_muted(&id, muted) {
+                    eprintln!("pill: could not {} the microphone ({e:#})", if muted { "mute" } else { "unmute" });
+                }
+                AUDIO_CHANGED.post();
+            }
+            _ => eprintln!("pill: no default microphone to mute"),
+        }
     }
 
     /// Watch the current defaults' volume and mute, keeping existing subscriptions whose endpoint
@@ -723,6 +788,7 @@ impl Tray {
         }
         // This thread's cached shell interface is a proxy into the dead Explorer.
         crate::music::player::forget_taskbar_list();
+        crate::pill::taskbar_restarted();
         // tray-icon re-registered the icon with its build-time defaults; put ours back.
         self.refresh();
         // ...unless that re-registration failed: see `ensure_icon`.
@@ -972,6 +1038,20 @@ impl Current {
             // A property of the microphone, not of an endpoint; a cached atomic, not COM.
             input_recording: mic::in_use(),
         }
+    }
+}
+
+/// Open a link in the default browser.
+fn open_url(url: &str) {
+    use windows::Win32::UI::Shell::ShellExecuteW;
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    // Only web links: the URL came from an integration.
+    if !url.starts_with("https://") {
+        return;
+    }
+    let url = crate::win::wide(url);
+    unsafe {
+        ShellExecuteW(None, windows::core::w!("open"), windows::core::PCWSTR(url.as_ptr()), None, None, SW_SHOWNORMAL);
     }
 }
 

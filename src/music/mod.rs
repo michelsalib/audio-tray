@@ -115,7 +115,7 @@ impl Drop for Handle {
 
 /// Start following YouTube Music on its own MTA thread. `None` when switched off or the thread
 /// cannot start; the audio half must come up either way.
-pub fn spawn(settings: &crate::config::Music) -> Option<Handle> {
+pub fn spawn(settings: &crate::config::Music, taskbar: bool) -> Option<Handle> {
     if !settings.enabled {
         return None;
     }
@@ -131,7 +131,7 @@ pub fn spawn(settings: &crate::config::Music) -> Option<Handle> {
             let notify: smtc::Notify = Arc::new(move |change| {
                 let _ = events.send(Request::Changed(change));
             });
-            match Music::new(pinned, notify) {
+            match Music::new(pinned, notify, taskbar) {
                 Ok(mut music) => music.serve(inbox),
                 Err(e) => eprintln!("music: unavailable ({e:#})"),
             }
@@ -156,6 +156,8 @@ pub struct Music {
     progress: progress::Progress,
     /// The transport buttons on the shell's thumbnail toolbar under the player's preview.
     toolbar: thumbbar::Toolbar,
+    /// The strip is on: publish its state file and drive the taskbar progress bar.
+    taskbar: bool,
     /// An SMTC change arrived since the last reading.
     dirty: bool,
     /// The media last reported to the hub (`Some(None)`: reported as nothing).
@@ -165,12 +167,13 @@ pub struct Music {
 impl Music {
     /// Open the session feed and report its changes to `notify`. Fails only if SMTC itself is
     /// unavailable.
-    pub fn new(pinned: Option<String>, notify: smtc::Notify) -> Result<Self> {
+    pub fn new(pinned: Option<String>, notify: smtc::Notify, taskbar: bool) -> Result<Self> {
         let mut feed = Ytm::new(pinned).context("opening the SMTC session manager")?;
         feed.watch(notify).context("subscribing to SMTC events")?;
         Ok(Self {
             feed,
             publisher: publish::Publisher::new(),
+            taskbar,
             progress: progress::Progress::new(),
             toolbar: thumbbar::Toolbar::new(),
             dirty: false,
@@ -194,14 +197,20 @@ impl Music {
         if let Some(app_id) = self.feed.current_app_id() {
             player::remember_player(app_id);
         }
-        if let Err(err) = self.publisher.publish(&state) {
-            eprintln!("music: could not publish the strip state: {err:#}");
+        // The state file and the taskbar progress bar are the strip's; without it they cost wakes
+        // for nothing.
+        if self.taskbar {
+            if let Err(err) = self.publisher.publish(&state) {
+                eprintln!("music: could not publish the strip state: {err:#}");
+            }
         }
 
         let playing = state
             .snapshot()
             .is_some_and(|snapshot| snapshot.status.is_playing());
-        self.progress.update(timeline, playing);
+        if self.taskbar {
+            self.progress.update(timeline, playing);
+        }
         self.toolbar.update(playing);
     }
 

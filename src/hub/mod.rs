@@ -153,7 +153,7 @@ impl Notice {
 }
 
 /// Everything the surfaces render, folded from events.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct State {
     pub media: Option<Media>,
     pub mic_users: Vec<String>,

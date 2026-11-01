@@ -76,6 +76,15 @@ pub unsafe fn sweep(diagnostics: &IXamlDiagnostics) {
     let Some(strip) = state::Strip::read() else {
         return;
     };
+    // Nothing playing (audio-tray says so only once the player has been gone a while, not for a
+    // track change): the button is the app's again, its own icon back.
+    if !strip.has_track() {
+        if !crate::lock(&PLACED).is_empty() {
+            logf!("music: nothing playing; handing the button back");
+            hand_back(diagnostics);
+        }
+        return;
+    }
 
     // The thumbnail-toolbar buttons are wired by `crate::wire_transport`, not here (this runs behind
     // the mutation gate, too late for the first press).
@@ -206,16 +215,26 @@ pub unsafe fn repin(diagnostics: &IXamlDiagnostics) {
 /// # Safety
 /// XAML UI thread only.
 pub unsafe fn revert(diagnostics: &IXamlDiagnostics) {
+    hand_back(diagnostics);
+    // audio-tray sets the progress bar, but a killed audio-tray cannot clear it; this revert runs on
+    // owner death (`lifecycle::watch_owner`), so clear it here.
+    clear_progress_bar();
+}
+
+/// Take the strips out of their buttons and give the buttons back as the shell drew them: sizes,
+/// margins and the app's own icon. A later sweep with a track draws them afresh.
+///
+/// # Safety
+/// XAML UI thread only.
+unsafe fn hand_back(diagnostics: &IXamlDiagnostics) {
     let placed = std::mem::take(&mut *crate::lock(&PLACED));
     // Sizes and margins go back before the content comes out.
     tile::restore(diagnostics);
     for placed in placed {
         let cleared = tile::clear_child(diagnostics, placed.border);
+        tile::show_app_icon(diagnostics, placed.button);
         logf!("music: cleared the strip on 0x{:x} -> {cleared}", placed.border);
     }
-    // audio-tray sets the progress bar, but a killed audio-tray cannot clear it; this revert runs on
-    // owner death (`lifecycle::watch_owner`), so clear it here.
-    clear_progress_bar();
 }
 
 /// The window audio-tray last put a progress bar on (0: none or not reported).

@@ -170,6 +170,10 @@ pub struct Music {
     sites: std::collections::HashMap<(String, String), String>,
     /// Sessions that went away, still reported until [`GAP`] has passed (see [`Music::bridge_gaps`]).
     vanished: Vec<(crate::hub::Media, std::time::Instant)>,
+    /// Since when the player has had no session, and whether the tile was told yet: told only
+    /// after [`GAP`], so a track change (Chromium drops the session for a second) keeps the tile,
+    /// and a closed player hands its button back.
+    absent: Option<(std::time::Instant, bool)>,
 }
 
 impl Music {
@@ -188,6 +192,7 @@ impl Music {
             reported: None,
             sites: Default::default(),
             vanished: Vec::new(),
+            absent: None,
         })
     }
 
@@ -209,7 +214,7 @@ impl Music {
         }
         // The state file and the taskbar progress bar are the strip's; without it they cost wakes
         // for nothing.
-        if self.taskbar {
+        if self.taskbar && self.tile_should_hear(&state) {
             if let Err(err) = self.publisher.publish(&state) {
                 eprintln!("music: could not publish the strip state: {err:#}");
             }
@@ -286,7 +291,23 @@ impl Music {
     /// When the oldest session in a gap is to be let go.
     fn gap_due(&self) -> Option<Duration> {
         let now = std::time::Instant::now();
-        self.vanished.iter().map(|(_, at)| (*at + GAP).saturating_duration_since(now)).min()
+        let absent = self.absent.filter(|(_, told)| !told).map(|(since, _)| (since + GAP).saturating_duration_since(now));
+        self.vanished.iter().map(|(_, at)| (*at + GAP).saturating_duration_since(now)).chain(absent).min()
+    }
+
+    /// Whether the tile is to hear of `state` now: a track at once, its absence after [`GAP`].
+    fn tile_should_hear(&mut self, state: &feed::State) -> bool {
+        if !matches!(state, feed::State::Absent) {
+            self.absent = None;
+            return true;
+        }
+        let now = std::time::Instant::now();
+        let (since, told) = self.absent.get_or_insert((now, false));
+        if *told || now.duration_since(*since) < GAP {
+            return false;
+        }
+        *told = true;
+        true
     }
 
     /// For a browser's session, the site playing in it ("Twitch", "YouTube"), from the browser's

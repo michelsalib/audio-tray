@@ -453,6 +453,27 @@ unsafe fn span_like_plate(diagnostics: &IXamlDiagnostics, panel: InstanceHandle,
     logf!("music: progress bar column span {live} -> {wanted} -> 0x{:08x}", hr.0);
 }
 
+/// Show the app's own icon again (what [`hide_app_icon`] collapsed, width zeroed and all).
+///
+/// # Safety
+/// XAML UI thread only.
+pub unsafe fn show_app_icon(diagnostics: &IXamlDiagnostics, button: InstanceHandle) {
+    for panel in crate::tree::children_of(button) {
+        for child in crate::tree::children_of(panel) {
+            let name = crate::tree::name_of(child).unwrap_or_default();
+            if !HIDE.contains(&name.as_str()) {
+                continue;
+            }
+            crate::decorate::set_visible(diagnostics, child, true);
+            if let Some(framework) = element::<IFrameworkElement>(diagnostics, child) {
+                // Auto, as the template has it.
+                let _ = framework.put_Width(f64::NAN);
+                let _ = framework.put_MinWidth(0.0);
+            }
+        }
+    }
+}
+
 /// Collapse the app's own icon, matched by name (never by position) so we cannot hit our strip.
 ///
 /// # Safety

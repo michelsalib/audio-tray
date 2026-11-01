@@ -334,8 +334,9 @@ fn replace<T: PartialEq>(slot: &mut T, value: T) -> bool {
     true
 }
 
-/// How long a tab stays hidden after its app's SMTC session went (a track change drops it ~1 s).
-pub const APP_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+/// How long a tab stays hidden after its app's SMTC session went: longer than the music feed's
+/// own bridge over a track change (`music::GAP`).
+pub const APP_GRACE: std::time::Duration = std::time::Duration::from_secs(6);
 
 /// How many media sessions the surfaces show at once.
 pub const MAX_SHOWN: usize = 4;
@@ -454,7 +455,7 @@ mod tests {
         // The tab already has the new title while the app still shows the old one…
         state.apply(Event::BrowserMedia(vec![app("browser:1:0", "New song")]));
         assert_eq!(state.all_media().len(), 1, "matched by app, not title");
-        // …then the app's session drops for a moment.
+        // …then the app's session drops for a moment (past the feed's own bridge).
         state.apply(Event::Media(vec![]));
         assert!(state.all_media().is_empty(), "the tab does not show alone in the gap");
         state.apply(Event::Media(vec![app("ytm!App", "New song")]));

@@ -91,8 +91,9 @@ impl Handle {
 // No `activate` on purpose: body clicks belong to the shell (activate/minimise, drag-to-reorder);
 // only the no-session fallback in [`Music::command`] raises the player.
 
-/// How long a vanished session is still reported: Chromium's track-change gap is about a second.
-const GAP: Duration = Duration::from_millis(1500);
+/// How long a vanished session is still reported. Chromium's track-change gap was measured at
+/// 1.1 s and 2.9 s (it waits for the next track to load); a player really closing lingers this long.
+const GAP: Duration = Duration::from_secs(5);
 
 /// How long Quit waits for the feed thread to tidy up.
 const SHUTDOWN_WAIT: Duration = Duration::from_secs(2);

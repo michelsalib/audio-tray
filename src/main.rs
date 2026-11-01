@@ -36,6 +36,7 @@ mod layered;
 mod music;
 mod osd;
 mod pill;
+mod secrets;
 mod taskbar;
 mod tray;
 mod update;

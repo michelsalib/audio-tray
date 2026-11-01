@@ -88,6 +88,9 @@ pub struct Discord {
     /// scopes are granted to the application's owner and testers. Without them, only the Vencord
     /// plugin's pipe is served.
     pub client_id: Option<String>,
+    /// Kept in the Credential Manager ([`crate::secrets`]), never written here; read from an
+    /// older file once, and moved on the next save.
+    #[serde(skip_serializing)]
     pub client_secret: Option<String>,
 }
 
@@ -111,11 +114,14 @@ impl Default for Browser {
 }
 
 /// Teams' local API must also be turned on in Teams (Settings > Privacy > Manage API); the first
-/// connection asks for approval inside Teams, which then hands over the `token` kept here.
+/// connection asks for approval inside Teams, which then hands over the `token` (kept in the
+/// Credential Manager).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Teams {
     pub enabled: bool,
+    /// Kept in the Credential Manager, like [`Discord::client_secret`].
+    #[serde(skip_serializing)]
     pub token: Option<String>,
 }
 
@@ -199,13 +205,21 @@ impl Config {
     /// Load config, falling back to defaults if it is missing or unreadable — a bad config file
     /// must never prevent the tray from starting.
     pub fn load() -> Self {
-        match Self::path() {
+        let mut config = match Self::path() {
             Ok(path) => Self::load_from(&path),
             Err(e) => {
                 eprintln!("config: using defaults ({e:#})");
                 Self::default()
             }
+        };
+        // The secrets live in the Credential Manager; one still in an older file wins until saved.
+        if config.discord.client_secret.is_none() {
+            config.discord.client_secret = crate::secrets::get(crate::secrets::DISCORD_SECRET);
         }
+        if config.teams.token.is_none() {
+            config.teams.token = crate::secrets::get(crate::secrets::TEAMS_TOKEN);
+        }
+        config
     }
 
     /// A file that does not parse is renamed to `config.toml.bad` (replacing an older one) rather
@@ -249,6 +263,8 @@ impl Config {
     }
 
     pub fn save(&self) -> Result<()> {
+        crate::secrets::set(crate::secrets::DISCORD_SECRET, self.discord.client_secret.as_deref());
+        crate::secrets::set(crate::secrets::TEAMS_TOKEN, self.teams.token.as_deref());
         let path = Self::path()?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)

@@ -2,7 +2,7 @@
 //! over `\\.\pipe\discord-ipc-N` as the user's own developer application (`[discord]`
 //! `client_id` / `client_secret`): the voice scopes are granted to the application's owner and
 //! testers. Discord asks the user once to authorise it; the token is kept in
-//! `discord-token.json` beside the config and refreshed as it expires.
+//! the Credential Manager and refreshed as it expires.
 //!
 //! One thread, blocked on the pipe while nothing happens. It connects at start-up and whenever
 //! Discord takes the microphone or opens an audio session ([`poke`]), never on a timer. Frames are
@@ -526,7 +526,8 @@ impl Session {
     }
 }
 
-/// The OAuth token, kept beside the config (not in it: the tray rewrites the config).
+/// The OAuth token, kept in the Credential Manager ([`crate::secrets`]); an older version kept it
+/// in `discord-token.json` beside the config, moved over on first read.
 struct Token {
     access: String,
     refresh: String,
@@ -535,12 +536,20 @@ struct Token {
 }
 
 impl Token {
-    fn path() -> Option<std::path::PathBuf> {
+    /// Where an older version kept it.
+    fn old_path() -> Option<std::path::PathBuf> {
         Some(crate::config::Config::path().ok()?.parent()?.join("discord-token.json"))
     }
 
     fn load() -> Option<Self> {
-        let value: Value = serde_json::from_str(&std::fs::read_to_string(Self::path()?).ok()?).ok()?;
+        let text = crate::secrets::get(crate::secrets::DISCORD_TOKEN).or_else(|| {
+            let path = Self::old_path()?;
+            let text = std::fs::read_to_string(&path).ok()?;
+            crate::secrets::set(crate::secrets::DISCORD_TOKEN, Some(&text));
+            let _ = std::fs::remove_file(path);
+            Some(text)
+        })?;
+        let value: Value = serde_json::from_str(&text).ok()?;
         Some(Self {
             access: value["access_token"].as_str()?.to_string(),
             refresh: value["refresh_token"].as_str()?.to_string(),
@@ -550,17 +559,15 @@ impl Token {
 
     /// The application changed: its token is worthless to the new one.
     fn forget() {
-        if let Some(path) = Self::path() {
+        crate::secrets::set(crate::secrets::DISCORD_TOKEN, None);
+        if let Some(path) = Self::old_path() {
             let _ = std::fs::remove_file(path);
         }
     }
 
     fn save(&self) {
-        let Some(path) = Self::path() else { return };
         let body = json!({ "access_token": self.access, "refresh_token": self.refresh, "expires_at": self.expires });
-        if let Err(e) = std::fs::write(&path, body.to_string()) {
-            eprintln!("discord: could not keep the token ({e})");
-        }
+        crate::secrets::set(crate::secrets::DISCORD_TOKEN, Some(&body.to_string()));
     }
 
     fn stale(&self) -> bool {

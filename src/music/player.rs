@@ -266,7 +266,16 @@ pub fn player_window() -> Option<HWND> {
 /// Set the taskbar progress bar on the player's (another process's) window. `fraction` is 0.0–1.0,
 /// `None` clears; `playing` picks normal vs paused colour. Call on an STA (the tray thread).
 pub fn set_player_progress(fraction: Option<f64>, playing: bool) -> Result<()> {
-    let hwnd = player_window().context("no YouTube Music window to put a progress bar on")?;
+    use windows::Win32::UI::WindowsAndMessaging::IsWindow;
+
+    // The window drawn on last is kept while it lives (as the thumbnail toolbar does): finding it
+    // walks every window, and this runs on every step of the bar.
+    let drawn = DRAWN.get().filter(|(raw, _)| unsafe { IsWindow(Some(HWND(*raw as _))) }.as_bool());
+    let hwnd = match drawn {
+        Some((raw, _)) => HWND(raw as _),
+        None => player_window().context("no YouTube Music window to put a progress bar on")?,
+    };
+    let state_set = drawn == Some((hwnd.0 as isize, playing));
     // Cached per thread (apartment-affine); droppable because an Explorer restart kills the proxy.
     TASKBAR.with(|cell| {
         if cell.borrow().is_none() {
@@ -274,7 +283,9 @@ pub fn set_player_progress(fraction: Option<f64>, playing: bool) -> Result<()> {
         }
         let borrowed = cell.borrow();
         let taskbar = borrowed.as_ref().context("caching ITaskbarList3")?;
-        set_progress(taskbar, hwnd, fraction, playing)?;
+        DRAWN.set(None);
+        set_progress(taskbar, hwnd, fraction, playing, state_set)?;
+        DRAWN.set(fraction.map(|_| (hwnd.0 as isize, playing)));
         crate::taskbar::report_progress_window(fraction.map(|_| hwnd));
         Ok(())
     })
@@ -283,12 +294,15 @@ pub fn set_player_progress(fraction: Option<f64>, playing: bool) -> Result<()> {
 thread_local! {
     static TASKBAR: std::cell::RefCell<Option<windows::Win32::UI::Shell::ITaskbarList3>> =
         const { std::cell::RefCell::new(None) };
+    /// The window [`set_player_progress`] last put a bar on, and the playing state it set there.
+    static DRAWN: std::cell::Cell<Option<(isize, bool)>> = const { std::cell::Cell::new(None) };
 }
 
 /// Drop the cached `ITaskbarList3` (a proxy into Explorer, which silently stops working after an
-/// Explorer restart) so the next call builds a fresh one.
+/// Explorer restart) so the next call builds a fresh one, and resends the bar's state.
 pub fn forget_taskbar_list() {
     TASKBAR.with(|cell| *cell.borrow_mut() = None);
+    DRAWN.set(None);
 }
 
 /// A fresh, initialised `ITaskbarList3` (the thumbnail toolbar keeps its own on the feed thread).
@@ -313,6 +327,8 @@ fn set_progress(
     hwnd: HWND,
     fraction: Option<f64>,
     playing: bool,
+    // The window already shows this playing state: only the value needs sending.
+    state_set: bool,
 ) -> Result<()> {
     use windows::Win32::UI::Shell::{TBPF_NOPROGRESS, TBPF_NORMAL, TBPF_PAUSED};
 
@@ -325,9 +341,11 @@ fn set_progress(
                 // Never 0: the shell treats zero as no progress and rebuilds `ProgressIndicator`, which
                 // jumps until the TAP re-pins it.
                 let completed = ((fraction.clamp(0.0, 1.0) * TOTAL as f64).round() as u64).max(1);
-                taskbar
-                    .SetProgressState(hwnd, if playing { TBPF_NORMAL } else { TBPF_PAUSED })
-                    .context("SetProgressState")?;
+                if !state_set {
+                    taskbar
+                        .SetProgressState(hwnd, if playing { TBPF_NORMAL } else { TBPF_PAUSED })
+                        .context("SetProgressState")?;
+                }
                 taskbar
                     .SetProgressValue(hwnd, completed, TOTAL)
                     .context("SetProgressValue")?;

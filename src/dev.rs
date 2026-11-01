@@ -17,6 +17,7 @@
 //!   --music-probe                  list SMTC sessions with their YouTube Music verdicts
 //!   --music-timeline [next|prev|toggle] [secs]
 //!                                  trace the followed session every 100 ms, optionally commanding it
+//!   --music-events [secs]          print each SMTC event and the reading it leads to, unpublished
 //!   --music-progress <pct|off> [paused]
 //!                                  set the player's taskbar progress bar by hand
 //!   --music-windows [all]          survey the player's windows, from an STA and an MTA
@@ -190,6 +191,10 @@ pub fn run(args: &[String], backend: &WasapiBackend) -> Result<bool> {
             };
             let seconds = args.iter().skip(1).find_map(|a| a.parse().ok()).unwrap_or(9);
             music::report_timeline(seconds, skip)?
+        }
+        Some("--music-events") => {
+            let seconds = args.get(1).and_then(|a| a.parse().ok()).unwrap_or(60);
+            music::report_events(seconds)?
         }
         Some("--music-progress") => {
             let value = args.get(1).map(String::as_str).unwrap_or("off");

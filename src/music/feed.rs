@@ -47,6 +47,21 @@ impl Ytm {
         })
     }
 
+    /// Report SMTC changes to `notify` (see [`smtc::Smtc::watch`]).
+    pub fn watch(&mut self, notify: smtc::Notify) -> Result<()> {
+        self.smtc.watch(notify)
+    }
+
+    /// Bring the feed's subscriptions and caches in line with a reported change.
+    pub fn changed(&self, change: smtc::Change) -> Result<()> {
+        match change {
+            smtc::Change::Sessions => self.smtc.watch_sessions()?,
+            smtc::Change::Properties => self.smtc.properties_changed(),
+            smtc::Change::Playback => {}
+        }
+        Ok(())
+    }
+
     /// Read the current state and track position, remembering which session they came from. Picks
     /// on the cheap [`smtc::Brief`]s and reads only the chosen session in full.
     pub fn read(&mut self) -> Result<(State, Option<smtc::Timeline>)> {

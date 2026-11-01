@@ -1,7 +1,8 @@
 //! YouTube Music in the taskbar: the feed, and the tile it draws into.
 //!
 //! It shares audio-tray's TAP because XAML Diagnostics takes one consumer per endpoint. All SMTC
-//! work runs on its own MTA thread ([`spawn`]); the tray thread holds only a channel. Nothing here
+//! work runs on its own MTA thread ([`spawn`]), woken only by SMTC events, requests, and the
+//! progress bar's next step; the tray thread holds only a channel. Nothing here
 //! draws the strip: [`publish`] hands state to the TAP as a file, while [`progress`] and
 //! [`thumbbar`] drive the shell's own progress bar and thumbnail toolbar on the player's window.
 
@@ -13,7 +14,9 @@ pub mod session;
 pub mod smtc;
 pub mod thumbbar;
 
+use std::ops::ControlFlow;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -47,8 +50,10 @@ fn enter_mta() {
     let _ = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
 }
 
-/// What the tray thread can ask the music thread to do.
+/// What the tray thread, or an SMTC event, can ask the music thread to do.
 enum Request {
+    /// Reported by an SMTC event handler.
+    Changed(smtc::Change),
     Command(smtc::Command),
     /// Explorer restarted (tray saw `WM_TASKBAR_RESTARTED`): shell-side state is gone.
     TaskbarRestarted,
@@ -110,12 +115,16 @@ pub fn spawn(settings: &crate::config::Music) -> Option<Handle> {
     let pinned = settings.app_id.clone();
     let (requests, inbox) = std::sync::mpsc::channel();
     let (finished_tx, finished) = std::sync::mpsc::channel::<()>();
+    let events = requests.clone();
     let thread = std::thread::Builder::new()
         .name("music".to_string())
         .spawn(move || {
             let _finished = finished_tx;
             enter_mta();
-            match Music::new(pinned) {
+            let notify: smtc::Notify = Arc::new(move |change| {
+                let _ = events.send(Request::Changed(change));
+            });
+            match Music::new(pinned, notify) {
                 Ok(mut music) => music.serve(inbox),
                 Err(e) => eprintln!("music: unavailable ({e:#})"),
             }
@@ -133,29 +142,36 @@ pub fn spawn(settings: &crate::config::Music) -> Option<Handle> {
     }
 }
 
-/// The feed and its outputs, which a poll always updates together.
+/// The feed and its outputs, which a reading always updates together.
 pub struct Music {
     feed: Ytm,
     publisher: publish::Publisher,
     progress: progress::Progress,
     /// The transport buttons on the shell's thumbnail toolbar under the player's preview.
     toolbar: thumbbar::Toolbar,
+    /// An SMTC change arrived since the last reading.
+    dirty: bool,
 }
 
 impl Music {
-    /// Open the session feed. Fails only if SMTC itself is unavailable.
-    pub fn new(pinned: Option<String>) -> Result<Self> {
+    /// Open the session feed and report its changes to `notify`. Fails only if SMTC itself is
+    /// unavailable.
+    pub fn new(pinned: Option<String>, notify: smtc::Notify) -> Result<Self> {
+        let mut feed = Ytm::new(pinned).context("opening the SMTC session manager")?;
+        feed.watch(notify).context("subscribing to SMTC events")?;
         Ok(Self {
-            feed: Ytm::new(pinned).context("opening the SMTC session manager")?,
+            feed,
             publisher: publish::Publisher::new(),
             progress: progress::Progress::new(),
             toolbar: thumbbar::Toolbar::new(),
+            dirty: false,
         })
     }
 
-    /// One poll: read the session, publish it, move the bar and toolbar. Errors are logged and the
-    /// last good state kept (a session dying mid-enumeration is routine).
+    /// Read the session, publish it, move the bar and toolbar. Errors are logged and the last good
+    /// state kept (a session dying mid-enumeration is routine).
     pub fn poll(&mut self) {
+        self.dirty = false;
         let (state, timeline) = match self.feed.read() {
             Ok(read) => read,
             Err(err) => {
@@ -199,32 +215,64 @@ impl Music {
         self.toolbar.clear();
     }
 
-    /// The thread body: poll every second (SMTC raises no position events) and act on requests the
-    /// moment they arrive.
+    /// The thread body: sleep until a request, an SMTC change, or the progress bar's next step.
+    /// Nothing wakes it while no track plays.
     fn serve(&mut self, inbox: Receiver<Request>) {
-        const POLL: Duration = Duration::from_secs(1);
         self.poll();
         loop {
-            match inbox.recv_timeout(POLL) {
-                Ok(Request::Command(command)) => self.command(command),
-                Ok(Request::TaskbarRestarted) => {
-                    self.progress.taskbar_restarted();
-                    self.toolbar.taskbar_restarted();
-                    // Now, alongside the strip's redraw, rather than flicker in a second later.
-                    self.poll();
-                }
-                Ok(Request::ShutDown) => {
-                    self.shut_down();
-                    return;
-                }
-                Err(RecvTimeoutError::Timeout) => self.poll(),
-                // Handle dropped without a shutdown: tear down anyway.
-                Err(RecvTimeoutError::Disconnected) => {
-                    self.shut_down();
+            let request = match self.progress.due() {
+                Some(wait) => match inbox.recv_timeout(wait) {
+                    Ok(request) => request,
+                    Err(RecvTimeoutError::Timeout) => {
+                        self.progress.tick();
+                        continue;
+                    }
+                    Err(RecvTimeoutError::Disconnected) => break,
+                },
+                None => match inbox.recv() {
+                    Ok(request) => request,
+                    Err(_) => break,
+                },
+            };
+            if self.handle(request).is_break() {
+                return;
+            }
+            // Events come in bursts (a track change raises several): read once for all of them.
+            while let Ok(request) = inbox.try_recv() {
+                if self.handle(request).is_break() {
                     return;
                 }
             }
+            if self.dirty {
+                self.poll();
+            }
         }
+        // Every sender gone without a shutdown: tear down anyway.
+        self.shut_down();
+    }
+
+    /// Act on one request. A change is only noted; [`Music::serve`] reads once the inbox is empty.
+    fn handle(&mut self, request: Request) -> ControlFlow<()> {
+        match request {
+            Request::Changed(change) => {
+                if let Err(err) = self.feed.changed(change) {
+                    eprintln!("music: could not follow {change:?}: {err:#}");
+                }
+                self.dirty = true;
+            }
+            Request::Command(command) => self.command(command),
+            Request::TaskbarRestarted => {
+                self.progress.taskbar_restarted();
+                self.toolbar.taskbar_restarted();
+                // Now, alongside the strip's redraw, rather than on the next change.
+                self.poll();
+            }
+            Request::ShutDown => {
+                self.shut_down();
+                return ControlFlow::Break(());
+            }
+        }
+        ControlFlow::Continue(())
     }
 }
 
@@ -341,6 +389,55 @@ fn report_position(feed: &mut Ytm, seconds: u64, skip: Option<smtc::Command>) ->
         println!("{at:6.2}s  {:<8} {:<10} {line}  {title}", feed.current_app_id().map_or("-", |_| "app"), status);
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
+    Ok(())
+}
+
+/// Watch SMTC as the feed does for `seconds`, printing each event (with its delay from the
+/// previous one) and the reading a burst of them leads to. Publishes nothing, so it can run beside
+/// the installed tray; its thread should not wake between events.
+#[cfg(feature = "dev")]
+pub fn report_events(seconds: u64) -> Result<()> {
+    on_mta_thread("music-events", move || {
+        let (events, inbox) = std::sync::mpsc::channel();
+        let mut feed = Ytm::new(None)?;
+        feed.watch(Arc::new(move |change| {
+            let _ = events.send((std::time::Instant::now(), change));
+        }))?;
+        let started = std::time::Instant::now();
+        let deadline = started + Duration::from_secs(seconds);
+        println!("watching SMTC for {seconds} s");
+        print_reading(&mut feed, 0.0)?;
+        while let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) {
+            let Ok((at, change)) = inbox.recv_timeout(left) else {
+                break;
+            };
+            let mut burst = vec![(at, change)];
+            while let Ok(event) = inbox.try_recv() {
+                burst.push(event);
+            }
+            for (at, change) in &burst {
+                println!("{:8.3}s  event {change:?}", (*at - started).as_secs_f64());
+                feed.changed(*change)?;
+            }
+            print_reading(&mut feed, (burst[0].0 - started).as_secs_f64())?;
+        }
+        Ok(())
+    })
+}
+
+#[cfg(feature = "dev")]
+fn print_reading(feed: &mut Ytm, since: f64) -> Result<()> {
+    let read_at = std::time::Instant::now();
+    let (state, timeline) = feed.read()?;
+    let took = read_at.elapsed().as_secs_f64() * 1000.0;
+    let what = match state.snapshot() {
+        Some(s) => format!("{:?} {} — {} (cover: {})", s.status, s.title, s.artist, s.cover.as_ref().map_or(0, Vec::len)),
+        None => "<absent>".into(),
+    };
+    let length = timeline
+        .and_then(|t| t.duration_seconds())
+        .map_or_else(|| "no length".into(), |d| format!("{d:.1}s long"));
+    println!("{:>10} read in {took:.0} ms: {what}, {length} (burst began at {since:.3}s)", "->");
     Ok(())
 }
 

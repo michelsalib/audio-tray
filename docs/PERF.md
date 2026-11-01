@@ -22,9 +22,45 @@ Installed release build, laptop on mains, 30 s window, taskbar strip on.
 | `wheel-hook` | 0 | 0 |
 | **Process** | **3.27** | **2.41 M** |
 
-All idle cost comes from the music feed's 1 s poll (`src/music/mod.rs`, `Music::serve`), which
-runs even when no player exists.
+The music feed's 1 s poll (`src/music/mod.rs`, `Music::serve`) runs even when no player exists.
+The unnamed thread is the microphone watcher (`src/audio/mic.rs`), not the WinRT pool: see below.
 
-### Music playing
+### Music playing (YouTube Music PWA, strip up)
 
-Not measured yet.
+| Thread | Wakeups/s | Cycles/s |
+| --- | --- | --- |
+| `main` (applies the progress bar) | 4.30 | 1.31 M |
+| `music` | 2.67 | 0.74 M |
+| unnamed, two threads | 2.63 | 1.72 M |
+| **Process** | **9.60** | **3.91 M** |
+
+## Phase 1: event-driven music (2026-11-01)
+
+SMTC events wake the feed; while a track plays it wakes only when the taskbar bar is due to move
+one step (200 steps, about a pixel of the ~150 epx bar), and interpolates the position locally.
+The tray keeps the player's window between steps and skips `SetProgressState` when the playing
+state is unchanged. Release build, 30 s windows.
+
+| State | `music` wakeups/s | `main` wakeups/s | Process wakeups/s | Process cycles/s |
+| --- | --- | --- | --- | --- |
+| No session (standalone `--music-events`) | 0 | 0 | 0.03 | 0.08 M |
+| Playing | 1.37 | 5.73 | 7.73 | 2.70 M |
+| Paused, steady state | 0 | 0 | 0.65 | 0.83 M |
+
+Event latency, `--music-events`: an SMTC change reaches a fresh reading in 1–12 ms. A skip takes
+about 1.1 s from click to new title, all of it Chromium dropping its SMTC session on Next and
+creating a new one ~1 s later; the old poll added up to another second on top. The cover arrives
+on a later `MediaPropertiesChanged`, which now marks the cached cover stale.
+
+YouTube Music publishes a timeline checkpoint once per state change and never updates it while
+playing ("updated 19 s ago"), so interpolation is required, not an optimisation.
+
+## Open: the costs that remain
+
+- **Playing: `main` wakes about four times per bar step.** It is the cross-process
+  `SetProgressValue` into Explorer. Fewer steps would mean a coarser bar; the edge pill's progress
+  ring (a DirectComposition animation) will not need steps at all.
+- **The microphone watcher: 0.55 wakeups/s, ~0.75 M cycles/s, with no session at all.** Its
+  `RegNotifyChangeKeyValue` on the consent store fires more often than the 5 s recheck, though no
+  `LastUsedTime*` value changed over 20 s (something rewrites identical values), and every wake
+  re-sweeps the whole store (~1.4 M cycles). For Phase 2, when mic becomes a source.

@@ -101,15 +101,16 @@ the app working at every step.
 
 - [x] Record idle CPU cycles and wakeups per second, with nothing playing (`scripts\idle-perf.ps1`;
       WPR needs elevation)
-- [ ] Same, with music playing
+- [x] Same, with music playing
 - [x] Write the numbers into `docs/PERF.md`
 
 **Phase 1: event-driven music**
 
-- [ ] Replace the 1 s poll loop in `src/music/mod.rs` with SMTC event subscriptions
-- [ ] Interpolate position from timeline checkpoints
-- [ ] Check: zero wakeups from the music thread when nothing plays; track changes appear in under
-      500 ms
+- [x] Replace the 1 s poll loop in `src/music/mod.rs` with SMTC event subscriptions
+- [x] Interpolate position from timeline checkpoints
+- [x] Check: zero wakeups from the music thread when nothing plays (0 with no session and when
+      paused); track changes appear in under 500 ms (1–12 ms after SMTC publishes them; the player
+      itself takes ~1 s to republish its session on a skip, see PERF.md)
 
 **Phase 2: source abstraction**
 

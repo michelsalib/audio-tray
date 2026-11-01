@@ -2,9 +2,14 @@
 //!
 //! Knows nothing about YouTube Music; picking its session is [`super::session`]'s job. All calls
 //! block on WinRT async operations, so this must run on an MTA thread. A missing cover is a normal
-//! state (Chromium publishes art only for fetched `http(s)` artwork).
+//! state (Chromium publishes art only for fetched `http(s)` artwork). [`Smtc::watch`] reports
+//! changes as they happen, so nothing needs to poll.
+
+use std::cell::RefCell;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use windows::Foundation::TypedEventHandler;
 use windows::Media::Control::{
     GlobalSystemMediaTransportControlsSession as Session,
     GlobalSystemMediaTransportControlsSessionManager as SessionManager,
@@ -129,10 +134,69 @@ pub enum Command {
     Previous,
 }
 
+/// What an SMTC event says changed. Handlers run on the WinRT pool, so they only report it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Change {
+    /// A session came or went: call [`Smtc::watch_sessions`] to follow the new set.
+    Sessions,
+    /// Title, artist or cover: call [`Smtc::properties_changed`] so the cover is read again.
+    Properties,
+    /// Playback status or timeline.
+    Playback,
+}
+
+/// Receives every [`Change`], from any thread.
+pub type Notify = Arc<dyn Fn(Change) + Send + Sync>;
+
+/// One session's handlers, removed on drop.
+struct Subscription {
+    session: Session,
+    playback: i64,
+    properties: i64,
+    timeline: i64,
+}
+
+impl Subscription {
+    fn new(session: Session, notify: &Notify) -> Result<Self> {
+        Ok(Self {
+            playback: session.PlaybackInfoChanged(&handler(notify, Change::Playback))?,
+            properties: session.MediaPropertiesChanged(&handler(notify, Change::Properties))?,
+            timeline: session.TimelinePropertiesChanged(&handler(notify, Change::Playback))?,
+            session,
+        })
+    }
+}
+
+/// An event handler that reports `change`, whatever the event's arguments.
+fn handler<S, A>(notify: &Notify, change: Change) -> TypedEventHandler<S, A>
+where
+    S: windows::core::RuntimeType + 'static,
+    A: windows::core::RuntimeType + 'static,
+{
+    let notify = notify.clone();
+    TypedEventHandler::new(move |_, _| {
+        notify(change);
+        Ok(())
+    })
+}
+
+impl Drop for Subscription {
+    fn drop(&mut self) {
+        // A session that is already gone takes its handlers with it.
+        let _ = self.session.RemovePlaybackInfoChanged(self.playback);
+        let _ = self.session.RemoveMediaPropertiesChanged(self.properties);
+        let _ = self.session.RemoveTimelinePropertiesChanged(self.timeline);
+    }
+}
+
 /// The SMTC session manager, requested once (it brokers to the shell) and held open.
 pub struct Smtc {
     manager: SessionManager,
-    covers: std::cell::RefCell<CoverCache>,
+    covers: RefCell<CoverCache>,
+    /// Set by [`Smtc::watch`]; `None` for the one-shot dev readers.
+    notify: Option<Notify>,
+    sessions_changed: Option<i64>,
+    subscriptions: RefCell<Vec<Subscription>>,
 }
 
 impl Smtc {
@@ -141,7 +205,47 @@ impl Smtc {
             .context("SMTC RequestAsync")?
             .get()
             .context("awaiting the SMTC session manager")?;
-        Ok(Self { manager, covers: Default::default() })
+        Ok(Self {
+            manager,
+            covers: Default::default(),
+            notify: None,
+            sessions_changed: None,
+            subscriptions: Default::default(),
+        })
+    }
+
+    /// Report every change to `notify`: sessions coming and going, and each session's playback,
+    /// properties and timeline.
+    pub fn watch(&mut self, notify: Notify) -> Result<()> {
+        let token = self
+            .manager
+            .SessionsChanged(&handler(&notify, Change::Sessions))
+            .context("subscribing to SessionsChanged")?;
+        self.sessions_changed = Some(token);
+        self.notify = Some(notify);
+        self.watch_sessions()
+    }
+
+    /// Subscribe to the sessions there are now, dropping the old subscriptions. Call after
+    /// [`Change::Sessions`]; does nothing before [`Smtc::watch`].
+    pub fn watch_sessions(&self) -> Result<()> {
+        let Some(notify) = &self.notify else {
+            return Ok(());
+        };
+        let mut subscriptions = self.subscriptions.borrow_mut();
+        subscriptions.clear();
+        for session in &self.manager.GetSessions().context("GetSessions")? {
+            // Sessions dying mid-enumeration is routine; their SessionsChanged follows.
+            if let Ok(subscription) = Subscription::new(session, notify) {
+                subscriptions.push(subscription);
+            }
+        }
+        Ok(())
+    }
+
+    /// The followed track's title, artist or cover changed: read the cover again next time.
+    pub fn properties_changed(&self) {
+        self.covers.borrow_mut().stale = true;
     }
 
     /// Every session, read in full. Expensive (a round-trip and artwork read each): `--music-probe` only.
@@ -209,6 +313,14 @@ impl Smtc {
             }
         }
         Ok(None)
+    }
+}
+
+impl Drop for Smtc {
+    fn drop(&mut self) {
+        if let Some(token) = self.sessions_changed {
+            let _ = self.manager.RemoveSessionsChanged(token);
+        }
     }
 }
 
@@ -281,27 +393,22 @@ impl CoverKey {
     }
 }
 
-/// The current track's cover, so a poll does not reopen and decode the thumbnail stream.
+/// The current track's cover, so a reading does not reopen and decode the thumbnail stream.
 ///
-/// Re-read for the first [`CoverCache::SETTLE_POLLS`] polls of a track (players can publish the new
-/// title before its art) and while there is none; reused after that.
+/// Re-read on a new track, after a properties change marks it `stale` (players can publish the new
+/// title before its art), and while there is none; reused otherwise.
 #[derive(Default)]
 struct CoverCache {
     key: Option<CoverKey>,
-    polls: u32,
+    stale: bool,
     bytes: Option<Vec<u8>>,
 }
 
 impl CoverCache {
-    const SETTLE_POLLS: u32 = 3;
-
     fn cover(&mut self, key: CoverKey, read: impl FnOnce() -> Option<Vec<u8>>) -> Option<Vec<u8>> {
-        if self.key.as_ref() != Some(&key) {
+        if self.key.as_ref() != Some(&key) || self.stale || self.bytes.is_none() {
             self.key = Some(key);
-            self.polls = 0;
-        }
-        self.polls = self.polls.saturating_add(1);
-        if self.polls <= Self::SETTLE_POLLS || self.bytes.is_none() {
+            self.stale = false;
             self.bytes = read();
         }
         self.bytes.clone()
@@ -408,7 +515,7 @@ mod tests {
     }
 
     #[test]
-    fn a_settled_cover_is_not_read_again() {
+    fn a_cover_is_read_once_per_track() {
         let mut cache = CoverCache::default();
         let mut reads = 0;
         for _ in 0..10 {
@@ -418,19 +525,17 @@ mod tests {
             });
             assert_eq!(got, Some(vec![1, 2, 3]));
         }
-        assert_eq!(reads, CoverCache::SETTLE_POLLS, "read while settling, reused after");
+        assert_eq!(reads, 1);
+        assert_eq!(cache.cover(key("B"), || Some(vec![2])), Some(vec![2]));
     }
 
     #[test]
-    fn a_new_track_reads_its_cover_again() {
+    fn a_properties_change_reads_the_cover_again() {
         let mut cache = CoverCache::default();
-        for _ in 0..5 {
-            cache.cover(key("A"), || Some(vec![1]));
-        }
-        assert_eq!(cache.cover(key("B"), || Some(vec![1])), Some(vec![1]));
-        assert_eq!(cache.cover(key("B"), || Some(vec![2])), Some(vec![2]));
-        assert_eq!(cache.cover(key("B"), || Some(vec![9])), Some(vec![9]));
-        assert_eq!(cache.cover(key("B"), || panic!("settled")), Some(vec![9]));
+        assert_eq!(cache.cover(key("A"), || Some(vec![1])), Some(vec![1]));
+        cache.stale = true;
+        assert_eq!(cache.cover(key("A"), || Some(vec![9])), Some(vec![9]));
+        assert_eq!(cache.cover(key("A"), || panic!("not stale")), Some(vec![9]));
     }
 
     #[test]

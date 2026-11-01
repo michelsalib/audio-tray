@@ -289,7 +289,8 @@ unsafe fn show_inner(
             }
             WM_MOUSEWHEEL => {
                 // Screen coordinates, unlike the other mouse messages.
-                let delta = crate::win::volume_delta((msg.wParam.0 >> 16) as u16 as i16 as i32, crate::win::from_touchpad()) as i16;
+                let raw = (msg.wParam.0 >> 16) as u16 as i16 as i32;
+                let delta = crate::win::volume_delta(raw, crate::win::touchpad_delta(raw)) as i16;
                 let (_, sy) = mouse_xy(msg.lParam);
                 fly.scroll_volume(sy - fly.surface.y, delta);
             }

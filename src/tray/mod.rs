@@ -398,7 +398,7 @@ fn handle(msg: Queued) {
         // Applied here because `ITaskbarList3` is apartment-threaded and this is the STA.
         WM_MUSIC_PROGRESS => taskbar::apply_progress(msg.wparam, msg.lparam != 0),
         WM_TASKBAR_SCROLL => {
-            // The hook marks the wheel's; the TAP's come from a touchpad.
+            // The hook marks a wheel's; the TAP's, and the hook's fine steps, are a touchpad's.
             let touchpad = msg.wparam & taskbar::SCROLL_FROM_WHEEL == 0;
             let flow = msg.wparam & !taskbar::SCROLL_FROM_WHEEL;
             let delta = crate::win::volume_delta(msg.lparam as i32, touchpad);

@@ -200,12 +200,26 @@ pub(crate) fn set_clipboard_text(text: &str) -> bool {
     }
 }
 
-/// Whether the input message being handled came from a touchpad (not a mouse wheel).
-pub(crate) fn from_touchpad() -> bool {
-    use windows::Win32::UI::Input::{GetCurrentInputMessageSource, IMDT_TOUCHPAD, INPUT_MESSAGE_SOURCE};
+/// Whether a wheel `delta` came from a touchpad. Windows hands a precision touchpad's scroll on as
+/// wheel input from a hardware mouse (the input source cannot tell them apart), but in small
+/// steps, where a wheel turns in whole notches of 120. A gesture is judged as a whole: a step of
+/// a whole notch within half a second of a fine one is the touchpad's too, so a fast swipe never
+/// flips direction half-way.
+pub(crate) fn touchpad_delta(delta: i32) -> bool {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::OnceLock;
+    use windows::Win32::UI::WindowsAndMessaging::WHEEL_DELTA;
 
-    let mut source = INPUT_MESSAGE_SOURCE::default();
-    unsafe { GetCurrentInputMessageSource(&mut source) }.is_ok() && source.deviceType.0 & IMDT_TOUCHPAD.0 != 0
+    // Milliseconds since the first scroll (+1, so 0 means none yet).
+    static START: OnceLock<std::time::Instant> = OnceLock::new();
+    static LAST_FINE: AtomicU64 = AtomicU64::new(0);
+    let now = START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64 + 1;
+    if delta % WHEEL_DELTA as i32 != 0 {
+        LAST_FINE.store(now, Ordering::Relaxed);
+        return true;
+    }
+    let last = LAST_FINE.load(Ordering::Relaxed);
+    last != 0 && now - last < 500
 }
 
 /// A scroll `delta` as a volume change: up is louder. A touchpad set to scroll the "natural" way

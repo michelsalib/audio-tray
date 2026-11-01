@@ -30,8 +30,8 @@ impl WheelHook {
         let join = std::thread::Builder::new()
             .name("wheel-hook".into())
             .spawn(move || {
-                // Only the physical wheel reaches a low-level hook; precision-touchpad scroll
-                // arrives from the TAP's own `PointerWheelChanged` handler instead.
+                // A precision touchpad's scroll reaches it too, as fine wheel steps (measured on
+                // 26300); where the hook passes on, the TAP's `PointerWheelChanged` handler takes it.
                 let hook = unsafe { SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook), None, 0) };
                 let _ = ready.send(hook.is_ok().then(|| unsafe { GetCurrentThreadId() }));
                 let Ok(hook) = hook else { return };
@@ -90,7 +90,9 @@ unsafe extern "system" fn mouse_hook(code: i32, wparam: WPARAM, lparam: LPARAM) 
             let flow = crate::taskbar::flow_code(flow_at(info.pt));
             // Swallowed only when the tray took it: so the shell does not also scroll, and so
             // XAML never sees it — which keeps the TAP's wheel handler from acting twice.
-            if super::post(WM_TASKBAR_SCROLL, flow | crate::taskbar::SCROLL_FROM_WHEEL, delta as isize) {
+            // A touchpad's scroll reaches this hook too, as wheel input: tagged by its steps.
+            let source = if crate::win::touchpad_delta(delta.into()) { 0 } else { crate::taskbar::SCROLL_FROM_WHEEL };
+            if super::post(WM_TASKBAR_SCROLL, flow | source, delta as isize) {
                 return LRESULT(1);
             }
         }

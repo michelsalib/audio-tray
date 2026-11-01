@@ -274,7 +274,7 @@ pub(super) fn build_view(model: &Model, scale: f32, width: i32, view: View, fill
             kinds.push(Elem::Setting { kind: SettingKind::DiscordSecret });
             kinds.push(Elem::Header("Teams"));
             kinds.push(Elem::Setting { kind: SettingKind::Teams });
-            kinds.push(Elem::Step("1. In Teams: Settings > Privacy > Manage API, turn it on"));
+            kinds.push(Elem::Step("1. Teams: Settings > Privacy > Third-party app API"));
             kinds.push(Elem::Step("2. In a meeting, allow Audio Tray when Teams asks"));
         }
     }

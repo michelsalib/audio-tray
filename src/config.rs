@@ -40,13 +40,27 @@ pub struct Pill {
     pub listening_alerts: bool,
     /// The output and input devices on the pill, clicked to switch like the taskbar buttons.
     pub devices: bool,
-    /// Only the sliver until the pointer reaches the edge (warnings and alerts still show).
-    pub compact: bool,
+    /// How much the pill shows at rest; hovering the edge always opens the full card, and warnings
+    /// and alerts always show in full.
+    pub size: PillSize,
+}
+
+/// How much the pill shows at rest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PillSize {
+    /// Only the sliver.
+    Hidden,
+    /// The same column at about half the size: small covers and rings, small device icons.
+    Small,
+    /// Covers with progress rings, LIVE badges, device buttons.
+    #[default]
+    Big,
 }
 
 impl Default for Pill {
     fn default() -> Self {
-        Self { enabled: true, listening_alerts: true, devices: true, compact: false }
+        Self { enabled: true, listening_alerts: true, devices: true, size: PillSize::Big }
     }
 }
 

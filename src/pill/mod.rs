@@ -133,6 +133,8 @@ struct Pill {
     appbar: bool,
     /// Whether the hover strip is up (see [`Pill::hoverable`]).
     edge_up: bool,
+    /// The size the shown scene was drawn at.
+    drawn_size: Option<crate::config::PillSize>,
     /// The last hub state, for re-deciding on hover, meter and fullscreen changes.
     last: State,
 }
@@ -164,7 +166,7 @@ pub fn create(config: &crate::config::Pill) -> Result<()> {
             enabled: config.enabled,
             listening_alerts: config.listening_alerts,
             devices: config.devices,
-            compact: config.compact,
+            size: config.size,
             fullscreen: fullscreen_now(),
             ..Default::default()
         },
@@ -175,6 +177,7 @@ pub fn create(config: &crate::config::Pill) -> Result<()> {
         quiet: 0,
         appbar: false,
         edge_up: false,
+        drawn_size: None,
         last: State::default(),
     };
     pill.register_appbar();
@@ -196,7 +199,7 @@ pub fn configure(config: &crate::config::Pill) {
         pill.inputs.enabled = config.enabled;
         pill.inputs.listening_alerts = config.listening_alerts;
         pill.inputs.devices = config.devices;
-        pill.inputs.compact = config.compact;
+        pill.inputs.size = config.size;
         pill.refresh();
     });
 }
@@ -277,10 +280,15 @@ impl Pill {
             *new = kept;
         }
         // Same state, same hover strip: nothing to repaint.
-        if next == self.view && self.gfx.is_some() && self.hoverable(&next) == self.edge_up {
+        let resized = self.drawn_size != Some(self.inputs.size);
+        if next == self.view && self.gfx.is_some() && self.hoverable(&next) == self.edge_up && !resized {
             return;
         }
-        let entrance = entrance(&self.view, &next);
+        let entrance = match entrance(&self.view, &next) {
+            // Same state at another size: it unfolds into the new one.
+            Entrance::None if resized => Entrance::Grow,
+            other => other,
+        };
         if let Err(e) = self.show(&next, entrance) {
             eprintln!("pill: could not draw ({e:#}); rebuilding the graphics next time");
             self.gfx = None;
@@ -295,7 +303,9 @@ impl Pill {
             self.gfx = Some(Gfx::new(self.hwnd, scale)?);
         }
         let gfx = self.gfx.as_ref().expect("just built");
-        let Some(scene) = draw::scene(gfx, view)? else {
+        let small = self.inputs.size == crate::config::PillSize::Small;
+        self.drawn_size = Some(self.inputs.size);
+        let Some(scene) = draw::scene(gfx, view, small)? else {
             unsafe {
                 let _ = ShowWindow(self.hwnd, SW_HIDE);
                 let _ = ShowWindow(self.edge, SW_HIDE);
@@ -381,7 +391,7 @@ impl Pill {
     fn hoverable(&self, view: &View) -> bool {
         match view {
             View::Music { .. } => true,
-            View::Idle { .. } => self.inputs.compact || !self.last.all_media().is_empty(),
+            View::Idle { .. } => self.inputs.size != crate::config::PillSize::Big || !self.last.all_media().is_empty(),
             _ => false,
         }
     }

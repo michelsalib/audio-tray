@@ -70,7 +70,7 @@ pub(super) struct Settings {
     pub buttons: bool,
     pub pill: bool,
     pub devices: bool,
-    pub compact: bool,
+    pub size: crate::config::PillSize,
     pub alerts: bool,
 }
 
@@ -81,7 +81,7 @@ impl Settings {
             buttons: config.strip.enabled,
             pill: config.pill.enabled,
             devices: config.pill.devices,
-            compact: config.pill.compact,
+            size: config.pill.size,
             alerts: config.pill.listening_alerts,
         }
     }

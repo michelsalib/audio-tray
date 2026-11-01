@@ -408,7 +408,13 @@ impl Flyout<'_> {
             }
             SettingKind::Pill => config.pill.enabled = !config.pill.enabled,
             SettingKind::PillDevices => config.pill.devices = !config.pill.devices,
-            SettingKind::PillCompact => config.pill.compact = !config.pill.compact,
+            SettingKind::PillSize => {
+                use crate::config::PillSize;
+                let Some(segment) = layout::segment_at(self.surface.width, self.scale, mx) else {
+                    return false;
+                };
+                config.pill.size = [PillSize::Hidden, PillSize::Small, PillSize::Big][segment];
+            }
             SettingKind::ListeningAlerts => config.pill.listening_alerts = !config.pill.listening_alerts,
             SettingKind::SoundSettings => {
                 open_sound_settings();

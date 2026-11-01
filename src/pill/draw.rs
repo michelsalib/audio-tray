@@ -83,7 +83,58 @@ const GLYPH_MIC_OFF: char = '\u{F781}';
 const GLYPH_MUSIC: char = '\u{EC4F}';
 
 /// Paint `view`. `None` for [`View::Hidden`].
-pub fn scene(gfx: &Gfx, view: &View) -> Result<Option<Scene>> {
+/// The quiet column's dimensions at one pill size: [`BIG`], or [`SMALL`] at about half.
+#[derive(Clone, Copy)]
+struct Metrics {
+    /// The column's width.
+    col: f32,
+    disc_step: f32,
+    /// A cover's diameter, its ring's radius and stroke.
+    art: f32,
+    ring_r: f32,
+    ring_stroke: f32,
+    /// A device button's step down the column, radius and glyph font.
+    dev_step: f32,
+    dev_r: f32,
+    dev_font: Font,
+    /// A face's diameter and step in the call column.
+    face: f32,
+    face_step: f32,
+    /// Room for words: the LIVE badge, a speaker's name tag, mute badges on faces.
+    words: bool,
+}
+
+const BIG: Metrics = Metrics {
+    col: 52.0,
+    disc_step: 44.0,
+    art: 30.0,
+    ring_r: 19.5,
+    ring_stroke: 3.0,
+    dev_step: 40.0,
+    dev_r: 16.0,
+    dev_font: Font::Icons,
+    face: 34.0,
+    face_step: 26.0,
+    words: true,
+};
+
+const SMALL: Metrics = Metrics {
+    col: 28.0,
+    disc_step: 25.0,
+    art: 16.0,
+    ring_r: 10.5,
+    ring_stroke: 2.0,
+    dev_step: 24.0,
+    dev_r: 10.0,
+    dev_font: Font::IconsSmall,
+    face: 18.0,
+    face_step: 14.0,
+    words: false,
+};
+
+/// Paint `view`, the quiet states `small` or not. `None` for [`View::Hidden`].
+pub fn scene(gfx: &Gfx, view: &View, small: bool) -> Result<Option<Scene>> {
+    let m = if small { SMALL } else { BIG };
     Ok(Some(match view {
         View::Hidden => return Ok(None),
         View::Idle { devices: None } => {
@@ -93,58 +144,64 @@ pub fn scene(gfx: &Gfx, view: &View) -> Result<Option<Scene>> {
         }
         View::Idle { devices: Some(devices) } => {
             // Just the devices, in a small pill of their own.
-            let w = 52.0;
-            let h = 8.0 + DEVICE_STEP * device_count(devices) as f32;
+            let w = m.col;
+            let pad = (m.col - 2.0 * m.dev_r) / 4.0;
+            let h = 2.0 * pad + m.dev_step * device_count(devices) as f32;
             let mut hits = Vec::new();
             let (content, _) = gfx.painted(w, h, |p| {
                 p.round_rect(-TUCK, 0.0, w + TUCK, h, w / 2.0, QUIET_BG)?;
-                device_column(p, devices, 4.0, &mut hits)
+                device_column(p, devices, pad, &mut hits, m)
             })?;
             Scene { w, h, content, rings: Vec::new(), pulses: Vec::new(), hits }
         }
         View::Music { media, card: false, devices } => {
             // One disc per playing session, stacked in the same pill, the devices under them.
-            const STEP: f32 = 44.0;
-            let w = 52.0;
-            let discs_h = 52.0 + STEP * (media.len() as f32 - 1.0);
-            let devices_h = devices.as_ref().map_or(0.0, |d| 6.0 + DEVICE_STEP * device_count(d) as f32);
+            let w = m.col;
+            let cx = m.col / 2.0;
+            let discs_h = m.col + m.disc_step * (media.len() as f32 - 1.0);
+            let devices_h = devices.as_ref().map_or(0.0, |d| 6.0 + m.dev_step * device_count(d) as f32);
             let h = discs_h + devices_h;
             let mut hits = Vec::new();
             let (content, _) = gfx.painted(w, h, |p| {
                 p.round_rect(-TUCK, 0.0, w + TUCK, h, w / 2.0, QUIET_BG)?;
-                for (i, m) in media.iter().enumerate() {
-                    let (cx, cy) = (26.0, 26.0 + i as f32 * STEP);
-                    art(p, m.cover.as_deref().map(|c| c.as_slice()), cx - 15.0, cy - 15.0, 30.0, None)?;
-                    if m.length_seconds().is_none() {
+                for (i, media) in media.iter().enumerate() {
+                    let cy = cx + i as f32 * m.disc_step;
+                    let half = m.art / 2.0;
+                    art(p, media.cover.as_deref().map(|c| c.as_slice()), cx - half, cy - half, m.art, None)?;
+                    if media.length_seconds().is_some() {
+                        p.ring(cx, cy, m.ring_r, m.ring_stroke, TRACK)?;
+                    } else if m.words {
                         // A stream has no end to fill a ring towards: a badge on the art instead.
                         p.round_rect(cx - 12.0, cy + 9.0, 24.0, 11.0, 3.0, LIVE_DOT)?;
                         p.text("LIVE", Font::Badge, (cx - 12.0, cy + 9.0, 24.0, 11.0), WHITE)?;
                     } else {
-                        p.ring(cx, cy, 19.5, 3.0, TRACK)?;
+                        // Small: a red dot says live.
+                        let (dx, dy) = (cx + half - 1.0, cy + half - 1.0);
+                        p.circle(dx, dy, 4.0, QUIET_BG)?;
+                        p.circle(dx, dy, 3.0, LIVE_DOT)?;
                     }
                 }
                 if let Some(devices) = devices {
-                    p.round_rect(14.0, discs_h + 1.0, w - 28.0, 1.0, 0.0, Rgba::hex(0xFFFFFF, 0.14))?;
-                    device_column(p, devices, discs_h + 4.0, &mut hits)?;
+                    p.round_rect(m.col / 4.0, discs_h + 1.0, m.col / 2.0, 1.0, 0.0, Rgba::hex(0xFFFFFF, 0.14))?;
+                    device_column(p, devices, discs_h + 4.0, &mut hits, m)?;
                 }
                 Ok(())
             })?;
             let rings = media
                 .iter()
                 .enumerate()
-                .filter(|(_, m)| m.length_seconds().is_some())
-                .map(|(i, m)| Ring {
-                    cx: 26.0,
-                    cy: 26.0 + i as f32 * STEP,
-                    r: 19.5,
-                    stroke: 3.0,
-                    fraction: m.fraction_now().unwrap_or(0.0) as f32,
-                    rate: m.length_seconds().filter(|_| m.playing).map_or(0.0, |len| (1.0 / len) as f32),
+                .filter(|(_, media)| media.length_seconds().is_some())
+                .map(|(i, media)| Ring {
+                    cx,
+                    cy: cx + i as f32 * m.disc_step,
+                    r: m.ring_r,
+                    stroke: m.ring_stroke,
+                    fraction: media.fraction_now().unwrap_or(0.0) as f32,
+                    rate: media.length_seconds().filter(|_| media.playing).map_or(0.0, |len| (1.0 / len) as f32),
                 })
                 .collect();
             Scene { w, h, content, rings, pulses: Vec::new(), hits }
-        }
-        View::Music { media, card: true, devices } => {
+        }        View::Music { media, card: true, devices } => {
             // One row per session, each with its own controls; a row of devices closes the card.
             const ROW: f32 = 92.0;
             const DEVICES_ROW: f32 = 48.0;
@@ -206,7 +263,8 @@ pub fn scene(gfx: &Gfx, view: &View) -> Result<Option<Scene>> {
                 Ok(())
             })?;
             Scene { w, h, content, rings: Vec::new(), pulses: Vec::new(), hits }
-        }        View::Call { app, holder, members, muted } => call(gfx, app.map(|a| a.label()).or(holder.as_deref()), members, *muted)?,
+        }
+        View::Call { app, holder, members, muted } => call(gfx, app.map(|a| a.label()).or(holder.as_deref()), members, *muted, m)?,
         View::Banner { level, glyph, text, .. } => {
             let (bg, fg) = match level {
                 Level::Alert => (ALERT_BG, WHITE),
@@ -225,8 +283,6 @@ pub fn scene(gfx: &Gfx, view: &View) -> Result<Option<Scene>> {
     }))
 }
 
-/// Height of one device button in the pill's column.
-const DEVICE_STEP: f32 = 40.0;
 const GLYPH_VOLUME_MUTED: char = '\u{E74F}';
 
 fn device_count(devices: &Devices) -> usize {
@@ -234,14 +290,13 @@ fn device_count(devices: &Devices) -> usize {
 }
 
 /// The output then the input, as round buttons down the pill's column from `top`.
-fn device_column(p: &mut Painter, devices: &Devices, top: f32, hits: &mut Vec<([f32; 4], Hit)>) -> Result<()> {
+fn device_column(p: &mut Painter, devices: &Devices, top: f32, hits: &mut Vec<([f32; 4], Hit)>, m: Metrics) -> Result<()> {
     let mut y = top;
     for (flow, device) in [(Flow::Output, &devices.output), (Flow::Input, &devices.input)] {
         let Some(device) = device else { continue };
-        let (cx, cy) = (26.0, y + DEVICE_STEP / 2.0);
-        device_button(p, flow, device, cx, cy)?;
-        hits.push(([4.0, y, 44.0, DEVICE_STEP], Hit::Device(flow)));
-        y += DEVICE_STEP;
+        device_button(p, flow, device, m.col / 2.0, y + m.dev_step / 2.0, m)?;
+        hits.push(([0.0, y, m.col, m.dev_step], Hit::Device(flow)));
+        y += m.dev_step;
     }
     Ok(())
 }
@@ -252,7 +307,7 @@ fn device_row(p: &mut Painter, devices: &Devices, top: f32, w: f32, hits: &mut V
     for (i, (flow, device)) in [(Flow::Output, &devices.output), (Flow::Input, &devices.input)].into_iter().enumerate() {
         let Some(device) = device else { continue };
         let x = 8.0 + i as f32 * half;
-        device_button(p, flow, device, x + 20.0, top + 22.0)?;
+        device_button(p, flow, device, x + 20.0, top + 22.0, BIG)?;
         p.text(&device.name, Font::Small, (x + 42.0, top + 8.0, half - 48.0, 28.0), DIM_WHITE)?;
         hits.push(([x, top, half, 44.0], Hit::Device(flow)));
     }
@@ -260,20 +315,20 @@ fn device_row(p: &mut Painter, devices: &Devices, top: f32, w: f32, hits: &mut V
 }
 
 /// One device: its glyph on a disc (the mute glyph when muted), and the recording dot.
-fn device_button(p: &mut Painter, flow: Flow, device: &Device, cx: f32, cy: f32) -> Result<()> {
-    p.circle(cx, cy, 16.0, if device.muted { Rgba::hex(0x5A5A5A, 1.0) } else { Rgba::hex(0x3A3A3A, 1.0) })?;
+fn device_button(p: &mut Painter, flow: Flow, device: &Device, cx: f32, cy: f32, m: Metrics) -> Result<()> {
+    let r = m.dev_r;
+    p.circle(cx, cy, r, if device.muted { Rgba::hex(0x5A5A5A, 1.0) } else { Rgba::hex(0x3A3A3A, 1.0) })?;
     let glyph = match (flow, device.muted) {
         (Flow::Output, true) => GLYPH_VOLUME_MUTED,
         (Flow::Input, true) => GLYPH_MIC_OFF,
         _ => device.glyph,
     };
-    p.text(&glyph.to_string(), Font::Icons, (cx - 16.0, cy - 16.0, 32.0, 32.0), WHITE)?;
+    p.text(&glyph.to_string(), m.dev_font, (cx - r, cy - r, 2.0 * r, 2.0 * r), WHITE)?;
     if device.recording {
-        p.circle(cx + 11.0, cy - 11.0, 4.5, LIVE_DOT)?;
+        p.circle(cx + r * 0.7, cy - r * 0.7, r * 0.28, LIVE_DOT)?;
     }
     Ok(())
 }
-
 /// Cover art, or a music glyph on a plain disc when there is none (or it will not decode).
 fn art(p: &mut Painter, cover: Option<&[u8]>, x: f32, y: f32, size: f32, radius: Option<f32>) -> Result<()> {
     if let Some(bytes) = cover {
@@ -291,58 +346,58 @@ fn art(p: &mut Painter, cover: Option<&[u8]>, x: f32, y: f32, size: f32, radius:
 
 /// The call pill: a column of faces (the speaking one lit green, its name beside it), then the
 /// microphone with its live dot.
-fn call(gfx: &Gfx, app: Option<&str>, members: &[Member], muted: bool) -> Result<Scene> {
-    const FACE: f32 = 34.0;
-    const STEP: f32 = 26.0;
+fn call(gfx: &Gfx, app: Option<&str>, members: &[Member], muted: bool, m: Metrics) -> Result<Scene> {
     const MAX_FACES: usize = 5;
-    let col = 48.0;
+    let (face_d, step) = (m.face, m.face_step);
+    let col = m.col - 4.0;
     let shown: Vec<&Member> = members.iter().take(MAX_FACES).collect();
     let extra = members.len().saturating_sub(MAX_FACES);
-    let faces_h = if shown.is_empty() { 0.0 } else { FACE + STEP * (shown.len() as f32 - 1.0) + 8.0 };
-    let label_h = if shown.is_empty() { 16.0 } else { 0.0 };
-    let h = 8.0 + faces_h + label_h + 40.0;
+    let faces_h = if shown.is_empty() { 0.0 } else { face_d + step * (shown.len() as f32 - 1.0) + 8.0 };
+    let label_h = if shown.is_empty() && m.words { 16.0 } else { 0.0 };
+    let h = 8.0 + faces_h + label_h + 2.0 * m.dev_r + 8.0;
     let speaker = shown.iter().position(|m| m.speaking);
-    let tag_w = speaker.map_or(0.0, |i| gfx.measure(Font::Small, &shown[i].name).min(160.0) + 20.0);
+    // Small has no room for the name: the lit face and its pulse say who.
+    let tag_w = speaker.filter(|_| m.words).map_or(0.0, |i| gfx.measure(Font::Small, &shown[i].name).min(160.0) + 20.0);
     let w = col + if tag_w > 0.0 { tag_w + 6.0 } else { 0.0 };
     let (content, _) = gfx.painted(w, h, |p| {
         p.round_rect(-TUCK, 0.0, col + TUCK, h, col / 2.0, NORMAL_BG)?;
         let cx = col / 2.0;
         for (i, member) in shown.iter().enumerate() {
-            let top = 8.0 + i as f32 * STEP;
+            let top = 8.0 + i as f32 * step;
             let lit = Some(i) == speaker;
-            face(p, member, cx - FACE / 2.0, top, FACE, lit)?;
-            if lit {
-                let ty = top + FACE / 2.0 - 11.0;
+            face(p, member, cx - face_d / 2.0, top, face_d, lit, m.words)?;
+            if lit && tag_w > 0.0 {
+                let ty = top + face_d / 2.0 - 11.0;
                 p.round_rect(col + 6.0, ty, tag_w, 22.0, 11.0, NORMAL_BG)?;
                 p.text(&member.name, Font::Small, (col + 16.0, ty, tag_w - 20.0, 22.0), WHITE)?;
             }
         }
-        if extra > 0 {
+        if extra > 0 && m.words {
             p.text(&format!("+{extra}"), Font::Small, (0.0, faces_h - 6.0, col, 12.0), DIM_WHITE)?;
         }
-        if shown.is_empty() {
+        if shown.is_empty() && m.words {
             if let Some(app) = app {
                 p.text(&app.chars().take(2).collect::<String>(), Font::Small, (0.0, 8.0, col, 16.0), DIM_WHITE)?;
             }
         }
-        let my = h - 24.0;
-        p.circle(cx, my, 16.0, if muted { Rgba::hex(0x5A5A5A, 1.0) } else { Rgba::hex(0x3A3A3A, 1.0) })?;
-        p.text(&(if muted { GLYPH_MIC_OFF } else { GLYPH_MIC }).to_string(), Font::Icons, (cx - 16.0, my - 16.0, 32.0, 32.0), WHITE)?;
+        let (my, r) = (h - m.dev_r - 6.0, m.dev_r);
+        p.circle(cx, my, r, if muted { Rgba::hex(0x5A5A5A, 1.0) } else { Rgba::hex(0x3A3A3A, 1.0) })?;
+        p.text(&(if muted { GLYPH_MIC_OFF } else { GLYPH_MIC }).to_string(), m.dev_font, (cx - r, my - r, 2.0 * r, 2.0 * r), WHITE)?;
         if !muted {
-            p.circle(cx + 11.0, my - 11.0, 4.5, LIVE_DOT)?;
+            p.circle(cx + r * 0.7, my - r * 0.7, r * 0.28, LIVE_DOT)?;
         }
         Ok(())
     })?;
     // The speaker's face pulses (see [`Pulse`]).
     let pulses = speaker
-        .map(|i| Pulse { cx: col / 2.0, cy: 8.0 + i as f32 * STEP + FACE / 2.0, r: FACE / 2.0 + 1.0 })
+        .map(|i| Pulse { cx: col / 2.0, cy: 8.0 + i as f32 * step + face_d / 2.0, r: face_d / 2.0 + 1.0 })
         .into_iter()
         .collect();
     Ok(Scene { w, h, content, rings: Vec::new(), pulses, hits: vec![([0.0, 0.0, col, h], Hit::Whole)] })
 }
 
 /// One face: the avatar, or an initial on a colour from the name; dimmed unless speaking.
-fn face(p: &mut Painter, member: &Member, x: f32, y: f32, size: f32, lit: bool) -> Result<()> {
+fn face(p: &mut Painter, member: &Member, x: f32, y: f32, size: f32, lit: bool, badges: bool) -> Result<()> {
     let (cx, cy, r) = (x + size / 2.0, y + size / 2.0, size / 2.0);
     // A dark rim separates overlapping faces.
     p.circle(cx, cy, r + 2.0, NORMAL_BG)?;
@@ -355,14 +410,14 @@ fn face(p: &mut Painter, member: &Member, x: f32, y: f32, size: f32, lit: bool) 
         const PALETTE: [u32; 6] = [0x5865F2, 0x2D7D9A, 0x8E44AD, 0xC0392B, 0x16A085, 0xD35400];
         p.circle(cx, cy, r, Rgba::hex(PALETTE[hue as usize % PALETTE.len()], 1.0))?;
         let initial: String = member.name.chars().next().map(|c| c.to_uppercase().collect()).unwrap_or_default();
-        p.text(&initial, Font::Initial, (x, y, size, size), WHITE)?;
+        p.text(&initial, if badges { Font::Initial } else { Font::Badge }, (x, y, size, size), WHITE)?;
     }
     if lit {
-        p.ring(cx, cy, r + 1.0, 2.5, SPEAKING)?;
+        p.ring(cx, cy, r + 1.0, if badges { 2.5 } else { 1.5 }, SPEAKING)?;
     } else {
         p.circle(cx, cy, r, Rgba::hex(0x000000, 0.45))?;
     }
-    if member.muted {
+    if member.muted && badges {
         p.circle(cx + r * 0.7, cy + r * 0.7, 7.0, NORMAL_BG)?;
         p.text(&GLYPH_MIC_OFF.to_string(), Font::IconsSmall, (cx + r * 0.7 - 7.0, cy + r * 0.7 - 7.0, 14.0, 14.0), WHITE)?;
     }

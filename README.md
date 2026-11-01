@@ -138,7 +138,7 @@ tile_style = "off"        # what it shows: "off", "cover" (cover + progress) or 
 enabled = true              # the edge pill
 listening_alerts = true     # the red alert when an app records outside a known call
 devices = true              # the output and input on the pill, clicked to switch
-compact = false             # only the sliver until the pointer reaches the edge
+size = "big"                # at rest: "hidden" (the sliver), "small" or "big"; hover shows all
 
 [discord]
 enabled = true              # host \\.\pipe\audio-tray for the Vencord plugin

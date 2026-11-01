@@ -30,7 +30,8 @@ pub(super) enum SettingKind {
     AudioButtons,
     Pill,
     PillDevices,
-    PillCompact,
+    /// How much the edge pill shows at rest: hidden, small or big.
+    PillSize,
     ListeningAlerts,
     /// Windows' own sound settings (a link).
     SoundSettings,
@@ -43,15 +44,23 @@ impl SettingKind {
             SettingKind::AudioButtons => "Audio buttons in the tray",
             SettingKind::Pill => "Show the edge pill",
             SettingKind::PillDevices => "Audio devices on the pill",
-            SettingKind::PillCompact => "Compact until hovered",
+            SettingKind::PillSize => "Pill size at rest",
             SettingKind::ListeningAlerts => "Alert when an app listens",
             SettingKind::SoundSettings => "Windows sound settings",
         }
     }
 }
 
-/// The tile style segments, in order, and their labels.
-pub(super) const TILE_SEGMENTS: [&str; 3] = ["Off", "Cover", "Full"];
+/// A segmented setting's choices, in order: the tile style's, the pill size's.
+pub(super) fn segments(kind: SettingKind) -> &'static [&'static str; 3] {
+    match kind {
+        SettingKind::PillSize => &["Hidden", "Small", "Big"],
+        _ => &["Off", "Cover", "Full"],
+    }
+}
+
+/// Every segmented setting has three choices.
+const SEGMENT_COUNT: usize = 3;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum ActionKind {
@@ -201,7 +210,7 @@ pub(super) fn build_view(model: &Model, scale: f32, width: i32, view: View, fill
             kinds.push(Elem::Setting { kind: SettingKind::TileStyle });
             kinds.push(Elem::Setting { kind: SettingKind::AudioButtons });
             kinds.push(Elem::Header("Edge pill"));
-            for kind in [SettingKind::Pill, SettingKind::PillDevices, SettingKind::PillCompact, SettingKind::ListeningAlerts] {
+            for kind in [SettingKind::Pill, SettingKind::PillSize, SettingKind::PillDevices, SettingKind::ListeningAlerts] {
                 kinds.push(Elem::Setting { kind });
             }
             kinds.push(Elem::Header("Windows"));
@@ -376,18 +385,18 @@ pub(super) fn voice_button_center_x(width: i32, scale: f32) -> f32 {
     width as f32 - (RIGHT_PAD - 4.0 + VOICE_BTN / 2.0) * scale
 }
 
-/// The tile style segment under `mx` (an index into [`TILE_SEGMENTS`]), right-aligned in the row.
+/// The segment under `mx` (an index into [`segments`]), right-aligned in the row.
 pub(super) fn segment_at(width: i32, scale: f32, mx: i32) -> Option<usize> {
-    (0..TILE_SEGMENTS.len()).find(|&i| {
+    (0..SEGMENT_COUNT).find(|&i| {
         let (x0, x1) = segment_span(width, scale, i);
         (mx as f32) >= x0 && (mx as f32) < x1
     })
 }
 
-/// Left and right edges (px) of tile style segment `i`; shared by hit-test and paint.
+/// Left and right edges (px) of segment `i`; shared by hit-test and paint.
 pub(super) fn segment_span(width: i32, scale: f32, i: usize) -> (f32, f32) {
     let w = SEGMENT_W * scale;
-    let right = width as f32 - RIGHT_PAD * scale - (TILE_SEGMENTS.len() - 1 - i) as f32 * w;
+    let right = width as f32 - RIGHT_PAD * scale - (SEGMENT_COUNT - 1 - i) as f32 * w;
     (right - w, right)
 }
 

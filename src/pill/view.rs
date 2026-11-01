@@ -114,8 +114,8 @@ pub struct Inputs {
     pub listening_alerts: bool,
     /// Show the output and input on the quiet states.
     pub devices: bool,
-    /// Collapse everything short of a warning to the sliver until hovered.
-    pub compact: bool,
+    /// How much shows at rest (`Hidden`: everything short of a warning collapses to the sliver).
+    pub size: crate::config::PillSize,
 }
 
 /// The state to show.
@@ -125,7 +125,7 @@ pub fn decide(state: &State, inputs: Inputs) -> View {
     }
     let view = loudest(state, inputs);
     // Compact: the sliver until hovered; warnings and alerts still speak up.
-    if inputs.compact && !inputs.hover && matches!(view.level(), Level::Quiet | Level::Normal) {
+    if inputs.size == crate::config::PillSize::Hidden && !inputs.hover && matches!(view.level(), Level::Quiet | Level::Normal) {
         return if inputs.fullscreen { View::Hidden } else { View::Idle { devices: None } };
     }
     // A fullscreen app hides everything but red.
@@ -244,7 +244,7 @@ mod tests {
     }
 
     fn on() -> Inputs {
-        Inputs { enabled: true, listening_alerts: true, ..Default::default() }
+        Inputs { enabled: true, listening_alerts: true, size: crate::config::PillSize::Big, ..Default::default() }
     }
 
     fn muted_input(state: &mut State, muted: bool) {
@@ -340,7 +340,7 @@ mod tests {
     fn compact_is_the_sliver_until_hovered_but_warnings_still_show() {
         let mut state = State::default();
         state.apply(Event::Media(vec![media(true)]));
-        let compact = Inputs { compact: true, devices: true, ..on() };
+        let compact = Inputs { size: crate::config::PillSize::Hidden, devices: true, ..on() };
         assert_eq!(decide(&state, compact), View::Idle { devices: None });
         assert!(matches!(decide(&state, Inputs { hover: true, ..compact }), View::Music { card: true, .. }));
         state.apply(Event::MicUsers(vec![r"C:\x\recorder.exe".into()]));

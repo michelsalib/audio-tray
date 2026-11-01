@@ -83,12 +83,12 @@ pub(super) fn render_page(ctx: &Ctx, elems: &[LaidElem], out: &mut [u8]) {
                     SettingKind::AudioButtons => Some(s.buttons),
                     SettingKind::Pill => Some(s.pill),
                     SettingKind::PillDevices => Some(s.devices),
-                    SettingKind::PillCompact => Some(s.compact),
+
                     SettingKind::ListeningAlerts => Some(s.alerts),
-                    SettingKind::TileStyle | SettingKind::SoundSettings => None,
+                    SettingKind::TileStyle | SettingKind::PillSize | SettingKind::SoundSettings => None,
                 };
                 // The pill's own options are moot while it is off: drawn dimmed.
-                let dim = matches!(kind, SettingKind::PillDevices | SettingKind::PillCompact | SettingKind::ListeningAlerts) && !s.pill;
+                let dim = matches!(kind, SettingKind::PillDevices | SettingKind::PillSize | SettingKind::ListeningAlerts) && !s.pill;
                 if let Some(on) = on {
                     let (sw, sh) = (SWITCH_W * scale, SWITCH_H * scale);
                     let x0 = right - sw;
@@ -105,12 +105,12 @@ pub(super) fn render_page(ctx: &Ctx, elems: &[LaidElem], out: &mut [u8]) {
                     let kcol = if on { DARK_GLYPH } else { TEXT };
                     cv.fill_round_rect(Rect::new(kx - knob, cy - knob, kx + knob, cy + knob), knob, kcol, 0.9 * a);
                 }
-                if kind == SettingKind::TileStyle {
-                    let selected = s.tile as usize;
+                if matches!(kind, SettingKind::TileStyle | SettingKind::PillSize) {
+                    let selected = if kind == SettingKind::TileStyle { s.tile as usize } else { s.size as usize };
                     let (left, _) = super::layout::segment_span(w, scale, 0);
                     let sh = 26.0 * scale;
                     cv.fill_round_rect(Rect::new(left, cy - sh / 2.0, right, cy + sh / 2.0), 4.0 * scale, TEXT, 0.08);
-                    for (i, label) in super::layout::TILE_SEGMENTS.iter().enumerate() {
+                    for (i, label) in super::layout::segments(kind).iter().enumerate() {
                         let (x0, x1) = super::layout::segment_span(w, scale, i);
                         let is = i == selected;
                         if is {

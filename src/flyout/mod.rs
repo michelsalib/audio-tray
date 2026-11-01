@@ -662,6 +662,11 @@ impl Flyout<'_> {
                 let Some(app_id) = self.model.now_playing.get(index).map(|np| np.app_id.clone()) else {
                     return false;
                 };
+                // The cover brings the app or tab to the front, and the panel steps aside.
+                if (mx as f32) < (theme::ART_X + model::ART_DIP) * self.scale {
+                    crate::tray::perform(crate::pill::Action::Focus(app_id));
+                    return true;
+                }
                 let live = !self.model.now_playing.get(index).is_some_and(|np| np.skip);
                 let command = match layout::media_button_at(self.surface.width, self.scale, mx) {
                     Some(1) => Command::TogglePlayPause,

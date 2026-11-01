@@ -15,6 +15,8 @@ use crate::music::smtc::Command;
 pub enum Hit {
     /// A transport button on the card's row for session `.0`.
     Media(usize, Command),
+    /// A session's cover: bring its app or tab to the front.
+    Focus(usize),
     /// A device button: switch that flow to its next device.
     Device(crate::audio::Flow),
     /// Anywhere on the scene: the view's [`super::view::Action`], or the call's mute.
@@ -167,6 +169,8 @@ pub fn scene(gfx: &Gfx, view: &View, small: bool) -> Result<Option<Scene>> {
                 for (i, media) in media.iter().enumerate() {
                     let cy = cx + i as f32 * m.disc_step;
                     let half = m.art / 2.0;
+                    // Clickable only when the pill is (with the devices); quiet, clicks pass through.
+                    hits.push(([0.0, cy - m.disc_step / 2.0, m.col, m.disc_step], Hit::Focus(i)));
                     art(p, media.cover.as_deref().map(|c| c.as_slice()), cx - half, cy - half, m.art, None)?;
                     if media.length_seconds().is_some() {
                         p.ring(cx, cy, m.ring_r, m.ring_stroke, TRACK)?;
@@ -228,10 +232,13 @@ pub fn scene(gfx: &Gfx, view: &View, small: bool) -> Result<Option<Scene>> {
                 .iter()
                 .enumerate()
                 .flat_map(|(i, (top, buttons))| {
-                    buttons
-                        .iter()
-                        .enumerate()
-                        .map(move |(b, (_, command))| ([text_x - 6.0 + b as f32 * 40.0, top + 58.0, 32.0, 32.0], Hit::Media(i, *command)))
+                    let art = std::iter::once(([14.0, top + 12.0, 60.0, 60.0], Hit::Focus(i)));
+                    art.chain(
+                        buttons
+                            .iter()
+                            .enumerate()
+                            .map(move |(b, (_, command))| ([text_x - 6.0 + b as f32 * 40.0, top + 58.0, 32.0, 32.0], Hit::Media(i, *command))),
+                    )
                 })
                 .collect();
             let (content, _) = gfx.painted(w, h, |p| {

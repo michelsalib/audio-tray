@@ -135,10 +135,11 @@ pub fn set_muted(app: VoiceApp, muted: bool) {
     }
 }
 
-/// Play or pause a browser tab's media (`id` is the part after [`browser::APP_ID_PREFIX`]).
-pub fn browser_toggle(id: &str) {
+/// A command for a browser tab (`id` is the part after [`browser::APP_ID_PREFIX`]):
+/// `toggle` plays or pauses its media, `focus` brings the tab and its window to the front.
+pub fn browser_command(id: &str, command: &str) {
     match BROWSER_COMMANDS.with(|b| b.borrow().clone()) {
-        Some(server) => server.borrow_mut().send(&browser::command(id)),
+        Some(server) => server.borrow_mut().send(&browser::command(id, command)),
         None => eprintln!("integrations: the browser extension is off; cannot send it a command"),
     }
 }

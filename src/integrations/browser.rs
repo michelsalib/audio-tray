@@ -9,7 +9,7 @@
 //!
 //! Extension → app: `{"type":"tabs","tabs":[{"id":"12:0","site":"www.twitch.tv","title":…,
 //! "artist":…,"art":"<base64>","playing":true,"muted":false,"duration":0,"position":12.5}]}`.
-//! App → extension: `{"type":"command","id":"12:0","command":"toggle"}`.
+//! App → extension: `{"type":"command","id":"12:0","command":"toggle"}` (or `"focus"`).
 
 use std::sync::Arc;
 
@@ -126,9 +126,10 @@ impl super::pipe::Handler for Commands {
     }
 }
 
-/// The JSON for a play/pause on tab frame `id` (the part after [`APP_ID_PREFIX`]).
-pub fn command(id: &str) -> String {
-    serde_json::json!({ "type": "command", "id": id, "command": "toggle" }).to_string()
+/// The JSON for `command` (`toggle`, `focus`) on tab frame `id` (the part after
+/// [`APP_ID_PREFIX`]).
+pub fn command(id: &str, command: &str) -> String {
+    serde_json::json!({ "type": "command", "id": id, "command": command }).to_string()
 }
 
 /// Register this exe as the extension's native messaging host for Edge and Chrome (per user, no

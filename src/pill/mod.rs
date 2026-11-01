@@ -55,6 +55,8 @@ pub enum Action {
     Unmute(Option<VoiceApp>),
     /// Mute the default microphone (the "is listening" alert).
     MuteMicrophone,
+    /// Bring the app or tab behind a media session (its app id) to the front.
+    Focus(String),
     /// Switch this flow to its next device, as the taskbar button's click does.
     CycleDevice(crate::audio::Flow),
     /// Change this flow's volume by so many wheel notches.
@@ -649,6 +651,11 @@ impl Pill {
         let hit = self.hit_at(x, y);
         match (&self.view, hit) {
             (_, Some(Hit::Device(flow))) => act(Action::CycleDevice(flow)),
+            (View::Music { media, .. }, Some(Hit::Focus(i))) => {
+                if let Some(m) = media.get(i) {
+                    act(Action::Focus(m.app_id.clone()));
+                }
+            }
             (View::Music { media, .. }, Some(Hit::Media(i, command))) => {
                 if let Some(m) = media.get(i) {
                     act(Action::Media(m.app_id.clone(), command));

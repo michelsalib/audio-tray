@@ -88,9 +88,15 @@ chrome.tabs.onRemoved.addListener(tabId => {
     push();
 });
 
-function onCommand(message) {
+async function onCommand(message) {
     if (message.type !== "command") return;
     const [tabId, frameId] = message.id.split(":").map(Number);
+    if (message.command === "focus") {
+        // The tab, then its window: Audio Tray allowed this browser to take the foreground.
+        const tab = await chrome.tabs.update(tabId, { active: true }).catch(() => null);
+        if (tab) await chrome.windows.update(tab.windowId, { focused: true }).catch(() => { });
+        return;
+    }
     chrome.tabs.sendMessage(tabId, { command: message.command }, { frameId }).catch(() => { });
 }
 

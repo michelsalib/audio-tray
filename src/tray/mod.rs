@@ -653,7 +653,7 @@ impl Tray {
             Action::Media(app_id, command) => {
                 if let Some(tab) = app_id.strip_prefix(crate::integrations::browser::APP_ID_PREFIX) {
                     // A browser tab: play/pause is all the extension does.
-                    crate::integrations::browser_toggle(tab);
+                    crate::integrations::browser_command(tab, "toggle");
                 } else if let Some(music) = self.music.as_ref() {
                     music.command_to(&app_id, command);
                 }
@@ -666,6 +666,23 @@ impl Tray {
             Action::Unmute(Some(app)) => crate::integrations::set_muted(app, false),
             Action::Unmute(None) => self.set_microphone_muted(false),
             Action::MuteMicrophone => self.set_microphone_muted(true),
+            Action::Focus(app_id) => {
+                if let Some(tab) = app_id.strip_prefix(crate::integrations::browser::APP_ID_PREFIX) {
+                    // The browser raises its own window: let it take the foreground we were given.
+                    unsafe {
+                        let _ = windows::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow(
+                            windows::Win32::UI::WindowsAndMessaging::ASFW_ANY,
+                        );
+                    }
+                    crate::integrations::browser_command(tab, "focus");
+                } else {
+                    let media = self.hub.all_media().into_iter().find(|m| m.app_id == app_id).cloned();
+                    let (title, artist) = media.map(|m| (m.title, m.artist)).unwrap_or_default();
+                    if let Err(e) = crate::music::player::focus_session(&app_id, &title, &artist) {
+                        eprintln!("pill: could not bring {app_id} to the front ({e:#})");
+                    }
+                }
+            }
             Action::CycleDevice(flow) => {
                 let action = match flow {
                     Flow::Output => taskbar::Action::CycleOutput,

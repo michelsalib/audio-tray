@@ -73,6 +73,57 @@ pub fn activate_player(app_id: Option<&str>) -> Result<Activation> {
     }
 }
 
+/// Bring the app behind a media session to the front (a click on its cover). By what the
+/// session's id says: YouTube Music through [`activate_player`]; an installed app (an AUMID) by
+/// its window, else activated; a bare browser by the window whose title names the media; any
+/// other by its process's main window. Call from the thread the click arrived on, which holds the
+/// right to change the foreground.
+pub fn focus_session(app_id: &str, title: &str, artist: &str) -> Result<()> {
+    use windows::Win32::UI::WindowsAndMessaging::{GetWindow, IsWindowVisible, GW_OWNER};
+
+    if super::session::classify(app_id) == super::session::Match::Certain {
+        activate_player(Some(app_id))?;
+        return Ok(());
+    }
+    let lower_id = app_id.to_ascii_lowercase();
+    let browser = super::session::classify(app_id) == super::session::Match::Browser;
+    let mentions = |text: &str| {
+        let text = text.to_lowercase();
+        [title, artist].iter().any(|n| !n.trim().is_empty() && text.contains(&n.to_lowercase()))
+    };
+    let mut found = None;
+    crate::win::enum_windows(|hwnd| {
+        // Top-level, visible, unowned, titled: an app's main window.
+        let main = unsafe { IsWindowVisible(hwnd).as_bool() && GetWindow(hwnd, GW_OWNER).is_err() };
+        let window_title = crate::win::window_title(hwnd);
+        if !main || window_title.is_empty() {
+            return true;
+        }
+        let matches = if app_id.contains('!') {
+            window_app_id(hwnd).is_some_and(|id| id.eq_ignore_ascii_case(app_id))
+        } else if browser {
+            // A browser window shows the active tab's title; the media is in it.
+            window_process(hwnd).is_some_and(|p| p.contains(&lower_id)) && mentions(&window_title)
+        } else {
+            let exe = lower_id.trim_end_matches(".exe");
+            window_process(hwnd).is_some_and(|p| p.trim_end_matches(".exe") == exe)
+        };
+        if matches {
+            found = Some(hwnd);
+        }
+        found.is_none()
+    });
+    match found {
+        Some(hwnd) => {
+            let raised = raise(hwnd);
+            println!("music: focus {app_id}: {raised:?}");
+            Ok(())
+        }
+        None if app_id.contains('!') => activate_packaged(app_id).map(|_| ()),
+        None => anyhow::bail!("no window found for {app_id}"),
+    }
+}
+
 /// Activate a packaged app by AUMID, the way the Start menu does. Unlike `ShellExecuteW` on
 /// `shell:AppsFolder`, this reports failure and returns the started pid.
 fn activate_packaged(aumid: &str) -> Result<u32> {

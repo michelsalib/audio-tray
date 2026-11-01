@@ -29,23 +29,28 @@ pub fn unregister(handle: HANDLE) {
 
 /// Pump messages and serve handles until `WM_QUIT`.
 pub fn run() {
+    let mut msg = MSG::default();
+    while get_message(&mut msg) {
+        unsafe {
+            let _ = TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+}
+
+/// `GetMessageW` that serves the registered handles while it waits, for every pump on this
+/// thread (the flyout's modal one too). `false` on `WM_QUIT`, like `GetMessageW` returning 0.
+pub fn get_message(msg: &mut MSG) -> bool {
     loop {
+        if unsafe { PeekMessageW(msg, None, 0, 0, PM_REMOVE) }.as_bool() {
+            return msg.message != WM_QUIT;
+        }
         let handles: Vec<HANDLE> = HANDLES.with(|h| h.borrow().iter().map(|(raw, _)| HANDLE(*raw as _)).collect());
         // At most 63 handles; the integrations use a handful.
         let woke = unsafe { MsgWaitForMultipleObjectsEx(Some(&handles), u32::MAX, QS_ALLINPUT, MWMO_INPUTAVAILABLE) };
         let index = woke.0.wrapping_sub(WAIT_OBJECT_0.0) as usize;
         if index < handles.len() {
             fire(handles[index]);
-        }
-        let mut msg = MSG::default();
-        while unsafe { PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE) }.as_bool() {
-            if msg.message == WM_QUIT {
-                return;
-            }
-            unsafe {
-                let _ = TranslateMessage(&msg);
-                DispatchMessageW(&msg);
-            }
         }
     }
 }

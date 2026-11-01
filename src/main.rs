@@ -29,6 +29,7 @@ mod dev;
 mod flyout;
 mod hub;
 mod icons;
+mod image;
 mod instance;
 mod integrations;
 mod layered;

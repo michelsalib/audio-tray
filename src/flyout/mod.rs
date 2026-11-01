@@ -23,7 +23,7 @@ use windows::Win32::Foundation::{LPARAM, POINT};
 use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, VK_ESCAPE};
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW, KillTimer, LoadCursorW, SetCursor,
+    DestroyWindow, DispatchMessageW, GetCursorPos, KillTimer, LoadCursorW, SetCursor,
     SetForegroundWindow, SetTimer, ShowWindow, TranslateMessage, IDC_ARROW,
     MSG, SW_SHOWNA, SW_SHOWNORMAL, WHEEL_DELTA,
     WM_APP, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN,
@@ -83,6 +83,8 @@ struct Interaction {
     hover_back: bool,          // the cursor is over the picker's back button
     hover_chip: Option<usize>, // chip index the cursor is over, within the icon grid
     hover_footer: Option<ActionKind>, // which footer action the cursor is over, if any
+    hover_media: Option<usize>, // the Now Playing transport button under the cursor
+    hover_voice: bool,          // the cursor is over the voice panel's mute button
     drag: Option<usize>,       // index into elems of the slider being dragged
     pending: Option<usize>,    // index pressed on button-down, acted on button-up
 }
@@ -113,6 +115,7 @@ struct Flyout<'a> {
     meters: Vec<Option<Meter>>,        // per-group live peak meters (polled on a timer)
     vol_dirty: Arc<AtomicBool>,        // shared coalescing flag for the volume callbacks
     anim: Option<Transition>,          // the in-flight screen slide, if any
+    hub_seen: u64,                     // the hub generation the media/apps/voice rows show
 }
 
 /// Show the flyout near the tray and operate it until the user dismisses it.
@@ -167,7 +170,9 @@ unsafe fn show_inner(
         meters: Vec::new(),
         vol_dirty: Arc::new(AtomicBool::new(false)),
         anim: None,
+        hub_seen: 0,
     };
+    fly.load_hub();
 
     fly.surface.wa = work_area;
     let gap = (8.0 * scale) as i32;
@@ -201,7 +206,13 @@ unsafe fn show_inner(
     let _ = SetTimer(Some(fly.surface.hwnd), METER_TIMER_ID, METER_INTERVAL_MS, None);
 
     let mut msg = MSG::default();
-    'pump: while GetMessageW(&mut msg, None, 0, 0).0 > 0 {
+    let mut quit = false;
+    // `wait::get_message`, not `GetMessageW`: the integrations keep being served while open.
+    'pump: loop {
+        if !crate::wait::get_message(&mut msg) {
+            quit = true;
+            break;
+        }
         // Mid-slide, `elems` still describes the outgoing screen, so pointer input is dropped;
         // Escape and capture loss still dismiss.
         let sliding = fly.anim.is_some();
@@ -211,12 +222,19 @@ unsafe fn show_inner(
             WM_MOUSEMOVE => {
                 let (mx, my) = mouse_xy(msg.lParam);
                 if let Some(si) = fly.hit.drag {
-                    if let Elem::Slider { group } = fly.surface.elems[si].elem {
-                        let level = layout::level_from_x(fly.surface.width, fly.scale, mx);
-                        fly.set_group_level(group, level);
-                        fly.compose();
-                        fly.surface.flush();
+                    match fly.surface.elems[si].elem {
+                        Elem::Slider { group } => {
+                            let level = layout::level_from_x(fly.surface.width, fly.scale, mx);
+                            fly.set_group_level(group, level);
+                        }
+                        Elem::AppSlider { app } => {
+                            let level = layout::app_level_from_x(fly.surface.width, fly.scale, mx);
+                            fly.set_app_level(app, level);
+                        }
+                        _ => {}
                     }
+                    fly.compose();
+                    fly.surface.flush();
                 } else if fly.set_hover(mx, my) {
                     fly.compose();
                     fly.surface.flush();
@@ -229,10 +247,10 @@ unsafe fn show_inner(
                 }
                 fly.hit.pending = None;
                 if let Some(i) = layout::elem_at(&fly.surface.elems, my) {
-                    if let Elem::Slider { group } = fly.surface.elems[i].elem {
-                        fly.press_slider(i, group, mx);
-                    } else {
-                        fly.hit.pending = Some(i);
+                    match fly.surface.elems[i].elem {
+                        Elem::Slider { group } => fly.press_slider(i, group, mx),
+                        Elem::AppSlider { app } => fly.press_app(i, app, mx),
+                        _ => fly.hit.pending = Some(i),
                     }
                 }
             }
@@ -289,6 +307,10 @@ unsafe fn show_inner(
     fly.meters.clear(); // release the peak-meter interfaces too
     let _ = ReleaseCapture();
     let _ = DestroyWindow(fly.surface.hwnd);
+    // The outer loop must still see the quit this pump took.
+    if quit {
+        windows::Win32::UI::WindowsAndMessaging::PostQuitMessage(0);
+    }
     Outcome {
         quit: fly.model.quit,
         config_changed: fly.model.config_changed,
@@ -299,6 +321,85 @@ unsafe fn show_inner(
 impl Flyout<'_> {
     fn reset_hover(&mut self) {
         self.hit = Interaction::default();
+    }
+
+    /// Fill the Now Playing, voice and apps rows from the hub (or, in the `--flyout` preview, the
+    /// mixer straight from the sessions). Returns whether the panel's rows changed shape.
+    fn load_hub(&mut self) -> bool {
+        let art_px = (model::ART_DIP * self.scale).round() as u32;
+        let shape = |m: &Model| (m.now_playing.is_some(), m.voice.is_some(), m.apps.len());
+        let before = shape(&self.model);
+        match crate::tray::hub_snapshot() {
+            Some((generation, state)) => {
+                let (now_playing, apps, voice) = model::from_hub(&state, art_px, self.model.now_playing.as_ref());
+                self.model.now_playing = now_playing;
+                // Mid-drag, keep the level under the finger.
+                if self.hit.drag.is_none() {
+                    self.model.apps = apps;
+                }
+                self.model.voice = voice;
+                self.hub_seen = generation;
+            }
+            None => {
+                self.model.apps = crate::audio::sessions::list()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|s| model::AppRow { app: s.app, level: s.volume, muted: s.muted })
+                    .collect();
+            }
+        }
+        shape(&self.model) != before
+    }
+
+    /// The hub moved on while the panel is open: repaint its rows, resizing if they came or went.
+    fn follow_hub(&mut self) {
+        if crate::tray::hub_generation() == self.hub_seen || self.anim.is_some() {
+            return;
+        }
+        if self.load_hub() && self.model.view == View::Main {
+            self.resize();
+        } else {
+            self.render_base();
+            self.compose();
+            self.surface.flush();
+        }
+    }
+
+    /// Re-lay out for rows that came or went (a list expanded, a call started), keeping the
+    /// panel's bottom edge where it was.
+    fn resize(&mut self) {
+        self.rebuild_layout();
+        self.surface.reposition();
+        self.sync_hover_to_cursor();
+        self.render_base();
+        self.compose();
+        self.surface.flush();
+    }
+
+    fn set_app_level(&mut self, app: usize, level: f32) {
+        let row = &mut self.model.apps[app];
+        row.level = level;
+        if let Err(e) = crate::audio::sessions::set_volume(&row.app, level) {
+            eprintln!("flyout: could not set {}'s volume ({e:#})", row.app);
+        }
+    }
+
+    /// A press on an app's row: its glyph toggles the mute, the rest starts a drag.
+    fn press_app(&mut self, elem: usize, app: usize, mx: i32) {
+        if (mx as f32) < (theme::TEXT_X - 10.0) * self.scale {
+            let row = &mut self.model.apps[app];
+            row.muted = !row.muted;
+            if let Err(e) = crate::audio::sessions::set_muted(&row.app, row.muted) {
+                eprintln!("flyout: could not mute {} ({e:#})", row.app);
+            }
+            self.render_base();
+        } else if (mx as f32) >= (theme::APP_TRACK_X0 - 10.0) * self.scale {
+            self.hit.drag = Some(elem);
+            let level = layout::app_level_from_x(self.surface.width, self.scale, mx);
+            self.set_app_level(app, level);
+        }
+        self.compose();
+        self.surface.flush();
     }
 
     /// Size the panel, lay out the current view and allocate buffers; clears hit state. The size
@@ -386,6 +487,8 @@ impl Flyout<'_> {
     /// Fold each endpoint's live peak into the smoothed `peak` (muted reads as silent) and
     /// repaint if anything moved.
     fn tick_meters(&mut self) {
+        // The hub's rows ride the meter tick too: a generation compare, nothing more when idle.
+        self.follow_hub();
         let mut changed = false;
         let mut base_changed = false;
         // The recording dot rides this tick (an atomic load); it is in the base layer, so a flip re-renders it.
@@ -487,6 +590,46 @@ impl Flyout<'_> {
     /// Act on a click at button-up. Returns true if the flyout should close.
     fn activate(&mut self, i: usize, mx: i32, my: i32) -> bool {
         match self.surface.elems[i].elem {
+            Elem::GroupHeader { group } => {
+                if self.model.groups[group].devices.len() > 1 {
+                    self.model.expanded[group] = !self.model.expanded[group];
+                    self.resize();
+                }
+                false
+            }
+            Elem::NowPlaying => {
+                use crate::music::smtc::Command;
+                let command = match layout::media_button_at(self.surface.width, self.scale, mx) {
+                    Some(0) => Command::Previous,
+                    Some(1) => Command::TogglePlayPause,
+                    Some(_) => Command::Next,
+                    None => return false,
+                };
+                crate::tray::perform(crate::pill::Action::Media(command));
+                // Show the toggle at once; the hub confirms it a moment later.
+                if command == Command::TogglePlayPause {
+                    if let Some(np) = self.model.now_playing.as_mut() {
+                        np.playing = !np.playing;
+                    }
+                    self.render_base();
+                    self.compose();
+                    self.surface.flush();
+                }
+                false
+            }
+            Elem::Voice => {
+                if layout::over_voice_button(self.surface.width, self.scale, mx) {
+                    let app = self.model.voice.as_ref().and_then(|v| v.app);
+                    crate::tray::perform(crate::pill::Action::ToggleMute(app));
+                    if let Some(voice) = self.model.voice.as_mut() {
+                        voice.muted = !voice.muted;
+                    }
+                    self.render_base();
+                    self.compose();
+                    self.surface.flush();
+                }
+                false
+            }
             Elem::Device { group, dev } => {
                 if layout::over_pencil(self.surface.width, self.scale, mx) {
                     // Slide to the device's dedicated icon-picker screen.
@@ -637,11 +780,20 @@ impl Flyout<'_> {
             Some(Elem::Footer) => layout::footer_hit(&self.model, self.surface.width, self.scale, mx),
             _ => None,
         };
+        let on_media = match kind {
+            Some(Elem::NowPlaying) => layout::media_button_at(self.surface.width, self.scale, mx),
+            _ => None,
+        };
+        let on_voice = matches!(kind, Some(Elem::Voice)) && layout::over_voice_button(self.surface.width, self.scale, mx);
         let changed = hover != self.hit.hover
             || on_pencil != self.hit.hover_pencil
             || on_back != self.hit.hover_back
             || on_chip != self.hit.hover_chip
-            || on_footer != self.hit.hover_footer;
+            || on_footer != self.hit.hover_footer
+            || on_media != self.hit.hover_media
+            || on_voice != self.hit.hover_voice;
+        self.hit.hover_media = on_media;
+        self.hit.hover_voice = on_voice;
         self.hit.hover = hover;
         self.hit.hover_pencil = on_pencil;
         self.hit.hover_back = on_back;

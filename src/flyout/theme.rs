@@ -74,8 +74,8 @@ pub(super) const GRID_ICON_RATIO: f32 = 0.55; // glyph size inside a cell
 // Fluent glyphs painted directly (not from the built-in IconId set).
 const GLYPH_VOLUME: char = '\u{E767}';
 const GLYPH_MUTE: char = '\u{E74F}';
-const GLYPH_MIC: char = '\u{E720}';
-const GLYPH_MIC_OFF: char = '\u{EC54}';
+pub(super) const GLYPH_MIC: char = '\u{E720}';
+pub(super) const GLYPH_MIC_OFF: char = '\u{EC54}';
 pub(super) const GLYPH_EDIT: char = '\u{E70F}';
 pub(super) const GLYPH_SETTINGS: char = '\u{E713}';
 pub(super) const GLYPH_CANCEL: char = '\u{E711}';
@@ -182,3 +182,25 @@ fn dwm_accent_rgb() -> [u8; 3] {
         None => [0x60, 0xCD, 0xFF], // fallback Win11 accent
     }
 }
+
+// The redesign's rows: Now Playing, the voice panel, the apps mixer and collapsible device lists.
+pub(super) const NOW_PLAYING_H: f32 = 76.0;
+pub(super) const ART_X: f32 = 12.0; // left inset of the cover
+pub(super) const MEDIA_BTN: f32 = 32.0; // a transport button's round target
+pub(super) const MEDIA_BTN_GAP: f32 = 2.0;
+pub(super) const VOICE_H: f32 = 60.0;
+pub(super) const FACE_DIP: f32 = 26.0; // a face in the voice panel
+pub(super) const VOICE_BTN: f32 = 36.0; // the voice panel's mute button
+pub(super) const APP_H: f32 = 40.0; // one app in the mixer
+pub(super) const APP_TRACK_X0: f32 = 170.0; // where an app's slider starts (its name sits before)
+pub(super) const CHEVRON_PX: f32 = 12.0; // a section header's expand chevron
+pub(super) const GLYPH_PREVIOUS: char = '\u{E892}';
+pub(super) const GLYPH_PLAY: char = '\u{E768}';
+pub(super) const GLYPH_PAUSE: char = '\u{E769}';
+pub(super) const GLYPH_NEXT: char = '\u{E893}';
+pub(super) const GLYPH_DOWN: char = '\u{E70D}';
+pub(super) const GLYPH_UP: char = '\u{E70E}';
+pub(super) const GLYPH_MUSIC: char = '\u{EC4F}';
+pub(super) const GLYPH_APP: char = '\u{E7F5}';
+pub(super) const GLYPH_APP_MUTED: char = '\u{E74F}';
+pub(super) const SPEAKING: [u8; 3] = [0x3D, 0xD6, 0x8C]; // the speaking ring, as on the pill

@@ -58,6 +58,148 @@ pub(super) fn render_page(ctx: &Ctx, elems: &[LaidElem], out: &mut [u8]) {
                     cv.draw_text(f, hdr_px, (d(HEADER_X) as f32, base), TEXT, 1.0, text);
                 }
             }
+            Elem::GroupHeader { group } => {
+                let g = &groups[group];
+                let base = le.top as f32 + le.height as f32 - hdr_px * 0.55;
+                if let Some(f) = font_sb {
+                    cv.draw_text(f, hdr_px, (d(HEADER_X) as f32, base), TEXT, 1.0, g.title);
+                }
+                // More than one device: a count and a chevron say the list folds.
+                if g.devices.len() > 1 {
+                    let expanded = ctx.model.expanded.get(group).copied().unwrap_or(false);
+                    let cpx = (CHEVRON_PX * scale).round() as u32;
+                    let right = w as f32 - RIGHT_PAD * scale;
+                    if let Ok((rgba, gw, gh)) = icons::render_glyph(if expanded { GLYPH_UP } else { GLYPH_DOWN }, cpx, TEXT) {
+                        cv.blit((right - gw as f32).round() as i32, (base - hdr_px * 0.36 - gh as f32 / 2.0).round() as i32, &rgba, gw, gh, 0.8);
+                    }
+                    if let Some(f) = font {
+                        let px = 12.5 * scale;
+                        let text = format!("{} devices", g.devices.len());
+                        let tw = measure(f, px, &text);
+                        cv.draw_text(f, px, (right - cpx as f32 - 8.0 * scale - tw, base), TEXT, 0.62, &text);
+                    }
+                }
+            }
+            Elem::NowPlaying => {
+                if let Some(np) = &ctx.model.now_playing {
+                    let art = (super::model::ART_DIP * scale).round() as i32;
+                    let ax = d(ART_X);
+                    let ay = le.top + (le.height - art) / 2;
+                    match &np.art {
+                        Some(sprite) => cv.blit(ax, ay, sprite, art as u32, art as u32, 1.0),
+                        None => {
+                            cv.fill_round_rect(Rect::new(ax as f32, ay as f32, (ax + art) as f32, (ay + art) as f32), art as f32 * 0.15, TEXT, 0.08);
+                            if let Ok((rgba, gw, gh)) = icons::render_glyph(GLYPH_MUSIC, (art as f32 * 0.42) as u32, TEXT) {
+                                cv.blit(ax + (art - gw as i32) / 2, ay + (art - gh as i32) / 2, &rgba, gw, gh, 0.7);
+                            }
+                        }
+                    }
+                    let tx = (ax + art) as f32 + 12.0 * scale;
+                    let max_w = super::layout::media_button_center_x(w, scale, 0) - MEDIA_BTN * scale / 2.0 - tx - 4.0 * scale;
+                    let cy = (le.top + le.height / 2) as f32;
+                    if let Some(f) = font_sb {
+                        let line = fit_label(f, text_px, &np.title, max_w);
+                        cv.draw_text(f, text_px, (tx, cy - 6.0 * scale), TEXT, 1.0, &line);
+                    }
+                    if let Some(f) = font {
+                        let px = 12.5 * scale;
+                        let line = fit_label(f, px, &format!("{} · {}", np.artist, np.app), max_w);
+                        cv.draw_text(f, px, (tx, cy + 13.0 * scale), TEXT, 0.68, &line);
+                    }
+                    let bpx = (16.0 * scale).round() as u32;
+                    for (i, glyph) in [GLYPH_PREVIOUS, if np.playing { GLYPH_PAUSE } else { GLYPH_PLAY }, GLYPH_NEXT].into_iter().enumerate() {
+                        if let Ok((rgba, gw, gh)) = icons::render_glyph(glyph, bpx, TEXT) {
+                            let bx = super::layout::media_button_center_x(w, scale, i) - gw as f32 / 2.0;
+                            cv.blit(bx.round() as i32, cy as i32 - gh as i32 / 2, &rgba, gw, gh, 1.0);
+                        }
+                    }
+                }
+            }
+            Elem::Voice => {
+                if let Some(voice) = &ctx.model.voice {
+                    let cy = (le.top + le.height / 2) as f32;
+                    let face = FACE_DIP * scale;
+                    let mut x = ICON_X * scale;
+                    // Overlapping faces, the speakers ringed green; a mic glyph when nobody is listed.
+                    if voice.members.is_empty() {
+                        if let Ok((rgba, gw, gh)) = icons::render_glyph(GLYPH_MIC, icon_px, TEXT) {
+                            cv.blit(x as i32, cy as i32 - gh as i32 / 2, &rgba, gw, gh, 1.0);
+                        }
+                        x += icon_px as f32 + 14.0 * scale;
+                    } else {
+                        for (name, speaking, _) in voice.members.iter().take(5) {
+                            let r = face / 2.0;
+                            let (cx, cyf) = (x + r, cy);
+                            cv.fill_round_rect(Rect::new(cx - r - 2.0, cyf - r - 2.0, cx + r + 2.0, cyf + r + 2.0), r + 2.0, TINT, 1.0);
+                            let hue = name.bytes().fold(0u32, |h, b| h.wrapping_mul(31).wrapping_add(b as u32));
+                            const PALETTE: [[u8; 3]; 6] = [[0x58, 0x65, 0xF2], [0x2D, 0x7D, 0x9A], [0x8E, 0x44, 0xAD], [0xC0, 0x39, 0x2B], [0x16, 0xA0, 0x85], [0xD3, 0x54, 0x00]];
+                            cv.fill_round_rect(Rect::new(cx - r, cyf - r, cx + r, cyf + r), r, PALETTE[hue as usize % 6], 1.0);
+                            if let Some(f) = font_sb {
+                                let initial: String = name.chars().next().map(|c| c.to_uppercase().collect()).unwrap_or_default();
+                                let px = 12.0 * scale;
+                                let tw = measure(f, px, &initial);
+                                cv.draw_text(f, px, (cx - tw / 2.0, cyf + px * 0.36), TEXT, 1.0, &initial);
+                            }
+                            if *speaking {
+                                ring(&mut cv, cx, cyf, r + 1.5, 2.0 * scale, SPEAKING);
+                            }
+                            x += face * 0.72;
+                        }
+                        x += face * 0.28 + 10.0 * scale;
+                    }
+                    let max_w = super::layout::voice_button_center_x(w, scale) - VOICE_BTN * scale / 2.0 - x - 6.0 * scale;
+                    if let Some(f) = font_sb {
+                        let line = fit_label(f, text_px, &voice.title, max_w);
+                        cv.draw_text(f, text_px, (x, cy - 4.0 * scale), TEXT, 1.0, &line);
+                    }
+                    if let Some(f) = font {
+                        let px = 12.5 * scale;
+                        let speaking: Vec<&str> = voice.members.iter().filter(|m| m.1).map(|m| m.0.as_str()).collect();
+                        let status = if !speaking.is_empty() {
+                            format!("{} talking", speaking.join(", "))
+                        } else if voice.muted {
+                            "You are muted".to_string()
+                        } else if voice.members.is_empty() {
+                            "Microphone live".to_string()
+                        } else {
+                            format!("{} in the call", voice.members.len())
+                        };
+                        let line = fit_label(f, px, &status, max_w);
+                        cv.draw_text(f, px, (x, cy + 14.0 * scale), TEXT, 0.68, &line);
+                    }
+                    // The mute button: a disc, accent when muted.
+                    let bx = super::layout::voice_button_center_x(w, scale);
+                    let r = VOICE_BTN * scale / 2.0;
+                    let (col, a) = if voice.muted { (accent, 1.0) } else { (TEXT, 0.10) };
+                    cv.fill_round_rect(Rect::new(bx - r, cy - r, bx + r, cy + r), r, col, a);
+                    let glyph = if voice.muted { GLYPH_MIC_OFF } else { GLYPH_MIC };
+                    let gcol = if voice.muted { DARK_GLYPH } else { TEXT };
+                    if let Ok((rgba, gw, gh)) = icons::render_glyph(glyph, (16.0 * scale) as u32, gcol) {
+                        cv.blit((bx - gw as f32 / 2.0).round() as i32, cy as i32 - gh as i32 / 2, &rgba, gw, gh, 1.0);
+                    }
+                }
+            }
+            Elem::AppSlider { app } => {
+                let row = &ctx.model.apps[app];
+                let cy_i = le.top + le.height / 2;
+                let col = if row.muted { accent } else { TEXT };
+                let glyph = if row.muted { GLYPH_APP_MUTED } else { GLYPH_APP };
+                let gpx = (16.0 * scale).round() as u32;
+                if let Ok((rgba, gw, gh)) = icons::render_glyph(glyph, gpx, col) {
+                    cv.blit(d(ICON_X) + 2, cy_i - gh as i32 / 2, &rgba, gw, gh, 1.0);
+                }
+                if let Some(f) = font {
+                    let px = 13.0 * scale;
+                    let max_w = (APP_TRACK_X0 - 14.0) * scale - d(TEXT_X - 8.0) as f32;
+                    let label = fit_label(f, px, &row.app, max_w);
+                    cv.draw_text(f, px, (d(TEXT_X - 8.0) as f32, cy_i as f32 + px * 0.34), TEXT, 1.0, &label);
+                }
+                let x0 = APP_TRACK_X0 * scale;
+                let x1 = w as f32 - VALUE_W * scale;
+                let th = TRACK_H * scale;
+                let cy = cy_i as f32;
+                cv.fill_round_rect(Rect::new(x0, cy - th / 2.0, x1, cy + th / 2.0), th / 2.0, TEXT, 0.28);
+            }
             Elem::Note => {
                 if let (Some(f), Some(text)) = (font, ctx.model.notice) {
                     let px = NOTE_TEXT_PX * scale;
@@ -218,6 +360,28 @@ pub(super) fn compose(ctx: &Ctx, hit: &Interaction, elems: &[LaidElem], base: &[
     let mut cv = Canvas::new(buf, w, h);
 
     for le in elems {
+        // An app's slider: the same fill and thumb as an endpoint's, without the live glow.
+        if let Elem::AppSlider { app } = le.elem {
+            let row = &ctx.model.apps[app];
+            let cy = le.top as f32 + le.height as f32 / 2.0;
+            let x0 = APP_TRACK_X0 * scale;
+            let x1 = w as f32 - VALUE_W * scale;
+            let level = row.level.clamp(0.0, 1.0);
+            let fx = x0 + (x1 - x0) * level;
+            let th = TRACK_H * scale;
+            let tr = THUMB_R * scale * 0.85;
+            let (col, a) = if row.muted { (TEXT, 0.34) } else { (accent, 1.0) };
+            if fx > x0 {
+                cv.fill_round_rect(Rect::new(x0, cy - th / 2.0, fx, cy + th / 2.0), th / 2.0, col, a);
+            }
+            cv.fill_round_rect(Rect::new(fx - tr, cy - tr, fx + tr, cy + tr), tr, col, if row.muted { 0.5 } else { 1.0 });
+            if let Some(f) = font {
+                let vpx = 13.0 * scale;
+                let s = (level * 100.0).round().to_string();
+                let tw = measure(f, vpx, &s);
+                cv.draw_text(f, vpx, (w as f32 - RIGHT_PAD * scale - tw, cy + vpx * 0.34), TEXT, if row.muted { 0.5 } else { 1.0 }, &s);
+            }
+        }
         if let Elem::Slider { group } = le.elem {
             let g = &groups[group];
             let cy = le.top as f32 + le.height as f32 / 2.0;
@@ -297,6 +461,25 @@ pub(super) fn compose(ctx: &Ctx, hit: &Interaction, elems: &[LaidElem], base: &[
                     draw_battery(&mut cv, scale, panel_w as f32 - RIGHT_PAD * scale, cy, pct, font);
                 }
             }
+            Elem::GroupHeader { group } if hovered && groups[group].devices.len() > 1 => {
+                let ry0 = le.top as f32 + 4.0 * scale;
+                let ry1 = (le.top + le.height) as f32 - 2.0;
+                cv.fill_round_rect(Rect::new(mx, ry0, w as f32 - mx, ry1), d(ROW_RADIUS) as f32, TEXT, HOVER_A);
+            }
+            Elem::NowPlaying if hovered => {
+                if let Some(i) = hit.hover_media {
+                    let cy = (le.top + le.height / 2) as f32;
+                    let cxb = super::layout::media_button_center_x(w, scale, i);
+                    let r = MEDIA_BTN * scale / 2.0;
+                    cv.fill_round_rect(Rect::new(cxb - r, cy - r, cxb + r, cy + r), r, TEXT, 0.10);
+                }
+            }
+            Elem::Voice if hovered && hit.hover_voice => {
+                let cy = (le.top + le.height / 2) as f32;
+                let cxb = super::layout::voice_button_center_x(w, scale);
+                let r = VOICE_BTN * scale / 2.0;
+                cv.fill_round_rect(Rect::new(cxb - r, cy - r, cxb + r, cy + r), r, TEXT, 0.08);
+            }
             Elem::PickerHeader { .. } if hovered && hover_back => {
                 // Round hover button behind the back arrow.
                 let cy = (le.top + le.height / 2) as f32;
@@ -340,6 +523,21 @@ pub(super) fn compose(ctx: &Ctx, hit: &Interaction, elems: &[LaidElem], base: &[
                 }
             }
             _ => {}
+        }
+    }
+}
+
+/// A ring of `stroke` px at radius `r`, as the difference of two discs' coverage.
+fn ring(cv: &mut Canvas, cx: f32, cy: f32, r: f32, stroke: f32, col: [u8; 3]) {
+    let outer = r + stroke / 2.0;
+    let inner = r - stroke / 2.0;
+    for y in (cy - outer).floor() as i32..(cy + outer).ceil() as i32 {
+        for x in (cx - outer).floor() as i32..(cx + outer).ceil() as i32 {
+            let dist = ((x as f32 + 0.5 - cx).powi(2) + (y as f32 + 0.5 - cy).powi(2)).sqrt();
+            let coverage = (outer - dist + 0.5).clamp(0.0, 1.0) * (dist - inner + 0.5).clamp(0.0, 1.0);
+            if coverage > 0.0 {
+                cv.fill_round_rect(Rect::new(x as f32, y as f32, x as f32 + 1.0, y as f32 + 1.0), 0.0, col, coverage);
+            }
         }
     }
 }

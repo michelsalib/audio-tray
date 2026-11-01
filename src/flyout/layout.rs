@@ -50,6 +50,14 @@ impl ActionKind {
 #[derive(Clone, Copy)]
 pub(super) enum Elem {
     Header(&'static str),
+    /// A device section's header: clicking it shows or hides the devices that are not selected.
+    GroupHeader { group: usize },
+    /// The media session shown anywhere, with transport buttons ([`media_button_at`]).
+    NowPlaying,
+    /// The call: who is in it, and the user's mute ([`over_voice_button`]).
+    Voice,
+    /// One app's volume in the mixer.
+    AppSlider { app: usize },
     Slider { group: usize },
     Device { group: usize, dev: usize },
     /// The icon-picker screen's header: a back arrow + the device name as the title.
@@ -90,6 +98,10 @@ pub(super) fn content_width(model: &Model, scale: f32) -> i32 {
     }
     // Wide enough for the footer's label and buttons on one line.
     max_w = max_w.max(footer_min_width(model, scale));
+    // An app's slider needs room after its name.
+    if !model.apps.is_empty() {
+        max_w = max_w.max((APP_TRACK_X0 + 130.0 + VALUE_W) * scale);
+    }
     // `ceil`, not `round`, or `fit_label` ellipsises text that was measured to fit.
     max_w.clamp(MIN_W * scale, MAX_W * scale).ceil() as i32
 }
@@ -112,13 +124,25 @@ pub(super) fn build_view(model: &Model, scale: f32, width: i32, view: View, fill
     let mut kinds: Vec<Elem> = Vec::new();
     match view {
         View::Main => {
+            if model.now_playing.is_some() {
+                kinds.push(Elem::NowPlaying);
+            }
+            if model.voice.is_some() {
+                kinds.push(Elem::Voice);
+            }
             for (gi, g) in model.groups.iter().enumerate() {
-                kinds.push(Elem::Header(g.title));
+                kinds.push(Elem::GroupHeader { group: gi });
                 if g.default_id.is_some() {
                     kinds.push(Elem::Slider { group: gi });
                 }
-                for di in 0..g.devices.len() {
+                for di in shown_devices(model, gi) {
                     kinds.push(Elem::Device { group: gi, dev: di });
+                }
+            }
+            if !model.apps.is_empty() {
+                kinds.push(Elem::Header("Apps"));
+                for app in 0..model.apps.len() {
+                    kinds.push(Elem::AppSlider { app });
                 }
             }
             if model.notice.is_some() {
@@ -142,7 +166,10 @@ pub(super) fn build_view(model: &Model, scale: f32, width: i32, view: View, fill
         }
         let height = match elem {
             // Later headers get a larger top gap to separate groups.
-            Elem::Header(_) => d(if i == 0 { HEADER_FIRST_H } else { HEADER_H }),
+            Elem::Header(_) | Elem::GroupHeader { .. } => d(if i == 0 { HEADER_FIRST_H } else { HEADER_H }),
+            Elem::NowPlaying => d(NOW_PLAYING_H),
+            Elem::Voice => d(VOICE_H),
+            Elem::AppSlider { .. } => d(APP_H),
             Elem::Slider { .. } => d(SLIDER_H),
             Elem::Device { .. } => d(ITEM_H),
             Elem::PickerHeader { .. } => d(PICKER_HEADER_H),
@@ -251,6 +278,10 @@ pub(super) fn elem_at(elems: &[LaidElem], y: i32) -> Option<usize> {
         let actionable = matches!(
             le.elem,
             Elem::Slider { .. }
+                | Elem::GroupHeader { .. }
+                | Elem::NowPlaying
+                | Elem::Voice
+                | Elem::AppSlider { .. }
                 | Elem::Device { .. }
                 | Elem::PickerHeader { .. }
                 | Elem::IconGrid { .. }
@@ -258,6 +289,43 @@ pub(super) fn elem_at(elems: &[LaidElem], y: i32) -> Option<usize> {
         );
         actionable && y >= le.top && y < le.top + le.height
     })
+}
+
+/// The devices a group lists: all of them when expanded, else only the selected one (the first
+/// when none is).
+pub(super) fn shown_devices(model: &Model, group: usize) -> Vec<usize> {
+    let g = &model.groups[group];
+    if model.expanded.get(group).copied().unwrap_or(false) || g.devices.len() <= 1 {
+        return (0..g.devices.len()).collect();
+    }
+    vec![g.devices.iter().position(|d| d.selected).unwrap_or(0)]
+}
+
+/// Which transport button of the Now Playing card is under `mx`: 0 previous, 1 play/pause,
+/// 2 next. Shared by hit-test and paint ([`media_button_center_x`]).
+pub(super) fn media_button_at(width: i32, scale: f32, mx: i32) -> Option<usize> {
+    (0..3).find(|&i| ((mx as f32) - media_button_center_x(width, scale, i)).abs() <= MEDIA_BTN * scale / 2.0)
+}
+
+pub(super) fn media_button_center_x(width: i32, scale: f32, i: usize) -> f32 {
+    let step = (MEDIA_BTN + MEDIA_BTN_GAP) * scale;
+    width as f32 - (RIGHT_PAD - 6.0 + MEDIA_BTN / 2.0) * scale - (2 - i) as f32 * step
+}
+
+/// Whether `mx` is over the voice panel's mute button.
+pub(super) fn over_voice_button(width: i32, scale: f32, mx: i32) -> bool {
+    ((mx as f32) - voice_button_center_x(width, scale)).abs() <= VOICE_BTN * scale / 2.0
+}
+
+pub(super) fn voice_button_center_x(width: i32, scale: f32) -> f32 {
+    width as f32 - (RIGHT_PAD - 4.0 + VOICE_BTN / 2.0) * scale
+}
+
+/// An app slider's level at `mx`.
+pub(super) fn app_level_from_x(width: i32, scale: f32, mx: i32) -> f32 {
+    let x0 = APP_TRACK_X0 * scale;
+    let x1 = width as f32 - VALUE_W * scale;
+    (((mx as f32) - x0) / (x1 - x0)).clamp(0.0, 1.0)
 }
 
 pub(super) fn level_from_x(width: i32, scale: f32, mx: i32) -> f32 {
@@ -332,6 +400,38 @@ mod tests {
             peak: 0.0,
             recording: false,
             devices,
+        }
+    }
+
+    #[test]
+    fn a_folded_group_lists_only_its_selected_device() {
+        let mut speakers = dev("Speakers", None);
+        speakers.selected = true;
+        let mut m = model(vec![output_group(vec![dev("Headphones", None), speakers, dev("TV", None)])], None);
+        let devices = |m: &Model| {
+            build_view(m, 1.0, 400, View::Main, 0)
+                .0
+                .iter()
+                .filter_map(|le| match le.elem {
+                    Elem::Device { dev, .. } => Some(dev),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(devices(&m), vec![1], "folded: the selected one only");
+        m.expanded[0] = true;
+        assert_eq!(devices(&m), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn media_buttons_are_hit_where_they_are_painted() {
+        for scale in [1.0_f32, 1.5, 2.0] {
+            let width = 400;
+            for i in 0..3 {
+                let x = media_button_center_x(width, scale, i).round() as i32;
+                assert_eq!(media_button_at(width, scale, x), Some(i));
+            }
+            assert_eq!(media_button_at(width, scale, 40), None, "the art is not a button");
         }
     }
 

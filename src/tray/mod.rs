@@ -525,6 +525,7 @@ fn open_flyout(anchor: Option<flyout::Anchor>) {
             if let Err(e) = tray.config.save() {
                 eprintln!("save config failed: {e:#}");
             }
+            crate::pill::configure(&tray.config.pill);
             tray.refresh();
         }
         if outcome.restart {
@@ -601,6 +602,7 @@ impl Tray {
 
     /// The hub state changed: bring the surfaces in line, and arm the next notice's expiry.
     fn hub_changed(&mut self) {
+        HUB_GENERATION.fetch_add(1, Ordering::SeqCst);
         let (_, next) = self.hub.expire(Instant::now());
         crate::pill::update(&self.hub);
         if let (Some(next), Some(window)) = (next, taskbar::receiver()) {
@@ -621,29 +623,34 @@ impl Tray {
 
     /// Carry out what the pill was clicked for.
     fn pill_actions(&mut self) {
-        use crate::pill::Action;
         for action in crate::pill::take_actions() {
             println!("pill: {action:?}");
-            match action {
-                Action::Media(command) => {
-                    if let Some(music) = self.music.as_ref() {
-                        music.command_shown(command);
-                    }
+            self.perform(action);
+        }
+    }
+
+    /// One action from a surface (the pill or the flyout).
+    fn perform(&mut self, action: crate::pill::Action) {
+        use crate::pill::Action;
+        match action {
+            Action::Media(command) => {
+                if let Some(music) = self.music.as_ref() {
+                    music.command_shown(command);
                 }
-                Action::ToggleMute(Some(app)) => crate::integrations::toggle_mute(app),
-                Action::ToggleMute(None) => {
-                    let muted = self.hub.endpoints.input.as_ref().is_some_and(|e| e.muted);
-                    self.set_microphone_muted(!muted);
-                }
-                Action::Unmute(Some(app)) => crate::integrations::set_muted(app, false),
-                Action::Unmute(None) => self.set_microphone_muted(false),
-                Action::MuteMicrophone => self.set_microphone_muted(true),
-                Action::Acknowledge(notice) => {
-                    self.hub.acknowledge(&notice);
-                    self.hub_changed();
-                }
-                Action::Open(url) => open_url(&url),
             }
+            Action::ToggleMute(Some(app)) => crate::integrations::toggle_mute(app),
+            Action::ToggleMute(None) => {
+                let muted = self.hub.endpoints.input.as_ref().is_some_and(|e| e.muted);
+                self.set_microphone_muted(!muted);
+            }
+            Action::Unmute(Some(app)) => crate::integrations::set_muted(app, false),
+            Action::Unmute(None) => self.set_microphone_muted(false),
+            Action::MuteMicrophone => self.set_microphone_muted(true),
+            Action::Acknowledge(notice) => {
+                self.hub.acknowledge(&notice);
+                self.hub_changed();
+            }
+            Action::Open(url) => open_url(&url),
         }
     }
 
@@ -1042,6 +1049,23 @@ impl Current {
             input_recording: mic::in_use(),
         }
     }
+}
+
+/// Bumped on every hub change, so the open flyout can tell when to re-read.
+static HUB_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+pub(crate) fn hub_generation() -> u64 {
+    HUB_GENERATION.load(Ordering::SeqCst)
+}
+
+/// The hub state and its generation, for the flyout; `None` outside the tray (the previews).
+pub(crate) fn hub_snapshot() -> Option<(u64, crate::hub::State)> {
+    with_tray(|tray| (hub_generation(), tray.hub.clone()))
+}
+
+/// Carry out a surface's action from outside a tray handler (the flyout's modal loop).
+pub(crate) fn perform(action: crate::pill::Action) {
+    with_tray(|tray| tray.perform(action));
 }
 
 /// Keep the token Teams handed over when the user allowed Audio Tray. Tray thread.

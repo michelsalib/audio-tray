@@ -34,7 +34,7 @@ pub struct Ytm {
     smtc: smtc::Smtc,
     /// An app id pinned in config, which overrides the built-in matching.
     pinned: Option<String>,
-    /// The app id the last [`Ytm::read`] settled on; commands address this rather than re-deciding.
+    /// The app id the last [`Ytm::read_with_any`] settled on; commands address this rather than re-deciding.
     current_app_id: Option<String>,
     /// The app id of the session to show anywhere (any app), from the last read.
     shown_app_id: Option<String>,
@@ -67,12 +67,14 @@ impl Ytm {
 
     /// Read the current state and track position, remembering which session they came from. Picks
     /// on the cheap [`smtc::Brief`]s and reads only the chosen session in full.
+    #[cfg(feature = "dev")]
     pub fn read(&mut self) -> Result<(State, Option<smtc::Timeline>)> {
         self.read_with_any().map(|(state, timeline, _)| (state, timeline))
     }
 
-    /// [`Ytm::read`], plus the session to show whatever the app: a playing one (the followed
-    /// player first), else the followed player, else the first session.
+    /// Read the current state and track position, remembering which session they came from, plus
+    /// the session to show whatever the app: a playing one (the followed player first), else the
+    /// followed player, else the first session.
     pub fn read_with_any(&mut self) -> Result<(State, Option<smtc::Timeline>, Option<smtc::Reading>)> {
         let pinned = self.pinned.clone();
         let [reading, any] = self.smtc.read_pair(|briefs| {
@@ -116,7 +118,7 @@ impl Ytm {
         self.smtc.send(app_id, command)
     }
 
-    /// Send a transport command to the session the last [`Ytm::read`] found. `Ok(false)` means no
+    /// Send a transport command to the session the last [`Ytm::read_with_any`] found. `Ok(false)` means no
     /// session or a refusal: the click did nothing, which is not an error.
     pub fn send(&self, command: Command) -> Result<bool> {
         let Some(app_id) = self.current_app_id.as_deref() else {

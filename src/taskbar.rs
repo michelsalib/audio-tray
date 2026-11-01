@@ -217,7 +217,7 @@ unsafe fn inject(pid: u32, dll: &std::path::Path, icons: StripIcons) -> Result<(
     // Both DLL parameters get the TAP's own path, matching the known-good C++ TAPs.
     let endpoint = crate::win::wide(ENDPOINT_NAME);
     let path = crate::win::wide(&dll.to_string_lossy());
-    let init_data = crate::win::wide(&init_data(icons, std::process::id()));
+    let init_data = crate::win::wide(&init_data(icons, std::process::id(), Payload::Injection));
 
     let hr = initialize(
         PCWSTR(endpoint.as_ptr()),
@@ -288,7 +288,7 @@ const PILL_ALPHA: &str = "80";
 /// is the stable part); `pid` is the owner the TAP watches and reverts on exit; `hidevolume`/`hidemic`
 /// collapse Windows' own indicators; `tile` names the app button for the music tile (empty = off);
 /// `ver`/`tap`/`hwnd` identify the build and receiver for [`offer_handover`].
-fn init_data(icons: StripIcons, owner_pid: u32) -> String {
+fn init_data(icons: StripIcons, owner_pid: u32, payload: Payload) -> String {
     let [r, g, b] = crate::flyout::theme::accent_rgb();
     let config = crate::config::Config::load();
     let buttons = config.strip.enabled;
@@ -318,7 +318,6 @@ fn init_data(icons: StripIcons, owner_pid: u32) -> String {
         ("pid", owner_pid.to_string()),
         ("ver", env!("CARGO_PKG_VERSION").to_string()),
         ("proto", tap_proto::PROTOCOL.to_string()),
-        ("tap", tap),
         ("hwnd", RECEIVER.load(std::sync::atomic::Ordering::SeqCst).to_string()),
     ];
     // Only when they differ from the TAP's defaults (buttons on, the full tile width): the
@@ -327,14 +326,27 @@ fn init_data(icons: StripIcons, owner_pid: u32) -> String {
     if !buttons {
         pairs.push(("buttons", "0".to_string()));
     }
+    // The DLL path only matters to a handover's compatibility check, which comes by WM_COPYDATA
+    // (no length cap); the injection's initialization data cannot spare its 70-odd characters.
+    if payload == Payload::Handover {
+        pairs.push(("tap", tap));
+    }
     if !strip.is_empty() {
         pairs.push(("strip", strip));
     }
     let data = tap_proto::encode_init(pairs);
-    if data.len() > INIT_DATA_BUDGET {
+    if payload == Payload::Injection && data.len() > INIT_DATA_BUDGET {
         eprintln!("taskbar: the TAP's init data is {} characters; past {INIT_DATA_BUDGET} it may arrive empty", data.len());
     }
     data
+}
+
+/// Which way the init data travels: as `InitializeXamlDiagnosticsEx`'s initialization data
+/// (capped, see [`INIT_DATA_BUDGET`]) or by `WM_COPYDATA` on a handover (uncapped).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Payload {
+    Injection,
+    Handover,
 }
 
 /// Where `InitializeXamlDiagnosticsEx`'s initialization data stops arriving: measured on
@@ -365,7 +377,7 @@ fn offer_handover(icons: StripIcons, owner_pid: u32) -> Result<()> {
     use windows::Win32::System::DataExchange::COPYDATASTRUCT;
     use windows::Win32::UI::WindowsAndMessaging::{SendMessageTimeoutW, SMTO_ABORTIFHUNG, WM_COPYDATA};
 
-    let payload = crate::win::wide(&init_data(icons, owner_pid));
+    let payload = crate::win::wide(&init_data(icons, owner_pid, Payload::Handover));
     let copy = COPYDATASTRUCT {
         dwData: HANDOVER_MAGIC,
         cbData: (payload.len() * 2) as u32,

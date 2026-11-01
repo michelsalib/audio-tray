@@ -1,7 +1,9 @@
 //! Teams, through its local third-party app API: a WebSocket on `127.0.0.1:8124` that the user
-//! turns on in Teams (Settings > Privacy > Manage API). The first command sent asks the user to
-//! allow Audio Tray inside Teams, which then hands over a token kept in config. The wire format
-//! is only community-documented; it reports the meeting and the user's mute, not who is there.
+//! turns on in Teams (Settings > Privacy > Manage API). Unpaired, the first command sent during a
+//! meeting asks the user to allow Audio Tray inside Teams, which then hands over a token kept in
+//! config: so when Teams says pairing is possible, a harmless `query-meeting-state` is sent. The
+//! wire format is only community-documented; it reports the meeting and the user's mute, not who
+//! is there.
 //!
 //! The socket's readiness is a `WSAEventSelect` event waited on by the tray thread. Connecting is
 //! attempted at start-up and whenever Teams takes the microphone (a meeting starting), never on a
@@ -37,6 +39,15 @@ struct Incoming {
 #[serde(rename_all = "camelCase")]
 struct MeetingUpdate {
     meeting_state: Option<MeetingState>,
+    meeting_permissions: Option<MeetingPermissions>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct MeetingPermissions {
+    /// In a meeting, unpaired: a command now shows Teams' "allow" prompt.
+    #[serde(default)]
+    can_pair: bool,
 }
 
 #[derive(Deserialize, Default)]
@@ -53,6 +64,10 @@ pub struct Client {
     event: WSAEVENT,
     in_meeting: bool,
     request: u32,
+    /// Whether Teams handed over a token (now or on an earlier run).
+    paired: bool,
+    /// Whether this connection already asked Teams to pair.
+    asked: bool,
 }
 
 /// Connect, with the saved token when there is one. Fails fast when Teams is not listening.
@@ -77,7 +92,22 @@ pub fn connect(token: Option<&str>) -> Result<Client> {
     }
     println!("teams: connected");
     crate::hub::emit(Event::Integration { name: NAME, connected: true });
-    Ok(Client { socket, event, in_meeting: false, request: 0 })
+    let mut client = Client { socket, event, in_meeting: false, request: 0, paired: token.is_some(), asked: false };
+    // The meeting as it is now; unpaired and in a meeting, this also asks to pair.
+    client.action("query-meeting-state");
+    client.asked = !client.paired;
+    Ok(client)
+}
+
+/// Whether Teams is running (new Teams or classic), to tell "the API is off" from "Teams is not
+/// open" when nothing listens. Only asked after a failed connection.
+pub fn running() -> bool {
+    let mut found = false;
+    crate::win::enum_windows(|hwnd| {
+        found = matches!(crate::music::player::window_process(hwnd).as_deref(), Some("ms-teams.exe" | "teams.exe"));
+        !found
+    });
+    found
 }
 
 impl Client {
@@ -125,9 +155,17 @@ impl Client {
         };
         if let Some(token) = incoming.token_refresh {
             println!("teams: Audio Tray was allowed; keeping the token");
+            self.paired = true;
             crate::tray::set_teams_token(token);
         }
-        if let Some(state) = incoming.meeting_update.and_then(|u| u.meeting_state) {
+        let update = incoming.meeting_update;
+        let can_pair = update.as_ref().and_then(|u| u.meeting_permissions.as_ref()).is_some_and(|p| p.can_pair);
+        if can_pair && !self.paired && !self.asked {
+            println!("teams: asking to pair (Teams shows an allow prompt)");
+            self.asked = true;
+            self.action("query-meeting-state");
+        }
+        if let Some(state) = update.and_then(|u| u.meeting_state) {
             let was = std::mem::replace(&mut self.in_meeting, state.is_in_meeting);
             let call = state.is_in_meeting.then(|| Call { self_muted: state.is_muted, ..Default::default() });
             if call.is_some() || was {

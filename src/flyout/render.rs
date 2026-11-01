@@ -87,6 +87,7 @@ pub(super) fn render_page(ctx: &Ctx, elems: &[LaidElem], out: &mut [u8]) {
                     SettingKind::ListeningAlerts => Some(s.alerts),
                     SettingKind::BrowserTabs => Some(s.browser),
                     SettingKind::Discord => Some(s.discord),
+                    SettingKind::Teams => Some(s.teams),
                     _ => None,
                 };
                 // The pill's own options are moot while it is off, the Discord keys while Discord
@@ -110,6 +111,12 @@ pub(super) fn render_page(ctx: &Ctx, elems: &[LaidElem], out: &mut [u8]) {
                         .to_string(),
                         if ctx.model.discord_problem.is_some() && !connected("Discord") { 0.9 } else { 0.6 },
                     )),
+                    SettingKind::Teams if s.teams => Some(match (connected("Teams"), ctx.model.teams_problem) {
+                        (true, _) if s.teams_paired => ("Connected".to_string(), 0.6),
+                        (true, _) => ("Allow it in your next meeting".to_string(), 0.9),
+                        (false, Some(problem)) => (problem.to_string(), 0.9),
+                        (false, None) => ("Waiting for Teams".to_string(), 0.6),
+                    }),
                     SettingKind::DiscordId => Some(s.discord_id.clone().map_or(("Paste".to_string(), 1.0), |id| (id, 0.6))),
                     SettingKind::DiscordSecret => Some(s.discord_secret.clone().map_or(("Paste".to_string(), 1.0), |secret| (secret, 0.6))),
                     _ => None,

@@ -85,6 +85,22 @@ pub fn reconfigure(old: &Config, new: &Config) {
             crate::hub::emit(crate::hub::Event::Integration { name: "Discord", connected: false });
         }
     }
+    if old.teams.enabled != new.teams.enabled {
+        if new.teams.enabled {
+            TEAMS_TOKEN.with(|t| *t.borrow_mut() = Some(new.teams.token.clone()));
+            connect_teams();
+        } else {
+            TEAMS_TOKEN.with(|t| *t.borrow_mut() = None);
+            TEAMS.with(|t| {
+                if let Some(client) = t.borrow_mut().take() {
+                    crate::wait::unregister(client.borrow().event());
+                }
+            });
+            crate::hub::emit(crate::hub::Event::Call { app: VoiceApp::Teams, call: None });
+            crate::hub::emit(crate::hub::Event::Integration { name: "Teams", connected: false });
+            crate::hub::emit(crate::hub::Event::IntegrationProblem { name: "Teams", problem: None });
+        }
+    }
     if old.browser.enabled != new.browser.enabled {
         if new.browser.enabled {
             start_browser();
@@ -139,6 +155,7 @@ fn connect_teams() {
             let event = client.event();
             let client = Rc::new(RefCell::new(client));
             let served = Rc::clone(&client);
+            crate::hub::emit(crate::hub::Event::IntegrationProblem { name: "Teams", problem: None });
             crate::wait::register(event, move || {
                 if !served.borrow_mut().signalled() {
                     let event = served.borrow().event();
@@ -148,7 +165,12 @@ fn connect_teams() {
             });
             TEAMS.with(|t| *t.borrow_mut() = Some(client));
         }
-        Err(e) => println!("teams: not connected ({e:#})"),
+        Err(e) => {
+            println!("teams: not connected ({e:#})");
+            // Nothing listening while Teams runs: its API is off.
+            let problem = teams::running().then_some("Turn on the API in Teams");
+            crate::hub::emit(crate::hub::Event::IntegrationProblem { name: "Teams", problem });
+        }
     }
 }
 

@@ -90,7 +90,7 @@ unsafe extern "system" fn mouse_hook(code: i32, wparam: WPARAM, lparam: LPARAM) 
             let flow = crate::taskbar::flow_code(flow_at(info.pt));
             // Swallowed only when the tray took it: so the shell does not also scroll, and so
             // XAML never sees it — which keeps the TAP's wheel handler from acting twice.
-            if super::post(WM_TASKBAR_SCROLL, flow, delta as isize) {
+            if super::post(WM_TASKBAR_SCROLL, flow | crate::taskbar::SCROLL_FROM_WHEEL, delta as isize) {
                 return LRESULT(1);
             }
         }

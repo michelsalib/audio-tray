@@ -77,6 +77,9 @@ pub(super) struct Settings {
     pub discord_id: Option<String>,
     /// The secret's last characters, when there is one: it is never shown whole.
     pub discord_secret: Option<String>,
+    pub teams: bool,
+    /// Teams handed over its token: Audio Tray was allowed.
+    pub teams_paired: bool,
 }
 
 impl Settings {
@@ -95,6 +98,8 @@ impl Settings {
                 let tail: String = s.chars().rev().take(4).collect::<Vec<_>>().into_iter().rev().collect();
                 format!("••••{tail}")
             }),
+            teams: config.teams.enabled,
+            teams_paired: config.teams.token.is_some(),
         }
     }
 }
@@ -118,6 +123,8 @@ pub(super) struct Model {
     pub hint: Option<(super::layout::SettingKind, &'static str)>,
     /// Why Discord's RPC last failed, in a few words (a missing redirect, a wrong secret).
     pub discord_problem: Option<&'static str>,
+    /// Why Teams cannot connect (its API is off).
+    pub teams_problem: Option<&'static str>,
     // outcome, accumulated while the flyout is open
     pub config_changed: bool,
     pub quit: bool,
@@ -140,6 +147,7 @@ impl Model {
             integrations: Vec::new(),
             hint: None,
             discord_problem: None,
+            teams_problem: None,
             config_changed: false,
             quit: false,
             restart: false,

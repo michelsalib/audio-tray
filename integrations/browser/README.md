@@ -20,9 +20,9 @@ the host registration allows.
 
 ## Install (Edge or Chrome)
 
-Audio Tray's **Settings > Connectors** does the first steps for you: **Open the browser's
-extensions** opens your default browser's page, **Open the extension's folder** shows the folder
-and copies its path. The installer puts the folder at `browser-extension` beside the exe.
+Audio Tray's **Settings > Connectors > Install the extension** does the first steps for you: it
+opens your default browser's extensions page, then shows the folder and copies its path. The
+installer puts the folder at `browser-extension` beside the exe.
 
 1. Start Audio Tray once, so the host is registered.
 2. Open `edge://extensions` (or `chrome://extensions`) and turn on **Developer mode**.

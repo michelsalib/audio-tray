@@ -199,3 +199,26 @@ pub(crate) fn set_clipboard_text(text: &str) -> bool {
         placed
     }
 }
+
+/// Whether the input message being handled came from a touchpad (not a mouse wheel).
+pub(crate) fn from_touchpad() -> bool {
+    use windows::Win32::UI::Input::{GetCurrentInputMessageSource, IMDT_TOUCHPAD, INPUT_MESSAGE_SOURCE};
+
+    let mut source = INPUT_MESSAGE_SOURCE::default();
+    unsafe { GetCurrentInputMessageSource(&mut source) }.is_ok() && source.deviceType.0 & IMDT_TOUCHPAD.0 != 0
+}
+
+/// A scroll `delta` as a volume change: up is louder. A touchpad set to scroll the "natural" way
+/// (content follows the fingers, Windows' default) reports pushing two fingers up as scrolling
+/// down; a volume is a slider, not content, so the fingers going up still raise it.
+pub(crate) fn volume_delta(delta: i32, touchpad: bool) -> i32 {
+    use windows::core::w;
+
+    // 0 is "down motion scrolls up"; the other choice is stored as 0xFFFFFFFF.
+    let natural = hkcu_dword(w!(r"Software\Microsoft\Windows\CurrentVersion\PrecisionTouchPad"), w!("ScrollDirection")).unwrap_or(0) == 0;
+    if touchpad && natural {
+        -delta
+    } else {
+        delta
+    }
+}

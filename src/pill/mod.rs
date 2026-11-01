@@ -890,7 +890,7 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESUL
         WM_MOUSEWHEEL => {
             // Screen coordinates, unlike the other mouse messages.
             let mut point = POINT { x: (lparam.0 & 0xFFFF) as i16 as i32, y: ((lparam.0 >> 16) & 0xFFFF) as i16 as i32 };
-            let delta = ((wparam.0 >> 16) & 0xFFFF) as u16 as i16;
+            let delta = crate::win::volume_delta(((wparam.0 >> 16) & 0xFFFF) as u16 as i16 as i32, crate::win::from_touchpad());
             with_pill(|pill| {
                 if hwnd != pill.hwnd || unsafe { !ScreenToClient(pill.hwnd, &mut point).as_bool() } {
                     return;

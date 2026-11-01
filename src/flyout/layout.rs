@@ -41,10 +41,9 @@ pub(super) enum SettingKind {
     Connectors,
     /// Every tab's media through the browser extension (a switch, with its status).
     BrowserTabs,
-    /// The extension's folder in Explorer, its path copied for "Load unpacked" (a link).
+    /// The default browser's extensions page, and the extension's folder in Explorer with its path
+    /// copied for "Load unpacked" (a link).
     ExtensionFolder,
-    /// The default browser's extensions page (a link).
-    ExtensionsPage,
     /// Discord's calls (a switch, with its status).
     Discord,
     /// The Discord application's id, pasted from the clipboard.
@@ -53,6 +52,8 @@ pub(super) enum SettingKind {
     DiscordSecret,
     /// Discord's developer portal, where the application is made (a link).
     DiscordPortal,
+    /// Teams' meetings (a switch, with its status).
+    Teams,
 }
 
 impl SettingKind {
@@ -65,14 +66,14 @@ impl SettingKind {
             SettingKind::PillSize => "Pill size at rest",
             SettingKind::ListeningAlerts => "Alert when an app listens",
             SettingKind::SoundSettings => "Windows sound settings",
-            SettingKind::Connectors => "Browser and Discord",
+            SettingKind::Connectors => "Browser, Discord and Teams",
             SettingKind::BrowserTabs => "Every tab's media",
-            SettingKind::ExtensionFolder => "Open the extension's folder",
-            SettingKind::ExtensionsPage => "Open the browser's extensions",
+            SettingKind::ExtensionFolder => "Install the extension",
             SettingKind::Discord => "Discord calls",
             SettingKind::DiscordId => "Application ID",
             SettingKind::DiscordSecret => "Client secret",
             SettingKind::DiscordPortal => "1. Create an app on the developer portal",
+            SettingKind::Teams => "Teams meetings",
         }
     }
 
@@ -83,7 +84,6 @@ impl SettingKind {
             SettingKind::SoundSettings
                 | SettingKind::Connectors
                 | SettingKind::ExtensionFolder
-                | SettingKind::ExtensionsPage
                 | SettingKind::DiscordPortal
         )
     }
@@ -262,7 +262,7 @@ pub(super) fn build_view(model: &Model, scale: f32, width: i32, view: View, fill
         View::Connectors => {
             kinds.push(Elem::SettingsHeader("Connectors"));
             kinds.push(Elem::Header("Browser"));
-            for kind in [SettingKind::BrowserTabs, SettingKind::ExtensionFolder, SettingKind::ExtensionsPage] {
+            for kind in [SettingKind::BrowserTabs, SettingKind::ExtensionFolder] {
                 kinds.push(Elem::Setting { kind });
             }
             kinds.push(Elem::Header("Discord"));
@@ -272,6 +272,10 @@ pub(super) fn build_view(model: &Model, scale: f32, width: i32, view: View, fill
             kinds.push(Elem::Step("3. Copy its client ID and secret, and click to paste:"));
             kinds.push(Elem::Setting { kind: SettingKind::DiscordId });
             kinds.push(Elem::Setting { kind: SettingKind::DiscordSecret });
+            kinds.push(Elem::Header("Teams"));
+            kinds.push(Elem::Setting { kind: SettingKind::Teams });
+            kinds.push(Elem::Step("1. In Teams: Settings > Privacy > Manage API, turn it on"));
+            kinds.push(Elem::Step("2. In a meeting, allow Audio Tray when Teams asks"));
         }
     }
 

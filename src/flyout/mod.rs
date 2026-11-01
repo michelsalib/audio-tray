@@ -289,7 +289,7 @@ unsafe fn show_inner(
             }
             WM_MOUSEWHEEL => {
                 // Screen coordinates, unlike the other mouse messages.
-                let delta = (msg.wParam.0 >> 16) as u16 as i16;
+                let delta = crate::win::volume_delta((msg.wParam.0 >> 16) as u16 as i16 as i32, crate::win::from_touchpad()) as i16;
                 let (_, sy) = mouse_xy(msg.lParam);
                 fly.scroll_volume(sy - fly.surface.y, delta);
             }
@@ -348,6 +348,7 @@ impl Flyout<'_> {
                 self.model.voice = voice;
                 self.model.integrations = state.integrations.clone();
                 self.model.discord_problem = state.problem("Discord");
+                self.model.teams_problem = state.problem("Teams");
                 self.hub_seen = generation;
             }
             None => {
@@ -427,22 +428,22 @@ impl Flyout<'_> {
             SettingKind::Connectors => {
                 // A redirect added since the last failure: try again now, not at the next call.
                 crate::integrations::discord_rpc::poke();
+                crate::integrations::poke_teams();
                 self.navigate(View::Connectors, true);
                 return false;
             }
             SettingKind::BrowserTabs => config.browser.enabled = !config.browser.enabled,
-            // Explorer and the browser come to the front: the panel steps aside.
+            // The browser's page (for Developer mode and "Load unpacked"), then the folder over it
+            // with its path copied for that dialog. The panel steps aside.
             SettingKind::ExtensionFolder => {
+                crate::integrations::browser::open_extensions_page();
                 if crate::integrations::browser::show_extension_dir() {
                     return true;
                 }
                 self.model.hint = Some((kind, "Folder not found"));
             }
-            SettingKind::ExtensionsPage => {
-                crate::integrations::browser::open_extensions_page();
-                return true;
-            }
             SettingKind::Discord => config.discord.enabled = !config.discord.enabled,
+            SettingKind::Teams => config.teams.enabled = !config.teams.enabled,
             SettingKind::DiscordId | SettingKind::DiscordSecret => {
                 let text = crate::win::clipboard_text().map(|t| t.trim().to_string()).unwrap_or_default();
                 match paste_key(kind, &text) {
@@ -458,8 +459,8 @@ impl Flyout<'_> {
                 return true;
             }
         }
-        if (config.browser.enabled, config.discord.enabled, &config.discord.client_id, &config.discord.client_secret)
-            != (before.browser.enabled, before.discord.enabled, &before.discord.client_id, &before.discord.client_secret)
+        if (config.browser.enabled, config.discord.enabled, config.teams.enabled, &config.discord.client_id, &config.discord.client_secret)
+            != (before.browser.enabled, before.discord.enabled, before.teams.enabled, &before.discord.client_id, &before.discord.client_secret)
         {
             crate::integrations::reconfigure(&before, config);
         }

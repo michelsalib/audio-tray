@@ -4,16 +4,13 @@
 
 use anyhow::{Context, Result};
 use windows::core::{implement, Interface};
-use windows::Win32::Foundation::CloseHandle;
 use windows::Win32::Media::Audio::{
     eConsole, eRender, AudioSessionStateExpired, IAudioSessionControl, IAudioSessionControl2,
     IAudioSessionManager2, IAudioSessionNotification, IAudioSessionNotification_Impl,
     IMMDeviceEnumerator, ISimpleAudioVolume, MMDeviceEnumerator,
 };
 use windows::Win32::System::Com::{CoCreateInstance, CoTaskMemFree, CLSCTX_ALL};
-use windows::Win32::System::Threading::{
-    OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
-};
+
 
 use crate::hub::AppSession;
 
@@ -108,7 +105,7 @@ fn describe(control: &IAudioSessionControl2) -> Option<AppSession> {
                 s
             })
             .filter(|s| !s.is_empty() && !s.starts_with('@'));
-        let app = display.unwrap_or_else(|| process_path(pid).map(|p| crate::hub::names::app_name(&p)).unwrap_or_else(|| format!("pid {pid}")));
+        let app = display.unwrap_or_else(|| crate::win::process_exe(pid).map(|p| crate::hub::names::app_name(&p)).unwrap_or_else(|| format!("pid {pid}")));
         let simple: ISimpleAudioVolume = control.cast().ok()?;
         let volume = simple.GetMasterVolume().unwrap_or(1.0);
         let muted = simple.GetMute().map(|m| m.as_bool()).unwrap_or(false);
@@ -116,20 +113,6 @@ fn describe(control: &IAudioSessionControl2) -> Option<AppSession> {
     }
 }
 
-fn process_path(pid: u32) -> Option<String> {
-    if pid == 0 {
-        return None;
-    }
-    unsafe {
-        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
-        let mut buf = [0u16; 1024];
-        let mut len = buf.len() as u32;
-        let ok = QueryFullProcessImageNameW(process, PROCESS_NAME_WIN32, windows::core::PWSTR(buf.as_mut_ptr()), &mut len);
-        let _ = CloseHandle(process);
-        ok.ok()?;
-        Some(String::from_utf16_lossy(&buf[..len as usize]))
-    }
-}
 
 #[implement(IAudioSessionNotification)]
 struct Created;

@@ -26,7 +26,8 @@ use windows::Win32::System::IO::{GetOverlappedResult, OVERLAPPED};
 
 use crate::hub::{Call, Event, Member, VoiceApp};
 
-const NAME: &str = "Discord";
+/// Its name in the hub, for Settings' status.
+pub const NAME: &str = "Discord";
 const SCOPES: [&str; 3] = ["rpc", "rpc.voice.read", "rpc.voice.write"];
 /// The redirect the application must register (Discord insists on one, even over IPC); the code
 /// exchange names it.

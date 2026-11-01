@@ -35,7 +35,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     DefWindowProcW, GetCursorPos, GetWindowLongPtrW, GetWindowRect, KillTimer, SetLayeredWindowAttributes,
     SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, GWL_EXSTYLE, HWND_TOPMOST, LWA_ALPHA, MA_NOACTIVATE,
     SWP_NOACTIVATE, SWP_SHOWWINDOW, SW_HIDE, WM_APP, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_LBUTTONUP,
-    WM_LBUTTONDOWN, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_MOUSEWHEEL, WHEEL_DELTA, WM_RBUTTONUP, WM_SETTINGCHANGE, WM_TIMER, WS_EX_LAYERED,
+    WM_LBUTTONDOWN, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_MOUSEWHEEL, WHEEL_DELTA, WM_RBUTTONUP, WM_SETTINGCHANGE, WM_TIMER, WS_EX_LAYERED, SPI_SETWORKAREA,
     WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT,
 };
 
@@ -931,8 +931,14 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESUL
             }
             Some(LRESULT(0))
         }
+        // Settings broadcasts arrive often and for anything: only a work-area change moves us.
+        WM_SETTINGCHANGE if wparam.0 as u32 != SPI_SETWORKAREA.0 => None,
         WM_DISPLAYCHANGE | WM_DPICHANGED | WM_SETTINGCHANGE => {
             with_pill(|pill| {
+                // Both windows get the broadcasts: one repaint.
+                if hwnd != pill.hwnd {
+                    return;
+                }
                 // Re-place (and re-scale) by repainting from scratch.
                 let view = std::mem::replace(&mut pill.view, View::Hidden);
                 if let Err(e) = pill.show(&view, Entrance::None) {

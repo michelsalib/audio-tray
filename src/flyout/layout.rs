@@ -203,7 +203,11 @@ pub(super) fn panel_height(model: &Model, scale: f32, width: i32) -> i32 {
         0
     };
     let settings_h = build_view(model, scale, width, View::Settings, 0).1;
-    let connectors_h = build_view(model, scale, width, View::Connectors, 0).1;
+    // Measured with every setup step, which come back when a connector drops while it shows.
+    let d = |v: f32| (v * scale).round() as i32;
+    let (discord_steps, teams_steps) = setup_steps(model);
+    let hidden = if discord_steps { 0 } else { d(ITEM_H) + 2 * d(NOTE_H) } + if teams_steps { 0 } else { 2 * d(NOTE_H) };
+    let connectors_h = build_view(model, scale, width, View::Connectors, 0).1 + hidden;
     main_h.max(picker_h).max(settings_h).max(connectors_h)
 }
 
@@ -265,17 +269,23 @@ pub(super) fn build_view(model: &Model, scale: f32, width: i32, view: View, fill
             for kind in [SettingKind::BrowserTabs, SettingKind::ExtensionFolder] {
                 kinds.push(Elem::Setting { kind });
             }
+            // The setup steps go once a connector works; the keys stay, to change them.
+            let (discord_steps, teams_steps) = setup_steps(model);
             kinds.push(Elem::Header("Discord"));
             kinds.push(Elem::Setting { kind: SettingKind::Discord });
-            kinds.push(Elem::Setting { kind: SettingKind::DiscordPortal });
-            kinds.push(Elem::Step("2. In OAuth2 > Redirects, paste http://localhost"));
-            kinds.push(Elem::Step("3. Copy its client ID and secret, and click to paste:"));
+            if discord_steps {
+                kinds.push(Elem::Setting { kind: SettingKind::DiscordPortal });
+                kinds.push(Elem::Step("2. In OAuth2 > Redirects, paste http://localhost (step 1 copied it)"));
+                kinds.push(Elem::Step("3. Copy its client ID and secret, and click to paste:"));
+            }
             kinds.push(Elem::Setting { kind: SettingKind::DiscordId });
             kinds.push(Elem::Setting { kind: SettingKind::DiscordSecret });
             kinds.push(Elem::Header("Teams"));
             kinds.push(Elem::Setting { kind: SettingKind::Teams });
-            kinds.push(Elem::Step("1. Teams: Settings > Privacy > Third-party app API"));
-            kinds.push(Elem::Step("2. In a meeting, allow Audio Tray when Teams asks"));
+            if teams_steps {
+                kinds.push(Elem::Step("1. Teams: Settings > Privacy > Third-party app API"));
+                kinds.push(Elem::Step("2. In a meeting, allow Audio Tray when Teams asks"));
+            }
         }
     }
 
@@ -321,6 +331,13 @@ pub(super) fn build_view(model: &Model, scale: f32, width: i32, view: View, fill
         }
     }
     (elems, total)
+}
+
+/// Whether the Discord and the Teams setup steps show: until that connector works.
+fn setup_steps(model: &Model) -> (bool, bool) {
+    use crate::integrations::{discord, discord_rpc, teams, teams_ui};
+    let connected = |names: &[&str]| model.integrations.iter().any(|(n, on)| *on && names.contains(n));
+    (!connected(&[discord_rpc::NAME, discord::NAME]), !connected(&[teams::NAME, teams_ui::NAME]))
 }
 
 /// Icon-grid geometry for `width`: `(cols, left_px, chip_px, step_px)`, as many columns as

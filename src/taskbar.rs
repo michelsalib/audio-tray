@@ -609,10 +609,11 @@ pub use tap_proto::WM_TASKBAR_ACTION;
 
 pub use tap_proto::WM_TASKBAR_SCROLL;
 
-/// Wire code for a direction in [`WM_TASKBAR_SCROLL`]'s `wParam`.
-/// Or-ed into a [`WM_TASKBAR_SCROLL`] flow code by the wheel hook: the TAP's scrolls are a touchpad's.
+/// Or-ed into a [`WM_TASKBAR_SCROLL`] flow code by the wheel hook for a mouse wheel's scroll (see
+/// [`crate::win::touchpad_delta`]); the TAP's scrolls reach it only where the hook passed them on.
 pub const SCROLL_FROM_WHEEL: usize = 0x100;
 
+/// Wire code for a direction in [`WM_TASKBAR_SCROLL`]'s `wParam`.
 pub fn flow_code(flow: crate::audio::Flow) -> usize {
     match flow {
         crate::audio::Flow::Output => tap_proto::FLOW_OUTPUT,

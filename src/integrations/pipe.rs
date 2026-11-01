@@ -11,10 +11,13 @@ use windows::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS,
     PIPE_TYPE_BYTE, PIPE_WAIT,
 };
-use windows::Win32::System::Threading::{CreateEventW, ResetEvent};
-use windows::Win32::System::IO::{CancelIo, GetOverlappedResult, OVERLAPPED};
+use windows::Win32::Foundation::WAIT_TIMEOUT;
+use windows::Win32::System::Threading::{CreateEventW, ResetEvent, WaitForSingleObject};
+use windows::Win32::System::IO::{CancelIo, CancelIoEx, GetOverlappedResult, OVERLAPPED};
 
 const BUFFER: usize = 64 * 1024;
+/// How long a send waits for a client that is not reading.
+const SEND_PATIENCE_MS: u32 = 250;
 /// A line longer than this is a broken client.
 const MAX_LINE: usize = 8 * 1024 * 1024;
 
@@ -155,7 +158,8 @@ impl<H: Handler> Server<H> {
         self.listen();
     }
 
-    /// Send one line to the client. Best-effort; small writes complete at once.
+    /// Send one line to the client. Best-effort: small writes complete at once, and one that a
+    /// client not reading leaves pending is given up after a moment (this is the tray thread).
     pub fn send(&mut self, line: &str) {
         if !self.connected {
             eprintln!("{}: no client connected; {line} not sent", self.name);
@@ -168,7 +172,13 @@ impl<H: Handler> Server<H> {
             let mut written = 0u32;
             let result = match WriteFile(self.pipe, Some(line.as_bytes()), None, Some(&mut overlapped)) {
                 Ok(()) => Ok(()),
-                Err(_) if GetLastError() == ERROR_IO_PENDING => GetOverlappedResult(self.pipe, &overlapped, &mut written, true),
+                Err(_) if GetLastError() == ERROR_IO_PENDING => {
+                    if WaitForSingleObject(event, SEND_PATIENCE_MS) == WAIT_TIMEOUT {
+                        // Cancelled, then waited for: the write reads `line` and `overlapped`.
+                        let _ = CancelIoEx(self.pipe, Some(&overlapped));
+                    }
+                    GetOverlappedResult(self.pipe, &overlapped, &mut written, true)
+                }
                 Err(e) => Err(e),
             };
             let _ = CloseHandle(event);
@@ -183,6 +193,10 @@ impl<H: Handler> Drop for Server<H> {
     fn drop(&mut self) {
         unsafe {
             let _ = CancelIo(self.pipe);
+            // The cancelled read writes into `buffer` and `overlapped` until it completes: wait
+            // for that before they are freed.
+            let mut moved = 0u32;
+            let _ = GetOverlappedResult(self.pipe, &*self.overlapped, &mut moved, true);
             let _ = DisconnectNamedPipe(self.pipe);
             let _ = CloseHandle(self.pipe);
             let _ = CloseHandle(self.event);

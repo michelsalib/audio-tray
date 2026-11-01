@@ -131,7 +131,8 @@ pub fn reconfigure(old: &Config, new: &Config) {
         } else {
             unserve(&DISCORD);
             crate::hub::emit(crate::hub::Event::Call { app: VoiceApp::Discord, call: None });
-            crate::hub::emit(crate::hub::Event::Integration { name: "Discord", connected: false });
+            crate::hub::emit(crate::hub::Event::Integration { name: discord_rpc::NAME, connected: false });
+            crate::hub::emit(crate::hub::Event::Integration { name: discord::NAME, connected: false });
         }
     }
     if old.teams.enabled != new.teams.enabled {
@@ -147,8 +148,8 @@ pub fn reconfigure(old: &Config, new: &Config) {
                 }
             });
             crate::hub::emit(crate::hub::Event::Call { app: VoiceApp::Teams, call: None });
-            crate::hub::emit(crate::hub::Event::Integration { name: "Teams", connected: false });
-            crate::hub::emit(crate::hub::Event::IntegrationProblem { name: "Teams", problem: None });
+            crate::hub::emit(crate::hub::Event::Integration { name: teams::NAME, connected: false });
+            crate::hub::emit(crate::hub::Event::IntegrationProblem { name: teams::NAME, problem: None });
             follow_teams_window();
         }
     }
@@ -158,7 +159,7 @@ pub fn reconfigure(old: &Config, new: &Config) {
         } else {
             stop_browser();
             crate::hub::emit(crate::hub::Event::BrowserMedia { host: None, media: Vec::new() });
-            crate::hub::emit(crate::hub::Event::Integration { name: "Browser", connected: false });
+            crate::hub::emit(crate::hub::Event::Integration { name: browser::NAME, connected: false });
         }
     }
 }
@@ -248,7 +249,7 @@ fn connect_teams() {
                 println!("teams: not connected ({e:#})");
                 // Nothing listening while Teams runs: its API is off, or an admin removed the switch.
                 let problem = teams::running().then_some(TEAMS_API_BLOCKED);
-                crate::hub::emit(crate::hub::Event::IntegrationProblem { name: "Teams", problem });
+                crate::hub::emit(crate::hub::Event::IntegrationProblem { name: teams::NAME, problem });
             }
         }
         unsafe {
@@ -272,7 +273,7 @@ fn teams_attempted() {
                 let event = client.event();
                 let client = Rc::new(RefCell::new(client));
                 let served = Rc::clone(&client);
-                crate::hub::emit(crate::hub::Event::IntegrationProblem { name: "Teams", problem: None });
+                crate::hub::emit(crate::hub::Event::IntegrationProblem { name: teams::NAME, problem: None });
                 crate::wait::register(event, move || {
                     if !served.borrow_mut().signalled() {
                         let event = served.borrow().event();

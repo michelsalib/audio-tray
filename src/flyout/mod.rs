@@ -18,14 +18,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{LPARAM, POINT};
 use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, VK_ESCAPE};
-use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
     DestroyWindow, DispatchMessageW, GetCursorPos, KillTimer, LoadCursorW, SetCursor,
     SetForegroundWindow, SetTimer, ShowWindow, TranslateMessage, IDC_ARROW,
-    MSG, SW_SHOWNA, SW_SHOWNORMAL, WHEEL_DELTA,
+    MSG, SW_SHOWNA, WHEEL_DELTA,
     WM_APP, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN,
     WM_TIMER,
 };
@@ -348,8 +346,8 @@ impl Flyout<'_> {
                 }
                 self.model.voice = voice;
                 self.model.integrations = state.integrations.clone();
-                self.model.discord_problem = state.problem("Discord");
-                self.model.teams_problem = state.problem("Teams");
+                self.model.discord_problem = state.problem(crate::integrations::discord_rpc::NAME);
+                self.model.teams_problem = state.problem(crate::integrations::teams::NAME);
                 self.hub_seen = generation;
             }
             None => {
@@ -446,11 +444,16 @@ impl Flyout<'_> {
             SettingKind::Discord => config.discord.enabled = !config.discord.enabled,
             SettingKind::Teams => config.teams.enabled = !config.teams.enabled,
             SettingKind::DiscordId | SettingKind::DiscordSecret => {
-                let text = crate::win::clipboard_text().map(|t| t.trim().to_string()).unwrap_or_default();
-                match paste_key(kind, &text) {
-                    Ok(()) if kind == SettingKind::DiscordId => config.discord.client_id = Some(text),
-                    Ok(()) => config.discord.client_secret = Some(text),
-                    Err(hint) => self.model.hint = Some((kind, hint)),
+                match crate::win::clipboard_text() {
+                    Err(()) => self.model.hint = Some((kind, "Clipboard busy, click again")),
+                    Ok(text) => {
+                        let text = text.map(|t| t.trim().to_string()).unwrap_or_default();
+                        match paste_key(kind, &text) {
+                            Ok(()) if kind == SettingKind::DiscordId => config.discord.client_id = Some(text),
+                            Ok(()) => config.discord.client_secret = Some(text),
+                            Err(hint) => self.model.hint = Some((kind, hint)),
+                        }
+                    }
                 }
             }
             SettingKind::DiscordPortal => {
@@ -980,16 +983,7 @@ fn paste_key(kind: layout::SettingKind, text: &str) -> Result<(), &'static str> 
 }
 
 fn open_sound_settings() {
-    unsafe {
-        ShellExecuteW(
-            None,
-            w!("open"),
-            w!("ms-settings:sound"),
-            PCWSTR::null(),
-            PCWSTR::null(),
-            SW_SHOWNORMAL,
-        );
-    }
+    crate::win::shell_open("ms-settings:sound", None);
 }
 
 #[cfg(test)]

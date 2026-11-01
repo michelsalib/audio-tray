@@ -193,35 +193,7 @@ pub fn window_app_id(hwnd: HWND) -> Option<String> {
 
 /// The lowercase image name of the process owning a window (`msedge.exe`, …).
 pub fn window_process(hwnd: HWND) -> Option<String> {
-    use windows::Win32::System::Threading::{
-        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
-        PROCESS_QUERY_LIMITED_INFORMATION,
-    };
-    use windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
-    use windows_core::PWSTR;
-
-    unsafe {
-        let mut pid = 0u32;
-        let _ = GetWindowThreadProcessId(hwnd, Some(&mut pid));
-        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
-        let mut buffer = [0u16; 260];
-        let mut len = buffer.len() as u32;
-        let path = QueryFullProcessImageNameW(
-            process,
-            PROCESS_NAME_WIN32,
-            PWSTR(buffer.as_mut_ptr()),
-            &mut len,
-        )
-        .ok()
-        .map(|()| String::from_utf16_lossy(&buffer[..len as usize]));
-        let _ = windows::Win32::Foundation::CloseHandle(process);
-        path.map(|path| {
-            path.rsplit('\\')
-                .next()
-                .unwrap_or(&path)
-                .to_ascii_lowercase()
-        })
-    }
+    crate::win::window_process(hwnd)
 }
 
 /// One window surveyed by [`player_windows`]. `hwnd` is an `isize` so the list can cross to

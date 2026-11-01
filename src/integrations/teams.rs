@@ -19,13 +19,14 @@ use serde::Deserialize;
 use tungstenite::{Message, WebSocket};
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Networking::WinSock::{
-    WSACloseEvent, WSACreateEvent, WSAEnumNetworkEvents, WSAEventSelect, FD_CLOSE, FD_READ, SOCKET, WSAEVENT,
+    WSACloseEvent, WSACreateEvent, WSAEnumNetworkEvents, WSAEventSelect, FD_CLOSE, FD_READ, FD_WRITE, SOCKET, WSAEVENT,
     WSANETWORKEVENTS,
 };
 
 use crate::hub::{Call, Event, VoiceApp};
 
-const NAME: &str = "Teams";
+/// Its name in the hub, for Settings' status.
+pub const NAME: &str = "Teams";
 const PORT: u16 = 8124;
 
 #[derive(Deserialize)]
@@ -91,7 +92,8 @@ pub fn client(socket: WebSocket<TcpStream>, paired: bool) -> Result<Client> {
     // From here every read is driven by the event; WSAEventSelect makes the socket non-blocking.
     let event = unsafe { WSACreateEvent() }.context("WSACreateEvent")?;
     let raw = SOCKET(socket.get_ref().as_raw_socket() as usize);
-    if unsafe { WSAEventSelect(raw, Some(event), (FD_READ | FD_CLOSE) as i32) } != 0 {
+    // FD_WRITE too: a send that would block stays queued in tungstenite until the next flush.
+    if unsafe { WSAEventSelect(raw, Some(event), (FD_READ | FD_WRITE | FD_CLOSE) as i32) } != 0 {
         unsafe {
             let _ = WSACloseEvent(event);
         }
@@ -111,7 +113,7 @@ pub fn client(socket: WebSocket<TcpStream>, paired: bool) -> Result<Client> {
 pub fn running() -> bool {
     let mut found = false;
     crate::win::enum_windows(|hwnd| {
-        found = matches!(crate::music::player::window_process(hwnd).as_deref(), Some("ms-teams.exe" | "teams.exe"));
+        found = matches!(crate::win::window_process(hwnd).as_deref(), Some("ms-teams.exe" | "teams.exe"));
         !found
     });
     found

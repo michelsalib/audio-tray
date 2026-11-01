@@ -246,31 +246,12 @@ fn attach(automation: &IUIAutomation, sender: &Sender<Command>) -> Result<Attach
 fn icon() -> Option<std::sync::Arc<Vec<u8>>> {
     static ICON: OnceLock<Option<std::sync::Arc<Vec<u8>>>> = OnceLock::new();
     ICON.get_or_init(|| {
-        let exe = teams_windows().first().and_then(|(hwnd, _)| exe_of(*hwnd))?;
+        let exe = teams_windows().first().and_then(|(hwnd, _)| crate::win::window_exe(*hwnd))?;
         crate::image::exe_icon_png(&exe, 64).map(std::sync::Arc::new).map_err(|e| eprintln!("teams: no icon ({e:#})")).ok()
     })
     .clone()
 }
 
-/// The full path of the program owning `hwnd`.
-fn exe_of(hwnd: HWND) -> Option<String> {
-    use windows::core::PWSTR;
-    use windows::Win32::Foundation::CloseHandle;
-    use windows::Win32::System::Threading::{OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION};
-    use windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
-
-    unsafe {
-        let mut pid = 0u32;
-        GetWindowThreadProcessId(hwnd, Some(&mut pid));
-        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
-        let mut buf = [0u16; 1024];
-        let mut len = buf.len() as u32;
-        let ok = QueryFullProcessImageNameW(process, PROCESS_NAME_WIN32, PWSTR(buf.as_mut_ptr()), &mut len);
-        let _ = CloseHandle(process);
-        ok.ok()?;
-        Some(String::from_utf16_lossy(&buf[..len as usize]))
-    }
-}
 
 /// Teams' top-level web views, with their titles.
 fn teams_windows() -> Vec<(HWND, String)> {
@@ -278,7 +259,7 @@ fn teams_windows() -> Vec<(HWND, String)> {
 
     let mut found = Vec::new();
     crate::win::enum_windows(|hwnd| {
-        if crate::win::class_name(hwnd) == WINDOW_CLASS && crate::music::player::window_process(hwnd).as_deref() == Some("ms-teams.exe") {
+        if crate::win::class_name(hwnd) == WINDOW_CLASS && crate::win::window_process(hwnd).as_deref() == Some("ms-teams.exe") {
             let mut buf = [0u16; 256];
             let len = unsafe { GetWindowTextW(hwnd, &mut buf) }.max(0) as usize;
             found.push((hwnd, String::from_utf16_lossy(&buf[..len])));

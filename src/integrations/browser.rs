@@ -31,7 +31,8 @@ pub const INSTANCES: u32 = 4;
 pub const READY_EVENT: &str = r"Local\AudioTray.BrowserPipes";
 /// Hosts connected now, for one status across browsers.
 static CONNECTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-const NAME: &str = "Browser";
+/// Its name in the hub, for Settings' status.
+pub const NAME: &str = "Browser";
 /// The native messaging host's name, as the extension asks for it.
 const HOST: &str = "com.audiotray.media";
 /// The extension's id, fixed by the `key` in its manifest.
@@ -179,8 +180,9 @@ pub fn command(frame: &str, command: &str) -> String {
     serde_json::json!({ "type": "command", "id": frame, "command": command }).to_string()
 }
 
-/// Register this exe as the extension's native messaging host for Edge and Chrome (per user, no
-/// administrator rights): a manifest next to the config, and a registry key naming it.
+/// Register this exe as the extension's native messaging host for Edge, Chrome, Brave and
+/// Vivaldi (per user, no administrator rights): a manifest next to the config, and a registry
+/// key naming it, where each looks.
 pub fn register_host() -> Result<()> {
     use windows::core::PCWSTR;
     use windows::Win32::System::Registry::{RegSetKeyValueW, HKEY_CURRENT_USER, REG_SZ};
@@ -198,7 +200,7 @@ pub fn register_host() -> Result<()> {
     });
     std::fs::write(&manifest, serde_json::to_string_pretty(&json)?)?;
     let value = crate::win::wide(&manifest.to_string_lossy());
-    for browser in [r"Microsoft\Edge", r"Google\Chrome"] {
+    for browser in [r"Microsoft\Edge", r"Google\Chrome", r"BraveSoftware\Brave-Browser", r"Vivaldi"] {
         let key = crate::win::wide(&format!(r"Software\{browser}\NativeMessagingHosts\{HOST}"));
         let status = unsafe {
             RegSetKeyValueW(

@@ -317,7 +317,7 @@ impl State {
         self.notices.retain(|(n, _)| n != notice);
     }
 
-    /// The call the pill shows: the one with someone in it, Discord before Teams.
+    /// The call the pill shows: the first one reported (two voice apps in calls at once is rare).
     pub fn call(&self) -> Option<(VoiceApp, &Call)> {
         self.calls.iter().map(|(app, call)| (*app, call)).next()
     }

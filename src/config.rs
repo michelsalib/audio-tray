@@ -23,7 +23,8 @@ pub struct Config {
     pub strip: Strip,
     /// The floating edge pill — see [`crate::pill`].
     pub pill: Pill,
-    /// The Discord integration: a named pipe a Vencord plugin writes to.
+    /// The Discord integration: its local RPC as the user's own application, and the Vencord
+    /// plugin's pipe.
     pub discord: Discord,
     /// The Teams integration: Teams' local third-party app API.
     pub teams: Teams,

@@ -99,9 +99,9 @@ pub(super) fn render_page(ctx: &Ctx, elems: &[LaidElem], out: &mut [u8]) {
                 let hint = ctx.model.hint.filter(|(k, _)| *k == kind).map(|(_, h)| h.to_string());
                 let value: Option<(String, f32)> = match kind {
                     _ if hint.is_some() => hint.map(|h| (h, 0.9)),
-                    SettingKind::BrowserTabs if s.browser => Some((if connected("Browser") { "Connected" } else { "Not connected" }.to_string(), 0.6)),
+                    SettingKind::BrowserTabs if s.browser => Some((if connected(crate::integrations::browser::NAME) { "Connected" } else { "Not connected" }.to_string(), 0.6)),
                     SettingKind::Discord if s.discord => Some((
-                        if connected("Discord") || connected(crate::integrations::discord::NAME) {
+                        if connected(crate::integrations::discord_rpc::NAME) || connected(crate::integrations::discord::NAME) {
                             "Connected"
                         } else if s.discord_id.is_none() || s.discord_secret.is_none() {
                             "Needs the app keys"
@@ -109,9 +109,9 @@ pub(super) fn render_page(ctx: &Ctx, elems: &[LaidElem], out: &mut [u8]) {
                             ctx.model.discord_problem.unwrap_or("Waiting for Discord")
                         }
                         .to_string(),
-                        if ctx.model.discord_problem.is_some() && !connected("Discord") { 0.9 } else { 0.6 },
+                        if ctx.model.discord_problem.is_some() && !connected(crate::integrations::discord_rpc::NAME) { 0.9 } else { 0.6 },
                     )),
-                    SettingKind::Teams if s.teams => Some(match (connected("Teams"), ctx.model.teams_problem) {
+                    SettingKind::Teams if s.teams => Some(match (connected(crate::integrations::teams::NAME), ctx.model.teams_problem) {
                         (true, _) if s.teams_paired => ("Connected".to_string(), 0.6),
                         (true, _) => ("Allow it in your next meeting".to_string(), 0.9),
                         (false, _) if connected(crate::integrations::teams_ui::NAME) => ("Following the meeting".to_string(), 0.6),

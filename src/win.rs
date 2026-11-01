@@ -144,27 +144,30 @@ pub(crate) fn shell_open(file: &str, args: Option<&str>) -> bool {
 }
 
 /// The clipboard's text, if it holds any.
-pub(crate) fn clipboard_text() -> Option<String> {
+/// `Err` when another program holds the clipboard open (clipboard managers do, briefly).
+pub(crate) fn clipboard_text() -> Result<Option<String>, ()> {
     use windows::Win32::Foundation::HGLOBAL;
     use windows::Win32::System::DataExchange::{CloseClipboard, GetClipboardData, OpenClipboard};
-    use windows::Win32::System::Memory::{GlobalLock, GlobalUnlock};
+    use windows::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
     use windows::Win32::System::Ole::CF_UNICODETEXT;
 
     unsafe {
-        OpenClipboard(None).ok()?;
+        OpenClipboard(crate::taskbar::receiver()).map_err(|_| ())?;
         let text = GetClipboardData(CF_UNICODETEXT.0 as u32).ok().and_then(|handle| {
             let global = HGLOBAL(handle.0);
             let ptr = GlobalLock(global) as *const u16;
             if ptr.is_null() {
                 return None;
             }
-            let len = (0..).take_while(|&i| *ptr.add(i) != 0).count();
+            // Up to the terminator, never past the block (a producer may have left none).
+            let units = GlobalSize(global) / 2;
+            let len = (0..units).take_while(|&i| *ptr.add(i) != 0).count();
             let text = String::from_utf16_lossy(std::slice::from_raw_parts(ptr, len));
             let _ = GlobalUnlock(global);
             Some(text)
         });
         let _ = CloseClipboard();
-        text
+        Ok(text)
     }
 }
 
@@ -185,7 +188,8 @@ pub(crate) fn set_clipboard_text(text: &str) -> bool {
         }
         std::ptr::copy_nonoverlapping(text.as_ptr(), ptr, text.len());
         let _ = GlobalUnlock(global);
-        if OpenClipboard(None).is_err() {
+        // An owner window: opened with none, the clipboard has no owner and setting data fails.
+        if OpenClipboard(crate::taskbar::receiver()).is_err() {
             let _ = GlobalFree(Some(global));
             return false;
         }
@@ -204,35 +208,112 @@ pub(crate) fn set_clipboard_text(text: &str) -> bool {
 /// wheel input from a hardware mouse (the input source cannot tell them apart), but in small
 /// steps, where a wheel turns in whole notches of 120. A gesture is judged as a whole: a step of
 /// a whole notch within half a second of a fine one is the touchpad's too, so a fast swipe never
-/// flips direction half-way.
+/// flips direction half-way. (A free-spinning high-resolution wheel also steps finely, and counts
+/// as a touchpad: the price of a guess no API answers for the taskbar's scrolls.)
 pub(crate) fn touchpad_delta(delta: i32) -> bool {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::OnceLock;
-    use windows::Win32::UI::WindowsAndMessaging::WHEEL_DELTA;
+    static SOURCE: std::sync::Mutex<ScrollSource> = std::sync::Mutex::new(ScrollSource { last_fine: None });
+    SOURCE.lock().unwrap_or_else(|p| p.into_inner()).touchpad(delta, millis())
+}
 
-    // Milliseconds since the first scroll (+1, so 0 means none yet).
-    static START: OnceLock<std::time::Instant> = OnceLock::new();
-    static LAST_FINE: AtomicU64 = AtomicU64::new(0);
-    let now = START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64 + 1;
-    if delta % WHEEL_DELTA as i32 != 0 {
-        LAST_FINE.store(now, Ordering::Relaxed);
-        return true;
+/// Milliseconds on a monotonic clock, from the first call.
+fn millis() -> u64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
+}
+
+/// [`touchpad_delta`]'s memory: when the last fine step came.
+struct ScrollSource {
+    last_fine: Option<u64>,
+}
+
+impl ScrollSource {
+    /// A gesture's whole-notch steps this close to a fine one are the touchpad's too.
+    const GESTURE_MS: u64 = 500;
+
+    fn touchpad(&mut self, delta: i32, now: u64) -> bool {
+        use windows::Win32::UI::WindowsAndMessaging::WHEEL_DELTA;
+        if delta % WHEEL_DELTA as i32 != 0 {
+            self.last_fine = Some(now);
+            return true;
+        }
+        self.last_fine.is_some_and(|last| now.saturating_sub(last) < Self::GESTURE_MS)
     }
-    let last = LAST_FINE.load(Ordering::Relaxed);
-    last != 0 && now - last < 500
 }
 
 /// A scroll `delta` as a volume change: up is louder. A touchpad set to scroll the "natural" way
 /// (content follows the fingers, Windows' default) reports pushing two fingers up as scrolling
 /// down; a volume is a slider, not content, so the fingers going up still raise it.
 pub(crate) fn volume_delta(delta: i32, touchpad: bool) -> i32 {
-    use windows::core::w;
-
-    // 0 is "down motion scrolls up"; the other choice is stored as 0xFFFFFFFF.
-    let natural = hkcu_dword(w!(r"Software\Microsoft\Windows\CurrentVersion\PrecisionTouchPad"), w!("ScrollDirection")).unwrap_or(0) == 0;
-    if touchpad && natural {
+    if touchpad && natural_scrolling() {
         -delta
     } else {
         delta
     }
+}
+
+/// Whether the touchpad scrolls the "natural" way. Read from the registry at most every few
+/// seconds (a touchpad sends a hundred steps a second), so a change in Settings soon applies.
+fn natural_scrolling() -> bool {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use windows::core::w;
+
+    const FRESH_MS: u64 = 5000;
+    // The reading in the low bit, when it was taken (+1, so 0 means never) above it.
+    static CACHED: AtomicU64 = AtomicU64::new(0);
+    let now = millis() + 1;
+    let cached = CACHED.load(Ordering::Relaxed);
+    if cached != 0 && now - (cached >> 1) < FRESH_MS {
+        return cached & 1 == 1;
+    }
+    // 0 is "down motion scrolls up"; the other choice is stored as 0xFFFFFFFF.
+    let natural = hkcu_dword(w!(r"Software\Microsoft\Windows\CurrentVersion\PrecisionTouchPad"), w!("ScrollDirection")).unwrap_or(0) == 0;
+    CACHED.store((now << 1) | u64::from(natural), Ordering::Relaxed);
+    natural
+}
+
+#[cfg(test)]
+mod scroll_tests {
+    use super::ScrollSource;
+
+    #[test]
+    fn fine_steps_are_a_touchpad_and_keep_its_gesture_together() {
+        let mut source = ScrollSource { last_fine: None };
+        assert!(!source.touchpad(120, 0), "a whole notch alone is a wheel");
+        assert!(source.touchpad(-27, 1_000), "a fine step is a touchpad");
+        assert!(source.touchpad(-120, 1_200), "a whole notch mid-gesture stays the touchpad's");
+        assert!(!source.touchpad(120, 2_000), "a notch well after is a wheel again");
+    }
+}
+/// The full path of process `pid`'s program, if it can be queried (not for protected processes).
+pub(crate) fn process_exe(pid: u32) -> Option<String> {
+    use windows::core::PWSTR;
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION};
+
+    if pid == 0 {
+        return None;
+    }
+    unsafe {
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+        let mut buf = [0u16; 1024];
+        let mut len = buf.len() as u32;
+        let ok = QueryFullProcessImageNameW(process, PROCESS_NAME_WIN32, PWSTR(buf.as_mut_ptr()), &mut len);
+        let _ = CloseHandle(process);
+        ok.ok()?;
+        Some(String::from_utf16_lossy(&buf[..len as usize]))
+    }
+}
+
+/// The full path of the program owning a window.
+pub(crate) fn window_exe(hwnd: windows::Win32::Foundation::HWND) -> Option<String> {
+    use windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
+    let mut pid = 0u32;
+    unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
+    process_exe(pid)
+}
+
+/// The lowercase file name of the program owning a window (`msedge.exe`, …).
+pub(crate) fn window_process(hwnd: windows::Win32::Foundation::HWND) -> Option<String> {
+    let path = window_exe(hwnd)?;
+    Some(path.rsplit('\\').next().unwrap_or(&path).to_ascii_lowercase())
 }

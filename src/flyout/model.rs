@@ -116,6 +116,8 @@ pub(super) struct Model {
     pub integrations: Vec<(&'static str, bool)>,
     /// A connector row's one-off message in place of its value (a paste that found nothing).
     pub hint: Option<(super::layout::SettingKind, &'static str)>,
+    /// Why Discord's RPC last failed, in a few words (a missing redirect, a wrong secret).
+    pub discord_problem: Option<&'static str>,
     // outcome, accumulated while the flyout is open
     pub config_changed: bool,
     pub quit: bool,
@@ -137,6 +139,7 @@ impl Model {
             notice: None,
             integrations: Vec::new(),
             hint: None,
+            discord_problem: None,
             config_changed: false,
             quit: false,
             restart: false,

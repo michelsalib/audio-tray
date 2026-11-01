@@ -347,6 +347,7 @@ impl Flyout<'_> {
                 }
                 self.model.voice = voice;
                 self.model.integrations = state.integrations.clone();
+                self.model.discord_problem = state.problem("Discord");
                 self.hub_seen = generation;
             }
             None => {
@@ -424,6 +425,8 @@ impl Flyout<'_> {
                 return true;
             }
             SettingKind::Connectors => {
+                // A redirect added since the last failure: try again now, not at the next call.
+                crate::integrations::discord_rpc::poke();
                 self.navigate(View::Connectors, true);
                 return false;
             }
@@ -449,6 +452,8 @@ impl Flyout<'_> {
                 }
             }
             SettingKind::DiscordPortal => {
+                // The redirect step 2 asks for, ready to paste.
+                crate::win::set_clipboard_text(crate::integrations::discord_rpc::REDIRECT);
                 crate::win::shell_open("https://discord.com/developers/applications", None);
                 return true;
             }

@@ -105,10 +105,10 @@ pub(super) fn render_page(ctx: &Ctx, elems: &[LaidElem], out: &mut [u8]) {
                         } else if s.discord_id.is_none() || s.discord_secret.is_none() {
                             "Needs the app keys"
                         } else {
-                            "Waiting for Discord"
+                            ctx.model.discord_problem.unwrap_or("Waiting for Discord")
                         }
                         .to_string(),
-                        0.6,
+                        if ctx.model.discord_problem.is_some() && !connected("Discord") { 0.9 } else { 0.6 },
                     )),
                     SettingKind::DiscordId => Some(s.discord_id.clone().map_or(("Paste".to_string(), 1.0), |id| (id, 0.6))),
                     SettingKind::DiscordSecret => Some(s.discord_secret.clone().map_or(("Paste".to_string(), 1.0), |secret| (secret, 0.6))),
@@ -316,6 +316,14 @@ pub(super) fn render_page(ctx: &Ctx, elems: &[LaidElem], out: &mut [u8]) {
                     let max_w = w as f32 - d(HEADER_X) as f32 - RIGHT_PAD * scale;
                     let line = fit_label(f, px, text, max_w);
                     cv.draw_text(f, px, (d(HEADER_X) as f32, base), TEXT, NOTE_A, &line);
+                }
+            }
+            Elem::Step(text) => {
+                if let Some(f) = font {
+                    let px = NOTE_TEXT_PX * scale;
+                    let base = (le.top + le.height / 2) as f32 + px * 0.34;
+                    let max_w = w as f32 - d(HEADER_X) as f32 - RIGHT_PAD * scale;
+                    cv.draw_text(f, px, (d(HEADER_X) as f32, base), TEXT, NOTE_A, &fit_label(f, px, text, max_w));
                 }
             }
             Elem::Slider { group } => {

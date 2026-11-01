@@ -29,7 +29,8 @@ use crate::hub::{Call, Event, Member, VoiceApp};
 const NAME: &str = "Discord";
 const SCOPES: [&str; 3] = ["rpc", "rpc.voice.read", "rpc.voice.write"];
 /// The redirect registered on the application; the code exchange must name it.
-const REDIRECT: &str = "http://localhost";
+/// The redirect the application must register (Discord insists on one, even over IPC).
+pub const REDIRECT: &str = "http://localhost";
 
 /// The open pipe, shared with the tray thread for commands (overlapped, so a write never waits
 /// behind the reader's pending read).
@@ -147,6 +148,9 @@ pub fn configure(settings: &crate::config::Discord) {
         _ => None,
     };
     let old = std::mem::replace(&mut shared().lock().unwrap_or_else(|p| p.into_inner()).app, app.clone());
+    if old != app {
+        crate::hub::emit(Event::IntegrationProblem { name: NAME, problem: None });
+    }
     if let (Some((old_id, _)), Some((id, _))) = (&old, &app) {
         if old_id != id {
             Token::forget();
@@ -170,6 +174,23 @@ pub fn poke() {
         if let Some(poke) = POKE.get() {
             let _ = poke.send(());
         }
+    }
+}
+
+
+/// The fixable cause behind a failed session, from Discord's own wording.
+fn problem_of(error: &str) -> Option<&'static str> {
+    let error = error.to_ascii_lowercase();
+    if error.contains("redirect") {
+        Some("Add the redirect http://localhost")
+    } else if error.contains("invalid client id") || error.contains("4000") {
+        Some("Wrong application ID")
+    } else if error.contains("invalid_client") {
+        Some("Wrong client secret")
+    } else if error.contains("access_denied") || error.contains("cancel") {
+        Some("Refused in Discord")
+    } else {
+        None
     }
 }
 
@@ -214,9 +235,12 @@ fn run(pokes: Receiver<()>) {
             call: None,
             avatars: HashMap::new(),
         };
-        match session.serve() {
-            Ok(()) => {}
-            Err(e) => eprintln!("discord: {e:#}"),
+        if let Err(e) = session.serve() {
+            eprintln!("discord: {e:#}");
+            // Only a failure before connecting says something about the setup.
+            if !connected() {
+                crate::hub::emit(Event::IntegrationProblem { name: NAME, problem: problem_of(&format!("{e:#}")) });
+            }
         }
         {
             let mut shared = shared().lock().unwrap_or_else(|p| p.into_inner());
@@ -251,6 +275,7 @@ impl Session {
         self.authenticate()?;
         println!("discord: connected over RPC");
         shared().lock().unwrap_or_else(|p| p.into_inner()).pipe = Some(Arc::clone(&self.pipe));
+        crate::hub::emit(Event::IntegrationProblem { name: NAME, problem: None });
         crate::hub::emit(Event::Integration { name: NAME, connected: true });
 
         self.request("SUBSCRIBE", json!({}), Some("VOICE_CHANNEL_SELECT"))?;
@@ -478,11 +503,18 @@ impl Token {
     fn exchange(id: &str, secret: &str, grant: &[(&str, &str)]) -> Result<Self> {
         let mut form: Vec<(&str, &str)> = vec![("client_id", id), ("client_secret", secret), ("redirect_uri", REDIRECT)];
         form.extend_from_slice(grant);
+        // A refusal's body says why (`invalid_client`, a redirect mismatch): read it, not the status.
         let mut response = agent()
             .post("https://discord.com/api/oauth2/token")
+            .config()
+            .http_status_as_error(false)
+            .build()
             .send_form(form)
             .context("the token exchange")?;
         let value: Value = serde_json::from_str(&response.body_mut().read_to_string()?).context("the token answer")?;
+        if let Some(error) = value["error"].as_str() {
+            bail!("the token exchange: {error}: {}", value["error_description"].as_str().unwrap_or_default());
+        }
         let token = Self {
             access: value["access_token"].as_str().context("no access token")?.to_string(),
             refresh: value["refresh_token"].as_str().unwrap_or_default().to_string(),
@@ -514,4 +546,21 @@ fn agent() -> ureq::Agent {
 fn fetch(url: &str) -> Result<Vec<u8>> {
     let mut response = agent().get(url).call()?;
     Ok(response.body_mut().with_config().limit(2 * 1024 * 1024).read_to_vec()?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::problem_of;
+
+    #[test]
+    fn discords_refusals_become_what_to_fix() {
+        let missing = r#"AUTHORIZE: "OAuth2 Error: invalid_request: Missing redirect_uri""#;
+        assert_eq!(problem_of(missing), Some("Add the redirect http://localhost"));
+        let mismatch = r#"the token exchange: invalid_request: Invalid "redirect_uri" in request."#;
+        assert_eq!(problem_of(mismatch), Some("Add the redirect http://localhost"));
+        let handshake = r#"Discord answered the handshake with {"code":4000,"message":"Invalid Client ID"}"#;
+        assert_eq!(problem_of(handshake), Some("Wrong application ID"));
+        assert_eq!(problem_of("the token exchange: invalid_client: "), Some("Wrong client secret"));
+        assert_eq!(problem_of("Discord closed the pipe"), None, "Discord quitting is nothing to fix");
+    }
 }

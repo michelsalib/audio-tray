@@ -72,7 +72,7 @@ impl SettingKind {
             SettingKind::Discord => "Discord calls",
             SettingKind::DiscordId => "Application ID",
             SettingKind::DiscordSecret => "Client secret",
-            SettingKind::DiscordPortal => "Discord developer portal",
+            SettingKind::DiscordPortal => "1. Create an app on the developer portal",
         }
     }
 
@@ -151,6 +151,8 @@ pub(super) enum Elem {
     Footer,
     /// One line of secondary text above the footer: [`Model::notice`].
     Note,
+    /// A line of guidance between settings (how to make the Discord application).
+    Step(&'static str),
     /// A settings screen's header: a back arrow and its title.
     SettingsHeader(&'static str),
     /// One setting: a label, and a switch, a segmented choice or a link.
@@ -264,9 +266,12 @@ pub(super) fn build_view(model: &Model, scale: f32, width: i32, view: View, fill
                 kinds.push(Elem::Setting { kind });
             }
             kinds.push(Elem::Header("Discord"));
-            for kind in [SettingKind::Discord, SettingKind::DiscordId, SettingKind::DiscordSecret, SettingKind::DiscordPortal] {
-                kinds.push(Elem::Setting { kind });
-            }
+            kinds.push(Elem::Setting { kind: SettingKind::Discord });
+            kinds.push(Elem::Setting { kind: SettingKind::DiscordPortal });
+            kinds.push(Elem::Step("2. In OAuth2 > Redirects, paste http://localhost"));
+            kinds.push(Elem::Step("3. Copy its client ID and secret, and click to paste:"));
+            kinds.push(Elem::Setting { kind: SettingKind::DiscordId });
+            kinds.push(Elem::Setting { kind: SettingKind::DiscordSecret });
         }
     }
 
@@ -289,7 +294,7 @@ pub(super) fn build_view(model: &Model, scale: f32, width: i32, view: View, fill
             Elem::Setting { .. } => d(ITEM_H),
             Elem::IconGrid { .. } => grid_px_height(width, scale),
             Elem::Footer => d(FOOTER_H),
-            Elem::Note => d(NOTE_H),
+            Elem::Note | Elem::Step(_) => d(NOTE_H),
         };
         elems.push(LaidElem { elem, top: y, height });
         y += height;

@@ -134,6 +134,8 @@ pub enum Event {
     SelfMuted { app: VoiceApp, muted: bool },
     /// An integration connected (`true`) or went away (`false`), for the flyout's status.
     Integration { name: &'static str, connected: bool },
+    /// Why an integration cannot connect, in a few words the user can act on (`None`: fixed).
+    IntegrationProblem { name: &'static str, problem: Option<&'static str> },
 }
 
 /// A short-lived notice the pill shows on top of the steady state.
@@ -170,11 +172,18 @@ pub struct State {
     pub sessions: Vec<AppSession>,
     pub calls: Vec<(VoiceApp, Call)>,
     pub integrations: Vec<(&'static str, bool)>,
+    /// Integrations that cannot connect, and why.
+    pub problems: Vec<(&'static str, &'static str)>,
     /// Shown newest last; each with when it started.
     pub notices: Vec<(Notice, std::time::Instant)>,
 }
 
 impl State {
+    /// Why integration `name` cannot connect, if it cannot.
+    pub fn problem(&self, name: &str) -> Option<&'static str> {
+        self.problems.iter().find(|(n, _)| *n == name).map(|(_, p)| *p)
+    }
+
     /// Fold one event in. Returns whether anything a surface shows changed.
     pub fn apply(&mut self, event: Event) -> bool {
         match event {
@@ -256,6 +265,14 @@ impl State {
                         true
                     }
                 }
+            }
+            Event::IntegrationProblem { name, problem } => {
+                let before = self.problem(name);
+                self.problems.retain(|(n, _)| *n != name);
+                if let Some(problem) = problem {
+                    self.problems.push((name, problem));
+                }
+                before != problem
             }
         }
     }

@@ -35,7 +35,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     DefWindowProcW, GetCursorPos, GetWindowLongPtrW, GetWindowRect, KillTimer, SetLayeredWindowAttributes,
     SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, GWL_EXSTYLE, HWND_TOPMOST, LWA_ALPHA, MA_NOACTIVATE,
     SWP_NOACTIVATE, SWP_SHOWWINDOW, SW_HIDE, WM_APP, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_LBUTTONUP,
-    WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_MOUSEWHEEL, WHEEL_DELTA, WM_RBUTTONUP, WM_SETTINGCHANGE, WM_TIMER, WS_EX_LAYERED,
+    WM_LBUTTONDOWN, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_MOUSEWHEEL, WHEEL_DELTA, WM_RBUTTONUP, WM_SETTINGCHANGE, WM_TIMER, WS_EX_LAYERED,
     WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT,
 };
 
@@ -80,18 +80,28 @@ const QUIET_TICKS: u32 = 15;
 const EDGE_H: f32 = 160.0;
 const SLIDE_SECONDS: f64 = 0.2;
 const GROW_SECONDS: f64 = 0.18;
+/// The card growing out of the pill, and shrinking back into it.
+const EXPAND_SECONDS: f64 = 0.22;
+const COLLAPSE_SECONDS: f64 = 0.14;
+/// A button's highlight fading in, and springing in on a press.
+const HIGHLIGHT_SECONDS: f64 = 0.09;
+const PRESS_SECONDS: f64 = 0.16;
+/// One-shot: the card's collapse has played.
+const COLLAPSE_TIMER: usize = 2;
 /// One beat of the speaking pulse.
 const PULSE_SECONDS: f64 = 1.1;
 
 /// How a new scene arrives.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum Entrance {
     /// Content changed in place (a track, a mute): no movement.
     None,
     /// Another state: slides in from the edge.
     Slide,
-    /// The same state changed shape (the card opened, a disc or the devices came): unfolds.
+    /// The same state changed shape (a disc or the devices came, another size): unfolds.
     Grow,
+    /// The card opening: grows out of the pill that was showing (its size, in DIPs).
+    Expand { from: (f32, f32) },
 }
 
 /// How `next` should arrive after `shown`.
@@ -135,6 +145,15 @@ struct Pill {
     edge_up: bool,
     /// The size the shown scene was drawn at.
     drawn_size: Option<crate::config::PillSize>,
+    /// The shown scene's size, and the last quiet (not card) one's, in DIPs: the card grows out
+    /// of the quiet pill and shrinks back into it.
+    scene_size: (f32, f32),
+    quiet_size: (f32, f32),
+    /// The soft highlight behind the button under the pointer, and which hit it is on.
+    highlight: Option<IDCompositionVisual2>,
+    hover_hit: Option<usize>,
+    /// The card is shrinking back; [`COLLAPSE_TIMER`] lets the quiet pill in when it is done.
+    collapsing: bool,
     /// The last hub state, for re-deciding on hover, meter and fullscreen changes.
     last: State,
 }
@@ -178,6 +197,11 @@ pub fn create(config: &crate::config::Pill) -> Result<()> {
         appbar: false,
         edge_up: false,
         drawn_size: None,
+        scene_size: (0.0, 0.0),
+        quiet_size: (6.0, 56.0),
+        highlight: None,
+        hover_hit: None,
+        collapsing: false,
         last: State::default(),
     };
     pill.register_appbar();
@@ -266,6 +290,10 @@ impl Pill {
 
     /// Re-decide and, when the state changed, repaint.
     fn refresh(&mut self) {
+        // Mid-collapse the card keeps shrinking; `finish_collapse` refreshes when it is done.
+        if self.collapsing {
+            return;
+        }
         let state = self.last.clone();
         self.follow_meter(&state);
         let mut next = view::decide(&state, self.inputs);
@@ -284,7 +312,10 @@ impl Pill {
         if next == self.view && self.gfx.is_some() && self.hoverable(&next) == self.edge_up && !resized {
             return;
         }
+        let opens_card = matches!(next, View::Music { card: true, .. }) && !matches!(self.view, View::Music { card: true, .. });
         let entrance = match entrance(&self.view, &next) {
+            // The card grows out of the pill that was showing.
+            _ if opens_card => Entrance::Expand { from: self.scene_size },
             // Same state at another size: it unfolds into the new one.
             Entrance::None if resized => Entrance::Grow,
             other => other,
@@ -335,7 +366,148 @@ impl Pill {
         gfx.commit()?;
         self.hits = scene.hits;
         self._visuals = visuals;
+        self.scene_size = (scene.w, scene.h);
+        if !matches!(view, View::Music { card: true, .. }) {
+            self.quiet_size = (scene.w, scene.h);
+        }
+        // The highlight went with the old visuals: put it back under a pointer that stayed put.
+        self.highlight = None;
+        self.hover_hit = None;
+        self.rehover();
         Ok(())
+    }
+
+    /// The card's hover just ended: shrink it back toward the quiet pill and fade it, then let the
+    /// quiet pill in when [`COLLAPSE_TIMER`] fires. `false` when there is nothing to animate.
+    fn start_collapse(&mut self) -> bool {
+        let (Some(gfx), Some(holder)) = (self.gfx.as_ref(), self._visuals.first()) else {
+            return false;
+        };
+        let (w, h) = self.scene_size;
+        let (qw, qh) = self.quiet_size;
+        let shrank = (|| -> Result<()> {
+            unsafe {
+                let scale = gfx.dcomp.CreateScaleTransform()?;
+                scale.SetCenterX2(0.0)?;
+                scale.SetCenterY2(h * gfx.scale / 2.0)?;
+                let sx = gfx.dcomp.CreateAnimation()?;
+                ease_out(&sx, 1.0, (qw / w).clamp(0.05, 1.0), COLLAPSE_SECONDS)?;
+                let sy = gfx.dcomp.CreateAnimation()?;
+                ease_out(&sy, 1.0, (qh / h).clamp(0.05, 1.0), COLLAPSE_SECONDS)?;
+                scale.SetScaleX(&sx)?;
+                scale.SetScaleY(&sy)?;
+                holder.SetTransform(&scale)?;
+                let fade = gfx.dcomp.CreateAnimation()?;
+                ease_out(&fade, 1.0, 0.0, COLLAPSE_SECONDS)?;
+                let effect = gfx.dcomp.CreateEffectGroup()?;
+                effect.SetOpacity(&fade)?;
+                holder.SetEffect(&effect)?;
+            }
+            gfx.commit()
+        })();
+        if shrank.is_err() {
+            return false;
+        }
+        self.collapsing = true;
+        unsafe { SetTimer(Some(self.hwnd), COLLAPSE_TIMER, (COLLAPSE_SECONDS * 1000.0) as u32 + 10, None) };
+        true
+    }
+
+    /// The collapse has played: show the quiet pill.
+    fn finish_collapse(&mut self) {
+        unsafe {
+            let _ = KillTimer(Some(self.hwnd), COLLAPSE_TIMER);
+        }
+        if !self.collapsing {
+            return;
+        }
+        self.collapsing = false;
+        self.inputs.hover = false;
+        self.refresh();
+    }
+
+    /// The pointer came back while the card was shrinking: keep the card.
+    fn cancel_collapse(&mut self) {
+        unsafe {
+            let _ = KillTimer(Some(self.hwnd), COLLAPSE_TIMER);
+        }
+        self.collapsing = false;
+        let view = self.view.clone();
+        if let Err(e) = self.show(&view, Entrance::None) {
+            eprintln!("pill: could not draw ({e:#})");
+            self.gfx = None;
+        }
+    }
+
+    /// Put the soft highlight on hit `index` (or take it away): fading in under a hovering
+    /// pointer, springing in brighter on a press.
+    fn set_highlight(&mut self, index: Option<usize>, pressed: bool) {
+        let Some(gfx) = self.gfx.as_ref() else { return };
+        let Some(holder) = self._visuals.first() else { return };
+        // A whole-scene target (a banner, the call) is a button in itself: no spot to light.
+        let index = index.filter(|&i| !matches!(self.hits.get(i), Some((_, Hit::Whole)) | None));
+        if index == self.hover_hit && !pressed {
+            return;
+        }
+        let lit = (|| -> Result<Option<IDCompositionVisual2>> {
+            unsafe {
+                if let Some(old) = &self.highlight {
+                    holder.RemoveVisual(old)?;
+                }
+                let Some(i) = index else { return Ok(None) };
+                let [x, y, w, h] = self.hits[i].0;
+                let (x, y, w, h) = (x + 2.0, y + 2.0, w - 4.0, h - 4.0);
+                let alpha = if pressed { 0.24 } else { 0.12 };
+                let (visual, _) = gfx.painted(w, h, |p| p.round_rect(0.0, 0.0, w, h, (w.min(h) / 2.0).min(14.0), gfx::Rgba::hex(0xFFFFFF, alpha)))?;
+                visual.SetOffsetX2(x * gfx.scale)?;
+                visual.SetOffsetY2(y * gfx.scale)?;
+                if pressed {
+                    let scale = gfx.dcomp.CreateScaleTransform()?;
+                    scale.SetCenterX2(w * gfx.scale / 2.0)?;
+                    scale.SetCenterY2(h * gfx.scale / 2.0)?;
+                    let spring = gfx.dcomp.CreateAnimation()?;
+                    ease_out(&spring, 0.82, 1.0, PRESS_SECONDS)?;
+                    scale.SetScaleX(&spring)?;
+                    scale.SetScaleY(&spring)?;
+                    visual.SetTransform(&scale)?;
+                } else {
+                    let fade = gfx.dcomp.CreateAnimation()?;
+                    ease_out(&fade, 0.0, 1.0, HIGHLIGHT_SECONDS)?;
+                    let effect = gfx.dcomp.CreateEffectGroup()?;
+                    effect.SetOpacity(&fade)?;
+                    visual.SetEffect(&effect)?;
+                }
+                holder.AddVisual(&visual, false, None)?;
+                Ok(Some(visual))
+            }
+        })();
+        match lit {
+            Ok(visual) => {
+                self.highlight = visual;
+                self.hover_hit = index;
+                let _ = gfx.commit();
+            }
+            Err(e) => eprintln!("pill: could not light a button ({e:#})"),
+        }
+    }
+
+    /// Light whatever button is under the pointer now (after a repaint).
+    fn rehover(&mut self) {
+        let mut point = POINT::default();
+        if unsafe { GetCursorPos(&mut point) }.is_err() || !cursor_in(self.hwnd) {
+            return;
+        }
+        if unsafe { ScreenToClient(self.hwnd, &mut point) }.as_bool() {
+            let index = self.hit_index(point.x, point.y);
+            self.set_highlight(index, false);
+        }
+    }
+
+    /// Which hit is under client pixel `(x, y)`.
+    fn hit_index(&self, x: i32, y: i32) -> Option<usize> {
+        let scale = self.gfx.as_ref().map_or(1.0, |g| g.scale);
+        let (x, y) = (x as f32 / scale, y as f32 / scale);
+        self.hits.iter().position(|([hx, hy, hw, hh], _)| x >= *hx && x < hx + hw && y >= *hy && y < hy + hh)
     }
 
     /// Hang the scene under the root: its content, the ring's two rotating halves, the speaking
@@ -375,8 +547,27 @@ impl Pill {
                     holder.SetTransform(&scale)?;
                     0.35
                 }
+                Entrance::Expand { from: (fw, fh) } => {
+                    // From the pill's own size to the card's, anchored on the edge's middle.
+                    let scale = gfx.dcomp.CreateScaleTransform()?;
+                    scale.SetCenterX2(0.0)?;
+                    scale.SetCenterY2(scene.h * gfx.scale / 2.0)?;
+                    let sx = gfx.dcomp.CreateAnimation()?;
+                    ease_out(&sx, (fw / scene.w).clamp(0.05, 1.0), 1.0, EXPAND_SECONDS)?;
+                    let sy = gfx.dcomp.CreateAnimation()?;
+                    ease_out(&sy, (fh / scene.h).clamp(0.05, 1.0), 1.0, EXPAND_SECONDS)?;
+                    scale.SetScaleX(&sx)?;
+                    scale.SetScaleY(&sy)?;
+                    holder.SetTransform(&scale)?;
+                    0.0
+                }
             };
-            let seconds = if entrance == Entrance::Slide { SLIDE_SECONDS } else { GROW_SECONDS };
+            let seconds = match entrance {
+                Entrance::Slide => SLIDE_SECONDS,
+                // The content arrives a little before the card has finished growing.
+                Entrance::Expand { .. } => EXPAND_SECONDS * 0.7,
+                _ => GROW_SECONDS,
+            };
             let fade = gfx.dcomp.CreateAnimation()?;
             ease_out(&fade, fade_from, 1.0, seconds)?;
             let effect = gfx.dcomp.CreateEffectGroup()?;
@@ -435,17 +626,23 @@ impl Pill {
     }
 
     fn set_hover(&mut self, hover: bool) {
-        if self.inputs.hover != hover {
-            self.inputs.hover = hover;
-            self.refresh();
+        if hover && self.collapsing {
+            return self.cancel_collapse();
         }
+        if self.inputs.hover == hover {
+            return;
+        }
+        // Leaving the card: it shrinks back before the quiet pill returns.
+        if !hover && matches!(self.view, View::Music { card: true, .. }) && self.start_collapse() {
+            return;
+        }
+        self.inputs.hover = hover;
+        self.refresh();
     }
 
     /// What is under client pixel `(x, y)`.
     fn hit_at(&self, x: i32, y: i32) -> Option<Hit> {
-        let scale = self.gfx.as_ref().map_or(1.0, |g| g.scale);
-        let (x, y) = (x as f32 / scale, y as f32 / scale);
-        self.hits.iter().find(|([hx, hy, hw, hh], _)| x >= *hx && x < hx + hw && y >= *hy && y < hy + hh).map(|(_, hit)| *hit)
+        self.hit_index(x, y).map(|i| self.hits[i].1)
     }
 
     fn click(&mut self, x: i32, y: i32, right: bool) {
@@ -637,9 +834,26 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESUL
         WM_MOUSEACTIVATE => Some(LRESULT(MA_NOACTIVATE as isize)),
         WM_MOUSEMOVE => {
             track_leave(hwnd);
+            let (x, y) = point();
             with_pill(|pill| {
                 if hwnd == pill.edge && pill.hoverable(&pill.view) {
                     pill.set_hover(true);
+                } else if hwnd == pill.hwnd {
+                    if pill.collapsing {
+                        pill.cancel_collapse();
+                    }
+                    let index = pill.hit_index(x, y);
+                    pill.set_highlight(index, false);
+                }
+            });
+            Some(LRESULT(0))
+        }
+        WM_LBUTTONDOWN => {
+            let (x, y) = point();
+            with_pill(|pill| {
+                if hwnd == pill.hwnd {
+                    let index = pill.hit_index(x, y);
+                    pill.set_highlight(index, true);
                 }
             });
             Some(LRESULT(0))
@@ -647,6 +861,9 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESUL
         WM_MOUSELEAVE => {
             with_pill(|pill| {
                 // Moving between the strip and the card is not leaving.
+                if !cursor_in(pill.hwnd) {
+                    pill.set_highlight(None, false);
+                }
                 if !cursor_in(pill.hwnd) && !cursor_in(pill.edge) {
                     pill.set_hover(false);
                 }
@@ -674,6 +891,10 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESUL
                     act(Action::Volume(flow, delta as f32 / WHEEL_DELTA as f32));
                 }
             });
+            Some(LRESULT(0))
+        }
+        WM_TIMER if wparam.0 == COLLAPSE_TIMER => {
+            with_pill(Pill::finish_collapse);
             Some(LRESULT(0))
         }
         WM_TIMER if wparam.0 == METER_TIMER => {

@@ -182,10 +182,14 @@ unsafe fn load_markup(markup: &str) -> Option<IInspectable> {
 /// # Safety
 /// XAML UI thread only.
 pub unsafe fn widen(diagnostics: &IXamlDiagnostics, border: InstanceHandle, host: &Host) {
-    let content = layout::layout().strip;
+    let layout = layout::layout();
+    let content = layout.strip;
     // The Border gets the content width, pinned left; its ancestors get the ask (corner clearance).
+    // A cover alone stays centred, as an icon is, over the shell's own indicators.
     set_width(diagnostics, border, f64::from(content));
-    pin_left(diagnostics, border);
+    if layout.shows_text() {
+        pin_left(diagnostics, border);
+    }
 
     let ask = host.ask(content);
     let mut handle = border;
@@ -339,6 +343,11 @@ fn character_budget(name: &str, l: &layout::Layout) -> usize {
 /// # Safety
 /// XAML UI thread only.
 pub unsafe fn place_button_state(diagnostics: &IXamlDiagnostics, button: InstanceHandle) {
+    // A cover alone sits where the icon was: the shell's own placement is right, and fighting it
+    // showed, the bar jumping a few pixels for a frame on every new value.
+    if !layout::layout().shows_text() {
+        return;
+    }
     for panel in crate::tree::children_of(button) {
         for child in crate::tree::children_of(panel) {
             let name = crate::tree::name_of(child).unwrap_or_default();

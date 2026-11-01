@@ -145,6 +145,11 @@ pub unsafe fn sweep(diagnostics: &IXamlDiagnostics) {
         return;
     }
 
+    // The other layout's pins (a bar spanning the plate, a cover pinned left) go first.
+    if layout::take_resized() {
+        logf!("music: strip width now {}; putting the old layout back", layout::layout().strip);
+        tile::restore(diagnostics);
+    }
     // Re-applied every sweep (the shell undoes them); each is a no-op when already ours.
     for (button, border) in drawn {
         if !crate::live() {

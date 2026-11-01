@@ -89,7 +89,18 @@ static CONTENT_WIDTH: std::sync::atomic::AtomicU32 =
     std::sync::atomic::AtomicU32::new(STRIP_WIDTH);
 
 pub fn set_content_width(width: u32) {
-    CONTENT_WIDTH.store(width, std::sync::atomic::Ordering::SeqCst);
+    if CONTENT_WIDTH.swap(width, std::sync::atomic::Ordering::SeqCst) != width {
+        RESIZED.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Set when the width changes under a strip already drawn (cover only ↔ cover and text): what was
+/// pinned for the old layout is put back before the new one is applied.
+static RESIZED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the width changed since the last call.
+pub fn take_resized() -> bool {
+    RESIZED.swap(false, std::sync::atomic::Ordering::SeqCst)
 }
 
 /// The live layout; cheap, so recomputed per use rather than cached.

@@ -64,7 +64,7 @@ pub(super) struct Voice {
 }
 
 /// The settings screen's values, copied from the config when the panel opens.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Default)]
 pub(super) struct Settings {
     pub tile: crate::config::TileStyle,
     pub buttons: bool,
@@ -72,6 +72,11 @@ pub(super) struct Settings {
     pub devices: bool,
     pub size: crate::config::PillSize,
     pub alerts: bool,
+    pub browser: bool,
+    pub discord: bool,
+    pub discord_id: Option<String>,
+    /// The secret's last characters, when there is one: it is never shown whole.
+    pub discord_secret: Option<String>,
 }
 
 impl Settings {
@@ -83,6 +88,13 @@ impl Settings {
             devices: config.pill.devices,
             size: config.pill.size,
             alerts: config.pill.listening_alerts,
+            browser: config.browser.enabled,
+            discord: config.discord.enabled,
+            discord_id: config.discord.client_id.clone(),
+            discord_secret: config.discord.client_secret.as_deref().map(|s| {
+                let tail: String = s.chars().rev().take(4).collect::<Vec<_>>().into_iter().rev().collect();
+                format!("••••{tail}")
+            }),
         }
     }
 }
@@ -100,6 +112,10 @@ pub(super) struct Model {
     pub view: View, // which screen is shown (main panel / an icon picker)
     pub update: Option<String>, // staged update's version, if any → the footer's restart button
     pub notice: Option<&'static str>, // taskbar integration trouble, one line above the footer
+    /// Which integrations are connected, by name (the hub's), for the connectors' status.
+    pub integrations: Vec<(&'static str, bool)>,
+    /// A connector row's one-off message in place of its value (a paste that found nothing).
+    pub hint: Option<(super::layout::SettingKind, &'static str)>,
     // outcome, accumulated while the flyout is open
     pub config_changed: bool,
     pub quit: bool,
@@ -119,6 +135,8 @@ impl Model {
             view: View::Main,
             update,
             notice: None,
+            integrations: Vec::new(),
+            hint: None,
             config_changed: false,
             quit: false,
             restart: false,

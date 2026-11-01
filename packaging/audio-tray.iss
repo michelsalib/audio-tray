@@ -74,6 +74,8 @@ Source: "{#SourceExe}"; DestDir: "{app}"; Flags: ignoreversion
 ; `uninsrestartdelete` likewise only takes effect for an elevated (all-users) install;
 ; per-user, a DLL Explorer still holds at uninstall is left behind.
 Source: "{#SourceTap}"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist uninsrestartdelete; BeforeInstall: SetAsideLoadedTap
+; The browser extension, loaded unpacked from here (Settings > Connectors opens the folder).
+Source: "..\integrations\browser\*"; DestDir: "{app}\browser-extension"; Flags: ignoreversion
 
 [Icons]
 Name: "{autoprograms}\{#AppName}"; Filename: "{app}\{#AppExeName}"

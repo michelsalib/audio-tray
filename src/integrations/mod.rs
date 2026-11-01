@@ -25,26 +25,34 @@ thread_local! {
 
 /// Start what config turns on. Tray thread, before [`crate::wait::run`].
 pub fn start(config: &Config) {
+    discord_rpc::configure(&config.discord);
     if config.discord.enabled {
-        discord_rpc::spawn(&config.discord);
-        if let Some(server) = serve(discord::PIPE, discord::Discord::default()) {
-            DISCORD.with(|d| *d.borrow_mut() = Some(server));
-            println!("discord: waiting for the Vencord plugin on \\\\.\\pipe\\{}", discord::PIPE);
-        }
+        start_discord();
     }
     if config.browser.enabled {
-        if let Err(e) = browser::register_host() {
-            eprintln!("browser: could not register the native messaging host ({e:#})");
-        }
-        let tabs = serve(browser::PIPE, browser::Tabs::default());
-        let commands = serve(browser::COMMAND_PIPE, browser::Commands);
-        BROWSER.with(|b| *b.borrow_mut() = tabs);
-        BROWSER_COMMANDS.with(|b| *b.borrow_mut() = commands);
+        start_browser();
     }
     if config.teams.enabled {
         TEAMS_TOKEN.with(|t| *t.borrow_mut() = Some(config.teams.token.clone()));
         connect_teams();
     }
+}
+
+fn start_discord() {
+    if let Some(server) = serve(discord::PIPE, discord::Discord::default()) {
+        DISCORD.with(|d| *d.borrow_mut() = Some(server));
+        println!("discord: waiting for the Vencord plugin on \\\\.\\pipe\\{}", discord::PIPE);
+    }
+}
+
+fn start_browser() {
+    if let Err(e) = browser::register_host() {
+        eprintln!("browser: could not register the native messaging host ({e:#})");
+    }
+    let tabs = serve(browser::PIPE, browser::Tabs::default());
+    let commands = serve(browser::COMMAND_PIPE, browser::Commands);
+    BROWSER.with(|b| *b.borrow_mut() = tabs);
+    BROWSER_COMMANDS.with(|b| *b.borrow_mut() = commands);
 }
 
 /// Host a pipe and serve it from the tray thread's wait.
@@ -64,29 +72,52 @@ fn serve<H: pipe::Handler + 'static>(name: &'static str, handler: H) -> Option<R
     }
 }
 
+/// The connectors changed in Settings (`old` to `new`): start or stop only what was switched,
+/// so a live connection is not dropped for nothing, and follow new Discord keys.
+pub fn reconfigure(old: &Config, new: &Config) {
+    discord_rpc::configure(&new.discord);
+    if old.discord.enabled != new.discord.enabled {
+        if new.discord.enabled {
+            start_discord();
+        } else {
+            unserve(&DISCORD);
+            crate::hub::emit(crate::hub::Event::Call { app: VoiceApp::Discord, call: None });
+            crate::hub::emit(crate::hub::Event::Integration { name: "Discord", connected: false });
+        }
+    }
+    if old.browser.enabled != new.browser.enabled {
+        if new.browser.enabled {
+            start_browser();
+        } else {
+            unserve(&BROWSER);
+            unserve(&BROWSER_COMMANDS);
+            crate::hub::emit(crate::hub::Event::BrowserMedia(Vec::new()));
+            crate::hub::emit(crate::hub::Event::Integration { name: "Browser", connected: false });
+        }
+    }
+}
+
+type Served<H> = std::thread::LocalKey<RefCell<Option<Rc<RefCell<pipe::Server<H>>>>>>;
+
+/// Stop serving a pipe: its wait goes, and the pipe closes with the last reference.
+fn unserve<H: pipe::Handler>(slot: &'static Served<H>) {
+    slot.with(|s| {
+        if let Some(server) = s.borrow_mut().take() {
+            crate::wait::unregister(server.borrow().event());
+        }
+    });
+}
+
 pub fn stop() {
-    DISCORD.with(|d| {
-        if let Some(server) = d.borrow_mut().take() {
-            crate::wait::unregister(server.borrow().event());
-        }
-    });
-    BROWSER.with(|b| {
-        if let Some(server) = b.borrow_mut().take() {
-            crate::wait::unregister(server.borrow().event());
-        }
-    });
-    BROWSER_COMMANDS.with(|b| {
-        if let Some(server) = b.borrow_mut().take() {
-            crate::wait::unregister(server.borrow().event());
-        }
-    });
+    unserve(&DISCORD);
+    unserve(&BROWSER);
+    unserve(&BROWSER_COMMANDS);
     TEAMS.with(|t| {
         if let Some(client) = t.borrow_mut().take() {
             crate::wait::unregister(client.borrow().event());
         }
     });
 }
-
 /// Try Teams again: called when Teams takes the microphone, since a meeting is starting. A no-op
 /// when it is off or already connected.
 pub fn poke_teams() {

@@ -128,3 +128,74 @@ pub(crate) fn window_title(hwnd: windows::Win32::Foundation::HWND) -> String {
     let len = unsafe { GetWindowTextW(hwnd, &mut buf) };
     String::from_utf16_lossy(&buf[..len.max(0) as usize])
 }
+
+/// Open `file` (a path, a URL, an exe on the App Paths list) with optional `args`, as Explorer
+/// would. `false` when the shell refused it.
+pub(crate) fn shell_open(file: &str, args: Option<&str>) -> bool {
+    use windows::Win32::UI::Shell::ShellExecuteW;
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+    let (verb, file) = (wide("open"), wide(file));
+    let args = args.map(wide);
+    let args = args.as_ref().map_or(PCWSTR::null(), |a| PCWSTR(a.as_ptr()));
+    let result = unsafe { ShellExecuteW(None, PCWSTR(verb.as_ptr()), PCWSTR(file.as_ptr()), args, PCWSTR::null(), SW_SHOWNORMAL) };
+    // An `HINSTANCE` of 32 or less is an error code.
+    result.0 as usize > 32
+}
+
+/// The clipboard's text, if it holds any.
+pub(crate) fn clipboard_text() -> Option<String> {
+    use windows::Win32::Foundation::HGLOBAL;
+    use windows::Win32::System::DataExchange::{CloseClipboard, GetClipboardData, OpenClipboard};
+    use windows::Win32::System::Memory::{GlobalLock, GlobalUnlock};
+    use windows::Win32::System::Ole::CF_UNICODETEXT;
+
+    unsafe {
+        OpenClipboard(None).ok()?;
+        let text = GetClipboardData(CF_UNICODETEXT.0 as u32).ok().and_then(|handle| {
+            let global = HGLOBAL(handle.0);
+            let ptr = GlobalLock(global) as *const u16;
+            if ptr.is_null() {
+                return None;
+            }
+            let len = (0..).take_while(|&i| *ptr.add(i) != 0).count();
+            let text = String::from_utf16_lossy(std::slice::from_raw_parts(ptr, len));
+            let _ = GlobalUnlock(global);
+            Some(text)
+        });
+        let _ = CloseClipboard();
+        text
+    }
+}
+
+/// Put `text` on the clipboard.
+pub(crate) fn set_clipboard_text(text: &str) -> bool {
+    use windows::Win32::Foundation::{GlobalFree, HANDLE};
+    use windows::Win32::System::DataExchange::{CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData};
+    use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
+    use windows::Win32::System::Ole::CF_UNICODETEXT;
+
+    let text = wide(text);
+    unsafe {
+        let Ok(global) = GlobalAlloc(GMEM_MOVEABLE, text.len() * 2) else { return false };
+        let ptr = GlobalLock(global) as *mut u16;
+        if ptr.is_null() {
+            let _ = GlobalFree(Some(global));
+            return false;
+        }
+        std::ptr::copy_nonoverlapping(text.as_ptr(), ptr, text.len());
+        let _ = GlobalUnlock(global);
+        if OpenClipboard(None).is_err() {
+            let _ = GlobalFree(Some(global));
+            return false;
+        }
+        let _ = EmptyClipboard();
+        // The clipboard owns the memory once this succeeds.
+        let placed = SetClipboardData(CF_UNICODETEXT.0 as u32, Some(HANDLE(global.0))).is_ok();
+        if !placed {
+            let _ = GlobalFree(Some(global));
+        }
+        let _ = CloseClipboard();
+        placed
+    }
+}

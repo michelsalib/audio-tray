@@ -58,7 +58,7 @@ pub(super) fn render_page(ctx: &Ctx, elems: &[LaidElem], out: &mut [u8]) {
                     cv.draw_text(f, hdr_px, (d(HEADER_X) as f32, base), TEXT, 1.0, text);
                 }
             }
-            Elem::SettingsHeader => {
+            Elem::SettingsHeader(title) => {
                 let cy_i = le.top + le.height / 2;
                 let bpx = (BACK_GLYPH_PX * scale).round() as u32;
                 if let Ok((rgba, gw, gh)) = icons::render_glyph(GLYPH_BACK, bpx, TEXT) {
@@ -67,7 +67,7 @@ pub(super) fn render_page(ctx: &Ctx, elems: &[LaidElem], out: &mut [u8]) {
                 }
                 if let Some(f) = font_sb {
                     let title_px = TITLE_PX * scale;
-                    cv.draw_text(f, title_px, (d(TEXT_X) as f32, cy_i as f32 + title_px * 0.34), TEXT, 1.0, "Settings");
+                    cv.draw_text(f, title_px, (d(TEXT_X) as f32, cy_i as f32 + title_px * 0.34), TEXT, 1.0, title);
                 }
             }
             Elem::Setting { kind } => {
@@ -85,10 +85,43 @@ pub(super) fn render_page(ctx: &Ctx, elems: &[LaidElem], out: &mut [u8]) {
                     SettingKind::PillDevices => Some(s.devices),
 
                     SettingKind::ListeningAlerts => Some(s.alerts),
-                    SettingKind::TileStyle | SettingKind::PillSize | SettingKind::SoundSettings => None,
+                    SettingKind::BrowserTabs => Some(s.browser),
+                    SettingKind::Discord => Some(s.discord),
+                    _ => None,
                 };
-                // The pill's own options are moot while it is off: drawn dimmed.
-                let dim = matches!(kind, SettingKind::PillDevices | SettingKind::PillSize | SettingKind::ListeningAlerts) && !s.pill;
+                // The pill's own options are moot while it is off, the Discord keys while Discord
+                // is: drawn dimmed.
+                let dim = matches!(kind, SettingKind::PillDevices | SettingKind::PillSize | SettingKind::ListeningAlerts) && !s.pill
+                    || matches!(kind, SettingKind::DiscordId | SettingKind::DiscordSecret) && !s.discord;
+                // What sits left of the switch or in place of a value: a status, a key, a hint.
+                let connected = |name: &str| ctx.model.integrations.iter().any(|(n, on)| *n == name && *on);
+                let hint = ctx.model.hint.filter(|(k, _)| *k == kind).map(|(_, h)| h.to_string());
+                let value: Option<(String, f32)> = match kind {
+                    _ if hint.is_some() => hint.map(|h| (h, 0.9)),
+                    SettingKind::BrowserTabs if s.browser => Some((if connected("Browser") { "Connected" } else { "Not connected" }.to_string(), 0.6)),
+                    SettingKind::Discord if s.discord => Some((
+                        if connected("Discord") {
+                            "Connected"
+                        } else if s.discord_id.is_none() || s.discord_secret.is_none() {
+                            "Needs the app keys"
+                        } else {
+                            "Waiting for Discord"
+                        }
+                        .to_string(),
+                        0.6,
+                    )),
+                    SettingKind::DiscordId => Some(s.discord_id.clone().map_or(("Paste".to_string(), 1.0), |id| (id, 0.6))),
+                    SettingKind::DiscordSecret => Some(s.discord_secret.clone().map_or(("Paste".to_string(), 1.0), |secret| (secret, 0.6))),
+                    _ => None,
+                };
+                if let (Some((text, alpha)), Some(f)) = (value, font) {
+                    let px = 12.5 * scale;
+                    let end = if on.is_some() { right - (SWITCH_W + 10.0) * scale } else { right };
+                    let tw = measure(f, px, &text);
+                    // An empty key reads as a call to action, in the accent.
+                    let color = if alpha >= 1.0 { accent } else { TEXT };
+                    cv.draw_text(f, px, (end - tw, cy + px * 0.34), color, alpha * if dim { 0.4 } else { 1.0 }, &text);
+                }
                 if let Some(on) = on {
                     let (sw, sh) = (SWITCH_W * scale, SWITCH_H * scale);
                     let x0 = right - sw;
@@ -123,7 +156,7 @@ pub(super) fn render_page(ctx: &Ctx, elems: &[LaidElem], out: &mut [u8]) {
                         }
                     }
                 }
-                if kind == SettingKind::SoundSettings {
+                if kind.is_link() {
                     if let Ok((rgba, gw, gh)) = icons::render_glyph(GLYPH_CHEVRON, (12.0 * scale) as u32, TEXT) {
                         cv.blit((right - gw as f32).round() as i32, cy as i32 - gh as i32 / 2, &rgba, gw, gh, 0.8);
                     }
@@ -561,7 +594,7 @@ pub(super) fn compose(ctx: &Ctx, hit: &Interaction, elems: &[LaidElem], base: &[
                 let ry1 = (le.top + le.height) as f32 - 1.0;
                 cv.fill_round_rect(Rect::new(mx, ry0, w as f32 - mx, ry1), d(ROW_RADIUS) as f32, TEXT, HOVER_A);
             }
-            Elem::PickerHeader { .. } | Elem::SettingsHeader if hovered && hover_back => {
+            Elem::PickerHeader { .. } | Elem::SettingsHeader(_) if hovered && hover_back => {
                 // Round hover button behind the back arrow.
                 let cy = (le.top + le.height / 2) as f32;
                 let cxb = (BACK_LEFT + BACK_BTN / 2.0) * scale;

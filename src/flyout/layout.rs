@@ -19,6 +19,8 @@ pub(super) enum View {
     IconPicker { group: usize, dev: usize },
     /// Audio Tray's settings: the taskbar and the edge pill.
     Settings,
+    /// The connectors, a level under Settings: the browser extension and the Discord application.
+    Connectors,
 }
 
 /// One row of the settings screen.
@@ -35,6 +37,22 @@ pub(super) enum SettingKind {
     ListeningAlerts,
     /// Windows' own sound settings (a link).
     SoundSettings,
+    /// The connectors screen (a link).
+    Connectors,
+    /// Every tab's media through the browser extension (a switch, with its status).
+    BrowserTabs,
+    /// The extension's folder in Explorer, its path copied for "Load unpacked" (a link).
+    ExtensionFolder,
+    /// The default browser's extensions page (a link).
+    ExtensionsPage,
+    /// Discord's calls (a switch, with its status).
+    Discord,
+    /// The Discord application's id, pasted from the clipboard.
+    DiscordId,
+    /// The Discord application's secret, pasted from the clipboard.
+    DiscordSecret,
+    /// Discord's developer portal, where the application is made (a link).
+    DiscordPortal,
 }
 
 impl SettingKind {
@@ -47,7 +65,27 @@ impl SettingKind {
             SettingKind::PillSize => "Pill size at rest",
             SettingKind::ListeningAlerts => "Alert when an app listens",
             SettingKind::SoundSettings => "Windows sound settings",
+            SettingKind::Connectors => "Browser and Discord",
+            SettingKind::BrowserTabs => "Every tab's media",
+            SettingKind::ExtensionFolder => "Open the extension's folder",
+            SettingKind::ExtensionsPage => "Open the browser's extensions",
+            SettingKind::Discord => "Discord calls",
+            SettingKind::DiscordId => "Application ID",
+            SettingKind::DiscordSecret => "Client secret",
+            SettingKind::DiscordPortal => "Discord developer portal",
         }
+    }
+
+    /// A row that opens something, drawn with a chevron.
+    pub(super) fn is_link(self) -> bool {
+        matches!(
+            self,
+            SettingKind::SoundSettings
+                | SettingKind::Connectors
+                | SettingKind::ExtensionFolder
+                | SettingKind::ExtensionsPage
+                | SettingKind::DiscordPortal
+        )
     }
 }
 
@@ -113,8 +151,8 @@ pub(super) enum Elem {
     Footer,
     /// One line of secondary text above the footer: [`Model::notice`].
     Note,
-    /// The settings screen's header: a back arrow and "Settings".
-    SettingsHeader,
+    /// A settings screen's header: a back arrow and its title.
+    SettingsHeader(&'static str),
     /// One setting: a label, and a switch, a segmented choice or a link.
     Setting { kind: SettingKind },
 }
@@ -163,7 +201,8 @@ pub(super) fn panel_height(model: &Model, scale: f32, width: i32) -> i32 {
         0
     };
     let settings_h = build_view(model, scale, width, View::Settings, 0).1;
-    main_h.max(picker_h).max(settings_h)
+    let connectors_h = build_view(model, scale, width, View::Connectors, 0).1;
+    main_h.max(picker_h).max(settings_h).max(connectors_h)
 }
 
 /// Lay out the elements for `view` at `width`, returning them and the total height. The layout
@@ -205,7 +244,7 @@ pub(super) fn build_view(model: &Model, scale: f32, width: i32, view: View, fill
             kinds.push(Elem::IconGrid { group, dev });
         }
         View::Settings => {
-            kinds.push(Elem::SettingsHeader);
+            kinds.push(Elem::SettingsHeader("Settings"));
             kinds.push(Elem::Header("Taskbar"));
             kinds.push(Elem::Setting { kind: SettingKind::TileStyle });
             kinds.push(Elem::Setting { kind: SettingKind::AudioButtons });
@@ -213,8 +252,21 @@ pub(super) fn build_view(model: &Model, scale: f32, width: i32, view: View, fill
             for kind in [SettingKind::Pill, SettingKind::PillSize, SettingKind::PillDevices, SettingKind::ListeningAlerts] {
                 kinds.push(Elem::Setting { kind });
             }
+            kinds.push(Elem::Header("Connectors"));
+            kinds.push(Elem::Setting { kind: SettingKind::Connectors });
             kinds.push(Elem::Header("Windows"));
             kinds.push(Elem::Setting { kind: SettingKind::SoundSettings });
+        }
+        View::Connectors => {
+            kinds.push(Elem::SettingsHeader("Connectors"));
+            kinds.push(Elem::Header("Browser"));
+            for kind in [SettingKind::BrowserTabs, SettingKind::ExtensionFolder, SettingKind::ExtensionsPage] {
+                kinds.push(Elem::Setting { kind });
+            }
+            kinds.push(Elem::Header("Discord"));
+            for kind in [SettingKind::Discord, SettingKind::DiscordId, SettingKind::DiscordSecret, SettingKind::DiscordPortal] {
+                kinds.push(Elem::Setting { kind });
+            }
         }
     }
 
@@ -233,7 +285,7 @@ pub(super) fn build_view(model: &Model, scale: f32, width: i32, view: View, fill
             Elem::AppSlider { .. } => d(APP_H),
             Elem::Slider { .. } => d(SLIDER_H),
             Elem::Device { .. } => d(ITEM_H),
-            Elem::PickerHeader { .. } | Elem::SettingsHeader => d(PICKER_HEADER_H),
+            Elem::PickerHeader { .. } | Elem::SettingsHeader(_) => d(PICKER_HEADER_H),
             Elem::Setting { .. } => d(ITEM_H),
             Elem::IconGrid { .. } => grid_px_height(width, scale),
             Elem::Footer => d(FOOTER_H),
@@ -346,7 +398,7 @@ pub(super) fn elem_at(elems: &[LaidElem], y: i32) -> Option<usize> {
                 | Elem::AppSlider { .. }
                 | Elem::Device { .. }
                 | Elem::PickerHeader { .. }
-                | Elem::SettingsHeader
+                | Elem::SettingsHeader(_)
                 | Elem::Setting { .. }
                 | Elem::IconGrid { .. }
                 | Elem::Footer

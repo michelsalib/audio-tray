@@ -346,6 +346,7 @@ impl Flyout<'_> {
                     self.model.apps = apps;
                 }
                 self.model.voice = voice;
+                self.model.integrations = state.integrations.clone();
                 self.hub_seen = generation;
             }
             None => {
@@ -389,7 +390,9 @@ impl Flyout<'_> {
     fn change_setting(&mut self, kind: layout::SettingKind, mx: i32) -> bool {
         use crate::config::TileStyle;
         use layout::SettingKind;
+        let before = self.config.clone();
         let config = &mut *self.config;
+        self.model.hint = None;
         match kind {
             SettingKind::TileStyle => {
                 let Some(segment) = layout::segment_at(self.surface.width, self.scale, mx) else {
@@ -420,6 +423,40 @@ impl Flyout<'_> {
                 open_sound_settings();
                 return true;
             }
+            SettingKind::Connectors => {
+                self.navigate(View::Connectors, true);
+                return false;
+            }
+            SettingKind::BrowserTabs => config.browser.enabled = !config.browser.enabled,
+            // Explorer and the browser come to the front: the panel steps aside.
+            SettingKind::ExtensionFolder => {
+                if crate::integrations::browser::show_extension_dir() {
+                    return true;
+                }
+                self.model.hint = Some((kind, "Folder not found"));
+            }
+            SettingKind::ExtensionsPage => {
+                crate::integrations::browser::open_extensions_page();
+                return true;
+            }
+            SettingKind::Discord => config.discord.enabled = !config.discord.enabled,
+            SettingKind::DiscordId | SettingKind::DiscordSecret => {
+                let text = crate::win::clipboard_text().map(|t| t.trim().to_string()).unwrap_or_default();
+                match paste_key(kind, &text) {
+                    Ok(()) if kind == SettingKind::DiscordId => config.discord.client_id = Some(text),
+                    Ok(()) => config.discord.client_secret = Some(text),
+                    Err(hint) => self.model.hint = Some((kind, hint)),
+                }
+            }
+            SettingKind::DiscordPortal => {
+                crate::win::shell_open("https://discord.com/developers/applications", None);
+                return true;
+            }
+        }
+        if (config.browser.enabled, config.discord.enabled, &config.discord.client_id, &config.discord.client_secret)
+            != (before.browser.enabled, before.discord.enabled, &before.discord.client_id, &before.discord.client_secret)
+        {
+            crate::integrations::reconfigure(&before, config);
         }
         crate::pill::configure(&config.pill);
         self.model.settings = model::Settings::of(config);
@@ -727,10 +764,11 @@ impl Flyout<'_> {
                 }
                 false
             }
-            Elem::PickerHeader { .. } | Elem::SettingsHeader => {
-                // The back arrow slides back to the main panel (the picker's choice is cancelled).
+            Elem::PickerHeader { .. } | Elem::SettingsHeader(_) => {
+                // The back arrow slides back a level (the picker's choice is cancelled).
                 if layout::over_back(self.scale, mx) {
-                    self.navigate(View::Main, false);
+                    let up = if self.model.view == View::Connectors { View::Settings } else { View::Main };
+                    self.navigate(up, false);
                 }
                 false
             }
@@ -839,7 +877,7 @@ impl Flyout<'_> {
         let kind = hover.map(|i| self.surface.elems[i].elem);
         let on_pencil = matches!(kind, Some(Elem::Device { .. }))
             && layout::over_pencil(self.surface.width, self.scale, mx);
-        let on_back = matches!(kind, Some(Elem::PickerHeader { .. } | Elem::SettingsHeader)) && layout::over_back(self.scale, mx);
+        let on_back = matches!(kind, Some(Elem::PickerHeader { .. } | Elem::SettingsHeader(_))) && layout::over_back(self.scale, mx);
         let on_chip = match (kind, hover) {
             (Some(Elem::IconGrid { .. }), Some(i)) => {
                 layout::grid_chip_at(self.surface.width, self.scale, mx, my, self.surface.elems[i].top)
@@ -920,6 +958,20 @@ fn beep_volume() {
 }
 
 /// Open Settings ▸ System ▸ Sound.
+/// Whether the clipboard's `text` is the Discord key `kind` wants, else what to say instead.
+fn paste_key(kind: layout::SettingKind, text: &str) -> Result<(), &'static str> {
+    let id_like = (15..=21).contains(&text.len()) && text.bytes().all(|b| b.is_ascii_digit());
+    let secret_like = (24..=64).contains(&text.len()) && text.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+    match kind {
+        layout::SettingKind::DiscordId if id_like => Ok(()),
+        layout::SettingKind::DiscordId if secret_like => Err("That is the secret"),
+        layout::SettingKind::DiscordId => Err("Copy the ID first"),
+        _ if id_like => Err("That is the ID"),
+        _ if secret_like => Ok(()),
+        _ => Err("Copy the secret first"),
+    }
+}
+
 fn open_sound_settings() {
     unsafe {
         ShellExecuteW(
@@ -930,5 +982,22 @@ fn open_sound_settings() {
             PCWSTR::null(),
             SW_SHOWNORMAL,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::layout::SettingKind;
+    use super::paste_key;
+
+    #[test]
+    fn a_pasted_key_must_look_like_the_one_asked_for() {
+        let (id, secret) = ("1234567890123456789", "abcdEFGH1234ijklMNOP5678qrstUVWX");
+        assert_eq!(paste_key(SettingKind::DiscordId, id), Ok(()));
+        assert_eq!(paste_key(SettingKind::DiscordSecret, secret), Ok(()));
+        assert_eq!(paste_key(SettingKind::DiscordId, secret), Err("That is the secret"));
+        assert_eq!(paste_key(SettingKind::DiscordSecret, id), Err("That is the ID"));
+        assert!(paste_key(SettingKind::DiscordId, "").is_err());
+        assert!(paste_key(SettingKind::DiscordSecret, "https://discord.com/developers").is_err());
     }
 }

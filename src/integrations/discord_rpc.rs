@@ -127,6 +127,8 @@ impl Drop for Pipe {
 struct Shared {
     pipe: Option<Arc<Pipe>>,
     muted: bool,
+    /// The application's id and secret, when Discord is on and both are set.
+    app: Option<(String, String)>,
 }
 
 fn shared() -> &'static Mutex<Shared> {
@@ -136,15 +138,29 @@ fn shared() -> &'static Mutex<Shared> {
 
 static POKE: OnceLock<Sender<()>> = OnceLock::new();
 
-/// Start the client when `[discord]` names an application. The thread lives with the process.
-pub fn spawn(settings: &crate::config::Discord) {
-    let (Some(id), Some(secret)) = (settings.client_id.clone(), settings.client_secret.clone()) else {
-        return;
+/// Follow `[discord]`: connect as the application it names, now and on later pokes. Called again
+/// when the keys change (Settings > Connectors); a token granted to another application is
+/// dropped. The thread starts with the first application and lives with the process.
+pub fn configure(settings: &crate::config::Discord) {
+    let app = match (settings.enabled, &settings.client_id, &settings.client_secret) {
+        (true, Some(id), Some(secret)) => Some((id.clone(), secret.clone())),
+        _ => None,
     };
-    let (poke, pokes) = std::sync::mpsc::channel();
-    let _ = POKE.set(poke.clone());
+    let old = std::mem::replace(&mut shared().lock().unwrap_or_else(|p| p.into_inner()).app, app.clone());
+    if let (Some((old_id, _)), Some((id, _))) = (&old, &app) {
+        if old_id != id {
+            Token::forget();
+        }
+    }
+    if app.is_none() || old == app {
+        return;
+    }
+    let poke = POKE.get_or_init(|| {
+        let (poke, pokes) = std::sync::mpsc::channel();
+        let _ = std::thread::Builder::new().name("discord".into()).spawn(move || run(pokes));
+        poke
+    });
     let _ = poke.send(());
-    let _ = std::thread::Builder::new().name("discord".into()).spawn(move || run(&id, &secret, pokes));
 }
 
 /// Try to connect now (Discord took the microphone or opened an audio session). Free when
@@ -182,16 +198,17 @@ fn nonce() -> String {
 }
 
 /// The thread: wait for a poke, connect, serve until Discord goes away, repeat.
-fn run(id: &str, secret: &str, pokes: Receiver<()>) {
+fn run(pokes: Receiver<()>) {
     while pokes.recv().is_ok() {
         // Several pokes may have queued while connected: one attempt for all.
         while pokes.try_recv().is_ok() {}
+        let Some((id, secret)) = shared().lock().unwrap_or_else(|p| p.into_inner()).app.clone() else { continue };
         let Some(pipe) = Pipe::open() else { continue };
         let pipe = Arc::new(pipe);
         let mut session = Session {
             pipe: Arc::clone(&pipe),
-            id: id.to_string(),
-            secret: secret.to_string(),
+            id,
+            secret,
             me: String::new(),
             channel: None,
             call: None,
@@ -432,6 +449,13 @@ impl Token {
             refresh: value["refresh_token"].as_str()?.to_string(),
             expires: value["expires_at"].as_u64()?,
         })
+    }
+
+    /// The application changed: its token is worthless to the new one.
+    fn forget() {
+        if let Some(path) = Self::path() {
+            let _ = std::fs::remove_file(path);
+        }
     }
 
     fn save(&self) {

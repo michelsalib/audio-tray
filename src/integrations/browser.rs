@@ -170,6 +170,68 @@ pub fn register_host() -> Result<()> {
     Ok(())
 }
 
+/// The extension's folder, to load unpacked: `browser-extension` beside the installed exe, else
+/// `integrations/browser` above it (a build from the repository).
+pub fn extension_dir() -> Option<std::path::PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let installed = exe.parent()?.join("browser-extension");
+    if installed.join("manifest.json").is_file() {
+        return Some(installed);
+    }
+    exe.ancestors().map(|dir| dir.join("integrations").join("browser")).find(|dir| dir.join("manifest.json").is_file())
+}
+
+/// Show the extension's folder in Explorer, its path on the clipboard for the browser's
+/// "Load unpacked" dialog. `false` when there is no folder to show.
+pub fn show_extension_dir() -> bool {
+    let Some(dir) = extension_dir() else {
+        eprintln!("browser: the extension's folder is missing");
+        return false;
+    };
+    let path = dir.to_string_lossy();
+    crate::win::set_clipboard_text(&path);
+    crate::win::shell_open(&path, None)
+}
+
+/// Open the default browser's extensions page (Edge's when the default is not a Chromium one
+/// we know): where Developer mode and "Load unpacked" are.
+pub fn open_extensions_page() {
+    let (exe, page) = match default_browser().as_deref() {
+        Some(id) if id.starts_with("ChromeHTML") => ("chrome.exe", "chrome://extensions"),
+        Some(id) if id.starts_with("BraveHTML") => ("brave.exe", "brave://extensions"),
+        Some(id) if id.starts_with("VivaldiHTM") => ("vivaldi.exe", "vivaldi://extensions"),
+        _ => ("msedge.exe", "edge://extensions"),
+    };
+    if !crate::win::shell_open(exe, Some(page)) {
+        eprintln!("browser: could not open {page} with {exe}");
+    }
+}
+
+/// The ProgId the user picked for https links.
+fn default_browser() -> Option<String> {
+    use windows::core::w;
+    use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_SZ};
+
+    let mut buf = [0u16; 128];
+    let mut size = std::mem::size_of_val(&buf) as u32;
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            w!(r"Software\Microsoft\Windows\Shell\Associations\UrlAssociations\https\UserChoice"),
+            w!("ProgId"),
+            RRF_RT_REG_SZ,
+            None,
+            Some(buf.as_mut_ptr() as *mut core::ffi::c_void),
+            Some(&mut size),
+        )
+    };
+    if status.is_err() {
+        return None;
+    }
+    let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    Some(String::from_utf16_lossy(&buf[..len]))
+}
+
 /// Whether the browser launched us as the native messaging host: its first argument is the
 /// calling extension's origin.
 pub fn is_host_launch(args: &[String]) -> bool {

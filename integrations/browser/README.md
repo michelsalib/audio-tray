@@ -20,9 +20,13 @@ the host registration allows.
 
 ## Install (Edge or Chrome)
 
+Audio Tray's **Settings > Connectors** does the first steps for you: **Open the browser's
+extensions** opens your default browser's page, **Open the extension's folder** shows the folder
+and copies its path. The installer puts the folder at `browser-extension` beside the exe.
+
 1. Start Audio Tray once, so the host is registered.
 2. Open `edge://extensions` (or `chrome://extensions`) and turn on **Developer mode**.
-3. **Load unpacked**, and pick this folder (`integrations/browser`).
+3. **Load unpacked**, and pick the folder (paste the copied path in the dialog's address bar).
 
 Tabs already open are picked up when they next play, pause or seek; reloading them works too.
 

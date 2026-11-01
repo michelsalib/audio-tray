@@ -184,13 +184,14 @@ unsafe fn load_markup(markup: &str) -> Option<IInspectable> {
 pub unsafe fn widen(diagnostics: &IXamlDiagnostics, border: InstanceHandle, host: &Host) {
     let layout = layout::layout();
     let content = layout.strip;
-    // The Border gets the content width, pinned left; its ancestors get the ask (corner clearance).
-    // A cover alone is an icon: centred, in a button of the shell's own width (narrowed to the
-    // cover, the button clipped the panel that centres it, and the cover's right edge with it).
-    set_width(diagnostics, border, f64::from(content));
+    // A cover alone is an icon: the plate (this Border, the hover background) and the button keep
+    // the shell's own sizes, and the cover centres in them. Narrowed to the cover, the plate looked
+    // thin and clipped the cover's right edge, the button the panel that centres it.
     if !layout.shows_text() {
         return;
     }
+    // The Border gets the content width, pinned left; its ancestors get the ask (corner clearance).
+    set_width(diagnostics, border, f64::from(content));
     pin_left(diagnostics, border);
 
     let ask = host.ask(content);

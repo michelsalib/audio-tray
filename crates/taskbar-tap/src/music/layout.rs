@@ -191,13 +191,15 @@ pub fn now_playing_markup(strip: &super::state::Strip) -> String {
         r#"<Border xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         x:Name="MusicTileStrip" Height="32" Width="{strip_px}" Padding="{pad},0,{pad},0"
-        Background="Transparent" HorizontalAlignment="Left">
+        Background="Transparent" HorizontalAlignment="{align}">
   <StackPanel Orientation="Horizontal" HorizontalAlignment="Left">
     {cover}
     {text}
   </StackPanel>
 </Border>"#,
         strip_px = l.strip,
+        // A cover alone centres in the shell's own plate, as the icon did.
+        align = if l.shows_text() { "Left" } else { "Center" },
         pad = l.pad,
     )
 }

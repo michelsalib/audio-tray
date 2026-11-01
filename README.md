@@ -25,9 +25,9 @@ A tiny Windows app for **audio awareness without opening anything** — a pill o
   It never takes focus, lets clicks through while quiet, hides behind fullscreen apps (except
   red), and costs nothing while still: it is drawn with DirectComposition and the progress ring
   is animated by the compositor, not the app.
-- **Integrations** (optional, each can be off): Discord through a
-  [Vencord plugin](integrations/vencord/README.md) (who is in the call, who is talking, your
-  mute), Teams through its local API (meeting and mute), and a
+- **Integrations** (optional, each can be off): Discord through its own local RPC with your own
+  Discord application, no client mod (who is in the call with their avatars, who is talking, your
+  mute, click to mute; or through a [Vencord plugin](integrations/vencord/README.md)), Teams through its local API (meeting and mute), and a
   [browser extension](integrations/browser/README.md) that shows every tab playing media (two
   Twitch streams, a YouTube video…), not just the one Windows' media controls know about.
 - **Taskbar controls** (opt-in, `[strip] enabled = true`) — a pair of buttons drawn into the
@@ -141,7 +141,9 @@ devices = true              # the output and input on the pill, clicked to switc
 size = "big"                # at rest: "hidden" (the sliver), "small" or "big"; hover shows all
 
 [discord]
-enabled = true              # host \\.\pipe\audio-tray for the Vencord plugin
+enabled = true              # Discord: RPC when client_id/client_secret are set, and the Vencord pipe
+# client_id = "..."         # your app at discord.com/developers (OAuth2 > Redirects: http://localhost)
+# client_secret = "..."     # Discord asks once to authorise it; the token is kept beside this file
 
 [browser]
 enabled = true              # register the browser extension's native messaging host

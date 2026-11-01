@@ -77,16 +77,22 @@ pub enum TileStyle {
     Full,
 }
 
-/// Audio Tray hosts `\\.\pipe\audio-tray`; the Vencord plugin in `integrations/vencord` connects.
+/// Discord: through its local RPC when `client_id` and `client_secret` name your application,
+/// and through `\\.\pipe\audio-tray`, which the Vencord plugin in `integrations/vencord` connects to.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Discord {
     pub enabled: bool,
+    /// Your own Discord application (discord.com/developers), for Discord's local RPC: its voice
+    /// scopes are granted to the application's owner and testers. Without them, only the Vencord
+    /// plugin's pipe is served.
+    pub client_id: Option<String>,
+    pub client_secret: Option<String>,
 }
 
 impl Default for Discord {
     fn default() -> Self {
-        Self { enabled: true }
+        Self { enabled: true, client_id: None, client_secret: None }
     }
 }
 

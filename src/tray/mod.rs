@@ -609,6 +609,15 @@ impl Tray {
                 if users.iter().any(|u| crate::hub::names::app_name(u) == "Teams") {
                     crate::integrations::poke_teams();
                 }
+                if users.iter().any(|u| crate::hub::names::app_name(u) == "Discord") {
+                    crate::integrations::discord_rpc::poke();
+                }
+            }
+            // Discord playing audio (a call, a stream) is the other moment to connect to it.
+            if let crate::hub::Event::AppSessions(sessions) = &event {
+                if sessions.iter().any(|s| s.app == "Discord") {
+                    crate::integrations::discord_rpc::poke();
+                }
             }
             changed |= self.hub.apply(event);
         }

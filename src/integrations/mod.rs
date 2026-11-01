@@ -5,6 +5,7 @@
 
 pub mod browser;
 pub mod discord;
+pub mod discord_rpc;
 pub mod pipe;
 pub mod teams;
 
@@ -25,6 +26,7 @@ thread_local! {
 /// Start what config turns on. Tray thread, before [`crate::wait::run`].
 pub fn start(config: &Config) {
     if config.discord.enabled {
+        discord_rpc::spawn(&config.discord);
         if let Some(server) = serve(discord::PIPE, discord::Discord::default()) {
             DISCORD.with(|d| *d.borrow_mut() = Some(server));
             println!("discord: waiting for the Vencord plugin on \\\\.\\pipe\\{}", discord::PIPE);
@@ -122,6 +124,7 @@ fn connect_teams() {
 /// Toggle the user's mute in a voice app.
 pub fn toggle_mute(app: VoiceApp) {
     match app {
+        VoiceApp::Discord if discord_rpc::connected() => discord_rpc::set_mute(None),
         VoiceApp::Discord => discord(|server| server.send(r#"{"type":"toggleMute"}"#)),
         VoiceApp::Teams => teams(|client| client.action("toggle-mute")),
     }
@@ -130,6 +133,7 @@ pub fn toggle_mute(app: VoiceApp) {
 /// Set the user's mute in a voice app.
 pub fn set_muted(app: VoiceApp, muted: bool) {
     match app {
+        VoiceApp::Discord if discord_rpc::connected() => discord_rpc::set_mute(Some(muted)),
         VoiceApp::Discord => discord(|server| server.send(&format!(r#"{{"type":"setMute","muted":{muted}}}"#))),
         VoiceApp::Teams => teams(|client| client.action(if muted { "mute" } else { "unmute" })),
     }

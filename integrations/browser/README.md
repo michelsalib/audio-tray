@@ -25,3 +25,12 @@ the host registration allows.
 3. **Load unpacked**, and pick this folder (`integrations/browser`).
 
 Tabs already open are picked up when they next play, pause or seek; reloading them works too.
+
+## What counts as playing
+
+A tab counts while its media plays, and also while Chromium holds it paused for being muted in
+a hidden tab (it resumes when the tab shows): a muted second stream is still being watched. A
+paused live player keeps its row (Twitch resets the position on pause), and players that swap
+`<video>` elements (Twitch after an ad) are followed through capture-phase media events.
+Duplicates of what Windows' media controls already report (YouTube Music's app runs in Edge)
+show once.

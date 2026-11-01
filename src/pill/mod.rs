@@ -219,7 +219,17 @@ impl Pill {
     fn refresh(&mut self) {
         let state = self.last.clone();
         self.follow_meter(&state);
-        let next = view::decide(&state, self.inputs);
+        let mut next = view::decide(&state, self.inputs);
+        // While the card is open its rows stay put: one whose session went away (a tab closed,
+        // a player reset on pause) stays, paused, rather than slide the next under the pointer.
+        if let (View::Music { media: new, card: true }, View::Music { media: old, card: true }) = (&mut next, &self.view) {
+            let mut kept: Vec<crate::hub::Media> = old
+                .iter()
+                .map(|o| new.iter().find(|n| n.app_id == o.app_id).cloned().unwrap_or_else(|| crate::hub::Media { playing: false, ..o.clone() }))
+                .collect();
+            kept.extend(new.iter().filter(|n| !old.iter().any(|o| o.app_id == n.app_id)).cloned());
+            *new = kept;
+        }
         // Same state, same hover strip: nothing to repaint.
         if next == self.view && self.gfx.is_some() && self.hoverable(&next) == self.edge_up {
             return;

@@ -138,6 +138,14 @@ pub(super) fn from_hub(state: &crate::hub::State, art_px: u32, old: &[NowPlaying
             art,
         }
     }).collect();
+    // Cards already shown keep their place; one whose session went away stays, paused, so the
+    // next card never slides under the pointer while the panel is open.
+    let fresh: Vec<NowPlaying> = now_playing;
+    let mut now_playing: Vec<NowPlaying> = old
+        .iter()
+        .map(|o| fresh.iter().find(|n| n.app_id == o.app_id).cloned().unwrap_or_else(|| NowPlaying { playing: false, ..o.clone() }))
+        .collect();
+    now_playing.extend(fresh.into_iter().filter(|n| !old.iter().any(|o| o.app_id == n.app_id)));
     let apps = state
         .sessions
         .iter()

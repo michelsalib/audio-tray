@@ -285,14 +285,21 @@ impl State {
         self.all_media().into_iter().filter(|m| m.playing).take(MAX_SHOWN)
     }
 
-    /// Every media session, SMTC's and the browser extension's, in a stable order. A browser's
-    /// SMTC session that is one of the extension's tabs (same title) is left out: it would show
-    /// twice.
+    /// Every media session, SMTC's and the browser extension's, in a stable order, each once. A
+    /// tab and an SMTC session with the same title are the same media: a browser's own session
+    /// gives way to the tab (one per tab, where SMTC has one per browser), while an installed web
+    /// app's (YouTube Music runs in Edge) wins over its tab, since it takes previous/next.
     pub fn all_media(&self) -> Vec<&Media> {
-        let duplicate = |m: &Media| {
-            names::is_browser(&names::app_name(&m.app_id)) && self.browser.iter().any(|b| b.title == m.title)
-        };
-        self.media.iter().filter(|m| !duplicate(m)).chain(&self.browser).collect()
+        let is_browser_session = |m: &Media| names::is_browser(&names::app_name(&m.app_id));
+        let smtc = self
+            .media
+            .iter()
+            .filter(|m| !(is_browser_session(m) && self.browser.iter().any(|b| b.title == m.title)));
+        let tabs = self
+            .browser
+            .iter()
+            .filter(|b| !self.media.iter().any(|m| !is_browser_session(m) && m.title == b.title));
+        smtc.chain(tabs).collect()
     }
 
     /// Whether the microphone is live for the user: an app holds it.
@@ -310,7 +317,7 @@ fn replace<T: PartialEq>(slot: &mut T, value: T) -> bool {
 }
 
 /// How many media sessions the surfaces show at once.
-pub const MAX_SHOWN: usize = 3;
+pub const MAX_SHOWN: usize = 4;
 
 /// Events waiting for the tray thread.
 static QUEUE: Mutex<Vec<Event>> = Mutex::new(Vec::new());
@@ -387,6 +394,35 @@ mod tests {
         let (_, call) = state.call().unwrap();
         assert!(call.self_muted && call.members[0].muted);
         assert!(!state.apply(Event::SelfMuted { app: VoiceApp::Teams, muted: true }), "no Teams call to mute");
+    }
+
+    fn media(app_id: &str, title: &str) -> Media {
+        Media {
+            app_id: app_id.into(),
+            app: String::new(),
+            title: title.into(),
+            artist: String::new(),
+            playing: true,
+            cover: None,
+            timeline: None,
+            skip: false,
+        }
+    }
+
+    #[test]
+    fn a_tab_and_its_smtc_session_show_once() {
+        let mut state = State::default();
+        state.apply(Event::Media(vec![
+            media("music.youtube.com-5929F88E_vezhnr0wkvrcy!App", "Silence"),
+            media("MSEdge", "WORLDS"),
+        ]));
+        state.apply(Event::BrowserMedia(vec![
+            media("browser:1:0", "Silence"),
+            media("browser:2:0", "WORLDS"),
+            media("browser:3:0", "Vikings"),
+        ]));
+        let ids: Vec<&str> = state.all_media().iter().map(|m| m.app_id.as_str()).collect();
+        assert_eq!(ids, ["music.youtube.com-5929F88E_vezhnr0wkvrcy!App", "browser:2:0", "browser:3:0"]);
     }
 
     #[test]

@@ -105,6 +105,11 @@ impl super::pipe::Handler for Tabs {
                 }
             })
             .collect();
+        let summary: Vec<String> = media
+            .iter()
+            .map(|m| format!("{} on {}{}", m.artist, m.app, if m.playing { "" } else { " (paused)" }))
+            .collect();
+        println!("browser: {} tab(s): {}", media.len(), summary.join(", "));
         self.media = media.clone();
         crate::hub::emit(Event::BrowserMedia(media));
         Ok(())

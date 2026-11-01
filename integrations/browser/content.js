@@ -24,10 +24,31 @@ function report() {
     timer = setTimeout(send, 150);
 }
 
-/** The element worth reporting: a playing one, else one that has started. */
+/** The element that last played: kept, paused, while it is on the page. */
+let lastPlayed = null;
+
+/** Elements the browser paused, not the user: Chromium pauses a muted video in a hidden tab and
+ * resumes it when the tab shows again. Those still count as playing. */
+const suspended = new WeakSet();
+document.addEventListener("pause", event => {
+    const el = event.target;
+    if (el instanceof HTMLMediaElement && document.hidden && (el.muted || el.volume === 0)) suspended.add(el);
+}, true);
+document.addEventListener("play", event => suspended.delete(event.target), true);
+document.addEventListener("visibilitychange", () => report());
+
+function isPlaying(el) {
+    return (!el.paused && !el.ended) || suspended.has(el);
+}
+
+/** The element worth reporting: a playing one, else the one that last played (a live player can
+ * reset its position on pause), else one that has started. */
 function active() {
     const live = [...elements].filter(el => el.isConnected);
-    return live.find(el => !el.paused && !el.ended) ?? live.find(el => el.currentTime > 0) ?? null;
+    const playing = live.find(isPlaying);
+    if (playing) lastPlayed = playing;
+    if (lastPlayed && !lastPlayed.isConnected) lastPlayed = null;
+    return playing ?? lastPlayed ?? live.find(el => el.currentTime > 0) ?? null;
 }
 
 function artwork(metadata) {
@@ -37,6 +58,8 @@ function artwork(metadata) {
 }
 
 function send() {
+    // Players swap elements (Twitch after an ad): pick up any not seen yet.
+    scan(document);
     const el = active();
     let state = null;
     if (el) {
@@ -45,7 +68,7 @@ function send() {
             title: metadata?.title || document.title,
             artist: metadata?.artist || "",
             artwork: artwork(metadata),
-            playing: !el.paused && !el.ended,
+            playing: isPlaying(el),
             muted: el.muted || el.volume === 0,
             duration: Number.isFinite(el.duration) ? el.duration : 0,
             position: el.currentTime || 0,
@@ -66,8 +89,26 @@ chrome.runtime.onMessage.addListener(message => {
     }
     const el = active() ?? [...elements].find(e => e.isConnected);
     if (!el) return;
-    if (message.command === "toggle") el.paused ? el.play() : el.pause();
+    if (message.command === "toggle") {
+        if (isPlaying(el)) {
+            suspended.delete(el);
+            el.pause();
+        } else {
+            el.play();
+        }
+    }
 });
+
+// Media events do not bubble, but they pass the document in the capture phase: this catches any
+// element, however the page made it (created off-document, moved, swapped after an ad).
+for (const name of EVENTS) {
+    document.addEventListener(name, event => {
+        if (event.target instanceof HTMLMediaElement) {
+            track(event.target);
+            report();
+        }
+    }, true);
+}
 
 new MutationObserver(mutations => {
     for (const m of mutations) for (const node of m.addedNodes) scan(node);

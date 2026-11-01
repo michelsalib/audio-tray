@@ -524,6 +524,8 @@ fn open_flyout(anchor: Option<flyout::Anchor>) {
     with_tray(|tray| {
         tray.flyout_open = false;
         tray.reopen_guard = Instant::now() + SETTLE;
+        // Teams may have handed over its token while the panel was open: the tray's copy has it.
+        config.teams.token = tray.config.teams.token.take();
         tray.config = config;
         if outcome.config_changed {
             if let Err(e) = tray.config.save() {

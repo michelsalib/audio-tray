@@ -218,7 +218,7 @@ impl Config {
                 return Self::default();
             }
         };
-        match toml::from_str(&text) {
+        match Self::parse(&text) {
             Ok(config) => config,
             Err(e) => {
                 let bad = path.with_extension("toml.bad");
@@ -229,6 +229,22 @@ impl Config {
                 Self::default()
             }
         }
+    }
+
+    /// Parse a config file, bringing one written by an older version forward.
+    fn parse(text: &str) -> std::result::Result<Self, toml::de::Error> {
+        let mut config: Self = toml::from_str(text)?;
+        let raw: toml::Table = toml::from_str(text)?;
+        let has = |section: &str, key: &str| raw.get(section).and_then(|s| s.get(key)).is_some();
+        // Versions before these switches drew the buttons and the tile whenever they ran, and every
+        // version since writes the keys: a file without them is an upgrade, which keeps both.
+        if !has("strip", "enabled") {
+            config.strip.enabled = true;
+        }
+        if !has("music", "tile_style") && !config.music.tile.is_empty() {
+            config.music.tile_style = TileStyle::Full;
+        }
+        Ok(config)
     }
 
     pub fn save(&self) -> Result<()> {
@@ -292,6 +308,18 @@ this is not toml").unwrap();
         // Missing is plain defaults, with nothing renamed.
         assert!(Config::load_from(&path).icons.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_upgrade_keeps_the_taskbar_buttons_and_the_tile() {
+        let old = "[music]\nenabled = true\ntile = \"YouTube Music\"\n\n[strip]\nnext_to_wifi = true\n";
+        let cfg = Config::parse(old).expect("parse");
+        assert!(cfg.strip.enabled, "older versions always drew the buttons");
+        assert_eq!(cfg.music.tile_style, TileStyle::Full);
+        let chosen = "[music]\ntile = \"YouTube Music\"\ntile_style = \"off\"\n\n[strip]\nenabled = false\n";
+        let cfg = Config::parse(chosen).expect("parse");
+        assert!(!cfg.strip.enabled, "a choice made in Settings stays");
+        assert_eq!(cfg.music.tile_style, TileStyle::Off);
     }
 
     /// Configs from when the strip was opt-in carry a `[taskbar]` section; it must be ignored.

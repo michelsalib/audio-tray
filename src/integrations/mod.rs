@@ -19,8 +19,11 @@ use crate::hub::VoiceApp;
 
 thread_local! {
     static DISCORD: RefCell<Option<Rc<RefCell<pipe::Server<discord::Discord>>>>> = const { RefCell::new(None) };
-    static BROWSER: RefCell<Option<Rc<RefCell<pipe::Server<browser::Tabs>>>>> = const { RefCell::new(None) };
-    static BROWSER_COMMANDS: RefCell<Option<Rc<RefCell<pipe::Server<browser::Commands>>>>> = const { RefCell::new(None) };
+    /// One instance per browser served at once ([`browser::INSTANCES`]).
+    static BROWSER: RefCell<Vec<Rc<RefCell<pipe::Server<browser::Tabs>>>>> = const { RefCell::new(Vec::new()) };
+    static BROWSER_COMMANDS: RefCell<Vec<Rc<RefCell<pipe::Server<browser::Commands>>>>> = const { RefCell::new(Vec::new()) };
+    /// [`browser::READY_EVENT`], set while the pipes are served.
+    static BROWSER_READY: Cell<Option<isize>> = const { Cell::new(None) };
     static TEAMS: RefCell<Option<Rc<RefCell<teams::Client>>>> = const { RefCell::new(None) };
     static TEAMS_TOKEN: RefCell<Option<Option<String>>> = const { RefCell::new(None) };
     /// Whether Teams holds the microphone (a meeting), as the tray last said.
@@ -60,15 +63,50 @@ fn start_browser() {
     if let Err(e) = browser::register_host() {
         eprintln!("browser: could not register the native messaging host ({e:#})");
     }
-    let tabs = serve(browser::PIPE, browser::Tabs::default());
-    let commands = serve(browser::COMMAND_PIPE, browser::Commands);
+    let tabs = (0..browser::INSTANCES).filter_map(|_| serve_instance(browser::PIPE, browser::Tabs::default(), browser::INSTANCES)).collect();
+    let commands = (0..browser::INSTANCES).filter_map(|_| serve_instance(browser::COMMAND_PIPE, browser::Commands::default(), browser::INSTANCES)).collect();
     BROWSER.with(|b| *b.borrow_mut() = tabs);
     BROWSER_COMMANDS.with(|b| *b.borrow_mut() = commands);
+    // Hosts waiting for the tray may connect now.
+    if let Some(ready) = browser_ready() {
+        unsafe {
+            let _ = windows::Win32::System::Threading::SetEvent(ready);
+        }
+    }
+}
+
+/// [`browser::READY_EVENT`], opened once.
+fn browser_ready() -> Option<windows::Win32::Foundation::HANDLE> {
+    let raw = match BROWSER_READY.with(Cell::get) {
+        Some(raw) => raw,
+        None => {
+            let event = browser::ready_event()?;
+            BROWSER_READY.with(|r| r.set(Some(event.0 as isize)));
+            event.0 as isize
+        }
+    };
+    Some(windows::Win32::Foundation::HANDLE(raw as *mut core::ffi::c_void))
+}
+
+/// Stop serving the browsers: hosts go back to waiting, and their tabs go.
+fn stop_browser() {
+    if let Some(ready) = browser_ready() {
+        unsafe {
+            let _ = windows::Win32::System::Threading::ResetEvent(ready);
+        }
+    }
+    BROWSER.with(|s| s.borrow_mut().drain(..).for_each(|server| crate::wait::unregister(server.borrow().event())));
+    BROWSER_COMMANDS.with(|s| s.borrow_mut().drain(..).for_each(|server| crate::wait::unregister(server.borrow().event())));
 }
 
 /// Host a pipe and serve it from the tray thread's wait.
 fn serve<H: pipe::Handler + 'static>(name: &'static str, handler: H) -> Option<Rc<RefCell<pipe::Server<H>>>> {
-    match pipe::Server::new(name, handler) {
+    serve_instance(name, handler, 1)
+}
+
+/// One of `instances` servers of a pipe, served from the tray thread's wait.
+fn serve_instance<H: pipe::Handler + 'static>(name: &'static str, handler: H, instances: u32) -> Option<Rc<RefCell<pipe::Server<H>>>> {
+    match pipe::Server::instance(name, handler, instances) {
         Ok(server) => {
             let event = server.event();
             let server = Rc::new(RefCell::new(server));
@@ -118,9 +156,8 @@ pub fn reconfigure(old: &Config, new: &Config) {
         if new.browser.enabled {
             start_browser();
         } else {
-            unserve(&BROWSER);
-            unserve(&BROWSER_COMMANDS);
-            crate::hub::emit(crate::hub::Event::BrowserMedia(Vec::new()));
+            stop_browser();
+            crate::hub::emit(crate::hub::Event::BrowserMedia { host: None, media: Vec::new() });
             crate::hub::emit(crate::hub::Event::Integration { name: "Browser", connected: false });
         }
     }
@@ -139,8 +176,7 @@ fn unserve<H: pipe::Handler>(slot: &'static Served<H>) {
 
 pub fn stop() {
     unserve(&DISCORD);
-    unserve(&BROWSER);
-    unserve(&BROWSER_COMMANDS);
+    stop_browser();
     TEAMS.with(|t| {
         if let Some(client) = t.borrow_mut().take() {
             crate::wait::unregister(client.borrow().event());
@@ -277,9 +313,14 @@ pub fn set_muted(app: VoiceApp, muted: bool) {
 /// A command for a browser tab (`id` is the part after [`browser::APP_ID_PREFIX`]):
 /// `toggle` plays or pauses its media, `focus` brings the tab and its window to the front.
 pub fn browser_command(id: &str, command: &str) {
-    match BROWSER_COMMANDS.with(|b| b.borrow().clone()) {
-        Some(server) => server.borrow_mut().send(&browser::command(id, command)),
-        None => eprintln!("integrations: the browser extension is off; cannot send it a command"),
+    let Some((host, frame)) = browser::split_id(id) else {
+        eprintln!("integrations: {id:?} names no browser tab");
+        return;
+    };
+    let server = BROWSER_COMMANDS.with(|b| b.borrow().iter().find(|s| s.borrow().handler.host == host).cloned());
+    match server {
+        Some(server) => server.borrow_mut().send(&browser::command(frame, command)),
+        None => eprintln!("integrations: no browser {host} connected; cannot send it a command"),
     }
 }
 

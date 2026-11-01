@@ -1,5 +1,6 @@
 // Audio Tray: reports this frame's playing <video>/<audio> to the extension's background, and
-// plays or pauses it on command. Event-driven: media events and DOM changes, never a timer.
+// plays or pauses it on command. Event-driven: media events (caught in the capture phase, so
+// every element, wherever the page puts it), never a timer, and no watching of the page's DOM.
 
 const elements = new Set();
 const EVENTS = ["play", "playing", "pause", "ended", "emptied", "loadedmetadata", "durationchange", "seeked", "volumechange"];
@@ -110,9 +111,6 @@ for (const name of EVENTS) {
     }, true);
 }
 
-new MutationObserver(mutations => {
-    for (const m of mutations) for (const node of m.addedNodes) scan(node);
-}).observe(document, { childList: true, subtree: true });
 
 // A new title on the same element (YouTube's next video, a stream retitled).
 const title = document.querySelector("title");

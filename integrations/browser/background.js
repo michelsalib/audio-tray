@@ -9,8 +9,11 @@ const frames = new Map();
 const art = new Map();
 let port = null;
 let pushTimer = null;
+/** When the last connection was tried, so a missing host is not retried on every media event. */
+let lastTry = 0;
 
 function connect() {
+    lastTry = Date.now();
     port = chrome.runtime.connectNative(HOST);
     port.onMessage.addListener(onCommand);
     port.onDisconnect.addListener(() => {
@@ -77,6 +80,8 @@ function push() {
 
 chrome.runtime.onMessage.addListener((message, sender) => {
     if (message.type !== "media" || !sender.tab) return;
+    // A sleeping worker loses the retry timer: a tab's media event is the next chance.
+    if (!port && Date.now() - lastTry > 10000) connect();
     const id = `${sender.tab.id}:${sender.frameId}`;
     if (message.state) frames.set(id, message.state);
     else frames.delete(id);

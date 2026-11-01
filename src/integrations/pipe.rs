@@ -1,6 +1,7 @@
-//! A one-client named-pipe server speaking newline-delimited text, overlapped and served by the
-//! tray thread's wait ([`crate::wait`]): nothing runs until the client writes. Local clients
-//! only. What the lines mean is the [`Handler`]'s business.
+//! A named-pipe server instance speaking newline-delimited text to one client at a time,
+//! overlapped and served by the tray thread's wait ([`crate::wait`]): nothing runs until the
+//! client writes. Local clients only. What the lines mean is the [`Handler`]'s business. Several
+//! instances of one name serve several clients (one browser each).
 
 use anyhow::{bail, Context, Result};
 use windows::core::PCWSTR;
@@ -36,15 +37,16 @@ pub struct Server<H: Handler> {
 }
 
 impl<H: Handler> Server<H> {
-    /// Host `\\.\pipe\<name>` and wait for its client.
-    pub fn new(name: &'static str, handler: H) -> Result<Self> {
+    /// Host one of `instances` servers of `\\.\pipe\<name>` (every instance must say the same
+    /// number) and wait for its client.
+    pub fn instance(name: &'static str, handler: H, instances: u32) -> Result<Self> {
         let path = crate::win::wide(&format!(r"\\.\pipe\{name}"));
         unsafe {
             let pipe = CreateNamedPipeW(
                 PCWSTR(path.as_ptr()),
                 PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
                 PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
-                1,
+                instances,
                 BUFFER as u32,
                 BUFFER as u32,
                 0,

@@ -72,8 +72,24 @@ fn enable(icons: StripIcons) -> Result<()> {
         *last = Some((pid, std::time::Instant::now()));
     }
     STRIP_UP.store(true, std::sync::atomic::Ordering::SeqCst);
+    // The initialization data had to leave the tile out: hand the TAP the whole of it by
+    // WM_COPYDATA (no cap) once it is up, as a handover from its own owner.
+    if TRIMMED.swap(false, std::sync::atomic::Ordering::SeqCst) {
+        std::thread::spawn(move || {
+            for _ in 0..10 {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                if offer_handover(icons, std::process::id()).is_ok() {
+                    return;
+                }
+            }
+            eprintln!("taskbar: could not hand the TAP the tile it was injected without");
+        });
+    }
     Ok(())
 }
+
+/// Set when the injection's initialization data went without the tile (see [`init_data`]).
+static TRIMMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Whether we injected into this same Explorer a moment ago.
 fn just_injected(pid: u32) -> bool {
@@ -336,9 +352,14 @@ fn init_data(icons: StripIcons, owner_pid: u32, payload: Payload) -> String {
     if strip != FULL_WIDTH || payload == Payload::Handover {
         pairs.push(("strip", strip.to_string()));
     }
-    let data = tap_proto::encode_init(pairs);
+    let data = tap_proto::encode_init(pairs.clone());
     if payload == Payload::Injection && data.len() > INIT_DATA_BUDGET {
-        eprintln!("taskbar: the TAP's init data is {} characters; past {INIT_DATA_BUDGET} it may arrive empty", data.len());
+        // Past the budget it all arrives empty: the user-named tile is what grows, so it goes,
+        // and follows by handover once the TAP is up (see [`enable`]).
+        eprintln!("taskbar: the TAP's init data is {} characters; the tile follows by handover", data.len());
+        TRIMMED.store(true, std::sync::atomic::Ordering::SeqCst);
+        pairs.retain(|(key, _)| *key != "tile");
+        return tap_proto::encode_init(pairs);
     }
     data
 }

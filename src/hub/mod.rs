@@ -122,8 +122,9 @@ pub struct Call {
 pub enum Event {
     /// Every media session with a track, in a stable order (Windows').
     Media(Vec<Media>),
-    /// Every tab playing media, from the browser extension (empty when it went away).
-    BrowserMedia(Vec<Media>),
+    /// Every tab playing media in one browser (`host`: its messaging host's id, which its tabs'
+    /// app ids carry), or `None` to clear every browser's.
+    BrowserMedia { host: Option<u32>, media: Vec<Media> },
     /// The apps holding the microphone (exe paths or package names), from the consent store.
     MicUsers(Vec<String>),
     /// The default endpoints, after any endpoint change.
@@ -199,7 +200,15 @@ impl State {
                 }
                 replace(&mut self.media, media)
             }
-            Event::BrowserMedia(media) => replace(&mut self.browser, media),
+            Event::BrowserMedia { host, media } => {
+                let mut next: Vec<Media> = match host {
+                    // The other browsers' tabs stay, in place.
+                    Some(host) => self.browser.iter().filter(|m| browser_host(&m.app_id) != Some(host)).cloned().collect(),
+                    None => Vec::new(),
+                };
+                next.extend(media);
+                replace(&mut self.browser, next)
+            }
             Event::MicUsers(users) => {
                 let started: Vec<String> =
                     users.iter().filter(|u| !self.mic_users.contains(u)).cloned().collect();
@@ -381,6 +390,10 @@ pub fn take() -> Vec<Event> {
     std::mem::take(&mut *QUEUE.lock().unwrap_or_else(|p| p.into_inner()))
 }
 
+/// The browser (messaging host id) a tab's app id names: `browser:<host>:<tab>:<frame>`.
+pub fn browser_host(app_id: &str) -> Option<u32> {
+    app_id.strip_prefix(crate::integrations::browser::APP_ID_PREFIX)?.split(':').next()?.parse().ok()
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -459,13 +472,24 @@ mod tests {
             media("music.youtube.com-5929F88E_vezhnr0wkvrcy!App", "Silence"),
             media("MSEdge", "WORLDS"),
         ]));
-        state.apply(Event::BrowserMedia(vec![
-            media("browser:1:0", "Silence"),
-            media("browser:2:0", "WORLDS"),
-            media("browser:3:0", "Vikings"),
-        ]));
+        state.apply(Event::BrowserMedia {
+            host: Some(7),
+            media: vec![media("browser:7:1:0", "Silence"), media("browser:7:2:0", "WORLDS"), media("browser:7:3:0", "Vikings")],
+        });
         let ids: Vec<&str> = state.all_media().iter().map(|m| m.app_id.as_str()).collect();
-        assert_eq!(ids, ["music.youtube.com-5929F88E_vezhnr0wkvrcy!App", "browser:2:0", "browser:3:0"]);
+        assert_eq!(ids, ["music.youtube.com-5929F88E_vezhnr0wkvrcy!App", "browser:7:2:0", "browser:7:3:0"]);
+    }
+
+    #[test]
+    fn each_browser_replaces_only_its_own_tabs() {
+        let mut state = State::default();
+        state.apply(Event::BrowserMedia { host: Some(1), media: vec![media("browser:1:4:0", "Edge stream")] });
+        state.apply(Event::BrowserMedia { host: Some(2), media: vec![media("browser:2:9:0", "Chrome stream")] });
+        state.apply(Event::BrowserMedia { host: Some(1), media: vec![] });
+        let ids: Vec<&str> = state.browser.iter().map(|m| m.app_id.as_str()).collect();
+        assert_eq!(ids, ["browser:2:9:0"], "Edge closing its tab leaves Chrome's");
+        state.apply(Event::BrowserMedia { host: None, media: vec![] });
+        assert!(state.browser.is_empty());
     }
 
     #[test]
@@ -474,7 +498,7 @@ mod tests {
         let mut state = State::default();
         state.apply(Event::Media(vec![app("ytm!App", "Old song")]));
         // The tab already has the new title while the app still shows the old one…
-        state.apply(Event::BrowserMedia(vec![app("browser:1:0", "New song")]));
+        state.apply(Event::BrowserMedia { host: Some(1), media: vec![app("browser:1:5:0", "New song")] });
         assert_eq!(state.all_media().len(), 1, "matched by app, not title");
         // …then the app's session drops for a moment (past the feed's own bridge).
         state.apply(Event::Media(vec![]));

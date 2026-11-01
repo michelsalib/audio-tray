@@ -39,6 +39,8 @@ pub(super) struct NowPlaying {
     pub playing: bool,
     /// A stream with no end: no previous/next.
     pub live: bool,
+    /// Previous/next reach the player.
+    pub skip: bool,
     /// The cover as a ready sprite, [`ART_DIP`] square at the panel's scale.
     pub art: Option<Vec<u8>>,
 }
@@ -106,14 +108,15 @@ pub(super) const ART_DIP: f32 = 52.0;
 /// `art_px` is the cover's size at the panel's scale; decoding is skipped when `old` already
 /// holds a track's sprite.
 pub(super) fn from_hub(state: &crate::hub::State, art_px: u32, old: &[NowPlaying]) -> (Vec<NowPlaying>, Vec<AppRow>, Option<Voice>) {
-    let mut shown: Vec<&crate::hub::Media> = state
-        .media
+    let all = state.all_media();
+    let mut shown: Vec<&crate::hub::Media> = all
         .iter()
+        .copied()
         .filter(|m| m.playing || old.iter().any(|o| o.app_id == m.app_id))
         .take(crate::hub::MAX_SHOWN)
         .collect();
     if shown.is_empty() {
-        shown.extend(state.media.first());
+        shown.extend(all.first().copied());
     }
     let now_playing = shown.into_iter().map(|m| {
         let same_track = old.iter().find(|o| o.title == m.title && o.artist == m.artist && o.app == m.app && o.art.is_some());
@@ -131,6 +134,7 @@ pub(super) fn from_hub(state: &crate::hub::State, art_px: u32, old: &[NowPlaying
             app: m.app.clone(),
             playing: m.playing,
             live: m.length_seconds().is_none(),
+            skip: m.skip,
             art,
         }
     }).collect();

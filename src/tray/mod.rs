@@ -634,7 +634,10 @@ impl Tray {
         use crate::pill::Action;
         match action {
             Action::Media(app_id, command) => {
-                if let Some(music) = self.music.as_ref() {
+                if let Some(tab) = app_id.strip_prefix(crate::integrations::browser::APP_ID_PREFIX) {
+                    // A browser tab: play/pause is all the extension does.
+                    crate::integrations::browser_toggle(tab);
+                } else if let Some(music) = self.music.as_ref() {
                     music.command_to(&app_id, command);
                 }
             }

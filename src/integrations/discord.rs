@@ -2,8 +2,8 @@
 //! `\\.\pipe\audio-tray`; the plugin's native half connects and writes one JSON object per line
 //! describing the voice call, and reads commands (mute toggles) back.
 //!
-//! The pipe is overlapped and its event is waited on by the tray thread ([`crate::wait`]): nothing
-//! runs until the plugin writes. Local clients only.
+//!
+//! The pipe is a [`super::pipe::Server`]: nothing runs until the plugin writes.
 //!
 //! Plugin → app:
 //! ```text
@@ -15,27 +15,16 @@
 //! ```
 //! App → plugin: `{"type":"toggleMute"}`, `{"type":"setMute","muted":false}`.
 
+
 use std::sync::Arc;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use serde::Deserialize;
-use windows::core::w;
-use windows::Win32::Foundation::{CloseHandle, GetLastError, ERROR_IO_PENDING, ERROR_PIPE_CONNECTED, HANDLE};
-use windows::Win32::Storage::FileSystem::{ReadFile, WriteFile, FILE_FLAG_OVERLAPPED, PIPE_ACCESS_DUPLEX};
-use windows::Win32::System::Pipes::{
-    ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS,
-    PIPE_TYPE_BYTE, PIPE_WAIT,
-};
-use windows::Win32::System::Threading::CreateEventW;
-use windows::Win32::System::IO::{CancelIo, GetOverlappedResult, OVERLAPPED};
 
 use crate::hub::{Call, Event, Member, VoiceApp};
 
+pub const PIPE: &str = "audio-tray";
 const NAME: &str = "Discord";
-const BUFFER: usize = 64 * 1024;
-/// A line longer than this (avatars are a few kB each) is a broken client, not a call.
-const MAX_LINE: usize = 4 * 1024 * 1024;
-
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 enum Message {
@@ -67,137 +56,27 @@ struct WireMember {
     me: bool,
 }
 
-/// The pipe and where its overlapped I/O stands. Lives on the tray thread.
-pub struct Server {
-    pipe: HANDLE,
-    event: HANDLE,
-    overlapped: Box<OVERLAPPED>,
-    buffer: Box<[u8; BUFFER]>,
-    pending: Vec<u8>,
-    connected: bool,
+/// The Discord side of the pipe: the call as the plugin last described it.
+#[derive(Default)]
+pub struct Discord {
     call: Option<Call>,
 }
 
-impl Server {
-    pub fn new() -> Result<Self> {
-        unsafe {
-            let pipe = CreateNamedPipeW(
-                w!(r"\\.\pipe\audio-tray"),
-                PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
-                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
-                1,
-                BUFFER as u32,
-                BUFFER as u32,
-                0,
-                None,
-            );
-            if pipe.is_invalid() {
-                bail!("CreateNamedPipe: {:?}", GetLastError());
-            }
-            let event = CreateEventW(None, true, false, None).context("CreateEvent")?;
-            let mut server = Self {
-                pipe,
-                event,
-                overlapped: Box::new(OVERLAPPED { hEvent: event, ..Default::default() }),
-                buffer: Box::new([0; BUFFER]),
-                pending: Vec::new(),
-                connected: false,
-                call: None,
-            };
-            server.listen();
-            Ok(server)
-        }
-    }
-
-    pub fn event(&self) -> HANDLE {
-        self.event
-    }
-
-    /// Wait for the plugin to connect.
-    fn listen(&mut self) {
-        self.reset();
-        unsafe {
-            match ConnectNamedPipe(self.pipe, Some(&mut *self.overlapped)) {
-                Ok(()) => self.on_connected(),
-                Err(_) if GetLastError() == ERROR_PIPE_CONNECTED => self.on_connected(),
-                Err(_) if GetLastError() == ERROR_IO_PENDING => {}
-                Err(e) => eprintln!("discord: cannot listen on the pipe ({e})"),
-            }
-        }
-    }
-
-    fn reset(&mut self) {
-        let _ = unsafe { windows::Win32::System::Threading::ResetEvent(self.event) };
-        *self.overlapped = OVERLAPPED { hEvent: self.event, ..Default::default() };
-    }
-
-    fn on_connected(&mut self) {
+impl super::pipe::Handler for Discord {
+    fn connected(&mut self) {
         println!("discord: plugin connected");
-        self.connected = true;
-        self.pending.clear();
         crate::hub::emit(Event::Integration { name: NAME, connected: true });
-        self.read();
-    }
-
-    /// Start the next overlapped read; completions arrive through [`Server::signalled`].
-    fn read(&mut self) {
-        self.reset();
-        unsafe {
-            match ReadFile(self.pipe, Some(&mut self.buffer[..]), None, Some(&mut *self.overlapped)) {
-                // Completed at once: the event is set too, so the wait loop delivers it.
-                Ok(()) => {}
-                Err(_) if GetLastError() == ERROR_IO_PENDING => {}
-                Err(_) => self.disconnected(),
-            }
-        }
-    }
-
-    /// The event fired: a connection or a read completed.
-    pub fn signalled(&mut self) {
-        let mut moved = 0u32;
-        let done = unsafe { GetOverlappedResult(self.pipe, &*self.overlapped, &mut moved, false) };
-        if !self.connected {
-            match done {
-                Ok(()) => self.on_connected(),
-                Err(_) => self.listen(),
-            }
-            return;
-        }
-        if done.is_err() {
-            return self.disconnected();
-        }
-        self.pending.extend_from_slice(&self.buffer[..moved as usize]);
-        while let Some(end) = self.pending.iter().position(|&b| b == b'\n') {
-            let line: Vec<u8> = self.pending.drain(..=end).collect();
-            if let Err(e) = self.line(&line) {
-                eprintln!("discord: ignoring a line ({e:#})");
-            }
-        }
-        if self.pending.len() > MAX_LINE {
-            eprintln!("discord: a line over {MAX_LINE} bytes; dropping the client");
-            return self.disconnected();
-        }
-        self.read();
     }
 
     fn disconnected(&mut self) {
         println!("discord: plugin went away");
-        self.connected = false;
-        unsafe {
-            let _ = DisconnectNamedPipe(self.pipe);
-        }
         if self.call.take().is_some() {
             crate::hub::emit(Event::Call { app: VoiceApp::Discord, call: None });
         }
         crate::hub::emit(Event::Integration { name: NAME, connected: false });
-        self.listen();
     }
 
-    fn line(&mut self, line: &[u8]) -> Result<()> {
-        let text = std::str::from_utf8(line).context("not UTF-8")?.trim();
-        if text.is_empty() {
-            return Ok(());
-        }
+    fn line(&mut self, text: &str) -> Result<()> {
         match serde_json::from_str::<Message>(text).context("not a message")? {
             Message::Hello {} => {}
             Message::Call { channel: None, .. } => {
@@ -230,42 +109,7 @@ impl Server {
         }
         Ok(())
     }
-
-    /// Send a command to the plugin. Best-effort; small writes complete at once.
-    pub fn send(&mut self, json: &str) {
-        if !self.connected {
-            eprintln!("discord: no plugin connected; {json} not sent");
-            return;
-        }
-        let line = format!("{json}\n");
-        unsafe {
-            let Ok(event) = CreateEventW(None, true, false, None) else { return };
-            let mut overlapped = OVERLAPPED { hEvent: event, ..Default::default() };
-            let mut written = 0u32;
-            let result = match WriteFile(self.pipe, Some(line.as_bytes()), None, Some(&mut overlapped)) {
-                Ok(()) => Ok(()),
-                Err(_) if GetLastError() == ERROR_IO_PENDING => GetOverlappedResult(self.pipe, &overlapped, &mut written, true),
-                Err(e) => Err(e),
-            };
-            let _ = CloseHandle(event);
-            if let Err(e) = result {
-                eprintln!("discord: could not send a command ({e})");
-            }
-        }
-    }
 }
-
-impl Drop for Server {
-    fn drop(&mut self) {
-        unsafe {
-            let _ = CancelIo(self.pipe);
-            let _ = DisconnectNamedPipe(self.pipe);
-            let _ = CloseHandle(self.pipe);
-            let _ = CloseHandle(self.event);
-        }
-    }
-}
-
 /// A member from the wire, keeping the previous avatar when the plugin sent none this time.
 fn member(wire: WireMember, old: Option<&Call>) -> Member {
     let avatar = wire
@@ -278,7 +122,7 @@ fn member(wire: WireMember, old: Option<&Call>) -> Member {
 }
 
 /// Standard base64 (with or without padding); `None` when it is not.
-fn base64_decode(text: &str) -> Option<Vec<u8>> {
+pub(super) fn base64_decode(text: &str) -> Option<Vec<u8>> {
     fn value(c: u8) -> Option<u32> {
         Some(match c {
             b'A'..=b'Z' => c - b'A',

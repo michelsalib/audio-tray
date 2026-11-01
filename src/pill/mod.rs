@@ -304,7 +304,7 @@ impl Pill {
     /// Whether the hover strip is up: on the music pill, and on the sliver while some media is
     /// paused (hovering opens its card to resume it).
     fn hoverable(&self, view: &View) -> bool {
-        matches!(view, View::Music { .. }) || (matches!(view, View::Idle) && !self.last.media.is_empty())
+        matches!(view, View::Music { .. }) || (matches!(view, View::Idle) && !self.last.all_media().is_empty())
     }
 
     /// Start or stop the 10 Hz microphone meter: it runs only while muted in a call.

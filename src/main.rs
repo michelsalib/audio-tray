@@ -45,6 +45,12 @@ mod win;
 use audio::wasapi::WasapiBackend;
 
 fn main() -> Result<()> {
+    // Launched by a browser as the extension's native messaging host: stdout is its channel, so
+    // nothing else may run (or print) first.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if integrations::browser::is_host_launch(&args) {
+        return integrations::browser::run_host();
+    }
     // STA: conventional for the GUI/tray thread that owns the message pump.
     unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok()? };
     // Per-monitor DPI aware, so nothing is bitmap-scaled by the OS.
@@ -53,7 +59,6 @@ fn main() -> Result<()> {
     }
     let backend = WasapiBackend::new()?;
 
-    let args: Vec<String> = std::env::args().skip(1).collect();
     if !args.is_empty() {
         // GUI-subsystem binaries don't inherit the parent console; re-attach so CLI output prints.
         unsafe {

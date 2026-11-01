@@ -135,7 +135,7 @@ fn loudest(state: &State, inputs: Inputs) -> View {
     // On hover the card lists every session (paused ones too, to resume them from here); quiet,
     // the pill shows the playing ones.
     let media: Vec<Media> = if inputs.hover {
-        state.media.iter().take(crate::hub::MAX_SHOWN).cloned().collect()
+        state.all_media().into_iter().take(crate::hub::MAX_SHOWN).cloned().collect()
     } else {
         state.playing().cloned().collect()
     };
@@ -200,6 +200,7 @@ mod tests {
             playing,
             cover: None,
             timeline: None,
+            skip: true,
         }
     }
 

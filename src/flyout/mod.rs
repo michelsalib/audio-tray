@@ -602,7 +602,7 @@ impl Flyout<'_> {
                 let Some(app_id) = self.model.now_playing.get(index).map(|np| np.app_id.clone()) else {
                     return false;
                 };
-                let live = self.model.now_playing.get(index).is_some_and(|np| np.live);
+                let live = !self.model.now_playing.get(index).is_some_and(|np| np.skip);
                 let command = match layout::media_button_at(self.surface.width, self.scale, mx) {
                     Some(1) => Command::TogglePlayPause,
                     // A live stream shows no previous/next.
@@ -788,7 +788,7 @@ impl Flyout<'_> {
         };
         let on_media = match kind {
             Some(Elem::NowPlaying { index }) => {
-                let live = self.model.now_playing.get(index).is_some_and(|np| np.live);
+                let live = !self.model.now_playing.get(index).is_some_and(|np| np.skip);
                 layout::media_button_at(self.surface.width, self.scale, mx).filter(|&i| !live || i == 1)
             }
             _ => None,

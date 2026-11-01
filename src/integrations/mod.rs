@@ -1,9 +1,11 @@
 //! Optional per-app integrations. Each reports through [`crate::hub`] and takes commands back
 //! (mute toggles); each can be off in config without touching the rest, and the app works with
-//! none of them. Discord and Teams live on the tray thread, their handles served by
+//! none of them. Discord, the browser and Teams live on the tray thread, their handles served by
 //! [`crate::wait`].
 
+pub mod browser;
 pub mod discord;
+pub mod pipe;
 pub mod teams;
 
 use std::cell::RefCell;
@@ -13,7 +15,9 @@ use crate::config::Config;
 use crate::hub::VoiceApp;
 
 thread_local! {
-    static DISCORD: RefCell<Option<Rc<RefCell<discord::Server>>>> = const { RefCell::new(None) };
+    static DISCORD: RefCell<Option<Rc<RefCell<pipe::Server<discord::Discord>>>>> = const { RefCell::new(None) };
+    static BROWSER: RefCell<Option<Rc<RefCell<pipe::Server<browser::Tabs>>>>> = const { RefCell::new(None) };
+    static BROWSER_COMMANDS: RefCell<Option<Rc<RefCell<pipe::Server<browser::Commands>>>>> = const { RefCell::new(None) };
     static TEAMS: RefCell<Option<Rc<RefCell<teams::Client>>>> = const { RefCell::new(None) };
     static TEAMS_TOKEN: RefCell<Option<Option<String>>> = const { RefCell::new(None) };
 }
@@ -21,17 +25,19 @@ thread_local! {
 /// Start what config turns on. Tray thread, before [`crate::wait::run`].
 pub fn start(config: &Config) {
     if config.discord.enabled {
-        match discord::Server::new() {
-            Ok(server) => {
-                let event = server.event();
-                let server = Rc::new(RefCell::new(server));
-                let served = Rc::clone(&server);
-                crate::wait::register(event, move || served.borrow_mut().signalled());
-                DISCORD.with(|d| *d.borrow_mut() = Some(server));
-                println!("discord: waiting for the Vencord plugin on \\\\.\\pipe\\audio-tray");
-            }
-            Err(e) => eprintln!("discord: unavailable ({e:#})"),
+        if let Some(server) = serve(discord::PIPE, discord::Discord::default()) {
+            DISCORD.with(|d| *d.borrow_mut() = Some(server));
+            println!("discord: waiting for the Vencord plugin on \\\\.\\pipe\\{}", discord::PIPE);
         }
+    }
+    if config.browser.enabled {
+        if let Err(e) = browser::register_host() {
+            eprintln!("browser: could not register the native messaging host ({e:#})");
+        }
+        let tabs = serve(browser::PIPE, browser::Tabs::default());
+        let commands = serve(browser::COMMAND_PIPE, browser::Commands);
+        BROWSER.with(|b| *b.borrow_mut() = tabs);
+        BROWSER_COMMANDS.with(|b| *b.borrow_mut() = commands);
     }
     if config.teams.enabled {
         TEAMS_TOKEN.with(|t| *t.borrow_mut() = Some(config.teams.token.clone()));
@@ -39,9 +45,36 @@ pub fn start(config: &Config) {
     }
 }
 
+/// Host a pipe and serve it from the tray thread's wait.
+fn serve<H: pipe::Handler + 'static>(name: &'static str, handler: H) -> Option<Rc<RefCell<pipe::Server<H>>>> {
+    match pipe::Server::new(name, handler) {
+        Ok(server) => {
+            let event = server.event();
+            let server = Rc::new(RefCell::new(server));
+            let served = Rc::clone(&server);
+            crate::wait::register(event, move || served.borrow_mut().signalled());
+            Some(server)
+        }
+        Err(e) => {
+            eprintln!("{name}: unavailable ({e:#})");
+            None
+        }
+    }
+}
+
 pub fn stop() {
     DISCORD.with(|d| {
         if let Some(server) = d.borrow_mut().take() {
+            crate::wait::unregister(server.borrow().event());
+        }
+    });
+    BROWSER.with(|b| {
+        if let Some(server) = b.borrow_mut().take() {
+            crate::wait::unregister(server.borrow().event());
+        }
+    });
+    BROWSER_COMMANDS.with(|b| {
+        if let Some(server) = b.borrow_mut().take() {
             crate::wait::unregister(server.borrow().event());
         }
     });
@@ -102,7 +135,15 @@ pub fn set_muted(app: VoiceApp, muted: bool) {
     }
 }
 
-fn discord(f: impl FnOnce(&mut discord::Server)) {
+/// Play or pause a browser tab's media (`id` is the part after [`browser::APP_ID_PREFIX`]).
+pub fn browser_toggle(id: &str) {
+    match BROWSER_COMMANDS.with(|b| b.borrow().clone()) {
+        Some(server) => server.borrow_mut().send(&browser::command(id)),
+        None => eprintln!("integrations: the browser extension is off; cannot send it a command"),
+    }
+}
+
+fn discord(f: impl FnOnce(&mut pipe::Server<discord::Discord>)) {
     match DISCORD.with(|d| d.borrow().clone()) {
         Some(server) => f(&mut server.borrow_mut()),
         None => eprintln!("integrations: Discord is off; cannot send it a command"),

@@ -63,6 +63,42 @@ const SITES: &[&str] = &[
     "Vimeo", "Dailymotion", "Bandcamp", "Apple Music", "Tidal", "Crunchyroll",
 ];
 
+/// Hosts and their names, for media the browser extension reports.
+const HOSTS: &[(&str, &str)] = &[
+    ("music.youtube.com", "YouTube Music"),
+    ("youtube.com", "YouTube"),
+    ("youtu.be", "YouTube"),
+    ("twitch.tv", "Twitch"),
+    ("kick.com", "Kick"),
+    ("netflix.com", "Netflix"),
+    ("primevideo.com", "Prime Video"),
+    ("disneyplus.com", "Disney+"),
+    ("soundcloud.com", "SoundCloud"),
+    ("spotify.com", "Spotify"),
+    ("deezer.com", "Deezer"),
+    ("vimeo.com", "Vimeo"),
+    ("dailymotion.com", "Dailymotion"),
+    ("bandcamp.com", "Bandcamp"),
+    ("crunchyroll.com", "Crunchyroll"),
+];
+
+/// A site's name from a tab's host name: a known one, else the domain's name capitalised
+/// (`www.example.org` → `Example`).
+pub fn site_name(host: &str) -> String {
+    let host = host.to_ascii_lowercase();
+    if let Some((_, name)) = HOSTS.iter().find(|(domain, _)| host == *domain || host.ends_with(&format!(".{domain}"))) {
+        return name.to_string();
+    }
+    let labels: Vec<&str> = host.split('.').filter(|l| !l.is_empty()).collect();
+    let name = match labels.len() {
+        0 => return "Browser".to_string(),
+        1 => labels[0],
+        n => labels[n - 2],
+    };
+    let mut chars = name.chars();
+    chars.next().map(|c| c.to_uppercase().chain(chars).collect()).unwrap_or_default()
+}
+
 pub fn is_browser(name: &str) -> bool {
     BROWSERS.contains(&name)
 }
@@ -115,6 +151,15 @@ mod tests {
         assert_eq!(app_name("Microsoft.WindowsSoundRecorder_8wekyb3d8bbwe"), "Sound Recorder");
         assert_eq!(app_name("Contoso.Notes_abc123"), "Contoso.Notes");
         assert_eq!(app_name("MSEdge"), "Edge");
+    }
+
+    #[test]
+    fn a_tabs_site_comes_from_its_host() {
+        assert_eq!(site_name("www.twitch.tv"), "Twitch");
+        assert_eq!(site_name("m.youtube.com"), "YouTube");
+        assert_eq!(site_name("music.youtube.com"), "YouTube Music");
+        assert_eq!(site_name("radio.example.org"), "Example");
+        assert_eq!(site_name(""), "Browser");
     }
 
     #[test]

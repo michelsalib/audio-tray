@@ -43,6 +43,9 @@ pub struct Media {
     pub cover: Option<Arc<Vec<u8>>>,
     /// The timeline checkpoint, in SMTC ticks (see [`crate::music::smtc::Timeline`]).
     pub timeline: Option<crate::music::smtc::Timeline>,
+    /// Previous and next reach the player (not for a live stream, nor a browser tab, whose page
+    /// handles them out of reach).
+    pub skip: bool,
 }
 
 impl Media {
@@ -115,6 +118,8 @@ pub struct Call {
 pub enum Event {
     /// Every media session with a track, in a stable order (Windows').
     Media(Vec<Media>),
+    /// Every tab playing media, from the browser extension (empty when it went away).
+    BrowserMedia(Vec<Media>),
     /// The apps holding the microphone (exe paths or package names), from the consent store.
     MicUsers(Vec<String>),
     /// The default endpoints, after any endpoint change.
@@ -153,6 +158,8 @@ impl Notice {
 pub struct State {
     /// Every media session with a track, in a stable order (Windows').
     pub media: Vec<Media>,
+    /// Every tab playing media, from the browser extension; see [`State::all_media`].
+    pub browser: Vec<Media>,
     pub mic_users: Vec<String>,
     pub endpoints: Endpoints,
     pub sessions: Vec<AppSession>,
@@ -167,6 +174,7 @@ impl State {
     pub fn apply(&mut self, event: Event) -> bool {
         match event {
             Event::Media(media) => replace(&mut self.media, media),
+            Event::BrowserMedia(media) => replace(&mut self.browser, media),
             Event::MicUsers(users) => {
                 let started: Vec<String> =
                     users.iter().filter(|u| !self.mic_users.contains(u)).cloned().collect();
@@ -274,7 +282,17 @@ impl State {
 
     /// The sessions to show: the playing ones, at most `MAX_SHOWN`.
     pub fn playing(&self) -> impl Iterator<Item = &Media> {
-        self.media.iter().filter(|m| m.playing).take(MAX_SHOWN)
+        self.all_media().into_iter().filter(|m| m.playing).take(MAX_SHOWN)
+    }
+
+    /// Every media session, SMTC's and the browser extension's, in a stable order. A browser's
+    /// SMTC session that is one of the extension's tabs (same title) is left out: it would show
+    /// twice.
+    pub fn all_media(&self) -> Vec<&Media> {
+        let duplicate = |m: &Media| {
+            names::is_browser(&names::app_name(&m.app_id)) && self.browser.iter().any(|b| b.title == m.title)
+        };
+        self.media.iter().filter(|m| !duplicate(m)).chain(&self.browser).collect()
     }
 
     /// Whether the microphone is live for the user: an app holds it.

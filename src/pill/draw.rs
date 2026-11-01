@@ -124,8 +124,8 @@ pub fn scene(gfx: &Gfx, view: &View) -> Result<Option<Scene>> {
                 .enumerate()
                 .map(|(i, m)| {
                     let play = if m.playing { GLYPH_PAUSE } else { GLYPH_PLAY };
-                    // A live stream has nothing before or after it: play/pause only.
-                    let buttons = if m.length_seconds().is_none() {
+                    // Previous/next only where they reach the player (not live, not a browser tab).
+                    let buttons = if !m.skip {
                         vec![(play, Command::TogglePlayPause)]
                     } else {
                         vec![(GLYPH_PREVIOUS, Command::Previous), (play, Command::TogglePlayPause), (GLYPH_NEXT, Command::Next)]

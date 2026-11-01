@@ -109,8 +109,8 @@ pub(super) fn render_page(ctx: &Ctx, elems: &[LaidElem], out: &mut [u8]) {
                     }
                     let bpx = (16.0 * scale).round() as u32;
                     for (i, glyph) in [GLYPH_PREVIOUS, if np.playing { GLYPH_PAUSE } else { GLYPH_PLAY }, GLYPH_NEXT].into_iter().enumerate() {
-                        // A live stream has nothing before or after it.
-                        if np.live && i != 1 {
+                        // Previous/next only where they reach the player.
+                        if !np.skip && i != 1 {
                             continue;
                         }
                         if let Ok((rgba, gw, gh)) = icons::render_glyph(glyph, bpx, TEXT) {

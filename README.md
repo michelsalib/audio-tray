@@ -27,7 +27,9 @@ A tiny Windows app for **audio awareness without opening anything** — a pill o
   is animated by the compositor, not the app.
 - **Integrations** (optional, each can be off): Discord through a
   [Vencord plugin](integrations/vencord/README.md) (who is in the call, who is talking, your
-  mute), and Teams through its local API (meeting and mute).
+  mute), Teams through its local API (meeting and mute), and a
+  [browser extension](integrations/browser/README.md) that shows every tab playing media (two
+  Twitch streams, a YouTube video…), not just the one Windows' media controls know about.
 - **Taskbar controls** (opt-in, `[strip] enabled = true`) — a pair of buttons drawn into the
   notification area, one for output and one for input, each showing that device's own icon.
   Windows' own volume and "microphone in use" icons are hidden, since the buttons say the same
@@ -137,6 +139,9 @@ listening_alerts = true     # the red alert when an app records outside a known 
 
 [discord]
 enabled = true              # host \\.\pipe\audio-tray for the Vencord plugin
+
+[browser]
+enabled = true              # register the browser extension's native messaging host
 
 [teams]
 enabled = false             # Teams' local API; turn it on in Teams too (Settings > Privacy > Manage API)

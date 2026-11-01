@@ -237,6 +237,7 @@ impl Music {
                     artist: r.snapshot.artist,
                     playing: r.snapshot.status.is_playing(),
                     cover,
+                    skip: r.timeline.is_some_and(|t| t.end > t.start),
                     timeline: r.timeline,
                 }
             })

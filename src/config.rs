@@ -27,6 +27,8 @@ pub struct Config {
     pub discord: Discord,
     /// The Teams integration: Teams' local third-party app API.
     pub teams: Teams,
+    /// Every tab playing media, through the browser extension in `integrations/browser`.
+    pub browser: Browser,
 }
 
 /// The floating pill on the screen's left edge.
@@ -52,6 +54,19 @@ pub struct Discord {
 }
 
 impl Default for Discord {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
+/// The browser extension's native messaging host is registered (per user) while this is on.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Browser {
+    pub enabled: bool,
+}
+
+impl Default for Browser {
     fn default() -> Self {
         Self { enabled: true }
     }

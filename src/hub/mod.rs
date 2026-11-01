@@ -30,7 +30,7 @@ impl VoiceApp {
     }
 }
 
-/// The media session worth showing: any app, a playing one first.
+/// One media session, from any app.
 #[derive(Clone, PartialEq, Debug)]
 pub struct Media {
     pub app_id: String,
@@ -113,8 +113,8 @@ pub struct Call {
 /// Every fact any source can report.
 #[derive(Clone, PartialEq, Debug)]
 pub enum Event {
-    /// The media session to show, or none.
-    Media(Option<Media>),
+    /// Every media session with a track, in a stable order (Windows').
+    Media(Vec<Media>),
     /// The apps holding the microphone (exe paths or package names), from the consent store.
     MicUsers(Vec<String>),
     /// The default endpoints, after any endpoint change.
@@ -151,7 +151,8 @@ impl Notice {
 /// Everything the surfaces render, folded from events.
 #[derive(Default, Clone)]
 pub struct State {
-    pub media: Option<Media>,
+    /// Every media session with a track, in a stable order (Windows').
+    pub media: Vec<Media>,
     pub mic_users: Vec<String>,
     pub endpoints: Endpoints,
     pub sessions: Vec<AppSession>,
@@ -271,6 +272,11 @@ impl State {
         self.calls.iter().map(|(app, call)| (*app, call)).next()
     }
 
+    /// The sessions to show: the playing ones, at most `MAX_SHOWN`.
+    pub fn playing(&self) -> impl Iterator<Item = &Media> {
+        self.media.iter().filter(|m| m.playing).take(MAX_SHOWN)
+    }
+
     /// Whether the microphone is live for the user: an app holds it.
     pub fn mic_live(&self) -> bool {
         !self.mic_users.is_empty()
@@ -284,6 +290,9 @@ fn replace<T: PartialEq>(slot: &mut T, value: T) -> bool {
     *slot = value;
     true
 }
+
+/// How many media sessions the surfaces show at once.
+pub const MAX_SHOWN: usize = 3;
 
 /// Events waiting for the tray thread.
 static QUEUE: Mutex<Vec<Event>> = Mutex::new(Vec::new());

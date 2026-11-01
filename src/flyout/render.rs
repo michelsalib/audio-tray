@@ -80,8 +80,8 @@ pub(super) fn render_page(ctx: &Ctx, elems: &[LaidElem], out: &mut [u8]) {
                     }
                 }
             }
-            Elem::NowPlaying => {
-                if let Some(np) = &ctx.model.now_playing {
+            Elem::NowPlaying { index } => {
+                if let Some(np) = ctx.model.now_playing.get(index) {
                     let art = (super::model::ART_DIP * scale).round() as i32;
                     let ax = d(ART_X);
                     let ay = le.top + (le.height - art) / 2;
@@ -471,7 +471,7 @@ pub(super) fn compose(ctx: &Ctx, hit: &Interaction, elems: &[LaidElem], base: &[
                 let ry1 = (le.top + le.height) as f32 - 2.0;
                 cv.fill_round_rect(Rect::new(mx, ry0, w as f32 - mx, ry1), d(ROW_RADIUS) as f32, TEXT, HOVER_A);
             }
-            Elem::NowPlaying if hovered => {
+            Elem::NowPlaying { .. } if hovered => {
                 if let Some(i) = hit.hover_media {
                     let cy = (le.top + le.height / 2) as f32;
                     let cxb = super::layout::media_button_center_x(w, scale, i);

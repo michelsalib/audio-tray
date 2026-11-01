@@ -19,8 +19,9 @@ pub enum View {
     Hidden,
     /// The grey sliver.
     Idle,
-    /// The art in its progress ring; `card` while the pointer is on it.
-    Music { media: Media, card: bool },
+    /// The art of each playing session in its progress ring; on hover (`card`), a row with
+    /// controls per session.
+    Music { media: Vec<Media>, card: bool },
     /// The microphone is live in a call: faces (when an integration sends them), a mic.
     Call {
         app: Option<VoiceApp>,
@@ -131,10 +132,17 @@ fn loudest(state: &State, inputs: Inputs) -> View {
     if let Some(view) = call_view(state) {
         return view;
     }
-    match &state.media {
-        // Paused media still opens on hover (from the sliver), so it can be resumed from here.
-        Some(media) if media.playing || inputs.hover => View::Music { media: media.clone(), card: inputs.hover },
-        _ => View::Idle,
+    // On hover the card lists every session (paused ones too, to resume them from here); quiet,
+    // the pill shows the playing ones.
+    let media: Vec<Media> = if inputs.hover {
+        state.media.iter().take(crate::hub::MAX_SHOWN).cloned().collect()
+    } else {
+        state.playing().cloned().collect()
+    };
+    if media.is_empty() {
+        View::Idle
+    } else {
+        View::Music { media, card: inputs.hover }
     }
 }
 
@@ -211,10 +219,10 @@ mod tests {
     fn music_shows_while_playing_and_the_sliver_otherwise() {
         let mut state = State::default();
         assert_eq!(decide(&state, on()), View::Idle);
-        state.apply(Event::Media(Some(media(true))));
+        state.apply(Event::Media(vec![media(true)]));
         assert!(matches!(decide(&state, on()), View::Music { card: false, .. }));
         assert!(matches!(decide(&state, Inputs { hover: true, ..on() }), View::Music { card: true, .. }));
-        state.apply(Event::Media(Some(media(false))));
+        state.apply(Event::Media(vec![media(false)]));
         assert_eq!(decide(&state, on()), View::Idle);
         assert!(
             matches!(decide(&state, Inputs { hover: true, ..on() }), View::Music { card: true, .. }),
@@ -223,9 +231,25 @@ mod tests {
     }
 
     #[test]
+    fn every_playing_session_shows_and_the_card_lists_the_paused_too() {
+        let mut state = State::default();
+        let twitch = Media { app_id: "MSEdge".into(), app: "Twitch".into(), ..media(true) };
+        let paused = Media { app_id: "Spotify.exe".into(), ..media(false) };
+        state.apply(Event::Media(vec![media(true), twitch, paused]));
+        match decide(&state, on()) {
+            View::Music { media, card: false } => assert_eq!(media.len(), 2, "both playing sessions"),
+            other => panic!("{other:?}"),
+        }
+        match decide(&state, Inputs { hover: true, ..on() }) {
+            View::Music { media, card: true } => assert_eq!(media.len(), 3, "the paused one too, to resume it"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
     fn a_meeting_app_on_the_mic_is_a_call_and_beats_music() {
         let mut state = State::default();
-        state.apply(Event::Media(Some(media(true))));
+        state.apply(Event::Media(vec![media(true)]));
         state.apply(Event::MicUsers(vec!["MSTeams_8wekyb3d8bbwe".into()]));
         match decide(&state, on()) {
             View::Call { holder, muted, .. } => {
@@ -264,7 +288,7 @@ mod tests {
     #[test]
     fn fullscreen_hides_all_but_red() {
         let mut state = State::default();
-        state.apply(Event::Media(Some(media(true))));
+        state.apply(Event::Media(vec![media(true)]));
         let fullscreen = Inputs { fullscreen: true, ..on() };
         assert_eq!(decide(&state, fullscreen), View::Hidden);
         state.apply(Event::MicUsers(vec![r"C:\x\recorder.exe".into()]));
@@ -275,7 +299,7 @@ mod tests {
     #[test]
     fn quiet_states_let_clicks_through() {
         assert!(View::Idle.click_through());
-        assert!(View::Music { media: media(true), card: false }.click_through());
-        assert!(!View::Music { media: media(true), card: true }.click_through());
+        assert!(View::Music { media: vec![media(true)], card: false }.click_through());
+        assert!(!View::Music { media: vec![media(true)], card: true }.click_through());
     }
 }

@@ -55,8 +55,8 @@ enum Request {
     /// Reported by an SMTC event handler.
     Changed(smtc::Change),
     Command(smtc::Command),
-    /// A transport command for the session shown anywhere (the pill), whatever the app.
-    CommandShown(smtc::Command),
+    /// A transport command for one session the pill or the flyout shows (app id), whatever the app.
+    CommandTo(String, smtc::Command),
     /// Explorer restarted (tray saw `WM_TASKBAR_RESTARTED`): shell-side state is gone.
     TaskbarRestarted,
     /// Clear the published state and toolbar, then stop. Sent by [`Handle::drop`].
@@ -77,9 +77,9 @@ impl Handle {
         let _ = self.requests.send(Request::Command(command));
     }
 
-    /// A transport command for the session the pill shows (any app).
-    pub fn command_shown(&self, command: smtc::Command) {
-        let _ = self.requests.send(Request::CommandShown(command));
+    /// A transport command for the session of `app_id` (a row on the pill or the flyout).
+    pub fn command_to(&self, app_id: &str, command: smtc::Command) {
+        let _ = self.requests.send(Request::CommandTo(app_id.to_string(), command));
     }
 
     /// Tell the feed Explorer restarted, so it re-asserts the progress bar and toolbar (their caches
@@ -160,10 +160,10 @@ pub struct Music {
     taskbar: bool,
     /// An SMTC change arrived since the last reading.
     dirty: bool,
-    /// The media last reported to the hub (`Some(None)`: reported as nothing).
-    reported: Option<Option<crate::hub::Media>>,
-    /// The site found for a browser session, by (title, artist).
-    site: Option<((String, String), Option<String>)>,
+    /// The media last reported to the hub.
+    reported: Option<Vec<crate::hub::Media>>,
+    /// The site found for browser sessions, by (title, artist).
+    sites: std::collections::HashMap<(String, String), String>,
 }
 
 impl Music {
@@ -180,7 +180,7 @@ impl Music {
             toolbar: thumbbar::Toolbar::new(),
             dirty: false,
             reported: None,
-            site: None,
+            sites: Default::default(),
         })
     }
 
@@ -217,26 +217,30 @@ impl Music {
         self.toolbar.update(playing);
     }
 
-    /// Tell the hub about the session to show anywhere, when it changed. A session with no title
-    /// yet (a track change in flight) is held back rather than shown empty.
-    fn report(&mut self, any: Option<smtc::Reading>) {
-        let site = any.as_ref().filter(|r| r.snapshot.has_track()).map(|r| self.site(&r.snapshot));
-        let media = any.filter(|r| r.snapshot.has_track()).map(|r| {
-            let cover = match (&self.reported, &r.snapshot.cover) {
-                // Same bytes: share the old allocation rather than make another.
-                (Some(Some(old)), Some(bytes)) if old.cover.as_deref().map(|c| c.as_slice()) == Some(bytes.as_slice()) => old.cover.clone(),
-                (_, cover) => cover.clone().map(Arc::new),
-            };
-            crate::hub::Media {
-                app: site.flatten().unwrap_or_else(|| crate::hub::names::app_name(&r.snapshot.app_id)),
-                app_id: r.snapshot.app_id,
-                title: r.snapshot.title,
-                artist: r.snapshot.artist,
-                playing: r.snapshot.status.is_playing(),
-                cover,
-                timeline: r.timeline,
-            }
-        });
+    /// Tell the hub about every session with a track, when anything in them changed. Sessions
+    /// with no title yet (a track change in flight) are left out by the feed.
+    fn report(&mut self, all: Vec<smtc::Reading>) {
+        let media: Vec<crate::hub::Media> = all
+            .into_iter()
+            .map(|r| {
+                let site = self.site(&r.snapshot);
+                let old = self.reported.as_ref().and_then(|old| old.iter().find(|m| m.app_id == r.snapshot.app_id));
+                let cover = match (old, &r.snapshot.cover) {
+                    // Same bytes: share the old allocation rather than make another.
+                    (Some(old), Some(bytes)) if old.cover.as_deref().map(|c| c.as_slice()) == Some(bytes.as_slice()) => old.cover.clone(),
+                    (_, cover) => cover.clone().map(Arc::new),
+                };
+                crate::hub::Media {
+                    app: site.unwrap_or_else(|| crate::hub::names::app_name(&r.snapshot.app_id)),
+                    app_id: r.snapshot.app_id,
+                    title: r.snapshot.title,
+                    artist: r.snapshot.artist,
+                    playing: r.snapshot.status.is_playing(),
+                    cover,
+                    timeline: r.timeline,
+                }
+            })
+            .collect();
         if self.reported.as_ref() != Some(&media) {
             crate::hub::emit(crate::hub::Event::Media(media.clone()));
             self.reported = Some(media);
@@ -244,30 +248,35 @@ impl Music {
     }
 
     /// For a browser's session, the site playing in it ("Twitch", "YouTube"), from the browser's
-    /// window titles; looked up once per track.
+    /// window titles; looked up once per track once found.
     fn site(&mut self, snapshot: &smtc::Snapshot) -> Option<String> {
         if !crate::hub::names::is_browser(&crate::hub::names::app_name(&snapshot.app_id)) {
             return None;
         }
         let key = (snapshot.title.clone(), snapshot.artist.clone());
-        if let Some((cached, site)) = &self.site {
-            if *cached == key {
-                return site.clone();
-            }
+        if let Some(site) = self.sites.get(&key) {
+            return Some(site.clone());
         }
         let mut found = None;
         crate::win::enum_windows(|hwnd| {
             found = crate::hub::names::site_in_window(&crate::win::window_title(hwnd), &key.0, &key.1);
             found.is_none()
         });
-        self.site = Some((key, found.clone()));
+        // Only hits are kept: a miss (the tab was not the active one) is tried again next time.
+        if let Some(site) = &found {
+            // A handful of tracks per session is plenty; start over rather than grow.
+            if self.sites.len() > 32 {
+                self.sites.clear();
+            }
+            self.sites.insert(key, site.clone());
+        }
         found
     }
 
-    /// A transport command for the session shown anywhere (the pill), whatever the app.
-    fn command_shown(&mut self, command: smtc::Command) {
-        if let Err(err) = self.feed.send_to_shown(command) {
-            eprintln!("music: {command:?} on the shown session failed: {err:#}");
+    /// A transport command for one session the pill or the flyout shows, whatever the app.
+    fn command_to(&mut self, app_id: &str, command: smtc::Command) {
+        if let Err(err) = self.feed.send_to(app_id, command) {
+            eprintln!("music: {command:?} on {app_id} failed: {err:#}");
         }
     }
 
@@ -338,7 +347,7 @@ impl Music {
                 self.dirty = true;
             }
             Request::Command(command) => self.command(command),
-            Request::CommandShown(command) => self.command_shown(command),
+            Request::CommandTo(app_id, command) => self.command_to(&app_id, command),
             Request::TaskbarRestarted => {
                 self.progress.taskbar_restarted();
                 self.toolbar.taskbar_restarted();
@@ -506,16 +515,25 @@ pub fn report_events(seconds: u64) -> Result<()> {
 #[cfg(feature = "dev")]
 fn print_reading(feed: &mut Ytm, since: f64) -> Result<()> {
     let read_at = std::time::Instant::now();
-    let (state, timeline) = feed.read()?;
+    let (_, _, all) = feed.read_with_any()?;
     let took = read_at.elapsed().as_secs_f64() * 1000.0;
-    let what = match state.snapshot() {
-        Some(s) => format!("{:?} {} — {} (cover: {})", s.status, s.title, s.artist, s.cover.as_ref().map_or(0, Vec::len)),
-        None => "<absent>".into(),
-    };
-    let length = timeline
-        .and_then(|t| t.duration_seconds())
-        .map_or_else(|| "no length".into(), |d| format!("{d:.1}s long"));
-    println!("{:>10} read in {took:.0} ms: {what}, {length} (burst began at {since:.3}s)", "->");
+    println!("{:>10} read {} session(s) in {took:.0} ms (burst began at {since:.3}s)", "->", all.len());
+    for r in &all {
+        let s = &r.snapshot;
+        let length = r
+            .timeline
+            .and_then(|t| t.duration_seconds())
+            .map_or_else(|| "no length".into(), |d| format!("{d:.1}s long"));
+        println!(
+            "{:>10} {} {:?} {} — {} (cover: {}), {length}",
+            "",
+            s.app_id,
+            s.status,
+            s.title,
+            s.artist,
+            s.cover.as_ref().map_or(0, Vec::len)
+        );
+    }
     Ok(())
 }
 

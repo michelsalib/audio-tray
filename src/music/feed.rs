@@ -36,8 +36,6 @@ pub struct Ytm {
     pinned: Option<String>,
     /// The app id the last [`Ytm::read_with_any`] settled on; commands address this rather than re-deciding.
     current_app_id: Option<String>,
-    /// The app id of the session to show anywhere (any app), from the last read.
-    shown_app_id: Option<String>,
 }
 
 impl Ytm {
@@ -46,7 +44,6 @@ impl Ytm {
             smtc: smtc::Smtc::new()?,
             pinned,
             current_app_id: None,
-            shown_app_id: None,
         })
     }
 
@@ -73,31 +70,23 @@ impl Ytm {
     }
 
     /// Read the current state and track position, remembering which session they came from, plus
-    /// the session to show whatever the app: a playing one (the followed player first), else the
-    /// followed player, else the first session.
-    pub fn read_with_any(&mut self) -> Result<(State, Option<smtc::Timeline>, Option<smtc::Reading>)> {
+    /// every session with a track, whatever the app, in Windows' order.
+    pub fn read_with_any(&mut self) -> Result<(State, Option<smtc::Timeline>, Vec<smtc::Reading>)> {
         let pinned = self.pinned.clone();
-        let [reading, any] = self.smtc.read_pair(|briefs| {
-            let followed = match pinned.as_deref() {
-                // A pinned id is an exact instruction: use that session or none.
-                Some(pinned) => briefs
-                    .iter()
-                    .position(|b| b.app_id.eq_ignore_ascii_case(pinned)),
-                None => session::pick(briefs, |b| b.app_id.as_str(), |b| b.status.is_playing()),
-            };
-            let playing = |i: &usize| briefs[*i].status.is_playing();
-            let any = followed
-                .filter(playing)
-                .or_else(|| (0..briefs.len()).find(playing))
-                .or(followed)
-                .or((!briefs.is_empty()).then_some(0));
-            [followed, any]
+        let (followed, readings) = self.smtc.read_all(|briefs| match pinned.as_deref() {
+            // A pinned id is an exact instruction: use that session or none.
+            Some(pinned) => briefs
+                .iter()
+                .position(|b| b.app_id.eq_ignore_ascii_case(pinned)),
+            None => session::pick(briefs, |b| b.app_id.as_str(), |b| b.status.is_playing()),
         })?;
+        let reading = followed.and_then(|i| readings.get(i).cloned());
+        // Windows' order, never re-sorted: rows must not swap under the pointer when one pauses.
+        let all: Vec<smtc::Reading> = readings.into_iter().filter(|r| r.snapshot.has_track()).collect();
 
-        self.shown_app_id = any.as_ref().map(|any| any.snapshot.app_id.clone());
         let Some(reading) = reading else {
             self.current_app_id = None;
-            return Ok((State::Absent, None, any));
+            return Ok((State::Absent, None, all));
         };
 
         self.current_app_id = Some(reading.snapshot.app_id.clone());
@@ -107,14 +96,11 @@ impl Ytm {
         } else {
             State::Absent
         };
-        Ok((state, reading.timeline, any))
+        Ok((state, reading.timeline, all))
     }
 
-    /// Send a transport command to the session [`Ytm::read_with_any`] picked to show.
-    pub fn send_to_shown(&self, command: Command) -> Result<bool> {
-        let Some(app_id) = self.shown_app_id.as_deref() else {
-            return Ok(false);
-        };
+    /// Send a transport command to the session of `app_id`, whatever the app (the pill's rows).
+    pub fn send_to(&self, app_id: &str, command: Command) -> Result<bool> {
         self.smtc.send(app_id, command)
     }
 

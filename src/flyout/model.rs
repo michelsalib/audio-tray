@@ -28,9 +28,11 @@ pub(super) struct Group {
     pub devices: Vec<DeviceRow>,
 }
 
-/// The Now Playing card: the media session shown anywhere (the pill's).
+/// A Now Playing card: one media session the pill shows.
 #[derive(Clone, PartialEq)]
 pub(super) struct NowPlaying {
+    /// Which session the buttons command.
+    pub app_id: String,
     pub title: String,
     pub artist: String,
     pub app: String,
@@ -65,7 +67,7 @@ pub(super) struct Model {
     pub groups: Vec<Group>,
     /// Per group: show every device (`true`) or only the selected one.
     pub expanded: Vec<bool>,
-    pub now_playing: Option<NowPlaying>,
+    pub now_playing: Vec<NowPlaying>,
     pub apps: Vec<AppRow>,
     pub voice: Option<Voice>,
     pub view: View, // which screen is shown (main panel / an icon picker)
@@ -81,7 +83,7 @@ impl Model {
     pub(super) fn new(groups: Vec<Group>, update: Option<String>) -> Self {
         Model {
             expanded: vec![false; groups.len()],
-            now_playing: None,
+            now_playing: Vec::new(),
             apps: Vec::new(),
             voice: None,
             groups,
@@ -98,11 +100,23 @@ impl Model {
 /// The Now Playing card's art size, in DIPs.
 pub(super) const ART_DIP: f32 = 52.0;
 
-/// The hub's media, sessions and call as the flyout shows them. `art_px` is the cover's size at
-/// the panel's scale; decoding is skipped when `old` already holds this track's sprite.
-pub(super) fn from_hub(state: &crate::hub::State, art_px: u32, old: Option<&NowPlaying>) -> (Option<NowPlaying>, Vec<AppRow>, Option<Voice>) {
-    let now_playing = state.media.as_ref().map(|m| {
-        let same_track = old.filter(|o| o.title == m.title && o.artist == m.artist && o.app == m.app && o.art.is_some());
+/// The hub's media, sessions and call as the flyout shows them: a Now Playing card per playing
+/// session, else for the first paused one. A card already shown (`old`) stays while its session
+/// lives, paused or not: a card vanishing on pause would slide the next one under the pointer.
+/// `art_px` is the cover's size at the panel's scale; decoding is skipped when `old` already
+/// holds a track's sprite.
+pub(super) fn from_hub(state: &crate::hub::State, art_px: u32, old: &[NowPlaying]) -> (Vec<NowPlaying>, Vec<AppRow>, Option<Voice>) {
+    let mut shown: Vec<&crate::hub::Media> = state
+        .media
+        .iter()
+        .filter(|m| m.playing || old.iter().any(|o| o.app_id == m.app_id))
+        .take(crate::hub::MAX_SHOWN)
+        .collect();
+    if shown.is_empty() {
+        shown.extend(state.media.first());
+    }
+    let now_playing = shown.into_iter().map(|m| {
+        let same_track = old.iter().find(|o| o.title == m.title && o.artist == m.artist && o.app == m.app && o.art.is_some());
         let art = match same_track {
             Some(old) => old.art.clone(),
             None => m
@@ -110,8 +124,16 @@ pub(super) fn from_hub(state: &crate::hub::State, art_px: u32, old: Option<&NowP
                 .as_ref()
                 .and_then(|bytes| crate::image::sprite(bytes, art_px, art_px as f32 * 0.15).ok()),
         };
-        NowPlaying { title: m.title.clone(), artist: m.artist.clone(), app: m.app.clone(), playing: m.playing, live: m.length_seconds().is_none(), art }
-    });
+        NowPlaying {
+            app_id: m.app_id.clone(),
+            title: m.title.clone(),
+            artist: m.artist.clone(),
+            app: m.app.clone(),
+            playing: m.playing,
+            live: m.length_seconds().is_none(),
+            art,
+        }
+    }).collect();
     let apps = state
         .sessions
         .iter()

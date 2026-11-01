@@ -633,9 +633,9 @@ impl Tray {
     fn perform(&mut self, action: crate::pill::Action) {
         use crate::pill::Action;
         match action {
-            Action::Media(command) => {
+            Action::Media(app_id, command) => {
                 if let Some(music) = self.music.as_ref() {
-                    music.command_shown(command);
+                    music.command_to(&app_id, command);
                 }
             }
             Action::ToggleMute(Some(app)) => crate::integrations::toggle_mute(app),

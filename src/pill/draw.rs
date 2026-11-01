@@ -1,5 +1,5 @@
 //! Lays out and paints each [`View`] into one composition surface, in DIPs. The progress ring's
-//! moving part is not painted here: [`Scene::ring`] says where it goes and [`super`] builds it
+//! moving part is not painted here: [`Scene::rings`] says where they go and [`super`] builds it
 //! from two half-rings the compositor rotates.
 
 use anyhow::Result;
@@ -7,13 +7,13 @@ use anyhow::Result;
 use super::gfx::{Font, Gfx, Painter, Rgba};
 use super::view::{Level, View};
 use crate::hub::Member;
+use crate::music::smtc::Command;
 
 /// Clickable parts of a scene.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Hit {
-    Previous,
-    PlayPause,
-    Next,
+    /// A transport button on the card's row for session `.0`.
+    Media(usize, Command),
     /// Anywhere on the scene: the view's [`super::view::Action`], or the call's mute.
     Whole,
 }
@@ -35,7 +35,7 @@ pub struct Scene {
     pub w: f32,
     pub h: f32,
     pub content: windows::Win32::Graphics::DirectComposition::IDCompositionVisual2,
-    pub ring: Option<Ring>,
+    pub rings: Vec<Ring>,
     pub hits: Vec<([f32; 4], Hit)>,
 }
 
@@ -75,70 +75,99 @@ pub fn scene(gfx: &Gfx, view: &View) -> Result<Option<Scene>> {
         View::Idle => {
             let (w, h) = (6.0, 56.0);
             let (content, _) = gfx.painted(w, h, |p| p.round_rect(-TUCK, 0.0, w + TUCK, h, 3.0, SLIVER))?;
-            Scene { w, h, content, ring: None, hits: Vec::new() }
+            Scene { w, h, content, rings: Vec::new(), hits: Vec::new() }
         }
         View::Music { media, card: false } => {
-            let (w, h) = (52.0, 52.0);
-            let (cx, cy) = (26.0, 26.0);
-            let live = media.length_seconds().is_none();
+            // One disc per playing session, stacked in the same pill.
+            const STEP: f32 = 44.0;
+            let w = 52.0;
+            let h = 52.0 + STEP * (media.len() as f32 - 1.0);
             let (content, _) = gfx.painted(w, h, |p| {
-                p.round_rect(-TUCK, 0.0, w + TUCK, h, h / 2.0, QUIET_BG)?;
-                art(p, media.cover.as_deref().map(|c| c.as_slice()), cx - 15.0, cy - 15.0, 30.0, None)?;
-                if live {
-                    // A stream has no end to fill a ring towards: a badge on the art instead.
-                    p.round_rect(cx - 12.0, cy + 9.0, 24.0, 11.0, 3.0, LIVE_DOT)?;
-                    p.text("LIVE", Font::Badge, (cx - 12.0, cy + 9.0, 24.0, 11.0), WHITE)?;
-                    Ok(())
-                } else {
-                    p.ring(cx, cy, 19.5, 3.0, TRACK)
-                }
-            })?;
-            let ring = (!live).then(|| Ring {
-                cx,
-                cy,
-                r: 19.5,
-                stroke: 3.0,
-                fraction: media.fraction_now().unwrap_or(0.0) as f32,
-                rate: media.length_seconds().filter(|_| media.playing).map_or(0.0, |len| (1.0 / len) as f32),
-            });
-            Scene { w, h, content, ring, hits: Vec::new() }
-        }
-        View::Music { media, card: true } => {
-            let (w, h) = (300.0, 100.0);
-            let text_x = 84.0;
-            let text_w = w - text_x - 16.0;
-            let play = if media.playing { GLYPH_PAUSE } else { GLYPH_PLAY };
-            // A live stream has nothing before or after it: play/pause only.
-            let live = media.length_seconds().is_none();
-            let buttons: Vec<(char, Hit)> = if live {
-                vec![(play, Hit::PlayPause)]
-            } else {
-                vec![(GLYPH_PREVIOUS, Hit::Previous), (play, Hit::PlayPause), (GLYPH_NEXT, Hit::Next)]
-            };
-            let (content, _) = gfx.painted(w, h, |p| {
-                p.round_rect(-TUCK, 0.0, w + TUCK, h, 18.0, NORMAL_BG)?;
-                art(p, media.cover.as_deref().map(|c| c.as_slice()), 14.0, 14.0, 60.0, Some(8.0))?;
-                p.text(&media.title, Font::Title, (text_x, 12.0, text_w, 20.0), WHITE)?;
-                p.text(&media.artist, Font::Body, (text_x, 32.0, text_w, 18.0), DIM_WHITE)?;
-                let app_w = gfx.measure(Font::Small, &media.app).min(text_w - 40.0);
-                p.text(&media.app, Font::Small, (text_x, 50.0, app_w + 2.0, 14.0), Rgba::hex(0xFFFFFF, 0.55))?;
-                if live {
-                    let x = text_x + app_w + 8.0;
-                    p.round_rect(x, 51.5, 26.0, 11.0, 3.0, LIVE_DOT)?;
-                    p.text("LIVE", Font::Badge, (x, 51.5, 26.0, 11.0), WHITE)?;
-                }
-                for (i, (glyph, _)) in buttons.iter().enumerate() {
-                    let x = text_x - 6.0 + i as f32 * 40.0;
-                    p.text(&glyph.to_string(), Font::Icons, (x, 66.0, 32.0, 28.0), WHITE)?;
+                p.round_rect(-TUCK, 0.0, w + TUCK, h, w / 2.0, QUIET_BG)?;
+                for (i, m) in media.iter().enumerate() {
+                    let (cx, cy) = (26.0, 26.0 + i as f32 * STEP);
+                    art(p, m.cover.as_deref().map(|c| c.as_slice()), cx - 15.0, cy - 15.0, 30.0, None)?;
+                    if m.length_seconds().is_none() {
+                        // A stream has no end to fill a ring towards: a badge on the art instead.
+                        p.round_rect(cx - 12.0, cy + 9.0, 24.0, 11.0, 3.0, LIVE_DOT)?;
+                        p.text("LIVE", Font::Badge, (cx - 12.0, cy + 9.0, 24.0, 11.0), WHITE)?;
+                    } else {
+                        p.ring(cx, cy, 19.5, 3.0, TRACK)?;
+                    }
                 }
                 Ok(())
             })?;
-            let hits = buttons
+            let rings = media
                 .iter()
                 .enumerate()
-                .map(|(i, (_, hit))| ([text_x - 6.0 + i as f32 * 40.0, 64.0, 32.0, 32.0], *hit))
+                .filter(|(_, m)| m.length_seconds().is_some())
+                .map(|(i, m)| Ring {
+                    cx: 26.0,
+                    cy: 26.0 + i as f32 * STEP,
+                    r: 19.5,
+                    stroke: 3.0,
+                    fraction: m.fraction_now().unwrap_or(0.0) as f32,
+                    rate: m.length_seconds().filter(|_| m.playing).map_or(0.0, |len| (1.0 / len) as f32),
+                })
                 .collect();
-            Scene { w, h, content, ring: None, hits }
+            Scene { w, h, content, rings, hits: Vec::new() }
+        }
+        View::Music { media, card: true } => {
+            // One row per session, each with its own controls.
+            const ROW: f32 = 92.0;
+            let w = 300.0;
+            let h = ROW * media.len() as f32 + 8.0;
+            let text_x = 84.0;
+            let text_w = w - text_x - 16.0;
+            let rows: Vec<(f32, Vec<(char, Command)>)> = media
+                .iter()
+                .enumerate()
+                .map(|(i, m)| {
+                    let play = if m.playing { GLYPH_PAUSE } else { GLYPH_PLAY };
+                    // A live stream has nothing before or after it: play/pause only.
+                    let buttons = if m.length_seconds().is_none() {
+                        vec![(play, Command::TogglePlayPause)]
+                    } else {
+                        vec![(GLYPH_PREVIOUS, Command::Previous), (play, Command::TogglePlayPause), (GLYPH_NEXT, Command::Next)]
+                    };
+                    (4.0 + i as f32 * ROW, buttons)
+                })
+                .collect();
+            let (content, _) = gfx.painted(w, h, |p| {
+                p.round_rect(-TUCK, 0.0, w + TUCK, h, 18.0, NORMAL_BG)?;
+                for (m, (top, buttons)) in media.iter().zip(&rows) {
+                    let top = *top;
+                    if top > 4.0 {
+                        p.round_rect(14.0, top - 1.0, w - 28.0, 1.0, 0.0, Rgba::hex(0xFFFFFF, 0.10))?;
+                    }
+                    art(p, m.cover.as_deref().map(|c| c.as_slice()), 14.0, top + 12.0, 60.0, Some(8.0))?;
+                    p.text(&m.title, Font::Title, (text_x, top + 8.0, text_w, 20.0), WHITE)?;
+                    p.text(&m.artist, Font::Body, (text_x, top + 28.0, text_w, 18.0), DIM_WHITE)?;
+                    let app_w = gfx.measure(Font::Small, &m.app).min(text_w - 40.0);
+                    p.text(&m.app, Font::Small, (text_x, top + 46.0, app_w + 2.0, 14.0), Rgba::hex(0xFFFFFF, 0.55))?;
+                    if m.length_seconds().is_none() {
+                        let x = text_x + app_w + 8.0;
+                        p.round_rect(x, top + 47.5, 26.0, 11.0, 3.0, LIVE_DOT)?;
+                        p.text("LIVE", Font::Badge, (x, top + 47.5, 26.0, 11.0), WHITE)?;
+                    }
+                    for (b, (glyph, _)) in buttons.iter().enumerate() {
+                        let x = text_x - 6.0 + b as f32 * 40.0;
+                        p.text(&glyph.to_string(), Font::Icons, (x, top + 60.0, 32.0, 28.0), WHITE)?;
+                    }
+                }
+                Ok(())
+            })?;
+            let hits = rows
+                .iter()
+                .enumerate()
+                .flat_map(|(i, (top, buttons))| {
+                    buttons
+                        .iter()
+                        .enumerate()
+                        .map(move |(b, (_, command))| ([text_x - 6.0 + b as f32 * 40.0, top + 58.0, 32.0, 32.0], Hit::Media(i, *command)))
+                })
+                .collect();
+            Scene { w, h, content, rings: Vec::new(), hits }
         }
         View::Call { app, holder, members, muted } => call(gfx, app.map(|a| a.label()).or(holder.as_deref()), members, *muted)?,
         View::Banner { level, glyph, text, .. } => {
@@ -154,7 +183,7 @@ pub fn scene(gfx: &Gfx, view: &View) -> Result<Option<Scene>> {
                 p.text(&glyph.to_string(), Font::Icons, (14.0, 0.0, 22.0, h), fg)?;
                 p.text(text, Font::Title, (46.0, 0.0, text_w + 2.0, h), fg)
             })?;
-            Scene { w, h, content, ring: None, hits: vec![([0.0, 0.0, w, h], Hit::Whole)] }
+            Scene { w, h, content, rings: Vec::new(), hits: vec![([0.0, 0.0, w, h], Hit::Whole)] }
         }
     }))
 }
@@ -218,7 +247,7 @@ fn call(gfx: &Gfx, app: Option<&str>, members: &[Member], muted: bool) -> Result
         }
         Ok(())
     })?;
-    Ok(Scene { w, h, content, ring: None, hits: vec![([0.0, 0.0, col, h], Hit::Whole)] })
+    Ok(Scene { w, h, content, rings: Vec::new(), hits: vec![([0.0, 0.0, col, h], Hit::Whole)] })
 }
 
 /// One face: the avatar, or an initial on a colour from the name; dimmed unless speaking.

@@ -52,8 +52,8 @@ pub(super) enum Elem {
     Header(&'static str),
     /// A device section's header: clicking it shows or hides the devices that are not selected.
     GroupHeader { group: usize },
-    /// The media session shown anywhere, with transport buttons ([`media_button_at`]).
-    NowPlaying,
+    /// One media session the pill shows, with transport buttons ([`media_button_at`]).
+    NowPlaying { index: usize },
     /// The call: who is in it, and the user's mute ([`over_voice_button`]).
     Voice,
     /// One app's volume in the mixer.
@@ -124,8 +124,8 @@ pub(super) fn build_view(model: &Model, scale: f32, width: i32, view: View, fill
     let mut kinds: Vec<Elem> = Vec::new();
     match view {
         View::Main => {
-            if model.now_playing.is_some() {
-                kinds.push(Elem::NowPlaying);
+            for index in 0..model.now_playing.len() {
+                kinds.push(Elem::NowPlaying { index });
             }
             if model.voice.is_some() {
                 kinds.push(Elem::Voice);
@@ -167,7 +167,7 @@ pub(super) fn build_view(model: &Model, scale: f32, width: i32, view: View, fill
         let height = match elem {
             // Later headers get a larger top gap to separate groups.
             Elem::Header(_) | Elem::GroupHeader { .. } => d(if i == 0 { HEADER_FIRST_H } else { HEADER_H }),
-            Elem::NowPlaying => d(NOW_PLAYING_H),
+            Elem::NowPlaying { .. } => d(NOW_PLAYING_H),
             Elem::Voice => d(VOICE_H),
             Elem::AppSlider { .. } => d(APP_H),
             Elem::Slider { .. } => d(SLIDER_H),
@@ -279,7 +279,7 @@ pub(super) fn elem_at(elems: &[LaidElem], y: i32) -> Option<usize> {
             le.elem,
             Elem::Slider { .. }
                 | Elem::GroupHeader { .. }
-                | Elem::NowPlaying
+                | Elem::NowPlaying { .. }
                 | Elem::Voice
                 | Elem::AppSlider { .. }
                 | Elem::Device { .. }

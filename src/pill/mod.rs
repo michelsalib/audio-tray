@@ -47,7 +47,8 @@ use view::{Inputs, View};
 /// What a click on the pill asks the tray to do.
 #[derive(Clone, PartialEq, Debug)]
 pub enum Action {
-    Media(Command),
+    /// A transport command for the session of this app id.
+    Media(String, Command),
     /// Toggle the user's mute: in the voice app, or on the default microphone.
     ToggleMute(Option<VoiceApp>),
     Unmute(Option<VoiceApp>),
@@ -93,6 +94,8 @@ struct Pill {
     loud: u32,
     quiet: u32,
     appbar: bool,
+    /// Whether the hover strip is up (see [`Pill::hoverable`]).
+    edge_up: bool,
     /// The last hub state, for re-deciding on hover, meter and fullscreen changes.
     last: State,
 }
@@ -127,6 +130,7 @@ pub fn create(config: &crate::config::Pill) -> Result<()> {
         loud: 0,
         quiet: 0,
         appbar: false,
+        edge_up: false,
         last: State::default(),
     };
     pill.register_appbar();
@@ -216,7 +220,8 @@ impl Pill {
         let state = self.last.clone();
         self.follow_meter(&state);
         let next = view::decide(&state, self.inputs);
-        if next == self.view && self.gfx.is_some() {
+        // Same state, same hover strip: nothing to repaint.
+        if next == self.view && self.gfx.is_some() && self.hoverable(&next) == self.edge_up {
             return;
         }
         let slide = std::mem::discriminant(&next) != std::mem::discriminant(&self.view) || matches!(next, View::Banner { .. });
@@ -241,6 +246,7 @@ impl Pill {
             }
             self.hits.clear();
             self._visuals.clear();
+            self.edge_up = false;
             return Ok(());
         };
         let visuals = self.compose(gfx, &scene, slide)?;
@@ -258,6 +264,7 @@ impl Pill {
             } else {
                 let _ = ShowWindow(self.edge, SW_HIDE);
             }
+            self.edge_up = self.hoverable(view);
         }
         gfx.commit()?;
         self.hits = scene.hits;
@@ -273,7 +280,7 @@ impl Pill {
             let holder = gfx.dcomp.CreateVisual()?;
             holder.AddVisual(&scene.content, false, None)?;
             let mut keep = vec![holder.clone(), scene.content.clone()];
-            if let Some(ring) = scene.ring {
+            for &ring in &scene.rings {
                 keep.extend(ring_visuals(gfx, &holder, ring)?);
             }
             gfx.root.AddVisual(&holder, false, None)?;
@@ -297,7 +304,7 @@ impl Pill {
     /// Whether the hover strip is up: on the music pill, and on the sliver while some media is
     /// paused (hovering opens its card to resume it).
     fn hoverable(&self, view: &View) -> bool {
-        matches!(view, View::Music { .. }) || (matches!(view, View::Idle) && self.last.media.is_some())
+        matches!(view, View::Music { .. }) || (matches!(view, View::Idle) && !self.last.media.is_empty())
     }
 
     /// Start or stop the 10 Hz microphone meter: it runs only while muted in a call.
@@ -350,9 +357,11 @@ impl Pill {
         let (x, y) = (x as f32 / scale, y as f32 / scale);
         let hit = self.hits.iter().find(|([hx, hy, hw, hh], _)| x >= *hx && x < hx + hw && y >= *hy && y < hy + hh).map(|(_, hit)| *hit);
         match (&self.view, hit) {
-            (View::Music { .. }, Some(Hit::Previous)) => act(Action::Media(Command::Previous)),
-            (View::Music { .. }, Some(Hit::PlayPause)) => act(Action::Media(Command::TogglePlayPause)),
-            (View::Music { .. }, Some(Hit::Next)) => act(Action::Media(Command::Next)),
+            (View::Music { media, .. }, Some(Hit::Media(i, command))) => {
+                if let Some(m) = media.get(i) {
+                    act(Action::Media(m.app_id.clone(), command));
+                }
+            }
             (View::Call { app, .. }, Some(_)) => act(Action::ToggleMute(*app)),
             (View::Banner { action, .. }, Some(_)) => match (action, right) {
                 // Right click only dismisses.

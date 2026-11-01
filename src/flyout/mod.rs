@@ -327,11 +327,11 @@ impl Flyout<'_> {
     /// mixer straight from the sessions). Returns whether the panel's rows changed shape.
     fn load_hub(&mut self) -> bool {
         let art_px = (model::ART_DIP * self.scale).round() as u32;
-        let shape = |m: &Model| (m.now_playing.is_some(), m.voice.is_some(), m.apps.len());
+        let shape = |m: &Model| (m.now_playing.len(), m.voice.is_some(), m.apps.len());
         let before = shape(&self.model);
         match crate::tray::hub_snapshot() {
             Some((generation, state)) => {
-                let (now_playing, apps, voice) = model::from_hub(&state, art_px, self.model.now_playing.as_ref());
+                let (now_playing, apps, voice) = model::from_hub(&state, art_px, &self.model.now_playing);
                 self.model.now_playing = now_playing;
                 // Mid-drag, keep the level under the finger.
                 if self.hit.drag.is_none() {
@@ -597,9 +597,12 @@ impl Flyout<'_> {
                 }
                 false
             }
-            Elem::NowPlaying => {
+            Elem::NowPlaying { index } => {
                 use crate::music::smtc::Command;
-                let live = self.model.now_playing.as_ref().is_some_and(|np| np.live);
+                let Some(app_id) = self.model.now_playing.get(index).map(|np| np.app_id.clone()) else {
+                    return false;
+                };
+                let live = self.model.now_playing.get(index).is_some_and(|np| np.live);
                 let command = match layout::media_button_at(self.surface.width, self.scale, mx) {
                     Some(1) => Command::TogglePlayPause,
                     // A live stream shows no previous/next.
@@ -608,10 +611,10 @@ impl Flyout<'_> {
                     Some(_) => Command::Next,
                     None => return false,
                 };
-                crate::tray::perform(crate::pill::Action::Media(command));
+                crate::tray::perform(crate::pill::Action::Media(app_id, command));
                 // Show the toggle at once; the hub confirms it a moment later.
                 if command == Command::TogglePlayPause {
-                    if let Some(np) = self.model.now_playing.as_mut() {
+                    if let Some(np) = self.model.now_playing.get_mut(index) {
                         np.playing = !np.playing;
                     }
                     self.render_base();
@@ -784,8 +787,8 @@ impl Flyout<'_> {
             _ => None,
         };
         let on_media = match kind {
-            Some(Elem::NowPlaying) => {
-                let live = self.model.now_playing.as_ref().is_some_and(|np| np.live);
+            Some(Elem::NowPlaying { index }) => {
+                let live = self.model.now_playing.get(index).is_some_and(|np| np.live);
                 layout::media_button_at(self.surface.width, self.scale, mx).filter(|&i| !live || i == 1)
             }
             _ => None,

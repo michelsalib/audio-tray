@@ -2,5 +2,8 @@
     "launch": {
         "configurations": [],
         "compounds": []
-    }
+    },
+    // rust-analyzer checks into target/rust-analyzer rather than target/, so its check on
+    // save never holds the lock a `cargo build` is waiting for.
+    "rust-analyzer.cargo.targetDir": true
 }

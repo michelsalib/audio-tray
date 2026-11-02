@@ -133,3 +133,9 @@ features = [
 
 [build-dependencies]
 winresource = "0.1.31"
+    # Unused here: the TAP's (crates/taskbar-tap), listed so this set is a superset of its own.
+    # Feature unification then gives `cargo build` and `cargo build --workspace` the same
+    # `windows` build, instead of two copies of the crate that each cost a cold compile.
+    "Win32_System_SystemInformation",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_WinRT",

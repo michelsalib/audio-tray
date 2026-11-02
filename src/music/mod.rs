@@ -7,6 +7,7 @@
 //! [`thumbbar`] drive the shell's own progress bar and thumbnail toolbar on the player's window.
 
 pub mod feed;
+mod local;
 pub mod player;
 pub mod progress;
 pub mod publish;
@@ -59,6 +60,8 @@ enum Request {
     CommandTo(String, smtc::Command),
     /// Explorer restarted (tray saw `WM_TASKBAR_RESTARTED`): shell-side state is gone.
     TaskbarRestarted,
+    /// Which sessions are reported changed (MPC-HC switched on): read them all again now.
+    Reread,
     /// Clear the published state and toolbar, then stop. Sent by [`Handle::drop`].
     ShutDown,
 }
@@ -86,6 +89,11 @@ impl Handle {
     /// cannot see a restart: the player's window is unchanged).
     pub fn taskbar_restarted(&self) {
         let _ = self.requests.send(Request::TaskbarRestarted);
+    }
+
+    /// Report the sessions again now, rather than on their next change.
+    pub fn reread(&self) {
+        let _ = self.requests.send(Request::Reread);
     }
 }
 // No `activate` on purpose: body clicks belong to the shell (activate/minimise, drag-to-reorder);
@@ -234,6 +242,7 @@ impl Music {
     fn report(&mut self, all: Vec<smtc::Reading>) {
         let media: Vec<crate::hub::Media> = all
             .into_iter()
+            .filter(|r| crate::integrations::mpc::followed(&r.snapshot.app_id))
             .map(|r| {
                 let site = self.site(&r.snapshot);
                 let old = self.reported.as_ref().and_then(|old| old.iter().find(|m| m.app_id == r.snapshot.app_id));
@@ -242,8 +251,10 @@ impl Music {
                     (Some(old), Some(bytes)) if old.cover.as_deref().map(|c| c.as_slice()) == Some(bytes.as_slice()) => old.cover.clone(),
                     (_, cover) => cover.clone().map(Arc::new),
                 };
+                let app = site.unwrap_or_else(|| crate::hub::names::app_name(&r.snapshot.app_id));
                 crate::hub::Media {
-                    app: site.unwrap_or_else(|| crate::hub::names::app_name(&r.snapshot.app_id)),
+                    video: r.snapshot.video || crate::hub::names::plays_video(&app),
+                    app,
                     app_id: r.snapshot.app_id,
                     title: r.snapshot.title,
                     artist: r.snapshot.artist,
@@ -419,6 +430,7 @@ impl Music {
             }
             Request::Command(command) => self.command(command),
             Request::CommandTo(app_id, command) => self.command_to(&app_id, command),
+            Request::Reread => self.poll(),
             Request::TaskbarRestarted => {
                 self.progress.taskbar_restarted();
                 self.toolbar.taskbar_restarted();

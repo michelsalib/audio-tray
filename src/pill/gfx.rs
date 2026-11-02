@@ -6,10 +6,11 @@ use anyhow::{Context, Result};
 use windows::core::{w, Interface, PCWSTR};
 use windows::Win32::Foundation::{HMODULE, HWND, POINT};
 use windows::Win32::Graphics::Direct2D::Common::{
-    D2D1_COLOR_F, D2D_RECT_F,
+    D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT, D2D_RECT_F, D2D_SIZE_U,
 };
 use windows::Win32::Graphics::Direct2D::{
-    D2D1CreateFactory, ID2D1Bitmap1, ID2D1Device, ID2D1DeviceContext, ID2D1Factory1,
+    D2D1CreateFactory, ID2D1Bitmap1, ID2D1Device, ID2D1DeviceContext, ID2D1Factory1, ID2D1RenderTarget,
+    D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, D2D1_BITMAP_PROPERTIES,
     ID2D1SolidColorBrush, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1_BITMAP_BRUSH_PROPERTIES1,
     D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_ELLIPSE, D2D1_EXTEND_MODE_CLAMP, D2D1_FACTORY_OPTIONS,
     D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC, D2D1_ROUNDED_RECT,
@@ -268,6 +269,14 @@ impl Painter<'_> {
         Ok(())
     }
 
+    /// The outline of a rounded rectangle, `stroke` wide, inside the box.
+    pub fn round_rect_outline(&mut self, (x, y, w, h): (f32, f32, f32, f32), radius: f32, stroke: f32, color: Rgba) -> Result<()> {
+        let half = stroke / 2.0;
+        let rect = D2D1_ROUNDED_RECT { rect: rect(x + half, y + half, w - stroke, h - stroke), radiusX: radius, radiusY: radius };
+        unsafe { self.dc.DrawRoundedRectangle(&rect, &self.brush(color)?, stroke, None) };
+        Ok(())
+    }
+
     pub fn circle(&mut self, cx: f32, cy: f32, r: f32, color: Rgba) -> Result<()> {
         unsafe { self.dc.FillEllipse(&ellipse(cx, cy, r), &self.brush(color)?) };
         Ok(())
@@ -279,13 +288,27 @@ impl Painter<'_> {
     }
 
     /// Only the half of a ring left (`left`) or right of its centre.
+    ///
+    /// The ends are cut a little short of the centre, so their anti-aliased edges never spill into
+    /// the other half's side, where they showed as ticks at the top and bottom. The left half's top
+    /// end is the exception and runs a little past instead: turned half a circle it meets the other
+    /// half at the bottom, where a short cut showed as a seam. The visual's own clip makes the exact
+    /// cut at the centre in both cases.
     pub fn half_ring(&mut self, cx: f32, cy: f32, r: f32, stroke: f32, color: Rgba, left: bool) -> Result<()> {
+        const PAST: f32 = 1.5;
+        const SHORT: f32 = 0.75;
         let reach = r + stroke;
-        let clip = if left { rect(cx - reach, cy - reach, reach, 2.0 * reach) } else { rect(cx, cy - reach, reach, 2.0 * reach) };
+        let clip = if left { rect(cx - reach, cy - reach, reach - SHORT, 2.0 * reach) } else { rect(cx + SHORT, cy - reach, reach - SHORT, 2.0 * reach) };
         unsafe {
+            let brush = self.brush(color)?;
             self.dc.PushAxisAlignedClip(&clip, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
-            self.dc.DrawEllipse(&ellipse(cx, cy, r), &self.brush(color)?, stroke, None);
+            self.dc.DrawEllipse(&ellipse(cx, cy, r), &brush, stroke, None);
             self.dc.PopAxisAlignedClip();
+            if left {
+                self.dc.PushAxisAlignedClip(&rect(cx - SHORT - 0.5, cy - reach, SHORT + PAST + 0.5, reach), D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+                self.dc.DrawEllipse(&ellipse(cx, cy, r), &brush, stroke, None);
+                self.dc.PopAxisAlignedClip();
+            }
         }
         Ok(())
     }
@@ -316,6 +339,37 @@ impl Painter<'_> {
             }
         }
         Ok(true)
+    }
+
+    /// A device icon in white, `size` DIPs square, centred on `(cx, cy)`: rendered as the tray
+    /// renders it, for the icons no font has.
+    pub fn icon(&mut self, icon: crate::icons::IconId, cx: f32, cy: f32, size: f32) -> Result<()> {
+        let px = (size * self.gfx.scale).round() as u32;
+        let (rgba, w, h) = icon.render(px, [0xFF, 0xFF, 0xFF])?;
+        // Straight RGBA to premultiplied BGRA.
+        let bgra: Vec<u8> = rgba
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .flat_map(|p| {
+                let m = |c: u8| ((c as u32 * p[3] as u32 + 127) / 255) as u8;
+                [m(p[2]), m(p[1]), m(p[0]), p[3]]
+            })
+            .collect();
+        let dpi = 96.0 * self.gfx.scale;
+        let props = D2D1_BITMAP_PROPERTIES {
+            pixelFormat: D2D1_PIXEL_FORMAT { format: DXGI_FORMAT_B8G8R8A8_UNORM, alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED },
+            dpiX: dpi,
+            dpiY: dpi,
+        };
+        unsafe {
+            let target: ID2D1RenderTarget = self.dc.cast()?;
+            let bitmap = target.CreateBitmap(D2D_SIZE_U { width: w, height: h }, Some(bgra.as_ptr() as *const _), w * 4, &props)?;
+            let (bw, bh) = (w as f32 / self.gfx.scale, h as f32 / self.gfx.scale);
+            let at = rect(cx - bw / 2.0, cy - bh / 2.0, bw, bh);
+            target.DrawBitmap(&bitmap, Some(&at), 1.0, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, None);
+        }
+        Ok(())
     }
 
     /// `text` in `font`, left-aligned in the box `(x, y, w, h)` (or centred, for the centred

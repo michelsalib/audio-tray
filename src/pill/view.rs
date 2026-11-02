@@ -43,7 +43,7 @@ pub struct CallPill {
 /// One default device on the pill.
 #[derive(Clone, PartialEq, Debug)]
 pub struct Device {
-    pub glyph: char,
+    pub icon: crate::icons::IconId,
     pub name: String,
     pub muted: bool,
     /// An app has the microphone open (input only).
@@ -59,7 +59,7 @@ pub struct Devices {
 
 impl Devices {
     fn of(state: &State) -> Option<Self> {
-        let device = |e: &crate::hub::Endpoint, recording: bool| Device { glyph: e.glyph, name: e.name.clone(), muted: e.muted, recording };
+        let device = |e: &crate::hub::Endpoint, recording: bool| Device { icon: e.icon, name: e.name.clone(), muted: e.muted, recording };
         let devices = Self {
             output: state.endpoints.output.as_ref().map(|e| device(e, false)),
             input: state.endpoints.input.as_ref().map(|e| device(e, state.mic_live())),
@@ -189,12 +189,13 @@ fn loudest(state: &State, inputs: Inputs) -> View {
     }
 
 
-    // On hover the card lists every session (paused ones too, to resume them from here); quiet,
-    // the pill shows the playing ones.
-    let media: Vec<Media> = if inputs.hover {
+    // The column and the card list the same sessions in the same order (paused ones too, to resume
+    // them; the column dims them), so a disc is the row it opens on. With nothing playing at all
+    // the column gives way to the quiet sliver; hovering still lists them.
+    let media: Vec<Media> = if inputs.hover || state.playing().next().is_some() {
         state.all_media().into_iter().take(crate::hub::MAX_SHOWN).cloned().collect()
     } else {
-        state.playing().cloned().collect()
+        Vec::new()
     };
     let devices = if inputs.devices { Devices::of(state) } else { None };
     let call = call_pill(state);
@@ -266,6 +267,7 @@ mod tests {
             cover: None,
             timeline: None,
             skip: true,
+            video: false,
         }
     }
 
@@ -276,7 +278,7 @@ mod tests {
     fn muted_input(state: &mut State, muted: bool) {
         state.apply(Event::Endpoints(Endpoints {
             output: None,
-            input: Some(Endpoint { id: DeviceId("mic".into()), name: "Mic".into(), muted, glyph: '\u{E720}' }),
+            input: Some(Endpoint { id: DeviceId("mic".into()), name: "Mic".into(), muted, icon: crate::icons::IconId::Microphone }),
             active_outputs: vec![],
         }));
     }
@@ -297,13 +299,13 @@ mod tests {
     }
 
     #[test]
-    fn every_playing_session_shows_and_the_card_lists_the_paused_too() {
+    fn the_column_lists_what_the_card_lists_once_something_plays() {
         let mut state = State::default();
         let twitch = Media { app_id: "MSEdge".into(), app: "Twitch".into(), ..media(true) };
         let paused = Media { app_id: "Spotify.exe".into(), ..media(false) };
         state.apply(Event::Media(vec![media(true), twitch, paused]));
         match decide(&state, on()) {
-            View::Music { media, card: false, .. } => assert_eq!(media.len(), 2, "both playing sessions"),
+            View::Music { media, card: false, .. } => assert_eq!(media.len(), 3, "the paused one too, in the card's order"),
             other => panic!("{other:?}"),
         }
         match decide(&state, Inputs { hover: true, ..on() }) {

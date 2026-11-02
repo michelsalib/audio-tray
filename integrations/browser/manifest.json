@@ -1,10 +1,10 @@
 {
   "manifest_version": 3,
   "name": "Audio Tray",
-  "version": "1.0",
+  "version": "0.13.1",
   "description": "Shows every tab playing video or audio (Twitch, YouTube...) on Audio Tray's edge pill, with play/pause.",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAwAJid1Z0ELTbHSSvW+qHYT0DWXDphMmbap3ZOKlwvL+xFK/J2u4vu28m+eZP2bAnl60LypyLogirQchK/+lF9rfZ0l0cm1YrhKTYq8Hr1uijShRNVth0iDSAfLJ7gZopJU756mwLlm41S7ODEd0/kBSrmfGWpuGjlHvCHzLplTErz/XuogRNo4LPJ/cof8HXZY20cxRN/B850SEinoJZFlrM5oTnm5NKab00t/G4wc8D6/Fmfu1AMHoWhigoGehaNg+0JdTnaGcxJ3RaN93tJH4yYlmouaIEFg4d7eZHv7YU5E/CLoH4wfr/M9M+R0qjgwtPQLU2cNYkmixqxvNwXQIDAQAB",
-  "permissions": ["nativeMessaging", "tabs"],
+  "permissions": ["nativeMessaging", "tabs", "alarms", "scripting", "storage"],
   "host_permissions": ["<all_urls>"],
   "background": { "service_worker": "background.js" },
   "content_scripts": [

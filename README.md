@@ -78,7 +78,7 @@ It installs per-user (no administrator rights required).
 > The installer is currently unsigned, so Windows SmartScreen may show an
 > "unknown publisher" prompt — choose **More info → Run anyway**.
 
-**Requirements:** Windows 10 (1903+) or Windows 11, 64-bit.
+**Requirements:** Windows 11, 64-bit.
 
 ## Usage
 
@@ -88,16 +88,22 @@ input:
 | Action | Result |
 |--------|--------|
 | Left-click a button | Switch that endpoint to the next device |
-| Right-click a button | Open the Audio Tray control flyout (volume, mute, switch output/input, pick icon, Sound settings, Quit) |
+| Right-click a button | Open the Audio Tray control flyout (volume, mute, switch output/input, pick icon, Settings, Quit) |
 | Scroll a button (wheel or touchpad) | Adjust that endpoint's volume, 2% per notch, with a level bar beside the buttons |
 | Scroll elsewhere on the taskbar | Adjust the output volume |
 
 On the fallback single tray icon, either button opens the flyout.
 
+The flyout's gear opens **Audio Tray Settings**, a normal window that stays open while you work
+elsewhere: the taskbar, the edge pill (with a map of your displays to place it on), each device's
+icon, the connectors, and About. Launching Audio Tray again (from the Start menu) while it runs
+opens the same window.
+
 ### Command-line
 
 ```
-audio-tray            run the tray (default; a second launch exits)
+audio-tray            run the tray (default; a second launch opens the running one's settings)
+audio-tray --settings run the tray and open its settings window
 audio-tray --update   check GitHub Releases and self-update now
 audio-tray --tap-version
                       which taskbar TAP is on disk — the exe and the DLL ship
@@ -141,6 +147,9 @@ enabled = true              # the edge pill
 listening_alerts = true     # the red alert when an app records outside a known call
 devices = true              # the output and input on the pill, clicked to switch
 size = "big"                # at rest: "hidden" (the sliver), "small" or "big"; hover shows all
+edge = "left"               # the screen edge it hugs: "left", "right" or "top"
+align = "center"            # where along it: "start" (top, or left), "center" or "end"
+# monitor = '\\.\DISPLAY2'  # which display; unset = the one at that edge of the desktop
 
 [discord]
 enabled = true              # Discord: RPC when client_id/client_secret are set, and the Vencord pipe
@@ -150,6 +159,11 @@ enabled = true              # Discord: RPC when client_id/client_secret are set,
 
 [browser]
 enabled = true              # register the browser extension's native messaging host
+every_site = true           # follow every tab that plays; false = only the `sites` below
+sites = ["youtube", "twitch"]  # the sites followed when not every_site (YouTube includes YouTube Music)
+
+[mpc]
+enabled = true              # follow MPC-HC (its Options > Player > Control via Windows UI must be on)
 
 [teams]
 enabled = false             # Teams: its local API (Teams > Settings > Privacy > Third-party app API),
@@ -164,12 +178,11 @@ hide_windows_mic = true     # hide Windows' "microphone in use" icon (the red do
 scroll_anywhere = true      # wheel over the whole taskbar sets the volume; false = our buttons only
 ```
 
-All of these except the integrations' details are also on the flyout's **Settings** screen (the
-gear in its footer), where they apply at once.
+All of these are in the **Settings** window (the gear in the flyout's footer), where they apply
+at once.
 
-Each `[strip]` switch also rules one shell edit out when the taskbar misbehaves. They are
-read when the buttons are placed, so restart Audio Tray after changing them; the same goes
-for the integrations.
+Each `[strip]` switch also rules one shell edit out when the taskbar misbehaves. Changed in the
+file by hand, they and the integrations are read when Audio Tray starts.
 
 ## Taskbar controls
 

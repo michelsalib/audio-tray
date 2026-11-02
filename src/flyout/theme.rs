@@ -151,12 +151,13 @@ pub(super) fn ui_font_semibold() -> Option<&'static FontVec> {
 /// The accent colour to paint: the palette's Light2 shade (what Windows uses on dark
 /// surfaces), else the DWM accent, else the Win11 default.
 pub(crate) fn accent_rgb() -> [u8; 3] {
-    accent_palette_light2().unwrap_or_else(dwm_accent_rgb)
+    accent_shade(1).unwrap_or_else(dwm_accent_rgb)
 }
 
-/// The "Light2" accent shade from `Explorer\Accent\AccentPalette` — an 8-entry RGBA blob
-/// ordered lightest→darkest `[Light3, Light2, Light1, Accent, Dark1, Dark2, Dark3, …]`.
-fn accent_palette_light2() -> Option<[u8; 3]> {
+/// Shade `index` of `Explorer\Accent\AccentPalette`, an 8-entry RGBA blob ordered
+/// lightest→darkest `[Light3, Light2, Light1, Accent, Dark1, Dark2, Dark3, …]`: Light2 (1) is what
+/// Windows paints on dark surfaces, Dark1 (4) on light ones.
+pub(crate) fn accent_shade(index: usize) -> Option<[u8; 3]> {
     use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_BINARY};
     let mut buf = [0u8; 32];
     let mut size = buf.len() as u32;
@@ -171,8 +172,8 @@ fn accent_palette_light2() -> Option<[u8; 3]> {
             Some(&mut size),
         )
     };
-    // Light2 is the second entry (bytes 4..7 = R,G,B).
-    (ok.0 == 0 && size >= 8).then(|| [buf[4], buf[5], buf[6]])
+    let at = index * 4;
+    (ok.0 == 0 && index < 8 && size as usize >= at + 4).then(|| [buf[at], buf[at + 1], buf[at + 2]])
 }
 
 /// The user's Windows accent colour from the DWM registry key (stored `AABBGGRR`).
@@ -201,12 +202,7 @@ pub(super) const GLYPH_NEXT: char = '\u{E893}';
 pub(super) const GLYPH_DOWN: char = '\u{E70D}';
 pub(super) const GLYPH_UP: char = '\u{E70E}';
 pub(super) const GLYPH_MUSIC: char = '\u{EC4F}';
+pub(super) const GLYPH_VIDEO: char = '\u{E714}';
 pub(super) const GLYPH_APP: char = '\u{E7F5}';
 pub(super) const GLYPH_APP_MUTED: char = '\u{E74F}';
 pub(super) const SPEAKING: [u8; 3] = [0x3D, 0xD6, 0x8C]; // the speaking ring, as on the pill
-
-// The settings screen.
-pub(super) const SEGMENT_W: f32 = 54.0; // one segment of the tile style choice
-pub(super) const SWITCH_W: f32 = 40.0; // a toggle switch's track
-pub(super) const SWITCH_H: f32 = 20.0;
-pub(super) const GLYPH_CHEVRON: char = '\u{E76C}'; // a link row's trailing arrow

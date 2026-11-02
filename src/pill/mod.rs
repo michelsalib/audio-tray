@@ -1,5 +1,5 @@
-//! The floating edge pill: the passive surface. It sits on the primary monitor's left edge,
-//! vertically centred, reserves no space, and shows the loudest state from [`view::decide`].
+//! The floating edge pill: the passive surface. It sits on a display's left, right or top edge
+//! (Settings > Edge pill), reserves no space, and shows the loudest state from [`view::decide`].
 //!
 //! **Nothing ticks.** Each state is painted once into a DirectComposition surface; slide-ins and
 //! the progress ring are compositor animations set once per change (the ring is two half-rings
@@ -39,7 +39,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT,
 };
 
+use crate::config::{PillAlign, PillEdge};
 use crate::hub::{State, VoiceApp};
+use crate::win::Monitor;
 use crate::music::smtc::Command;
 use draw::{Hit, Ring, Scene};
 use gfx::Gfx;
@@ -78,20 +80,34 @@ const METER_MS: u32 = 100;
 const TALK_PEAK: f32 = 0.04;
 const TALK_TICKS: u32 = 3;
 const QUIET_TICKS: u32 = 15;
-/// The hover strip's height, centred on the pill's place.
+/// The hover strip's length, centred on the pill's place.
 const EDGE_H: f32 = 160.0;
+/// The gap between the pill and the end of its edge, when pinned to one.
+const EDGE_MARGIN: f32 = 16.0;
 const SLIDE_SECONDS: f64 = 0.2;
 const GROW_SECONDS: f64 = 0.18;
 /// The card growing out of the pill, and shrinking back into it.
 const EXPAND_SECONDS: f64 = 0.22;
 const COLLAPSE_SECONDS: f64 = 0.14;
-/// A button's highlight fading in, and springing in on a press.
+/// A button's highlight fading in.
 const HIGHLIGHT_SECONDS: f64 = 0.09;
-const PRESS_SECONDS: f64 = 0.16;
 /// One-shot: the card's collapse has played.
 const COLLAPSE_TIMER: usize = 2;
 /// One beat of the speaking pulse.
 const PULSE_SECONDS: f64 = 1.1;
+
+/// The shape that lights a hovered target.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Highlight {
+    /// A ring around a cover.
+    Outline,
+    /// A round button's own disc, lightened.
+    Disc,
+    /// A glyph button's square.
+    Square,
+    /// A wide target (a device's row, a song's note).
+    Pill,
+}
 
 /// How a new scene arrives.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -134,6 +150,10 @@ struct Pill {
     gfx: Option<Gfx>,
     view: View,
     inputs: Inputs,
+    /// Where it goes: the edge, the place along it and the display.
+    side: PillEdge,
+    align: PillAlign,
+    monitor: Option<String>,
     /// Click targets of the shown scene, in DIPs from the window's origin.
     hits: Vec<([f32; 4], Hit)>,
     /// Kept alive while shown: the visuals and their animations.
@@ -190,6 +210,9 @@ pub fn create(config: &crate::config::Pill) -> Result<()> {
             fullscreen: fullscreen_now(),
             ..Default::default()
         },
+        side: config.edge,
+        align: config.align,
+        monitor: config.monitor.clone(),
         hits: Vec::new(),
         _visuals: Vec::new(),
         meter: None,
@@ -199,7 +222,7 @@ pub fn create(config: &crate::config::Pill) -> Result<()> {
         edge_up: false,
         drawn_size: None,
         scene_size: (0.0, 0.0),
-        quiet_size: (6.0, 56.0),
+        quiet_size: if config.edge.vertical() { (6.0, 56.0) } else { (56.0, 6.0) },
         highlight: None,
         hover_hit: None,
         collapsing: false,
@@ -218,7 +241,7 @@ pub fn update(state: &State) {
     });
 }
 
-/// New settings from the flyout.
+/// New settings.
 pub fn configure(config: &crate::config::Pill) {
     with_pill(|pill| {
         pill.inputs.enabled = config.enabled;
@@ -226,6 +249,15 @@ pub fn configure(config: &crate::config::Pill) {
         pill.inputs.devices = config.devices;
         pill.inputs.size = config.size;
         pill.inputs.announce_tracks = config.announce_tracks;
+        let moved = (pill.side, pill.align, &pill.monitor) != (config.edge, config.align, &config.monitor);
+        pill.side = config.edge;
+        pill.align = config.align;
+        pill.monitor = config.monitor.clone();
+        if moved {
+            // Elsewhere, the same state is drawn again from scratch (another edge tucks another side).
+            pill.quiet_size = if config.edge.vertical() { (6.0, 56.0) } else { (56.0, 6.0) };
+            pill.redraw();
+        }
         pill.refresh();
     });
 }
@@ -255,13 +287,20 @@ pub fn destroy() {
     });
 }
 
-/// A point on the desktop's left edge, for the monitor the pill lives on: the primary, unless a
-/// monitor sits to its left. Its edge would then be mid-desktop, and the hover strip would open
-/// the card whenever the pointer crossed from one screen to the other.
-fn edge_point() -> POINT {
-    use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_XVIRTUALSCREEN};
-    let left = unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) };
-    POINT { x: left.min(0), y: 0 }
+/// The display the pill goes on, as an index into `monitors`: the one the settings name, else the
+/// outermost on its edge's side of the desktop, the primary among equals. On a display with
+/// another beyond that edge, the edge is mid-desktop and the hover strip would open the card
+/// whenever the pointer crossed from one screen to the other.
+pub fn display_for(edge: PillEdge, monitor: Option<&str>, monitors: &[Monitor]) -> Option<usize> {
+    if let Some(named) = monitor.and_then(|name| monitors.iter().position(|m| m.name == name)) {
+        return Some(named);
+    }
+    let outermost = |m: &Monitor| match edge {
+        PillEdge::Left => m.rect.left,
+        PillEdge::Right => -m.rect.right,
+        PillEdge::Top => m.rect.top,
+    };
+    monitors.iter().enumerate().min_by_key(|(_, m)| (outermost(m), !m.primary)).map(|(i, _)| i)
 }
 
 fn with_pill<R>(f: impl FnOnce(&mut Pill) -> R) -> Option<R> {
@@ -338,16 +377,57 @@ impl Pill {
         self.view = next;
     }
 
+    /// Draw the shown state again from scratch: re-placed, and re-scaled for its display.
+    fn redraw(&mut self) {
+        let view = std::mem::replace(&mut self.view, View::Hidden);
+        if let Err(e) = self.show(&view, Entrance::None) {
+            eprintln!("pill: could not re-place ({e:#})");
+            self.gfx = None;
+        }
+        self.view = view;
+    }
+
+    /// The scale and work area of the display the pill goes on (see [`display_for`]).
+    fn screen(&self) -> (f32, RECT) {
+        let monitors = crate::win::monitors();
+        let centre = match display_for(self.side, self.monitor.as_deref(), &monitors) {
+            Some(i) => {
+                let r = monitors[i].rect;
+                POINT { x: (r.left + r.right) / 2, y: (r.top + r.bottom) / 2 }
+            }
+            None => POINT::default(),
+        };
+        crate::win::monitor_at(centre)
+    }
+
+    /// The point, in pixels of a `w` × `h` DIP scene, that it grows out of and shrinks back into:
+    /// on the edge, where along it the pill is pinned.
+    fn anchor(&self, (w, h): (f32, f32), scale: f32) -> (f32, f32) {
+        let along = match self.align {
+            PillAlign::Start => 0.0,
+            PillAlign::Center => 0.5,
+            PillAlign::End => 1.0,
+        };
+        let (x, y) = match self.side {
+            PillEdge::Left => (0.0, h * along),
+            PillEdge::Right => (w, h * along),
+            PillEdge::Top => (w * along, 0.0),
+        };
+        (x * scale, y * scale)
+    }
+
     /// Paint and place `view`; `slide` animates it in from the edge.
     fn show(&mut self, view: &View, entrance: Entrance) -> Result<()> {
-        let (scale, work) = crate::win::monitor_at(edge_point());
+        let (scale, work) = self.screen();
         if self.gfx.as_ref().is_none_or(|gfx| gfx.scale != scale) {
             self.gfx = Some(Gfx::new(self.hwnd, scale)?);
         }
         let gfx = self.gfx.as_ref().expect("just built");
         let small = self.inputs.size == crate::config::PillSize::Small;
         self.drawn_size = Some(self.inputs.size);
-        let Some(scene) = draw::scene(gfx, view, small)? else {
+        // At the start of an edge there is no room before the pills for a song's note.
+        let place = draw::Place { edge: self.side, note_after: self.align == PillAlign::Start };
+        let Some(scene) = draw::scene(gfx, view, small, place)? else {
             unsafe {
                 let _ = ShowWindow(self.hwnd, SW_HIDE);
                 let _ = ShowWindow(self.edge, SW_HIDE);
@@ -360,18 +440,35 @@ impl Pill {
         let visuals = self.compose(gfx, &scene, entrance)?;
         let px = |v: f32| (v * scale).round() as i32;
         let (w, h) = (px(scene.w), px(scene.h));
-        let x = work.left;
-        // Centred on what stays (the pills), whatever sits above it (a song's note): the pills
+        let vertical = self.side.vertical();
+        let (start, end) = if vertical { (work.top, work.bottom) } else { (work.left, work.right) };
+        let len = if vertical { h } else { w };
+        // Placed by what stays (the pills), whatever comes before it (a song's note): the pills
         // never move for it.
         let lead = px(scene.lead);
-        let y = work.top + (work.bottom - work.top - (h - lead)) / 2 - lead;
+        let along = match self.align {
+            PillAlign::Start => start + px(EDGE_MARGIN),
+            PillAlign::Center => start + (end - start - (len - lead)) / 2 - lead,
+            PillAlign::End => end - px(EDGE_MARGIN) - len,
+        };
+        let (x, y) = match self.side {
+            PillEdge::Left => (work.left, along),
+            PillEdge::Right => (work.right - w, along),
+            PillEdge::Top => (along, work.top),
+        };
         unsafe {
             set_click_through(self.hwnd, view.click_through());
             SetWindowPos(self.hwnd, Some(HWND_TOPMOST), x, y, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW)?;
             if self.hoverable(view) {
-                let edge_h = px(EDGE_H).max(h);
-                let edge_y = work.top + (work.bottom - work.top - edge_h) / 2;
-                SetWindowPos(self.edge, Some(HWND_TOPMOST), x, edge_y, 2, edge_h, SWP_NOACTIVATE | SWP_SHOWWINDOW)?;
+                // Centred on the pills, kept on the edge.
+                let strip = px(EDGE_H).max(len - lead);
+                let strip_at = (along + lead + (len - lead) / 2 - strip / 2).clamp(start, (end - strip).max(start));
+                let (sx, sy, sw, sh) = match self.side {
+                    PillEdge::Left => (work.left, strip_at, 2, strip),
+                    PillEdge::Right => (work.right - 2, strip_at, 2, strip),
+                    PillEdge::Top => (strip_at, work.top, strip, 2),
+                };
+                SetWindowPos(self.edge, Some(HWND_TOPMOST), sx, sy, sw, sh, SWP_NOACTIVATE | SWP_SHOWWINDOW)?;
             } else {
                 let _ = ShowWindow(self.edge, SW_HIDE);
             }
@@ -399,11 +496,12 @@ impl Pill {
         };
         let (w, h) = self.scene_size;
         let (qw, qh) = self.quiet_size;
+        let (ax, ay) = self.anchor((w, h), gfx.scale);
         let shrank = (|| -> Result<()> {
             unsafe {
                 let scale = gfx.dcomp.CreateScaleTransform()?;
-                scale.SetCenterX2(0.0)?;
-                scale.SetCenterY2(h * gfx.scale / 2.0)?;
+                scale.SetCenterX2(ax)?;
+                scale.SetCenterY2(ay)?;
                 let sx = gfx.dcomp.CreateAnimation()?;
                 ease_out(&sx, 1.0, (qw / w).clamp(0.05, 1.0), COLLAPSE_SECONDS)?;
                 let sy = gfx.dcomp.CreateAnimation()?;
@@ -469,22 +567,42 @@ impl Pill {
                     holder.RemoveVisual(old)?;
                 }
                 let Some(i) = index else { return Ok(None) };
-                let [x, y, w, h] = self.hits[i].0;
-                let (x, y, w, h) = (x + 2.0, y + 2.0, w - 4.0, h - 4.0);
-                let alpha = if pressed { 0.24 } else { 0.12 };
-                let (visual, _) = gfx.painted(w, h, |p| p.round_rect(0.0, 0.0, w, h, (w.min(h) / 2.0).min(14.0), gfx::Rgba::hex(0xFFFFFF, alpha)))?;
-                visual.SetOffsetX2(x * gfx.scale)?;
-                visual.SetOffsetY2(y * gfx.scale)?;
-                if pressed {
-                    let scale = gfx.dcomp.CreateScaleTransform()?;
-                    scale.SetCenterX2(w * gfx.scale / 2.0)?;
-                    scale.SetCenterY2(h * gfx.scale / 2.0)?;
-                    let spring = gfx.dcomp.CreateAnimation()?;
-                    ease_out(&spring, 0.82, 1.0, PRESS_SECONDS)?;
-                    scale.SetScaleX(&spring)?;
-                    scale.SetScaleY(&spring)?;
-                    visual.SetTransform(&scale)?;
-                } else {
+                let ([x, y, w, h], hit) = self.hits[i];
+                let card = matches!(self.view, View::Music { card: true, .. });
+                // Drawn over the scene, so never a wash over a picture: a cover gets an outline; a
+                // button a soft shape behind its glyph's look, its own (a disc on a disc).
+                let shape = match hit {
+                    // The quiet column's covers carry the progress ring: no outline to add there.
+                    Hit::Focus(_) if !card => return Ok(None),
+                    Hit::Focus(_) => Highlight::Outline,
+                    Hit::Device(_) | Hit::CallMute if w < 2.0 * h => Highlight::Disc,
+                    Hit::Media(..) => Highlight::Square,
+                    _ => Highlight::Pill,
+                };
+                let pad = if shape == Highlight::Outline { -3.0 } else { 2.0 };
+                let (x, y, w, h) = (x + pad, y + pad, w - 2.0 * pad, h - 2.0 * pad);
+                // Pressed is quieter than hovered, as Windows' buttons are.
+                let alpha = match (shape, pressed) {
+                    (Highlight::Outline, false) => 0.55,
+                    (Highlight::Outline, true) => 0.85,
+                    (_, false) => 0.10,
+                    (_, true) => 0.06,
+                };
+                let color = gfx::Rgba::hex(0xFFFFFF, alpha);
+                // The visual on whole pixels, what is left of the offset drawn inside it: a visual
+                // between pixels has its anti-aliased curves resampled into steps.
+                let (px, py) = ((x * gfx.scale).floor(), (y * gfx.scale).floor());
+                let (dx, dy) = (x - px / gfx.scale, y - py / gfx.scale);
+                let (visual, _) = gfx.painted(w + 1.0, h + 1.0, |p| match shape {
+                    // Concentric with the cover's own corners (8): its centre line 2 out.
+                    Highlight::Outline => p.round_rect_outline((dx, dy, w, h), 10.0, 2.0, color),
+                    Highlight::Disc => p.circle(dx + w / 2.0, dy + h / 2.0, w.min(h) / 2.0, color),
+                    Highlight::Square => p.round_rect(dx, dy, w, h, 6.0, color),
+                    Highlight::Pill => p.round_rect(dx, dy, w, h, w.min(h) / 2.0, color),
+                })?;
+                visual.SetOffsetX2(px)?;
+                visual.SetOffsetY2(py)?;
+                if !pressed {
                     let fade = gfx.dcomp.CreateAnimation()?;
                     ease_out(&fade, 0.0, 1.0, HIGHLIGHT_SECONDS)?;
                     let effect = gfx.dcomp.CreateEffectGroup()?;
@@ -545,15 +663,24 @@ impl Pill {
                 Entrance::Slide => {
                     // From just off the edge to its place, easing out.
                     let offset = gfx.dcomp.CreateAnimation()?;
-                    ease_out(&offset, -scene.w * gfx.scale, 0.0, SLIDE_SECONDS)?;
-                    holder.SetOffsetX(&offset)?;
+                    match self.side {
+                        PillEdge::Left => ease_out(&offset, -scene.w * gfx.scale, 0.0, SLIDE_SECONDS)?,
+                        PillEdge::Right => ease_out(&offset, scene.w * gfx.scale, 0.0, SLIDE_SECONDS)?,
+                        PillEdge::Top => ease_out(&offset, -scene.h * gfx.scale, 0.0, SLIDE_SECONDS)?,
+                    }
+                    if self.side.vertical() {
+                        holder.SetOffsetX(&offset)?;
+                    } else {
+                        holder.SetOffsetY(&offset)?;
+                    }
                     0.0
                 }
                 Entrance::Grow => {
-                    // Unfolds from the edge: a slight scale up from the left middle.
+                    // Unfolds from the edge: a slight scale up from where it is pinned.
+                    let (ax, ay) = self.anchor((scene.w, scene.h), gfx.scale);
                     let scale = gfx.dcomp.CreateScaleTransform()?;
-                    scale.SetCenterX2(0.0)?;
-                    scale.SetCenterY2(scene.h * gfx.scale / 2.0)?;
+                    scale.SetCenterX2(ax)?;
+                    scale.SetCenterY2(ay)?;
                     let grow = gfx.dcomp.CreateAnimation()?;
                     ease_out(&grow, 0.9, 1.0, GROW_SECONDS)?;
                     scale.SetScaleX(&grow)?;
@@ -562,10 +689,11 @@ impl Pill {
                     0.35
                 }
                 Entrance::Expand { from: (fw, fh) } => {
-                    // From the pill's own size to the card's, anchored on the edge's middle.
+                    // From the pill's own size to the card's, anchored where it is pinned.
+                    let (ax, ay) = self.anchor((scene.w, scene.h), gfx.scale);
                     let scale = gfx.dcomp.CreateScaleTransform()?;
-                    scale.SetCenterX2(0.0)?;
-                    scale.SetCenterY2(scene.h * gfx.scale / 2.0)?;
+                    scale.SetCenterX2(ax)?;
+                    scale.SetCenterY2(ay)?;
                     let sx = gfx.dcomp.CreateAnimation()?;
                     ease_out(&sx, (fw / scene.w).clamp(0.05, 1.0), 1.0, EXPAND_SECONDS)?;
                     let sy = gfx.dcomp.CreateAnimation()?;
@@ -950,13 +1078,7 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESUL
                 if hwnd != pill.hwnd {
                     return;
                 }
-                // Re-place (and re-scale) by repainting from scratch.
-                let view = std::mem::replace(&mut pill.view, View::Hidden);
-                if let Err(e) = pill.show(&view, Entrance::None) {
-                    eprintln!("pill: could not re-place ({e:#})");
-                    pill.gfx = None;
-                }
-                pill.view = view;
+                pill.redraw();
             });
             None
         }

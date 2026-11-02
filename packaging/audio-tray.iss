@@ -45,6 +45,9 @@ UninstallDisplayIcon={app}\{#AppExeName}
 UninstallDisplayName={#AppName}
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
+; Windows 11 only (build 22000): the taskbar buttons draw into its XAML taskbar, and the flyout and
+; settings follow its look. Setup refuses to run on Windows 10.
+MinVersion=10.0.22000
 OutputDir=dist
 OutputBaseFilename=AudioTray-{#AppVersion}-Setup
 ; Icon for the Setup.exe itself (the installed exe already embeds it via build.rs).

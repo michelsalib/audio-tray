@@ -37,6 +37,31 @@ pub const NAME: &str = "Browser";
 const HOST: &str = "com.audiotray.media";
 /// The extension's id, fixed by the `key` in its manifest.
 const EXTENSION_ID: &str = "eajikcpfpkjjbdfibhfnnacflhgklgll";
+/// The sites that can be followed on their own: the config's key, the name shown, and the names
+/// their tabs carry ([`crate::hub::names::site_name`]). Add a row to offer another.
+pub const SITES: &[(&str, &str, &[&str])] = &[
+    ("youtube", "YouTube", &["YouTube", "YouTube Music"]),
+    ("twitch", "Twitch", &["Twitch"]),
+];
+
+thread_local! {
+    /// The tab names followed; `None` for every site (`[browser] every_site`).
+    static FOLLOWED: std::cell::RefCell<Option<Vec<&'static str>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Follow the tabs `config` asks for. Tray thread, where tabs arrive.
+pub fn set_sites(config: &crate::config::Browser) {
+    let names = (!config.every_site).then(|| {
+        SITES.iter().filter(|(key, _, _)| config.sites.iter().any(|s| s == key)).flat_map(|(_, _, names)| names.iter().copied()).collect()
+    });
+    FOLLOWED.with(|f| *f.borrow_mut() = names);
+}
+
+/// Whether a tab whose site is named `app` is followed.
+pub fn followed(app: &str) -> bool {
+    FOLLOWED.with(|f| f.borrow().as_ref().is_none_or(|names| names.contains(&app)))
+}
+
 /// Prefix of the app id a browser tab's media carries, so commands find their way back.
 pub const APP_ID_PREFIX: &str = "browser:";
 
@@ -125,8 +150,10 @@ impl super::pipe::Handler for Tabs {
                         kept.end == fresh.end && (kept.position + moved - fresh.position).abs() < 10_000_000
                     })
                     .unwrap_or(fresh);
+                let app = crate::hub::names::site_name(&t.site);
                 Media {
-                    app: crate::hub::names::site_name(&t.site),
+                    video: crate::hub::names::plays_video(&app),
+                    app,
                     app_id,
                     title: t.title,
                     artist: t.artist,
@@ -137,10 +164,15 @@ impl super::pipe::Handler for Tabs {
                     skip: false,
                 }
             })
+            .filter(|m| followed(&m.app))
             .collect();
         let summary: Vec<String> = media
             .iter()
-            .map(|m| format!("{} on {}{}", m.artist, m.app, if m.playing { "" } else { " (paused)" }))
+            .map(|m| {
+                let at = m.timeline.map(|t| format!(" {:.0}s/{:.0}s", t.position as f64 / 1e7, (t.end - t.start) as f64 / 1e7)).unwrap_or_default();
+                let live = if m.length_seconds().is_none() { " live" } else { "" };
+                format!("{} on {}{}{live}{at}", m.artist, m.app, if m.playing { "" } else { " (paused)" })
+            })
             .collect();
         println!("browser: {} tab(s): {}", media.len(), summary.join(", "));
         self.media = media.clone();
@@ -221,6 +253,52 @@ pub fn register_host() -> Result<()> {
 
 /// The extension's folder, to load unpacked: `browser-extension` beside the installed exe, else
 /// `integrations/browser` above it (a build from the repository).
+/// The extension, built into the exe, so an update of the app (the installer or the self-update,
+/// which only replaces the exe) updates it too: see [`sync_extension`].
+const EXTENSION: [(&str, &str); 4] = [
+    ("manifest.json", include_str!("../../integrations/browser/manifest.json")),
+    ("background.js", include_str!("../../integrations/browser/background.js")),
+    ("content.js", include_str!("../../integrations/browser/content.js")),
+    ("README.md", include_str!("../../integrations/browser/README.md")),
+];
+
+/// A manifest's `version`.
+fn manifest_version(manifest: &str) -> Option<String> {
+    let json: serde_json::Value = serde_json::from_str(manifest).ok()?;
+    json.get("version")?.as_str().map(str::to_string)
+}
+
+/// The extension version this exe carries: the app's own, which `cargo release` writes into the
+/// extension's manifest (`[package.metadata.release]` in Cargo.toml).
+pub fn extension_version() -> String {
+    manifest_version(EXTENSION[0].1).unwrap_or_default()
+}
+
+/// Bring the installed extension's folder (next to the exe, where the installer puts it and the
+/// browser loads it from) to the version this exe carries, whichever way it differs: the folder is
+/// this install's own, and extensions before 0.14 were numbered apart from the app (1.0 then). A
+/// folder that is not there (a build run from the repo) is left alone. The browser picks the files up when the
+/// extension reloads itself, on the host's word (see [`run_host`]).
+pub fn sync_extension() {
+    let Some(dir) = std::env::current_exe().ok().and_then(|exe| exe.parent().map(|d| d.join("browser-extension"))) else {
+        return;
+    };
+    let Ok(installed) = std::fs::read_to_string(dir.join("manifest.json")) else {
+        return;
+    };
+    let carried = extension_version();
+    if manifest_version(&installed).as_deref() == Some(carried.as_str()) {
+        return;
+    }
+    for (name, text) in EXTENSION {
+        if let Err(e) = std::fs::write(dir.join(name), text) {
+            eprintln!("browser: could not update the extension's {name} ({e})");
+            return;
+        }
+    }
+    println!("browser: extension files updated to {carried}");
+}
+
 pub fn extension_dir() -> Option<std::path::PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let installed = exe.parent()?.join("browser-extension");
@@ -303,6 +381,15 @@ pub fn run_host() -> Result<()> {
     use std::io::{BufRead, BufReader, Read, Write};
     use std::sync::Mutex;
 
+    // The files first, then the version they are at: an older extension reloads itself onto them.
+    sync_extension();
+    {
+        let host = serde_json::json!({ "type": "host", "extension": extension_version() }).to_string();
+        let mut out = std::io::stdout().lock();
+        let _ = out.write_all(&(host.len() as u32).to_le_bytes());
+        let _ = out.write_all(host.as_bytes());
+        let _ = out.flush();
+    }
     let pipe = Arc::new(Mutex::new(None::<std::fs::File>));
     let last = Arc::new(Mutex::new(None::<String>));
     // The tray side: connect (and reconnect), replay the last list, pass commands to stdout.
@@ -359,5 +446,32 @@ pub fn run_host() -> Result<()> {
             }
         }
         *last.lock().unwrap_or_else(|p| p.into_inner()) = Some(line);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_extension_carries_the_app_version() {
+        assert_eq!(manifest_version(r#"{"version": "1.5"}"#).as_deref(), Some("1.5"));
+        // `cargo release` writes it; a manifest left behind fails here rather than ship.
+        assert_eq!(extension_version(), env!("CARGO_PKG_VERSION"), "integrations/browser/manifest.json");
+    }
+
+    #[test]
+    fn each_chosen_site_is_followed_and_nothing_else() {
+        let follows = |site: &str| followed(&crate::hub::names::site_name(site));
+        let mut config = crate::config::Browser { every_site: false, sites: vec!["twitch".into()], ..Default::default() };
+        set_sites(&config);
+        assert!(follows("www.twitch.tv"));
+        assert!(!follows("www.youtube.com") && !follows("music.youtube.com") && !follows("radio.example.org"));
+        config.sites = vec!["youtube".into()];
+        set_sites(&config);
+        assert!(follows("www.youtube.com") && follows("music.youtube.com") && !follows("www.twitch.tv"));
+        config.every_site = true;
+        set_sites(&config);
+        assert!(follows("radio.example.org"));
     }
 }

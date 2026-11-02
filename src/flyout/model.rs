@@ -41,6 +41,8 @@ pub(super) struct NowPlaying {
     pub live: bool,
     /// Previous/next reach the player.
     pub skip: bool,
+    /// A video: with no cover, a video glyph.
+    pub video: bool,
     /// The cover as a ready sprite, [`ART_DIP`] square at the panel's scale.
     pub art: Option<Vec<u8>>,
 }
@@ -63,49 +65,6 @@ pub(super) struct Voice {
     pub muted: bool,
 }
 
-/// The settings screen's values, copied from the config when the panel opens.
-#[derive(Clone, Default)]
-pub(super) struct Settings {
-    pub tile: crate::config::TileStyle,
-    pub buttons: bool,
-    pub pill: bool,
-    pub devices: bool,
-    pub size: crate::config::PillSize,
-    pub alerts: bool,
-    pub songs: bool,
-    pub browser: bool,
-    pub discord: bool,
-    pub discord_id: Option<String>,
-    /// The secret's last characters, when there is one: it is never shown whole.
-    pub discord_secret: Option<String>,
-    pub teams: bool,
-    /// Teams handed over its token: Audio Tray was allowed.
-    pub teams_paired: bool,
-}
-
-impl Settings {
-    pub(super) fn of(config: &Config) -> Self {
-        Self {
-            tile: config.music.tile_style,
-            buttons: config.strip.enabled,
-            pill: config.pill.enabled,
-            devices: config.pill.devices,
-            size: config.pill.size,
-            alerts: config.pill.listening_alerts,
-            songs: config.pill.announce_tracks,
-            browser: config.browser.enabled,
-            discord: config.discord.enabled,
-            discord_id: config.discord.client_id.clone(),
-            discord_secret: config.discord.client_secret.as_deref().map(|s| {
-                let tail: String = s.chars().rev().take(4).collect::<Vec<_>>().into_iter().rev().collect();
-                format!("••••{tail}")
-            }),
-            teams: config.teams.enabled,
-            teams_paired: config.teams.token.is_some(),
-        }
-    }
-}
-
 /// Everything the flyout paints, plus the outcome flags the caller reads back when it
 /// closes. No live audio handles — see the module docs.
 pub(super) struct Model {
@@ -115,23 +74,15 @@ pub(super) struct Model {
     pub now_playing: Vec<NowPlaying>,
     pub apps: Vec<AppRow>,
     pub voice: Option<Voice>,
-    pub settings: Settings,
     pub view: View, // which screen is shown (main panel / an icon picker)
     pub update: Option<String>, // staged update's version, if any → the footer's restart button
     pub notice: Option<&'static str>, // taskbar integration trouble, one line above the footer
-    /// Which integrations are connected, by name (the hub's), for the connectors' status.
-    pub integrations: Vec<(&'static str, bool)>,
-    /// A connector row's one-off message in place of its value (a paste that found nothing).
-    pub hint: Option<(super::layout::SettingKind, &'static str)>,
-    /// Why Discord's RPC last failed, in a few words (a missing redirect, a wrong secret).
-    pub discord_problem: Option<&'static str>,
-    /// Why Teams cannot connect (its API is off).
-    pub teams_problem: Option<&'static str>,
     // outcome, accumulated while the flyout is open
     pub config_changed: bool,
     pub quit: bool,
     pub restart: bool,
-    pub taskbar_changed: bool,
+    /// Open the settings window once the flyout has closed.
+    pub settings: bool,
 }
 
 impl Model {
@@ -141,19 +92,14 @@ impl Model {
             now_playing: Vec::new(),
             apps: Vec::new(),
             voice: None,
-            settings: Settings::default(),
             groups,
             view: View::Main,
             update,
             notice: None,
-            integrations: Vec::new(),
-            hint: None,
-            discord_problem: None,
-            teams_problem: None,
             config_changed: false,
             quit: false,
             restart: false,
-            taskbar_changed: false,
+            settings: false,
         }
     }
 }
@@ -194,6 +140,7 @@ pub(super) fn from_hub(state: &crate::hub::State, art_px: u32, old: &[NowPlaying
             playing: m.playing,
             live: m.length_seconds().is_none(),
             skip: m.skip,
+            video: m.video,
             art,
         }
     }).collect();

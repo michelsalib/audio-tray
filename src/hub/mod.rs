@@ -46,6 +46,8 @@ pub struct Media {
     /// Previous and next reach the player (not for a live stream, nor a browser tab, whose page
     /// handles them out of reach).
     pub skip: bool,
+    /// A video, not music: with no cover, it is drawn with a video glyph.
+    pub video: bool,
 }
 
 impl Media {
@@ -68,8 +70,8 @@ pub struct Endpoint {
     pub id: DeviceId,
     pub name: String,
     pub muted: bool,
-    /// The device's chosen icon, as a Segoe Fluent glyph.
-    pub glyph: char,
+    /// The device's chosen icon.
+    pub icon: crate::icons::IconId,
 }
 
 /// The default endpoints and which outputs exist, so a vanished default can be told from a switch.
@@ -430,7 +432,7 @@ mod tests {
     use super::*;
 
     fn endpoint(id: &str) -> Endpoint {
-        Endpoint { id: DeviceId(id.into()), name: id.into(), muted: false, glyph: ' ' }
+        Endpoint { id: DeviceId(id.into()), name: id.into(), muted: false, icon: crate::icons::IconId::Speakers }
     }
 
     fn endpoints(output: &str, active: &[&str]) -> Event {
@@ -493,6 +495,7 @@ mod tests {
             cover: None,
             timeline: None,
             skip: false,
+            video: false,
         }
     }
 

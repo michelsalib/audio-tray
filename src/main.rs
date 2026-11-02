@@ -6,7 +6,9 @@
 //! buttons), an acrylic control flyout, a scroll readout, and a YouTube Music tile.
 //!
 //! Modes in the release binary — what users, the installer and the updater run:
-//!   audio-tray                     run the tray (also with `--relaunched`, from `restart_app`)
+//!   audio-tray                     run the tray (also with `--relaunched`, from `restart_app`); when
+//!                                  one already runs, open its settings window instead
+//!   audio-tray --settings          the same, opening the settings window once the tray is up
 //!   audio-tray --update            check GitHub releases and self-update now (see update.rs)
 //!   audio-tray --tap-version       which TAP is on disk next to the exe
 //!   audio-tray --taskbar-restart   restart explorer.exe (frees the TAP, placing a staged one)
@@ -37,6 +39,7 @@ mod music;
 mod osd;
 mod pill;
 mod secrets;
+mod settings;
 mod taskbar;
 mod tray;
 mod update;
@@ -86,6 +89,11 @@ fn main() -> Result<()> {
             println!("taskbar: controls removed.");
         }
         _ => {
+            // Launched again (the Start menu): the running tray opens its settings. Not a relaunch,
+            // which is waiting for this tray to go.
+            if !args.iter().any(|arg| arg == instance::RELAUNCHED) && tray::forward_open_settings() {
+                return Ok(());
+            }
             // One tray per session. A second launch exits quietly once the wait runs out.
             let Some(_instance) = instance::acquire(instance::wait_budget(&args)) else {
                 eprintln!("audio-tray: already running — exiting");
@@ -93,7 +101,7 @@ fn main() -> Result<()> {
             };
             // Background self-update, applied on next launch. No-op in debug builds.
             update::spawn_background_check();
-            tray::run(backend)?;
+            tray::run(backend, args.iter().any(|arg| arg == "--settings"))?;
         }
     }
     Ok(())

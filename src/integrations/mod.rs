@@ -4,6 +4,8 @@
 //! [`crate::wait`].
 
 pub mod browser;
+pub mod edge;
+pub mod mpc;
 pub mod discord;
 pub mod discord_rpc;
 pub mod pipe;
@@ -39,6 +41,10 @@ static TEAMS_ATTEMPT: Mutex<Option<tungstenite::WebSocket<std::net::TcpStream>>>
 
 /// Start what config turns on. Tray thread, before [`crate::wait::run`].
 pub fn start(config: &Config) {
+    // An update replaced the exe: the extension's files follow, whether or not it is on.
+    browser::sync_extension();
+    browser::set_sites(&config.browser);
+    mpc::set_followed(config.mpc.enabled);
     discord_rpc::configure(&config.discord);
     if config.discord.enabled {
         start_discord();
@@ -124,6 +130,8 @@ fn serve_instance<H: pipe::Handler + 'static>(name: &'static str, handler: H, in
 /// The connectors changed in Settings (`old` to `new`): start or stop only what was switched,
 /// so a live connection is not dropped for nothing, and follow new Discord keys.
 pub fn reconfigure(old: &Config, new: &Config) {
+    browser::set_sites(&new.browser);
+    mpc::set_followed(new.mpc.enabled);
     discord_rpc::configure(&new.discord);
     if old.discord.enabled != new.discord.enabled {
         if new.discord.enabled {

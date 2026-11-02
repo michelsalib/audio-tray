@@ -23,6 +23,8 @@ const KNOWN: &[(&str, &str)] = &[
     ("zunemusic", "Media Player"),
     ("microsoft.media.player", "Media Player"),
     ("vlc", "VLC"),
+    ("mpc-hc", "MPC-HC"),
+    ("mpc-be", "MPC-BE"),
     ("msedge", "Edge"),
     ("chrome", "Chrome"),
     ("firefox", "Firefox"),
@@ -52,6 +54,17 @@ pub fn app_name(id: &str) -> String {
     } else {
         last.to_string()
     }
+}
+
+/// Players and sites that play video, by name ([`app_name`], [`site_name`]): what they play is a video
+/// whatever their session says.
+const VIDEO: &[&str] = &[
+    "MPC-HC", "MPC-BE", "YouTube", "Twitch", "Kick", "Netflix", "Prime Video", "Disney+", "Vimeo", "Dailymotion", "Crunchyroll",
+];
+
+/// Whether the player or site named `name` plays video.
+pub fn plays_video(name: &str) -> bool {
+    VIDEO.contains(&name)
 }
 
 /// Browsers, whose media session names the browser rather than the site playing in it.
@@ -151,6 +164,7 @@ mod tests {
         assert_eq!(app_name("Microsoft.WindowsSoundRecorder_8wekyb3d8bbwe"), "Sound Recorder");
         assert_eq!(app_name("Contoso.Notes_abc123"), "Contoso.Notes");
         assert_eq!(app_name("MSEdge"), "Edge");
+        assert_eq!(app_name("mpc-hc64.exe"), "MPC-HC");
     }
 
     #[test]

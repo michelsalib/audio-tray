@@ -12,17 +12,29 @@ let pushTimer = null;
 /** When the last connection was tried, so a missing host is not retried on every media event. */
 let lastTry = 0;
 
+/** While disconnected, an alarm wakes the worker to try again: a sleeping worker forgets its timers,
+ * and a tab playing a stream sends no event to wake it. */
+const RETRY = "reconnect";
+
 function connect() {
     lastTry = Date.now();
     port = chrome.runtime.connectNative(HOST);
     port.onMessage.addListener(onCommand);
     port.onDisconnect.addListener(() => {
         port = null;
-        // Audio Tray not installed or the host refused: try again in a while, not in a loop.
-        setTimeout(connect, 60000);
+        // A connection that was up went away (Audio Tray restarting for an update): back in a
+        // moment. One that never came up (not installed): every half minute, never in a loop.
+        if (Date.now() - lastTry > 5000) setTimeout(() => port || connect(), 2000);
+        chrome.alarms.create(RETRY, { periodInMinutes: 0.5 });
     });
     push();
 }
+
+chrome.alarms.onAlarm.addListener(alarm => {
+    if (alarm.name !== RETRY) return;
+    if (port) chrome.alarms.clear(RETRY);
+    else connect();
+});
 
 async function artOf(url) {
     if (!url) return null;
@@ -94,6 +106,18 @@ chrome.tabs.onRemoved.addListener(tabId => {
 });
 
 async function onCommand(message) {
+    // Audio Tray was updated and has written its copy of this extension where the browser loads it
+    // from (the extension carries the app's version): reload onto it. Once per version, so files
+    // that failed to be written cannot loop it.
+    if (message.type === "host") {
+        const mine = chrome.runtime.getManifest().version;
+        if (!message.extension || message.extension === mine) return;
+        const { reloadedFor } = await chrome.storage.local.get("reloadedFor");
+        if (reloadedFor === message.extension) return;
+        await chrome.storage.local.set({ reloadedFor: message.extension });
+        chrome.runtime.reload();
+        return;
+    }
     if (message.type !== "command") return;
     const [tabId, frameId] = message.id.split(":").map(Number);
     if (message.command === "focus") {
@@ -104,6 +128,15 @@ async function onCommand(message) {
     }
     chrome.tabs.sendMessage(tabId, { command: message.command }, { frameId }).catch(() => { });
 }
+
+// Installed, updated or reloaded: tabs already open still run the old copy of content.js, cut off
+// from this one, and the browser only injects into pages loaded from now on. Inject it into them.
+chrome.runtime.onInstalled.addListener(async () => {
+    const tabs = await chrome.tabs.query({ url: ["http://*/*", "https://*/*"] });
+    for (const tab of tabs) {
+        chrome.scripting.executeScript({ target: { tabId: tab.id, allFrames: true }, files: ["content.js"] }).catch(() => { });
+    }
+});
 
 // A restarted worker has forgotten everything: ask every frame again.
 chrome.tabs.query({}).then(tabs => {

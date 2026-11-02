@@ -121,6 +121,49 @@ pub(crate) fn monitor_at(point: windows::Win32::Foundation::POINT) -> (f32, wind
     ((dpi as f32 / 96.0).max(1.0), work)
 }
 
+/// One display, as the desktop arranges it.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Monitor {
+    /// Its device name (`\\.\DISPLAY1`), which is what the config names it by.
+    pub name: String,
+    /// Its rectangle and work area, in desktop pixels.
+    pub rect: windows::Win32::Foundation::RECT,
+    pub work: windows::Win32::Foundation::RECT,
+    pub primary: bool,
+}
+
+/// Every display, left to right then top to bottom: the order Windows numbers them in its own
+/// display settings is not exposed, so this is the order the user sees them laid out in.
+pub(crate) fn monitors() -> Vec<Monitor> {
+    use windows::Win32::Foundation::{LPARAM, RECT};
+    use windows::Win32::Graphics::Gdi::{EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFOEXW};
+    use windows_core::BOOL;
+
+    unsafe extern "system" fn visit(monitor: HMONITOR, _: HDC, _: *mut RECT, found: LPARAM) -> BOOL {
+        let found = unsafe { &mut *(found.0 as *mut Vec<Monitor>) };
+        let mut info = MONITORINFOEXW::default();
+        info.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
+        if unsafe { GetMonitorInfoW(monitor, &mut info.monitorInfo) }.as_bool() {
+            let len = info.szDevice.iter().position(|&c| c == 0).unwrap_or(info.szDevice.len());
+            found.push(Monitor {
+                name: String::from_utf16_lossy(&info.szDevice[..len]),
+                rect: info.monitorInfo.rcMonitor,
+                work: info.monitorInfo.rcWork,
+                // MONITORINFOF_PRIMARY
+                primary: info.monitorInfo.dwFlags & 1 != 0,
+            });
+        }
+        true.into()
+    }
+
+    let mut found: Vec<Monitor> = Vec::new();
+    unsafe {
+        let _ = EnumDisplayMonitors(None, None, Some(visit), LPARAM(&mut found as *mut _ as isize));
+    }
+    found.sort_by_key(|m| (m.rect.left, m.rect.top));
+    found
+}
+
 /// A window's title, empty when it has none.
 pub(crate) fn window_title(hwnd: windows::Win32::Foundation::HWND) -> String {
     use windows::Win32::UI::WindowsAndMessaging::GetWindowTextW;
@@ -271,19 +314,6 @@ fn natural_scrolling() -> bool {
     natural
 }
 
-#[cfg(test)]
-mod scroll_tests {
-    use super::ScrollSource;
-
-    #[test]
-    fn fine_steps_are_a_touchpad_and_keep_its_gesture_together() {
-        let mut source = ScrollSource { last_fine: None };
-        assert!(!source.touchpad(120, 0), "a whole notch alone is a wheel");
-        assert!(source.touchpad(-27, 1_000), "a fine step is a touchpad");
-        assert!(source.touchpad(-120, 1_200), "a whole notch mid-gesture stays the touchpad's");
-        assert!(!source.touchpad(120, 2_000), "a notch well after is a wheel again");
-    }
-}
 /// The full path of process `pid`'s program, if it can be queried (not for protected processes).
 pub(crate) fn process_exe(pid: u32) -> Option<String> {
     use windows::core::PWSTR;
@@ -316,4 +346,18 @@ pub(crate) fn window_exe(hwnd: windows::Win32::Foundation::HWND) -> Option<Strin
 pub(crate) fn window_process(hwnd: windows::Win32::Foundation::HWND) -> Option<String> {
     let path = window_exe(hwnd)?;
     Some(path.rsplit('\\').next().unwrap_or(&path).to_ascii_lowercase())
+}
+
+#[cfg(test)]
+mod scroll_tests {
+    use super::ScrollSource;
+
+    #[test]
+    fn fine_steps_are_a_touchpad_and_keep_its_gesture_together() {
+        let mut source = ScrollSource { last_fine: None };
+        assert!(!source.touchpad(120, 0), "a whole notch alone is a wheel");
+        assert!(source.touchpad(-27, 1_000), "a fine step is a touchpad");
+        assert!(source.touchpad(-120, 1_200), "a whole notch mid-gesture stays the touchpad's");
+        assert!(!source.touchpad(120, 2_000), "a notch well after is a wheel again");
+    }
 }

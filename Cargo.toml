@@ -18,6 +18,14 @@ authors = ["Michel Salib"]
 # (and `cargo release`) from ever trying to publish it to the registry.
 publish = false
 
+# The browser extension carries the app's version: `cargo release` writes it into the extension's
+# manifest with the bump (a test fails if the two differ). Here, not in release.toml, which every
+# workspace member reads and whose paths would be the TAP's.
+[package.metadata.release]
+pre-release-replacements = [
+    { file = "integrations/browser/manifest.json", search = '"version": "[^"]+"', replace = '"version": "{{version}}"', exactly = 1 },
+]
+
 [features]
 # Developer and diagnostic CLI modes (src/dev.rs). Off in release builds; CI builds it too.
 dev = []
@@ -129,13 +137,13 @@ features = [
     "Win32_UI_Accessibility",
     # The Credential Manager, where the integrations' secrets are kept (src/secrets.rs).
     "Win32_Security_Credentials",
-]
-
-[build-dependencies]
-winresource = "0.1.31"
     # Unused here: the TAP's (crates/taskbar-tap), listed so this set is a superset of its own.
     # Feature unification then gives `cargo build` and `cargo build --workspace` the same
     # `windows` build, instead of two copies of the crate that each cost a cold compile.
     "Win32_System_SystemInformation",
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_WinRT",
+]
+
+[build-dependencies]
+winresource = "0.1.31"

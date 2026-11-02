@@ -1,5 +1,6 @@
 //! Decode PNG or JPEG bytes (cover art, avatars) into a square straight-alpha RGBA sprite for
-//! the software canvas: centre-cropped, scaled by WIC, its corners masked.
+//! the software canvas: centre-cropped, scaled by WIC, its corners masked. And the reverse: an
+//! icon or a file's thumbnail as PNG, for the surfaces that take covers as bytes.
 
 use anyhow::{Context, Result};
 use windows::Win32::Graphics::Imaging::{
@@ -38,9 +39,6 @@ pub fn sprite(bytes: &[u8], size: u32, radius: f32) -> Result<Vec<u8>> {
 /// The icon of the program at `exe`, `px` pixels square, as PNG (what the pill decodes).
 pub fn exe_icon_png(exe: &str, px: u32) -> Result<Vec<u8>> {
     use windows::core::PCWSTR;
-    use windows::Win32::Graphics::Imaging::{GUID_ContainerFormatPng, WICBitmapEncoderNoCache};
-    use windows::Win32::System::Com::StructuredStorage::{CreateStreamOnHGlobal, GetHGlobalFromStream};
-    use windows::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
     use windows::Win32::UI::Shell::SHDefExtractIconW;
     use windows::Win32::UI::WindowsAndMessaging::{DestroyIcon, HICON};
 
@@ -50,6 +48,44 @@ pub fn exe_icon_png(exe: &str, px: u32) -> Result<Vec<u8>> {
     let png = (|| unsafe {
         let wic: IWICImagingFactory = CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER).context("WIC factory")?;
         let bitmap = wic.CreateBitmapFromHICON(icon)?;
+        encode_png(&wic, &bitmap)
+    })();
+    unsafe {
+        let _ = DestroyIcon(icon);
+    }
+    png
+}
+
+/// The shell's thumbnail of the file at `path` (a video's frame, as Explorer shows it), at most
+/// `px` pixels on a side, as PNG. Never an icon: `Err` when there is no thumbnail.
+pub fn file_thumbnail_png(path: &std::path::Path, px: u32) -> Result<Vec<u8>> {
+    use windows::Win32::Foundation::SIZE;
+    use windows::Win32::Graphics::Gdi::DeleteObject;
+    use windows::Win32::Graphics::Imaging::WICBitmapIgnoreAlpha;
+    use windows::Win32::UI::Shell::{IShellItemImageFactory, SHCreateItemFromParsingName, SIIGBF_BIGGERSIZEOK, SIIGBF_THUMBNAILONLY};
+
+    let wide = windows_core::HSTRING::from(path.as_os_str());
+    unsafe {
+        let item: IShellItemImageFactory = SHCreateItemFromParsingName(&wide, None).context("no such file")?;
+        let size = SIZE { cx: px as i32, cy: px as i32 };
+        let hbitmap = item.GetImage(size, SIIGBF_THUMBNAILONLY | SIIGBF_BIGGERSIZEOK).context("no thumbnail")?;
+        let png = (|| {
+            let wic: IWICImagingFactory = CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER).context("WIC factory")?;
+            // A video frame is opaque; the shell often leaves its alpha at 0.
+            let bitmap = wic.CreateBitmapFromHBITMAP(hbitmap, windows::Win32::Graphics::Gdi::HPALETTE::default(), WICBitmapIgnoreAlpha)?;
+            encode_png(&wic, &bitmap)
+        })();
+        let _ = DeleteObject(hbitmap.into());
+        png
+    }
+}
+
+/// `bitmap` as PNG bytes.
+fn encode_png(wic: &IWICImagingFactory, bitmap: &windows::Win32::Graphics::Imaging::IWICBitmap) -> Result<Vec<u8>> {
+    use windows::Win32::Graphics::Imaging::{GUID_ContainerFormatPng, WICBitmapEncoderNoCache};
+    use windows::Win32::System::Com::StructuredStorage::{CreateStreamOnHGlobal, GetHGlobalFromStream};
+    use windows::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
+    unsafe {
         let stream = CreateStreamOnHGlobal(Default::default(), true)?;
         let encoder = wic.CreateEncoder(&GUID_ContainerFormatPng, std::ptr::null())?;
         encoder.Initialize(&stream, WICBitmapEncoderNoCache)?;
@@ -57,7 +93,7 @@ pub fn exe_icon_png(exe: &str, px: u32) -> Result<Vec<u8>> {
         encoder.CreateNewFrame(&mut frame, std::ptr::null_mut())?;
         let frame = frame.context("no PNG frame")?;
         frame.Initialize(None)?;
-        frame.WriteSource(&bitmap, std::ptr::null())?;
+        frame.WriteSource(bitmap, std::ptr::null())?;
         frame.Commit()?;
         encoder.Commit()?;
         let global = GetHGlobalFromStream(&stream)?;
@@ -67,11 +103,7 @@ pub fn exe_icon_png(exe: &str, px: u32) -> Result<Vec<u8>> {
         let bytes = std::slice::from_raw_parts(ptr, len).to_vec();
         let _ = GlobalUnlock(global);
         Ok(bytes)
-    })();
-    unsafe {
-        let _ = DestroyIcon(icon);
     }
-    png
 }
 
 /// Fade the alpha outside a rounded square, anti-aliased over one pixel.

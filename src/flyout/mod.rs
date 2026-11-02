@@ -46,8 +46,8 @@ pub struct Outcome {
     pub config_changed: bool,
     /// Relaunch the already-updated exe and exit.
     pub restart: bool,
-    /// A taskbar setting changed: the strip is to be drawn again.
-    pub taskbar_changed: bool,
+    /// Open the settings window.
+    pub settings: bool,
 }
 
 /// Where to open the flyout: centred on `cx`, its bottom at `bottom` (the tray icon's top).
@@ -158,7 +158,6 @@ unsafe fn show_inner(
     let groups = build_groups(backend, config);
     let update = crate::update::pending_version();
 
-    let settings = model::Settings::of(config);
     let mut fly = Flyout {
         backend,
         config,
@@ -166,7 +165,6 @@ unsafe fn show_inner(
         accent,
         model: Model {
             notice: crate::taskbar::current_notice(),
-            settings,
             ..Model::new(groups, update)
         },
         hit: Interaction::default(),
@@ -321,7 +319,7 @@ unsafe fn show_inner(
         quit: fly.model.quit,
         config_changed: fly.model.config_changed,
         restart: fly.model.restart,
-        taskbar_changed: fly.model.taskbar_changed,
+        settings: fly.model.settings,
     }
 }
 
@@ -345,9 +343,6 @@ impl Flyout<'_> {
                     self.model.apps = apps;
                 }
                 self.model.voice = voice;
-                self.model.integrations = state.integrations.clone();
-                self.model.discord_problem = state.problem(crate::integrations::discord_rpc::NAME);
-                self.model.teams_problem = state.problem(crate::integrations::teams::NAME);
                 self.hub_seen = generation;
             }
             None => {
@@ -384,98 +379,6 @@ impl Flyout<'_> {
         self.render_base();
         self.compose();
         self.surface.flush();
-    }
-
-    /// A click on a settings row. Pill settings apply at once; taskbar ones when the panel closes
-    /// (the strip is drawn again). Returns whether the flyout should close.
-    fn change_setting(&mut self, kind: layout::SettingKind, mx: i32) -> bool {
-        use crate::config::TileStyle;
-        use layout::SettingKind;
-        let before = self.config.clone();
-        let config = &mut *self.config;
-        self.model.hint = None;
-        match kind {
-            SettingKind::TileStyle => {
-                let Some(segment) = layout::segment_at(self.surface.width, self.scale, mx) else {
-                    return false;
-                };
-                let style = [TileStyle::Off, TileStyle::Cover, TileStyle::Full][segment];
-                if config.music.tile_style == style {
-                    return false;
-                }
-                config.music.tile_style = style;
-                self.model.taskbar_changed = true;
-            }
-            SettingKind::AudioButtons => {
-                config.strip.enabled = !config.strip.enabled;
-                self.model.taskbar_changed = true;
-            }
-            SettingKind::Pill => config.pill.enabled = !config.pill.enabled,
-            SettingKind::PillDevices => config.pill.devices = !config.pill.devices,
-            SettingKind::PillSize => {
-                use crate::config::PillSize;
-                let Some(segment) = layout::segment_at(self.surface.width, self.scale, mx) else {
-                    return false;
-                };
-                config.pill.size = [PillSize::Hidden, PillSize::Small, PillSize::Big][segment];
-            }
-            SettingKind::ListeningAlerts => config.pill.listening_alerts = !config.pill.listening_alerts,
-            SettingKind::AnnounceTracks => config.pill.announce_tracks = !config.pill.announce_tracks,
-            SettingKind::SoundSettings => {
-                open_sound_settings();
-                return true;
-            }
-            SettingKind::Connectors => {
-                // A redirect added since the last failure: try again now, not at the next call.
-                crate::integrations::discord_rpc::retry();
-                crate::integrations::poke_teams();
-                self.navigate(View::Connectors, true);
-                return false;
-            }
-            SettingKind::BrowserTabs => config.browser.enabled = !config.browser.enabled,
-            // The browser's page (for Developer mode and "Load unpacked"), then the folder over it
-            // with its path copied for that dialog. The panel steps aside.
-            SettingKind::ExtensionFolder => {
-                crate::integrations::browser::open_extensions_page();
-                if crate::integrations::browser::show_extension_dir() {
-                    return true;
-                }
-                self.model.hint = Some((kind, "Folder not found"));
-            }
-            SettingKind::Discord => config.discord.enabled = !config.discord.enabled,
-            SettingKind::Teams => config.teams.enabled = !config.teams.enabled,
-            SettingKind::DiscordId | SettingKind::DiscordSecret => {
-                match crate::win::clipboard_text() {
-                    Err(()) => self.model.hint = Some((kind, "Clipboard busy, click again")),
-                    Ok(text) => {
-                        let text = text.map(|t| t.trim().to_string()).unwrap_or_default();
-                        match paste_key(kind, &text) {
-                            Ok(()) if kind == SettingKind::DiscordId => config.discord.client_id = Some(text),
-                            Ok(()) => config.discord.client_secret = Some(text),
-                            Err(hint) => self.model.hint = Some((kind, hint)),
-                        }
-                    }
-                }
-            }
-            SettingKind::DiscordPortal => {
-                // The redirect step 2 asks for, ready to paste.
-                crate::win::set_clipboard_text(crate::integrations::discord_rpc::REDIRECT);
-                crate::win::shell_open("https://discord.com/developers/applications", None);
-                return true;
-            }
-        }
-        if (config.browser.enabled, config.discord.enabled, config.teams.enabled, &config.discord.client_id, &config.discord.client_secret)
-            != (before.browser.enabled, before.discord.enabled, before.teams.enabled, &before.discord.client_id, &before.discord.client_secret)
-        {
-            crate::integrations::reconfigure(&before, config);
-        }
-        crate::pill::configure(&config.pill);
-        self.model.settings = model::Settings::of(config);
-        self.model.config_changed = true;
-        self.render_base();
-        self.compose();
-        self.surface.flush();
-        false
     }
 
     fn set_app_level(&mut self, app: usize, level: f32) {
@@ -692,12 +595,6 @@ impl Flyout<'_> {
     /// Act on a click at button-up. Returns true if the flyout should close.
     fn activate(&mut self, i: usize, mx: i32, my: i32) -> bool {
         match self.surface.elems[i].elem {
-            Elem::Setting { kind } => {
-                if self.change_setting(kind, mx) {
-                    return true;
-                }
-                false
-            }
             Elem::GroupHeader { group } => {
                 if self.model.groups[group].devices.len() > 1 {
                     self.model.expanded[group] = !self.model.expanded[group];
@@ -775,11 +672,10 @@ impl Flyout<'_> {
                 }
                 false
             }
-            Elem::PickerHeader { .. } | Elem::SettingsHeader(_) => {
-                // The back arrow slides back a level (the picker's choice is cancelled).
+            Elem::PickerHeader { .. } => {
+                // The back arrow slides back (the picker's choice is cancelled).
                 if layout::over_back(self.scale, mx) {
-                    let up = if self.model.view == View::Connectors { View::Settings } else { View::Main };
-                    self.navigate(up, false);
+                    self.navigate(View::Main, false);
                 }
                 false
             }
@@ -799,8 +695,9 @@ impl Flyout<'_> {
             // The inert gap between footer targets (`None`) leaves the flyout open.
             Elem::Footer => match layout::footer_hit(&self.model, self.surface.width, self.scale, mx) {
                 Some(ActionKind::Settings) => {
-                    self.navigate(View::Settings, true);
-                    false
+                    // The settings window opens once the flyout has gone.
+                    self.model.settings = true;
+                    true
                 }
                 Some(ActionKind::Quit) => {
                     self.model.quit = true;
@@ -888,7 +785,7 @@ impl Flyout<'_> {
         let kind = hover.map(|i| self.surface.elems[i].elem);
         let on_pencil = matches!(kind, Some(Elem::Device { .. }))
             && layout::over_pencil(self.surface.width, self.scale, mx);
-        let on_back = matches!(kind, Some(Elem::PickerHeader { .. } | Elem::SettingsHeader(_))) && layout::over_back(self.scale, mx);
+        let on_back = matches!(kind, Some(Elem::PickerHeader { .. })) && layout::over_back(self.scale, mx);
         let on_chip = match (kind, hover) {
             (Some(Elem::IconGrid { .. }), Some(i)) => {
                 layout::grid_chip_at(self.surface.width, self.scale, mx, my, self.surface.elems[i].top)
@@ -968,38 +865,3 @@ fn beep_volume() {
     }
 }
 
-/// Open Settings ▸ System ▸ Sound.
-/// Whether the clipboard's `text` is the Discord key `kind` wants, else what to say instead.
-fn paste_key(kind: layout::SettingKind, text: &str) -> Result<(), &'static str> {
-    let id_like = (15..=21).contains(&text.len()) && text.bytes().all(|b| b.is_ascii_digit());
-    let secret_like = (24..=64).contains(&text.len()) && text.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
-    match kind {
-        layout::SettingKind::DiscordId if id_like => Ok(()),
-        layout::SettingKind::DiscordId if secret_like => Err("That is the secret"),
-        layout::SettingKind::DiscordId => Err("Copy the ID first"),
-        _ if id_like => Err("That is the ID"),
-        _ if secret_like => Ok(()),
-        _ => Err("Copy the secret first"),
-    }
-}
-
-fn open_sound_settings() {
-    crate::win::shell_open("ms-settings:sound", None);
-}
-
-#[cfg(test)]
-mod tests {
-    use super::layout::SettingKind;
-    use super::paste_key;
-
-    #[test]
-    fn a_pasted_key_must_look_like_the_one_asked_for() {
-        let (id, secret) = ("1234567890123456789", "abcdEFGH1234ijklMNOP5678qrstUVWX");
-        assert_eq!(paste_key(SettingKind::DiscordId, id), Ok(()));
-        assert_eq!(paste_key(SettingKind::DiscordSecret, secret), Ok(()));
-        assert_eq!(paste_key(SettingKind::DiscordId, secret), Err("That is the secret"));
-        assert_eq!(paste_key(SettingKind::DiscordSecret, id), Err("That is the ID"));
-        assert!(paste_key(SettingKind::DiscordId, "").is_err());
-        assert!(paste_key(SettingKind::DiscordSecret, "https://discord.com/developers").is_err());
-    }
-}

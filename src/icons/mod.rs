@@ -51,6 +51,11 @@ impl IconId {
         IconId::Unknown,
     ];
 
+    /// Drawn by hand, not a font's glyph: see [`IconId::render`].
+    pub fn drawn(self) -> bool {
+        matches!(self, IconId::WirelessEarbuds | IconId::RoundEarbuds)
+    }
+
     /// Segoe Fluent code point; the earbud variants are hand-drawn and return headphones here.
     pub fn glyph(self) -> char {
         match self {

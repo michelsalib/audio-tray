@@ -50,6 +50,8 @@ pub struct Snapshot {
     pub title: String,
     pub artist: String,
     pub status: PlaybackStatus,
+    /// The app says it plays a video, not music.
+    pub video: bool,
     /// Cover art bytes as published (PNG or JPEG: read the magic). `None` if none published.
     pub cover: Option<Vec<u8>>,
 }
@@ -59,6 +61,7 @@ pub struct Snapshot {
 pub struct Brief {
     pub app_id: String,
     pub status: PlaybackStatus,
+    pub video: bool,
 }
 
 /// One poll's answer: the chosen session and its timeline, from one enumeration.
@@ -285,7 +288,7 @@ impl Smtc {
             .iter()
             .zip(&briefs)
             .map(|(session, brief)| {
-                let mut snapshot = Snapshot { app_id: brief.app_id.clone(), status: brief.status, ..Default::default() };
+                let mut snapshot = Snapshot { app_id: brief.app_id.clone(), status: brief.status, video: brief.video, ..Default::default() };
                 read_properties_into(session, &mut snapshot, Some(covers.entry(brief.app_id.clone()).or_default()));
                 Reading { snapshot, timeline: read_timeline(session) }
             })
@@ -342,6 +345,7 @@ fn read_session(session: &Session) -> Result<Snapshot> {
     let mut snapshot = Snapshot {
         app_id: brief.app_id,
         status: brief.status,
+        video: brief.video,
         ..Default::default()
     };
     read_properties_into(session, &mut snapshot, None);
@@ -362,6 +366,7 @@ fn read_brief(session: &Session) -> Brief {
         if let Ok(status) = info.PlaybackStatus() {
             brief.status = PlaybackStatus::from_winrt(status);
         }
+        brief.video = info.PlaybackType().and_then(|t| t.Value()).is_ok_and(|t| t == windows::Media::MediaPlaybackType::Video);
     }
     brief
 }
@@ -372,9 +377,12 @@ fn read_properties_into(session: &Session, snapshot: &mut Snapshot, covers: Opti
         if let Ok(props) = op.get() {
             snapshot.title = props.Title().map(|s| s.to_string()).unwrap_or_default();
             snapshot.artist = props.Artist().map(|s| s.to_string()).unwrap_or_default();
+            // None published: a local file's own thumbnail, for the players this can find it for.
+            let (app_id, title) = (snapshot.app_id.clone(), snapshot.title.clone());
+            let read = || read_thumbnail(&props).or_else(|| super::local::thumbnail(&app_id, &title));
             snapshot.cover = match covers {
-                Some(covers) => covers.cover(CoverKey::of(snapshot), || read_thumbnail(&props)),
-                None => read_thumbnail(&props),
+                Some(covers) => covers.cover(CoverKey::of(snapshot), read),
+                None => read(),
             };
         }
     }

@@ -210,8 +210,9 @@ fn with_tray<R>(f: impl FnOnce(&mut Tray) -> R) -> Option<R> {
     TRAY.with(|cell| cell.try_borrow_mut().ok().and_then(|mut tray| tray.as_mut().map(f)))
 }
 
-/// Build the tray icon and run the message loop until the user quits.
-pub fn run(backend: WasapiBackend) -> Result<()> {
+/// Build the tray icon and run the message loop until the user quits; `settings` opens the settings
+/// window once it is up.
+pub fn run(backend: WasapiBackend, settings: bool) -> Result<()> {
     let config = Config::load();
 
     // First: everything below posts here, and the TAP needs a receiver before the strip exists.
@@ -278,12 +279,16 @@ pub fn run(backend: WasapiBackend) -> Result<()> {
         })
     });
     with_tray(Tray::refresh);
+    if settings {
+        post(crate::settings::WM_OPEN_SETTINGS, 0, 0);
+    }
 
     // The integrations' handles are waited on beside the message queue (see `wait`).
     crate::integrations::start(&with_tray(|tray| tray.config.clone()).unwrap_or_default());
     crate::wait::run();
     crate::integrations::stop();
 
+    crate::settings::destroy();
     crate::pill::destroy();
     // The progress bar sits on *another app's* button, so it has to come off here, while this
     // thread still pumps; dropping the music handle below is what stops the feed re-adding it.
@@ -333,6 +338,8 @@ fn is_ours(msg: u32, wparam: usize) -> bool {
             | crate::hub::WM_HUB_EVENTS
             | sessions::WM_SESSIONS_CHANGED
             | crate::pill::WM_PILL_ACTION
+            | crate::settings::WM_SETTINGS
+            | crate::settings::WM_OPEN_SETTINGS
     ) || (msg == WM_TIMER && (wparam == crate::osd::TIMER_ID || wparam == NOTICE_TIMER))
 }
 
@@ -350,7 +357,7 @@ fn drain() {
 /// Whether a message has to wait for the flyout to close: a refresh would race the flyout's own
 /// copy of the config, and re-injecting after an Explorer restart is best done with it gone.
 fn waits_for_flyout(message: u32) -> bool {
-    matches!(message, notify::WM_AUDIO_REFRESH | WM_TASKBAR_RESTARTED)
+    matches!(message, notify::WM_AUDIO_REFRESH | WM_TASKBAR_RESTARTED | crate::settings::WM_SETTINGS)
 }
 
 /// The oldest queued message that may run now.
@@ -378,6 +385,16 @@ fn handle(msg: Queued) {
         crate::pill::WM_PILL_ACTION => {
             with_tray(Tray::pill_actions);
         }
+        crate::settings::WM_SETTINGS => match msg.wparam {
+            crate::settings::QUIT => quit(),
+            crate::settings::RESTART => {
+                with_tray(|tray| restart_app(&tray.backend, &tray.config));
+            }
+            _ => {
+                with_tray(Tray::adopt_settings);
+            }
+        },
+        crate::settings::WM_OPEN_SETTINGS => open_settings(),
         WM_TIMER if msg.wparam == NOTICE_TIMER => {
             with_tray(Tray::expire_notices);
         }
@@ -531,22 +548,36 @@ fn open_flyout(anchor: Option<flyout::Anchor>) {
             if let Err(e) = tray.config.save() {
                 eprintln!("save config failed: {e:#}");
             }
-            crate::pill::configure(&tray.config.pill);
-            if outcome.taskbar_changed {
-                tray.apply_taskbar();
-            }
             tray.refresh();
+            crate::settings::sync(&tray.config);
         }
         if outcome.restart {
             restart_app(&tray.backend, &tray.config);
         }
-        if outcome.quit {
-            // Put the taskbar back before we go. The TAP's owner watch would do it too, but asking
-            // means a normal quit tidies up promptly instead of racing our own teardown.
-            taskbar::revert(std::process::id());
-            unsafe { PostQuitMessage(0) };
-        }
     });
+    if outcome.quit {
+        quit();
+    }
+    if outcome.settings {
+        open_settings();
+    }
+}
+
+/// Put the taskbar back and end the message loop. The TAP's owner watch would revert it too, but
+/// asking means a normal quit tidies up promptly instead of racing our own teardown.
+fn quit() {
+    taskbar::revert(std::process::id());
+    unsafe { PostQuitMessage(0) };
+}
+
+/// Open the settings window on the tray's config (or bring it to the front).
+fn open_settings() {
+    if let Some(config) = with_tray(|tray| {
+        tray.osd.hide();
+        tray.config.clone()
+    }) {
+        crate::settings::open(&config);
+    }
 }
 
 impl Tray {
@@ -564,6 +595,57 @@ impl Tray {
             eprintln!("tray: could not update the icon, will retry when the taskbar is back ({e:#})");
         }
         self.report_endpoints();
+        crate::settings::devices_changed();
+    }
+
+    /// Take the settings window's config: save it first (the TAP's init data is read from the
+    /// file), then bring along only what changed.
+    fn adopt_settings(&mut self) {
+        let Some(mut config) = crate::settings::take_pending() else {
+            return;
+        };
+        // Teams hands its token to the tray, never to the window.
+        config.teams.token = self.config.teams.token.clone();
+        let before = std::mem::replace(&mut self.config, config);
+        if let Err(e) = self.config.save() {
+            eprintln!("save config failed: {e:#}");
+        }
+        let c = &self.config;
+        let connectors = |c: &Config| (c.mpc.enabled, c.browser.enabled, c.browser.every_site, c.browser.sites.clone(), c.discord.enabled, c.teams.enabled, c.discord.client_id.clone(), c.discord.client_secret.clone());
+        if connectors(&before) != connectors(c) {
+            crate::integrations::reconfigure(&before, c);
+        }
+        crate::pill::configure(&c.pill);
+        // The wheel needs only the hook; the rest of the strip, and the tile, a fresh injection.
+        let drawn = |c: &Config| {
+            let s = &c.strip;
+            (s.enabled, s.next_to_wifi, s.hide_windows_volume, s.hide_windows_mic, c.music.enabled, c.music.tile_style)
+        };
+        if drawn(&before) != drawn(c) {
+            self.apply_taskbar();
+        } else if before.strip.scroll_anywhere != c.strip.scroll_anywhere {
+            hook::set_scroll_anywhere(c.strip.enabled && c.strip.scroll_anywhere);
+        }
+        if before.icons != self.config.icons {
+            self.refresh();
+        }
+        // MPC-HC's session goes at once, and comes back with a fresh reading.
+        if self.config.mpc.enabled != before.mpc.enabled {
+            if self.config.mpc.enabled {
+                if let Some(music) = &self.music {
+                    music.reread();
+                }
+            } else {
+                self.hub.media.retain(|m| crate::integrations::mpc::followed(&m.app_id));
+                self.hub_changed();
+            }
+        }
+        // Tabs now left out go at once; ones let back in come with the browser's next update.
+        let sites = |c: &Config| (c.browser.every_site, c.browser.sites.clone());
+        if sites(&self.config) != sites(&before) {
+            self.hub.browser.retain(|m| crate::integrations::browser::followed(&m.app));
+            self.hub_changed();
+        }
     }
 
     /// The taskbar settings changed: take the strip off and draw what is asked for now (a TAP
@@ -635,6 +717,7 @@ impl Tray {
         HUB_GENERATION.fetch_add(1, Ordering::SeqCst);
         let (_, next) = self.hub.expire(Instant::now());
         crate::pill::update(&self.hub);
+        crate::settings::follow(&self.hub);
         if let (Some(next), Some(window)) = (next, taskbar::receiver()) {
             // One-shot: the handler re-arms for whatever is due next.
             unsafe { SetTimer(Some(window), NOTICE_TIMER, next.as_millis() as u32 + 1, None) };
@@ -993,6 +1076,20 @@ pub(crate) fn restyle_strip(backend: &WasapiBackend, config: &Config) {
     with_tray(|tray| tray.push_strip(icons));
 }
 
+/// Ask a running tray (another process) to open its settings window, letting it come to the front.
+/// `false` when none is running.
+pub fn forward_open_settings() -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::{AllowSetForegroundWindow, GetWindowThreadProcessId};
+    crate::win::windows_by_class(tap_proto::RECEIVER_CLASS).into_iter().any(|hwnd| {
+        let mut pid = 0;
+        unsafe {
+            GetWindowThreadProcessId(hwnd, Some(&mut pid));
+            let _ = AllowSetForegroundWindow(pid);
+            PostMessageW(Some(hwnd), crate::settings::WM_OPEN_SETTINGS, WPARAM(0), LPARAM(0)).is_ok()
+        }
+    })
+}
+
 /// Relaunch the (already self-updated on disk) exe and quit this one. Best-effort: if the
 /// relaunch fails we stay running.
 ///
@@ -1139,6 +1236,7 @@ pub(crate) fn set_teams_token(token: String) {
         if let Err(e) = tray.config.save() {
             eprintln!("teams: could not save the token ({e:#})");
         }
+        crate::settings::sync(&tray.config);
     });
 }
 
@@ -1148,9 +1246,9 @@ fn read_endpoints(backend: &WasapiBackend, config: &Config) -> crate::hub::Endpo
     let endpoint = |flow: Flow| -> Option<crate::hub::Endpoint> {
         let id = backend.default_of(flow).ok().flatten()?;
         let device = backend.enumerate_flow(flow).ok()?.into_iter().find(|d| d.id == id)?;
-        let glyph = config.icon_of(&device).glyph();
+        let icon = config.icon_of(&device);
         let muted = backend.is_muted(&id).unwrap_or(false);
-        Some(crate::hub::Endpoint { id, name: device.friendly_name, muted, glyph })
+        Some(crate::hub::Endpoint { id, name: device.friendly_name, muted, icon })
     };
     crate::hub::Endpoints {
         output: endpoint(Flow::Output),
@@ -1201,6 +1299,9 @@ mod tests {
             WM_ICON_CHECK,
             crate::hub::WM_HUB_EVENTS,
             sessions::WM_SESSIONS_CHANGED,
+            crate::pill::WM_PILL_ACTION,
+            crate::settings::WM_SETTINGS,
+            crate::settings::WM_OPEN_SETTINGS,
             tap_proto::WM_TASKBAR_ACTION,
             tap_proto::WM_TASKBAR_RESTARTED,
             tap_proto::WM_TASKBAR_SCROLL,

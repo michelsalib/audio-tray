@@ -6,6 +6,10 @@
 //!   --set <q> / --set-icon <q> <IconId>
 //!                                  switch the default output / store a device's icon
 //!   --flyout [icons|update]        preview the panel (icons = the picker, update = fake a staged update)
+//!   --pill-preview <left|right|top> <start|center|end> [secs] [small] [earbuds] [live]
+//!                                  the edge pill alone there, with a song and the devices
+//!   --settings-preview [page]      the settings window alone (taskbar, pill, devices, connectors,
+//!                                  about); changes are not applied, there is no tray to apply them
 //!   --vol <up|down|get>            nudge or read the default output volume by one scroll notch
 //!   --osd [out|in] [level%]        preview the scroll readout beside the cursor until it fades
 //!   --mic [secs]                   who holds the microphone, then watch it change
@@ -54,6 +58,8 @@ pub fn run(args: &[String], backend: &WasapiBackend) -> Result<bool> {
                 outcome.config_changed, outcome.quit, outcome.restart
             );
         }
+        Some("--pill-preview") => pill_preview(backend, &args[1..])?,
+        Some("--settings-preview") => crate::settings::preview(&Config::load(), args.get(1).map_or("", String::as_str)),
         Some("--list") => list(backend)?,
         Some("--set") => {
             let Some(query) = args.get(1) else {
@@ -290,4 +296,66 @@ fn find_device<'a>(devices: &'a [Device], query: &str) -> Result<&'a Device> {
             bail!("{query:?} is ambiguous, matches: {names:?}")
         }
     }
+}
+
+/// The edge pill at a place, showing a song and the default devices, for `secs` (default 20).
+fn pill_preview(backend: &WasapiBackend, args: &[String]) -> Result<()> {
+    use crate::config::{PillAlign, PillEdge, PillSize};
+    let mut config = Config::load().pill;
+    config.enabled = true;
+    config.devices = true;
+    config.monitor = None;
+    config.edge = match args.first().map(String::as_str) {
+        Some("right") => PillEdge::Right,
+        Some("top") => PillEdge::Top,
+        _ => PillEdge::Left,
+    };
+    config.align = match args.get(1).map(String::as_str) {
+        Some("start") => PillAlign::Start,
+        Some("end") => PillAlign::End,
+        _ => PillAlign::Center,
+    };
+    config.size = if args.iter().any(|a| a == "small") { PillSize::Small } else { PillSize::Big };
+    let secs: u64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(20);
+    crate::pill::create(&config)?;
+    let endpoint = |flow: Flow| -> Option<crate::hub::Endpoint> {
+        let id = backend.default_of(flow).ok().flatten()?;
+        let device = backend.enumerate_flow(flow).ok()?.into_iter().find(|d| d.id == id)?;
+        // `earbuds`: the hand-drawn icon, whatever the device.
+        let earbuds = args.iter().any(|a| a == "earbuds") && flow == Flow::Output;
+        let icon = if earbuds { IconId::RoundEarbuds } else { Config::load().icon_of(&device) };
+        Some(crate::hub::Endpoint { id, name: device.friendly_name, muted: false, icon })
+    };
+    let now = music::smtc::now_ticks();
+    let live = args.iter().any(|a| a == "live");
+    let mut state = crate::hub::State::default();
+    state.endpoints.output = endpoint(Flow::Output);
+    state.endpoints.input = endpoint(Flow::Input);
+    state.media.push(crate::hub::Media {
+        app_id: "preview".into(),
+        // `live`: a stream, as a Twitch tab reports it (no end, no previous or next).
+        app: if live { "Twitch" } else { "YouTube Music" }.into(),
+        title: if live { "A stream" } else { "A song" }.into(),
+        artist: "An artist".into(),
+        playing: true,
+        cover: None,
+        timeline: (!live).then_some(music::smtc::Timeline { start: 0, end: 200 * 10_000_000, position: 140 * 10_000_000, last_updated: now }),
+        skip: !live,
+        video: live,
+    });
+    crate::pill::update(&state);
+    println!("pill: {:?} {:?}, {}s", config.edge, config.align, secs);
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+    let mut msg = windows::Win32::UI::WindowsAndMessaging::MSG::default();
+    while std::time::Instant::now() < until {
+        unsafe {
+            while windows::Win32::UI::WindowsAndMessaging::PeekMessageW(&mut msg, None, 0, 0, windows::Win32::UI::WindowsAndMessaging::PM_REMOVE).as_bool() {
+                let _ = windows::Win32::UI::WindowsAndMessaging::TranslateMessage(&msg);
+                windows::Win32::UI::WindowsAndMessaging::DispatchMessageW(&msg);
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(15));
+    }
+    crate::pill::destroy();
+    Ok(())
 }

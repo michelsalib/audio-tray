@@ -17,95 +17,11 @@ pub(super) enum View {
     Main,
     /// The per-device icon chooser: a back arrow, the device name as title, and a grid.
     IconPicker { group: usize, dev: usize },
-    /// Audio Tray's settings: the taskbar and the edge pill.
-    Settings,
-    /// The connectors, a level under Settings: the browser extension and the Discord application.
-    Connectors,
 }
-
-/// One row of the settings screen.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(super) enum SettingKind {
-    /// The music tile in the player's taskbar button: off, cover, or cover and title.
-    TileStyle,
-    /// The audio buttons drawn over the notification icon.
-    AudioButtons,
-    Pill,
-    PillDevices,
-    /// How much the edge pill shows at rest: hidden, small or big.
-    PillSize,
-    /// A new song's title on the pill for a moment.
-    AnnounceTracks,
-    ListeningAlerts,
-    /// Windows' own sound settings (a link).
-    SoundSettings,
-    /// The connectors screen (a link).
-    Connectors,
-    /// Every tab's media through the browser extension (a switch, with its status).
-    BrowserTabs,
-    /// The default browser's extensions page, and the extension's folder in Explorer with its path
-    /// copied for "Load unpacked" (a link).
-    ExtensionFolder,
-    /// Discord's calls (a switch, with its status).
-    Discord,
-    /// The Discord application's id, pasted from the clipboard.
-    DiscordId,
-    /// The Discord application's secret, pasted from the clipboard.
-    DiscordSecret,
-    /// Discord's developer portal, where the application is made (a link).
-    DiscordPortal,
-    /// Teams' meetings (a switch, with its status).
-    Teams,
-}
-
-impl SettingKind {
-    pub(super) fn label(self) -> &'static str {
-        match self {
-            SettingKind::TileStyle => "Music in the player's button",
-            SettingKind::AudioButtons => "Audio buttons in the tray",
-            SettingKind::Pill => "Show the edge pill",
-            SettingKind::PillDevices => "Audio devices on the pill",
-            SettingKind::PillSize => "Pill size at rest",
-            SettingKind::AnnounceTracks => "Show each new song",
-            SettingKind::ListeningAlerts => "Alert when an app listens",
-            SettingKind::SoundSettings => "Windows sound settings",
-            SettingKind::Connectors => "Browser, Discord and Teams",
-            SettingKind::BrowserTabs => "Every tab's media",
-            SettingKind::ExtensionFolder => "Install the extension",
-            SettingKind::Discord => "Discord calls",
-            SettingKind::DiscordId => "Application ID",
-            SettingKind::DiscordSecret => "Client secret",
-            SettingKind::DiscordPortal => "1. Create an app on the developer portal",
-            SettingKind::Teams => "Teams meetings",
-        }
-    }
-
-    /// A row that opens something, drawn with a chevron.
-    pub(super) fn is_link(self) -> bool {
-        matches!(
-            self,
-            SettingKind::SoundSettings
-                | SettingKind::Connectors
-                | SettingKind::ExtensionFolder
-                | SettingKind::DiscordPortal
-        )
-    }
-}
-
-/// A segmented setting's choices, in order: the tile style's, the pill size's.
-pub(super) fn segments(kind: SettingKind) -> &'static [&'static str; 3] {
-    match kind {
-        SettingKind::PillSize => &["Hidden", "Small", "Big"],
-        _ => &["Off", "Cover", "Full"],
-    }
-}
-
-/// Every segmented setting has three choices.
-const SEGMENT_COUNT: usize = 3;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum ActionKind {
-    /// Audio Tray's own settings screen.
+    /// Audio Tray's settings window.
     Settings,
     Quit,
     /// Relaunch into an update already staged on disk. Only offered while there is one.
@@ -154,12 +70,6 @@ pub(super) enum Elem {
     Footer,
     /// One line of secondary text above the footer: [`Model::notice`].
     Note,
-    /// A line of guidance between settings (how to make the Discord application).
-    Step(&'static str),
-    /// A settings screen's header: a back arrow and its title.
-    SettingsHeader(&'static str),
-    /// One setting: a label, and a switch, a segmented choice or a link.
-    Setting { kind: SettingKind },
 }
 
 pub(super) struct LaidElem {
@@ -205,13 +115,7 @@ pub(super) fn panel_height(model: &Model, scale: f32, width: i32) -> i32 {
     } else {
         0
     };
-    let settings_h = build_view(model, scale, width, View::Settings, 0).1;
-    // Measured with every setup step, which come back when a connector drops while it shows.
-    let d = |v: f32| (v * scale).round() as i32;
-    let (discord_steps, teams_steps) = setup_steps(model);
-    let hidden = if discord_steps { 0 } else { d(ITEM_H) + 2 * d(NOTE_H) } + if teams_steps { 0 } else { 2 * d(NOTE_H) };
-    let connectors_h = build_view(model, scale, width, View::Connectors, 0).1 + hidden;
-    main_h.max(picker_h).max(settings_h).max(connectors_h)
+    main_h.max(picker_h)
 }
 
 /// Lay out the elements for `view` at `width`, returning them and the total height. The layout
@@ -252,44 +156,6 @@ pub(super) fn build_view(model: &Model, scale: f32, width: i32, view: View, fill
             kinds.push(Elem::PickerHeader { group, dev });
             kinds.push(Elem::IconGrid { group, dev });
         }
-        View::Settings => {
-            kinds.push(Elem::SettingsHeader("Settings"));
-            kinds.push(Elem::Header("Taskbar"));
-            kinds.push(Elem::Setting { kind: SettingKind::TileStyle });
-            kinds.push(Elem::Setting { kind: SettingKind::AudioButtons });
-            kinds.push(Elem::Header("Edge pill"));
-            for kind in [SettingKind::Pill, SettingKind::PillSize, SettingKind::PillDevices, SettingKind::AnnounceTracks, SettingKind::ListeningAlerts] {
-                kinds.push(Elem::Setting { kind });
-            }
-            kinds.push(Elem::Header("Connectors"));
-            kinds.push(Elem::Setting { kind: SettingKind::Connectors });
-            kinds.push(Elem::Header("Windows"));
-            kinds.push(Elem::Setting { kind: SettingKind::SoundSettings });
-        }
-        View::Connectors => {
-            kinds.push(Elem::SettingsHeader("Connectors"));
-            kinds.push(Elem::Header("Browser"));
-            for kind in [SettingKind::BrowserTabs, SettingKind::ExtensionFolder] {
-                kinds.push(Elem::Setting { kind });
-            }
-            // The setup steps go once a connector works; the keys stay, to change them.
-            let (discord_steps, teams_steps) = setup_steps(model);
-            kinds.push(Elem::Header("Discord"));
-            kinds.push(Elem::Setting { kind: SettingKind::Discord });
-            if discord_steps {
-                kinds.push(Elem::Setting { kind: SettingKind::DiscordPortal });
-                kinds.push(Elem::Step("2. In OAuth2 > Redirects, paste http://localhost (step 1 copied it)"));
-                kinds.push(Elem::Step("3. Copy its client ID and secret, and click to paste:"));
-            }
-            kinds.push(Elem::Setting { kind: SettingKind::DiscordId });
-            kinds.push(Elem::Setting { kind: SettingKind::DiscordSecret });
-            kinds.push(Elem::Header("Teams"));
-            kinds.push(Elem::Setting { kind: SettingKind::Teams });
-            if teams_steps {
-                kinds.push(Elem::Step("1. Teams: Settings > Privacy > Third-party app API"));
-                kinds.push(Elem::Step("2. In a meeting, allow Audio Tray when Teams asks"));
-            }
-        }
     }
 
     let mut elems = Vec::with_capacity(kinds.len());
@@ -307,11 +173,10 @@ pub(super) fn build_view(model: &Model, scale: f32, width: i32, view: View, fill
             Elem::AppSlider { .. } => d(APP_H),
             Elem::Slider { .. } => d(SLIDER_H),
             Elem::Device { .. } => d(ITEM_H),
-            Elem::PickerHeader { .. } | Elem::SettingsHeader(_) => d(PICKER_HEADER_H),
-            Elem::Setting { .. } => d(ITEM_H),
+            Elem::PickerHeader { .. } => d(PICKER_HEADER_H),
             Elem::IconGrid { .. } => grid_px_height(width, scale),
             Elem::Footer => d(FOOTER_H),
-            Elem::Note | Elem::Step(_) => d(NOTE_H),
+            Elem::Note => d(NOTE_H),
         };
         elems.push(LaidElem { elem, top: y, height });
         y += height;
@@ -334,13 +199,6 @@ pub(super) fn build_view(model: &Model, scale: f32, width: i32, view: View, fill
         }
     }
     (elems, total)
-}
-
-/// Whether the Discord and the Teams setup steps show: until that connector works.
-fn setup_steps(model: &Model) -> (bool, bool) {
-    use crate::integrations::{discord, discord_rpc, teams, teams_ui};
-    let connected = |names: &[&str]| model.integrations.iter().any(|(n, on)| *on && names.contains(n));
-    (!connected(&[discord_rpc::NAME, discord::NAME]), !connected(&[teams::NAME, teams_ui::NAME]))
 }
 
 /// Icon-grid geometry for `width`: `(cols, left_px, chip_px, step_px)`, as many columns as
@@ -427,8 +285,6 @@ pub(super) fn elem_at(elems: &[LaidElem], y: i32) -> Option<usize> {
                 | Elem::AppSlider { .. }
                 | Elem::Device { .. }
                 | Elem::PickerHeader { .. }
-                | Elem::SettingsHeader(_)
-                | Elem::Setting { .. }
                 | Elem::IconGrid { .. }
                 | Elem::Footer
         );
@@ -466,20 +322,6 @@ pub(super) fn voice_button_center_x(width: i32, scale: f32) -> f32 {
     width as f32 - (RIGHT_PAD - 4.0 + VOICE_BTN / 2.0) * scale
 }
 
-/// The segment under `mx` (an index into [`segments`]), right-aligned in the row.
-pub(super) fn segment_at(width: i32, scale: f32, mx: i32) -> Option<usize> {
-    (0..SEGMENT_COUNT).find(|&i| {
-        let (x0, x1) = segment_span(width, scale, i);
-        (mx as f32) >= x0 && (mx as f32) < x1
-    })
-}
-
-/// Left and right edges (px) of segment `i`; shared by hit-test and paint.
-pub(super) fn segment_span(width: i32, scale: f32, i: usize) -> (f32, f32) {
-    let w = SEGMENT_W * scale;
-    let right = width as f32 - RIGHT_PAD * scale - (SEGMENT_COUNT - 1 - i) as f32 * w;
-    (right - w, right)
-}
 
 /// An app slider's level at `mx`.
 pub(super) fn app_level_from_x(width: i32, scale: f32, mx: i32) -> f32 {

@@ -30,13 +30,22 @@ pub struct Config {
     pub teams: Teams,
     /// Every tab playing media, through the browser extension in `integrations/browser`.
     pub browser: Browser,
+    /// MPC-HC's session: followed, or left out.
+    pub mpc: Mpc,
 }
 
-/// The floating pill on the screen's left edge.
+/// The floating pill on a screen's edge.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Pill {
     pub enabled: bool,
+    /// Which edge of the screen it hugs.
+    pub edge: PillEdge,
+    /// Where along that edge: its start (the top, or the left of the top edge), middle or end.
+    pub align: PillAlign,
+    /// The display, by its device name (`\\.\DISPLAY2`). `None`, or a display no longer
+    /// connected, is the one at the chosen edge of the desktop (see [`crate::pill`]).
+    pub monitor: Option<String>,
     /// The red "is listening" alert when an app records outside a known call.
     pub listening_alerts: bool,
     /// The output and input devices on the pill, clicked to switch like the taskbar buttons.
@@ -61,9 +70,45 @@ pub enum PillSize {
     Big,
 }
 
+/// The screen edge the pill hugs. Not the bottom: that is the taskbar's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PillEdge {
+    #[default]
+    Left,
+    Right,
+    Top,
+}
+
+impl PillEdge {
+    /// The pill runs down the edge (a column), not along the top (a row).
+    pub fn vertical(self) -> bool {
+        self != PillEdge::Top
+    }
+}
+
+/// Where along its edge the pill sits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PillAlign {
+    Start,
+    #[default]
+    Center,
+    End,
+}
+
 impl Default for Pill {
     fn default() -> Self {
-        Self { enabled: true, listening_alerts: true, devices: true, size: PillSize::Big, announce_tracks: false }
+        Self {
+            enabled: true,
+            edge: PillEdge::Left,
+            align: PillAlign::Center,
+            monitor: None,
+            listening_alerts: true,
+            devices: true,
+            size: PillSize::Big,
+            announce_tracks: false,
+        }
     }
 }
 
@@ -102,16 +147,35 @@ impl Default for Discord {
     }
 }
 
+/// MPC-HC, followed through its own Windows media controls ([`crate::integrations::mpc`]).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Mpc {
+    /// Off: its session is left out, whatever MPC-HC shares.
+    pub enabled: bool,
+}
+
+impl Default for Mpc {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
 /// The browser extension's native messaging host is registered (per user) while this is on.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Browser {
     pub enabled: bool,
+    /// Follow every tab that plays, or only those of `sites`.
+    pub every_site: bool,
+    /// The sites followed when not every one is, by the keys of
+    /// [`crate::integrations::browser::SITES`] ("youtube", "twitch").
+    pub sites: Vec<String>,
 }
 
 impl Default for Browser {
     fn default() -> Self {
-        Self { enabled: true }
+        Self { enabled: true, every_site: true, sites: vec!["youtube".into(), "twitch".into()] }
     }
 }
 
@@ -339,6 +403,19 @@ this is not toml").unwrap();
         let cfg = Config::parse(chosen).expect("parse");
         assert!(!cfg.strip.enabled, "a choice made in Settings stays");
         assert_eq!(cfg.music.tile_style, TileStyle::Off);
+    }
+
+    #[test]
+    fn the_pill_stays_where_it_was_unless_placed() {
+        let cfg = Config::parse("[pill]\nsize = \"small\"\n").expect("parse");
+        assert_eq!((cfg.pill.edge, cfg.pill.align, cfg.pill.monitor), (PillEdge::Left, PillAlign::Center, None));
+        let mut placed = Config::default();
+        placed.pill.edge = PillEdge::Top;
+        placed.pill.align = PillAlign::End;
+        placed.pill.monitor = Some(r"\\.\DISPLAY2".into());
+        let back: Config = toml::from_str(&toml::to_string_pretty(&placed).unwrap()).unwrap();
+        assert_eq!((back.pill.edge, back.pill.align), (PillEdge::Top, PillAlign::End));
+        assert_eq!(back.pill.monitor.as_deref(), Some(r"\\.\DISPLAY2"));
     }
 
     /// Configs from when the strip was opt-in carry a `[taskbar]` section; it must be ignored.

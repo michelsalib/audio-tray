@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <!--
+    audio-tray.svg in one colour (currentColor): the tile, with the speaker, its waves and the
+    taskbar bar cut out of it so the surface shows through. For a title bar or a header, painted
+    in the accent shade that suits the surface: Light2 (AccentPalette entry 1) on dark, Dark1
+    (entry 4) on light. The same as media-cast's AppLogo.
+  -->
+  <mask id="aCut">
+    <rect x="64" y="64" width="896" height="896" rx="200" fill="#fff"/>
+    <path d="M 236 364 H 350 L 480 260 V 592 L 350 488 H 236 Z" fill="#000" stroke="#000" stroke-width="40" stroke-linejoin="round"/>
+    <g fill="none" stroke="#000" stroke-width="64" stroke-linecap="round">
+      <path d="M 592 334 A 130 130 0 0 1 592 518"/>
+      <path d="M 710 250 A 274 274 0 0 1 710 602"/>
+    </g>
+    <rect x="256" y="768" width="512" height="64" rx="32" fill="#000"/>
+  </mask>
+  <rect width="1024" height="1024" fill="currentColor" mask="url(#aCut)"/>
+</svg>

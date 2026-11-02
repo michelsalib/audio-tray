@@ -1,0 +1,48 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <!--
+    audio-tray.svg, painted from the Windows accent. The fallbacks are the default Windows 11
+    blue, so this renders exactly as audio-tray.svg until something sets the three inputs.
+
+    Inputs: three shades of HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\Accent
+    \AccentPalette (8 RGBA entries, lightest to darkest: Light3, Light2, Light1, Accent, Dark1,
+    Dark2, Dark3, unused):
+      --accent-light1  entry 2   (default #0091f8)
+      --accent-dark1   entry 4   (default #0067c0)
+      --accent-dark3   entry 6   (default #001a68)
+
+    Roles, each a plain sRGB mix, so the app can compute them with the same arithmetic:
+      tile, top-left      12% Light1 over white
+      tile, bottom-right  22% Light1 over white
+      speaker and waves   55% Dark3 over #1c1c1c   (dark, a hint of the accent)
+      the taskbar bar     Dark1, the shade Windows itself uses for accent on light surfaces
+
+    Inline the SVG (an <img> cannot see the page's custom properties) and set the inputs on it or
+    on an ancestor.
+  -->
+  <style>
+    svg {
+      --at-tile-from: color-mix(in srgb, var(--accent-light1, #0091f8) 12%, #fff);
+      --at-tile-to: color-mix(in srgb, var(--accent-light1, #0091f8) 22%, #fff);
+      --at-glyph: color-mix(in srgb, var(--accent-dark3, #001a68) 55%, #1c1c1c);
+      --at-bar: var(--accent-dark1, #0067c0);
+    }
+    .at-from { stop-color: var(--at-tile-from); }
+    .at-to { stop-color: var(--at-tile-to); }
+    .at-glyph { fill: var(--at-glyph); stroke: var(--at-glyph); }
+    .at-waves { fill: none; stroke: var(--at-glyph); }
+    .at-bar { fill: var(--at-bar); }
+  </style>
+  <defs>
+    <linearGradient id="aTile" x1="64" y1="64" x2="960" y2="960" gradientUnits="userSpaceOnUse">
+      <stop offset="0" class="at-from"/>
+      <stop offset="1" class="at-to"/>
+    </linearGradient>
+  </defs>
+  <rect x="64" y="64" width="896" height="896" rx="200" fill="url(#aTile)"/>
+  <path class="at-glyph" d="M 236 364 H 350 L 480 260 V 592 L 350 488 H 236 Z" stroke-width="40" stroke-linejoin="round"/>
+  <g class="at-waves" stroke-width="64" stroke-linecap="round">
+    <path d="M 592 334 A 130 130 0 0 1 592 518"/>
+    <path d="M 710 250 A 274 274 0 0 1 710 602"/>
+  </g>
+  <rect class="at-bar" x="256" y="768" width="512" height="64" rx="32"/>
+</svg>

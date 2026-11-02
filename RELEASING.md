@@ -7,6 +7,14 @@ This repo ships three automated pieces:
 | Build + installer | GitHub Actions on a `v*` tag → Inno Setup `Setup.exe` | [`.github/workflows/release.yml`](.github/workflows/release.yml), [`packaging/audio-tray.iss`](packaging/audio-tray.iss) |
 | Auto-update | In-app updater checks GitHub Releases on launch | [`src/update.rs`](src/update.rs) |
 | winget | winget-releaser opens a manifest PR on each release (opt-in) | [`.github/workflows/winget.yml`](.github/workflows/winget.yml), [`packaging/winget/`](packaging/winget/) |
+| Website | A `project-released` dispatch rebuilds [micheldev.com/audio-tray](https://micheldev.com/audio-tray), whose download button points at the release's `Setup.exe` | last step of [`.github/workflows/release.yml`](.github/workflows/release.yml) |
+
+The website step needs the secret **`SITE_DISPATCH_TOKEN`** (a fine-grained PAT with *Contents:
+write* on `michelsalib/micheldev.com` only; media-cast's release uses one under the same name, set
+in this repository's secrets too). Without it the step
+warns and the page catches up at the site's weekly rebuild. The page reads `/releases/latest`, so
+the installer must keep the name `AudioTray-<version>-Setup.exe`, and the logo
+(`assets/logo/audio-tray.svg`) must stay at that path: both are synced at the release tag.
 
 CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs clippy/build/test on every push and PR.
 The repo must stay **public** so the self-updater and winget can download release assets anonymously.

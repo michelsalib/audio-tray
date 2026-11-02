@@ -71,6 +71,9 @@ pub(super) struct Palette {
 impl Palette {
     pub(super) fn current() -> Self {
         let light = crate::win::hkcu_dword(w!(r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"), w!("AppsUseLightTheme")) == Some(1);
+        // Dev: screenshots in either theme without switching Windows' (`AUDIO_TRAY_THEME=light|dark`).
+        #[cfg(feature = "dev")]
+        let light = std::env::var("AUDIO_TRAY_THEME").map_or(light, |t| t == "light");
         if light {
             Palette {
                 bg: Color::hex(0xF3F3F3, 1.0),

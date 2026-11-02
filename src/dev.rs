@@ -6,7 +6,7 @@
 //!   --set <q> / --set-icon <q> <IconId>
 //!                                  switch the default output / store a device's icon
 //!   --flyout [icons|update]        preview the panel (icons = the picker, update = fake a staged update)
-//!   --pill-preview <left|right|top> <start|center|end> [secs] [small] [earbuds] [live]
+//!   --pill-preview <left|right|top> <start|center|end> [secs] [small] [earbuds] [live] [shots]
 //!                                  the edge pill alone there, with a song and the devices
 //!   --settings-preview [page]      the settings window alone (taskbar, pill, devices, connectors,
 //!                                  about); changes are not applied, there is no tray to apply them
@@ -343,6 +343,35 @@ fn pill_preview(backend: &WasapiBackend, args: &[String]) -> Result<()> {
         skip: !live,
         video: live,
     });
+    // `shots`: two invented sessions with covers from %TEMP%\audio-tray-shots (cover1.png,
+    // cover2.png), for the website: nothing of anyone's.
+    if args.iter().any(|a| a == "shots") {
+        let dir = std::env::temp_dir().join("audio-tray-shots");
+        let cover = |n: u32| std::fs::read(dir.join(format!("cover{n}.png"))).ok().map(std::sync::Arc::new);
+        state.media.clear();
+        state.media.push(crate::hub::Media {
+            app_id: "shots-1".into(),
+            app: "YouTube Music".into(),
+            title: "Night Drive".into(),
+            artist: "Low Orbit".into(),
+            playing: true,
+            cover: cover(1),
+            timeline: Some(music::smtc::Timeline { start: 0, end: 214 * 10_000_000, position: 92 * 10_000_000, last_updated: now }),
+            skip: true,
+            video: false,
+        });
+        state.media.push(crate::hub::Media {
+            app_id: "shots-2".into(),
+            app: "Twitch".into(),
+            title: "Building a synth from scratch".into(),
+            artist: "Workbench".into(),
+            playing: true,
+            cover: cover(2),
+            timeline: None,
+            skip: false,
+            video: true,
+        });
+    }
     crate::pill::update(&state);
     println!("pill: {:?} {:?}, {}s", config.edge, config.align, secs);
     let until = std::time::Instant::now() + std::time::Duration::from_secs(secs);

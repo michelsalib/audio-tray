@@ -100,3 +100,19 @@ jobs:
             packaging/dist/SHA256SUMS
           generate_release_notes: true
           fail_on_unmatched_files: true
+
+      # micheldev.com/audio-tray links its download button to this release's installer: a
+      # dispatch makes it rebuild now rather than at its weekly run. Never for a pre-release tag
+      # (v1.0.0-rc.1), which the site's /releases/latest skips anyway.
+      # SITE_DISPATCH_TOKEN can only write to michelsalib/micheldev.com.
+      - name: Rebuild micheldev.com/audio-tray
+        if: ${{ !contains(github.ref_name, '-') }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.SITE_DISPATCH_TOKEN }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::warning::SITE_DISPATCH_TOKEN is not set: micheldev.com/audio-tray updates at its weekly rebuild"
+            exit 0
+          fi
+          gh api repos/michelsalib/micheldev.com/dispatches -f event_type=project-released -f "client_payload[project]=audio-tray"

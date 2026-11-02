@@ -12,7 +12,7 @@ description = "Windows system-tray app for viewing and switching the default aud
 license = "MIT"
 readme = "README.md"
 repository = "https://github.com/michelsalib/audio-tray"
-homepage = "https://github.com/michelsalib/audio-tray"
+homepage = "https://micheldev.com/audio-tray"
 authors = ["Michel Salib"]
 # This is an installable app, not a crates.io library. Keeps `cargo publish`
 # (and `cargo release`) from ever trying to publish it to the registry.

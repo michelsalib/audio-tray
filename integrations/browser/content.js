@@ -61,10 +61,13 @@ document.addEventListener("emptied", event => {
     durations.delete(event.target);
 }, true);
 
+/** YouTube itself: YouTube Music's pages carry the same player markup, marker included. */
+const YOUTUBE = ["www.youtube.com", "youtube.com", "m.youtube.com"];
+
 /** YouTube's player marks a live video in its time display, from the start (its duration only
  * grows every half hour): read that there. */
 function youTubeLive() {
-    return location.hostname.endsWith("youtube.com") && !!document.querySelector(".ytp-time-display.ytp-live");
+    return YOUTUBE.includes(location.hostname) && !!document.querySelector(".ytp-time-display.ytp-live");
 }
 
 function isLive(el) {
@@ -75,11 +78,31 @@ function isPlaying(el) {
     return (!el.paused && !el.ended) || suspended.has(el);
 }
 
+/** Elements that have played with sound. A muted video playing by itself (YouTube's preview of a
+ * hovered thumbnail, a page's background clip) is not media anyone is listening to; one that was
+ * heard and then muted still is. */
+const heard = new WeakSet();
+for (const name of ["playing", "volumechange"]) {
+    document.addEventListener(name, event => {
+        const el = event.target;
+        if (el instanceof HTMLMediaElement && isPlaying(el) && !el.muted && el.volume > 0) heard.add(el);
+    }, true);
+}
+
+/** YouTube's hover previews, whatever their sound: never the video being watched. */
+const PREVIEWS = "#inline-preview-player, ytd-video-preview";
+
+/** Whether an element is media worth reporting at all (see `heard`). */
+function worth(el) {
+    if (el.closest(PREVIEWS)) return false;
+    return heard.has(el) || (!el.muted && el.volume > 0);
+}
+
 /** The element worth reporting: a playing one, else the one that last played (a live player can
  * reset its position on pause), else one that has started or holds a live stream (paused, a
  * Twitch player is at 0 when this script arrives late, injected after an update). */
 function active() {
-    const live = [...elements].filter(el => el.isConnected);
+    const live = [...elements].filter(el => el.isConnected && worth(el));
     const playing = live.find(isPlaying);
     if (playing) lastPlayed = playing;
     if (lastPlayed && !lastPlayed.isConnected) lastPlayed = null;

@@ -6,7 +6,7 @@
 //!   --set <q> / --set-icon <q> <IconId>
 //!                                  switch the default output / store a device's icon
 //!   --flyout [icons|update]        preview the panel (icons = the picker, update = fake a staged update)
-//!   --pill-preview <left|right|top> <start|center|end> [secs] [small] [earbuds] [live] [shots]
+//!   --pill-preview <left|right|top> <start|center|end> [secs] [small] [earbuds] [live] [shots] [call]
 //!                                  the edge pill alone there, with a song and the devices
 //!   --settings-preview [page]      the settings window alone (taskbar, pill, devices, connectors,
 //!                                  about); changes are not applied, there is no tray to apply them
@@ -343,6 +343,13 @@ fn pill_preview(backend: &WasapiBackend, args: &[String]) -> Result<()> {
         skip: !live,
         video: live,
     });
+    // `call`: a Teams call with no faces (its icon in their place; Audio Tray's, here).
+    if args.iter().any(|a| a == "call") {
+        let icon = std::env::current_exe().ok().and_then(|exe| crate::image::exe_icon_png(&exe.to_string_lossy(), 64).ok()).map(std::sync::Arc::new);
+        let call = crate::hub::Call { channel: None, members: Vec::new(), self_muted: false, self_deafened: false, icon };
+        state.calls.push((crate::hub::VoiceApp::Teams, call));
+        state.media.clear();
+    }
     // `shots`: two invented sessions with covers from %TEMP%\audio-tray-shots (cover1.png,
     // cover2.png), for the website: nothing of anyone's.
     if args.iter().any(|a| a == "shots") {

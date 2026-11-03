@@ -156,6 +156,8 @@ struct Pill {
     monitor: Option<String>,
     /// Click targets of the shown scene, in DIPs from the window's origin.
     hits: Vec<([f32; 4], Hit)>,
+    /// Where some hits are lit instead ([`draw::Scene::spots`]).
+    spots: Vec<(usize, [f32; 4])>,
     /// Kept alive while shown: the visuals and their animations.
     _visuals: Vec<IDCompositionVisual2>,
     meter: Option<IAudioMeterInformation>,
@@ -214,6 +216,7 @@ pub fn create(config: &crate::config::Pill) -> Result<()> {
         align: config.align,
         monitor: config.monitor.clone(),
         hits: Vec::new(),
+        spots: Vec::new(),
         _visuals: Vec::new(),
         meter: None,
         loud: 0,
@@ -433,6 +436,7 @@ impl Pill {
                 let _ = ShowWindow(self.edge, SW_HIDE);
             }
             self.hits.clear();
+            self.spots.clear();
             self._visuals.clear();
             self.edge_up = false;
             return Ok(());
@@ -476,6 +480,7 @@ impl Pill {
         }
         gfx.commit()?;
         self.hits = scene.hits;
+        self.spots = scene.spots;
         self._visuals = visuals;
         self.scene_size = (scene.w, scene.h);
         if !matches!(view, View::Music { card: true, .. }) {
@@ -567,12 +572,16 @@ impl Pill {
                     holder.RemoveVisual(old)?;
                 }
                 let Some(i) = index else { return Ok(None) };
-                let ([x, y, w, h], hit) = self.hits[i];
+                let (rect, hit) = self.hits[i];
+                // A target lit elsewhere than where it is hit (the call pill's microphone) is a disc there.
+                let spot = self.spots.iter().find(|(at, _)| *at == i).map(|(_, r)| *r);
+                let [x, y, w, h] = spot.unwrap_or(rect);
                 let card = matches!(self.view, View::Music { card: true, .. });
                 // Drawn over the scene, so never a wash over a picture: a cover gets an outline; a
                 // button a soft shape behind its glyph's look, its own (a disc on a disc).
                 let shape = match hit {
                     // The quiet column's covers carry the progress ring: no outline to add there.
+                    _ if spot.is_some() => Highlight::Disc,
                     Hit::Focus(_) if !card => return Ok(None),
                     Hit::Focus(_) => Highlight::Outline,
                     Hit::Device(_) | Hit::CallMute if w < 2.0 * h => Highlight::Disc,

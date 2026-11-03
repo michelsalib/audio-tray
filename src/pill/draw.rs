@@ -59,6 +59,9 @@ pub struct Scene {
     pub rings: Vec<Ring>,
     pub pulses: Vec<Pulse>,
     pub hits: Vec<([f32; 4], Hit)>,
+    /// Where a hit's hover highlight goes when that is not the hit itself, by the hit's index: the
+    /// whole call pill mutes, but the highlight is on its microphone.
+    pub spots: Vec<(usize, [f32; 4])>,
 }
 
 const WHITE: Rgba = Rgba::hex(0xFFFFFF, 1.0);
@@ -206,7 +209,7 @@ pub fn scene(gfx: &Gfx, view: &View, small: bool, place: Place) -> Result<Option
         View::Idle { call: None, devices: None } => {
             let (w, h) = if edge.vertical() { (6.0, 56.0) } else { (56.0, 6.0) };
             let (content, _) = gfx.painted(w, h, |p| tucked(p, edge, [0.0, 0.0, w, h], 3.0, SLIVER))?;
-            Scene { w, h, lead: 0.0, content, rings: Vec::new(), pulses: Vec::new(), hits: Vec::new() }
+            Scene { w, h, lead: 0.0, content, rings: Vec::new(), pulses: Vec::new(), hits: Vec::new(), spots: Vec::new() }
         }
         View::Idle { call, devices } => stack(gfx, m, &[], call.as_ref(), devices.as_ref(), None, place)?,
         View::Music { media, card: false, call, devices, song } => stack(gfx, m, media, call.as_ref(), devices.as_ref(), song.as_ref(), place)?,
@@ -286,7 +289,7 @@ pub fn scene(gfx: &Gfx, view: &View, small: bool, place: Place) -> Result<Option
                 }
                 Ok(())
             })?;
-            Scene { w, h, lead: 0.0, content, rings: Vec::new(), pulses: Vec::new(), hits }
+            Scene { w, h, lead: 0.0, content, rings: Vec::new(), pulses: Vec::new(), hits, spots: Vec::new() }
         }
         View::Banner { level, glyph, text, .. } => {
             let (bg, fg) = match level {
@@ -301,7 +304,7 @@ pub fn scene(gfx: &Gfx, view: &View, small: bool, place: Place) -> Result<Option
                 p.text(&glyph.to_string(), Font::Icons, (14.0, 0.0, 22.0, h), fg)?;
                 p.text(text, Font::Title, (46.0, 0.0, text_w + 2.0, h), fg)
             })?;
-            Scene { w, h, lead: 0.0, content, rings: Vec::new(), pulses: Vec::new(), hits: vec![([0.0, 0.0, w, h], Hit::Whole)] }
+            Scene { w, h, lead: 0.0, content, rings: Vec::new(), pulses: Vec::new(), hits: vec![([0.0, 0.0, w, h], Hit::Whole)], spots: Vec::new() }
         }
     }))
 }
@@ -415,6 +418,7 @@ fn stack(gfx: &Gfx, m: Metrics, media: &[crate::hub::Media], call: Option<&CallP
     let frame = Frame { edge: place.edge, w };
     let mut hits = Vec::new();
     let mut pulses = Vec::new();
+    let mut spots = Vec::new();
     let (content, _) = gfx.painted(w, h, |p| {
         if let Some(song) = song {
             let at = if place.note_after { len - note_len } else { 0.0 };
@@ -455,6 +459,10 @@ fn stack(gfx: &Gfx, m: Metrics, media: &[crate::hub::Media], call: Option<&CallP
         if let (Some(call), Some(layout)) = (call, &call_layout) {
             pulses.extend(paint_call(p, &frame, call, layout, m, starts[1]));
             hits.push((frame.rect(starts[1], 0.0, layout.h, col), Hit::CallMute));
+            // Lit on the microphone, where paint_call draws it.
+            let (mx, my) = frame.pt(starts[1] + layout.h - m.dev_r - 6.0, mid);
+            let r = m.dev_r + 2.0;
+            spots.push((hits.len() - 1, [mx - r, my - r, 2.0 * r, 2.0 * r]));
         }
         if let Some(devices) = devices {
             tucked(p, place.edge, frame.rect(starts[2], 0.0, devices_len, col), col / 2.0, QUIET_BG)?;
@@ -478,7 +486,7 @@ fn stack(gfx: &Gfx, m: Metrics, media: &[crate::hub::Media], call: Option<&CallP
             }
         })
         .collect();
-    Ok(Scene { w, h, lead, content, rings, pulses, hits })
+    Ok(Scene { w, h, lead, content, rings, pulses, hits, spots })
 }
 
 /// The call pill's geometry, measured before painting.

@@ -117,15 +117,19 @@ unsafe fn already_decorated(diagnostics: &xamlom::IXamlDiagnostics) -> bool {
 static WIRED: Mutex<Vec<u64>> = Mutex::new(Vec::new());
 
 /// One of Explorer's own indicators that our strip replaces and therefore hides (the volume
-/// glyph, the "microphone in use" icon): found by glyph, collapsed with its slot, restorable.
+/// glyph, the "microphone in use" icon): found by glyph within its tray section, collapsed with
+/// its slot, restorable. See FINDINGS "Telling the shell's tray icons apart".
 struct Indicator {
     what: &'static str,
+    /// `x:Name` of the `SystemTrayFrameGrid` child it lives in. The same codepoint can mean
+    /// something else in another section.
+    section: &'static str,
     /// Codepoints that identify it. Names are localised; glyphs are not.
     glyphs: &'static [char],
     /// Whether audio-tray asked for this one to be hidden.
     wanted: fn(&decorate::StripState) -> bool,
-    /// The icon element and the container holding its slot, once found.
-    slot: Mutex<Option<(xamlom::InstanceHandle, xamlom::InstanceHandle)>>,
+    /// Where it was found, once found.
+    slot: Mutex<Option<Found>>,
     /// Collapse re-applications for the current slot. Bounded, because a collapsed element keeps
     /// reporting its old `ActualWidth`, so success cannot be read back.
     retries: std::sync::atomic::AtomicU32,
@@ -133,14 +137,26 @@ struct Indicator {
     announced: std::sync::atomic::AtomicBool,
 }
 
+/// An indicator's elements: the glyph's `TextBlock` (re-read every sweep, since the shell reuses an
+/// `IconView` for another indicator by changing its text), the `IconView`, and the container
+/// holding its slot.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Found {
+    text_block: xamlom::InstanceHandle,
+    icon: xamlom::InstanceHandle,
+    slot: xamlom::InstanceHandle,
+}
+
 impl Indicator {
     const fn new(
         what: &'static str,
+        section: &'static str,
         glyphs: &'static [char],
         wanted: fn(&decorate::StripState) -> bool,
     ) -> Self {
         Self {
             what,
+            section,
             glyphs,
             wanted,
             slot: Mutex::new(None),
@@ -149,18 +165,24 @@ impl Indicator {
         }
     }
 
-    fn recorded(&self) -> Option<(xamlom::InstanceHandle, xamlom::InstanceHandle)> {
+    fn recorded(&self) -> Option<Found> {
         *lock(&self.slot)
+    }
+
+    /// Whether this text, read from an `IconView` in `section`, is this indicator: exactly one
+    /// character, one of ours. Anything else (longer text, an unknown glyph) is never hidden.
+    fn matches(&self, section: &str, text: &str) -> bool {
+        section == self.section && single_glyph(text).is_some_and(|glyph| self.glyphs.contains(&glyph))
     }
 
     /// Record where it is. A *different* element than last time restarts the retry budget (the
     /// microphone indicator may be rebuilt per recording session).
-    fn record(&self, pair: (xamlom::InstanceHandle, xamlom::InstanceHandle)) {
+    fn record(&self, found: Found) {
         let mut held = lock(&self.slot);
-        if *held != Some(pair) {
+        if *held != Some(found) {
             self.retries.store(0, Ordering::SeqCst);
         }
-        *held = Some(pair);
+        *held = Some(found);
     }
 
     fn forget(&self) {
@@ -173,10 +195,23 @@ impl Indicator {
 /// Enough to cover the replay burst without re-applying for the process lifetime.
 const HIDE_MAX_RETRIES: u32 = 24;
 
-static SYSTEM_VOLUME: Indicator =
-    Indicator::new("volume", decorate::VOLUME_GLYPHS, |s| s.hide_system_volume);
+static SYSTEM_VOLUME: Indicator = Indicator::new(
+    "volume",
+    "ControlCenterButton",
+    decorate::VOLUME_GLYPHS,
+    |s| s.hide_system_volume,
+);
 static SYSTEM_MIC: Indicator =
-    Indicator::new("microphone", decorate::MIC_GLYPHS, |s| s.hide_system_mic);
+    Indicator::new("microphone", "MainStack", decorate::MIC_GLYPHS, |s| s.hide_system_mic);
+
+/// The text's only character, if it is exactly one (how the shell draws a system icon).
+fn single_glyph(text: &str) -> Option<char> {
+    let mut chars = text.chars();
+    match (chars.next(), chars.next()) {
+        (Some(glyph), None) => Some(glyph),
+        _ => None,
+    }
+}
 
 fn indicators() -> [&'static Indicator; 2] {
     [&SYSTEM_VOLUME, &SYSTEM_MIC]
@@ -663,6 +698,7 @@ pub(crate) unsafe fn stand_down() {
     for indicator in indicators() {
         indicator.forget();
     }
+    lock(&WATCHED).clear();
     lock(&WIRED).clear();
     reorder::forget();
     PROBED.store(false, Ordering::SeqCst);
@@ -817,6 +853,7 @@ unsafe fn sweep_claimed() {
 
     {
         let _phase = watch::enter("sweep: hide indicators");
+        recheck_indicators(&diagnostics);
         enforce_hidden(&diagnostics);
     }
     if !live() {
@@ -1125,19 +1162,30 @@ unsafe fn note_system_indicator(
     let Some(icon) = ancestor_of_type(text_block, ICON_VIEW, 8) else {
         return;
     };
-    let Some(text) = decorate::text_of(diagnostics, text_block) else {
+    let Some(section) = section_of(icon) else {
+        logf!("tray IconView 0x{icon:x} is in no recorded tray section — not matching it");
         return;
     };
-    let Some(glyph) = text.chars().next() else {
+    let Some(text) = decorate::text_of(diagnostics, text_block) else {
+        lock(&WATCHED).retain(|&known| known != text_block);
         return;
     };
     let found = indicators()
         .into_iter()
-        .find(|i| (i.wanted)(&state) && i.glyphs.contains(&glyph));
+        .find(|i| (i.wanted)(&state) && i.matches(&section, &text));
     let Some(wanted) = found else {
-        note_unknown_glyph(glyph);
+        // In a section we hide from, it may turn into one of ours later without a tree event.
+        if indicators().iter().any(|i| i.section == section) {
+            let mut watched = lock(&WATCHED);
+            if !watched.contains(&text_block) {
+                watched.push(text_block);
+            }
+        }
+        note_unknown_glyph(&section, &text);
         return;
     };
+    lock(&WATCHED).retain(|&known| known != text_block);
+    let glyph = single_glyph(&text).unwrap_or_default();
 
     // The generated `ContentPresenter` around the icon keeps its layout box, so it must be
     // collapsed too or a hole remains.
@@ -1149,32 +1197,109 @@ unsafe fn note_system_indicator(
 
     if !wanted.announced.swap(true, Ordering::SeqCst) {
         logf!(
-            "system {} indicator found: glyph {:04X} in IconView 0x{icon:x}, slot 0x{slot:x} (hidden only once our strip is placed)",
+            "system {} indicator found: glyph {:04X} in {section} IconView 0x{icon:x}, slot 0x{slot:x} (hidden only once our strip is placed)",
             wanted.what,
             glyph as u32
         );
     }
     // Remembered so it can be re-applied: a collapse before layout has measured it frees nothing.
-    wanted.record((icon, slot));
+    wanted.record(Found { text_block, icon, slot });
     enforce_hidden(diagnostics);
 }
 
-/// Logs a tray glyph we do not recognise, once per codepoint: the diagnostic for a Windows build
-/// whose "microphone in use" glyph is missing from [`decorate::MIC_GLYPHS`].
-fn note_unknown_glyph(glyph: char) {
-    /// Cap on distinct glyphs logged.
-    const MAX_SEEN: usize = 48;
-
-    let mut seen = lock(&UNKNOWN_GLYPHS);
-    if seen.contains(&glyph) || seen.len() >= MAX_SEEN {
-        return;
+/// The `x:Name` of the `SystemTrayFrameGrid` child an element sits in (`MainStack`,
+/// `ControlCenterButton`, …), from the recorded tree.
+fn section_of(start: xamlom::InstanceHandle) -> Option<String> {
+    let mut handle = start;
+    for _ in 0..24 {
+        let parent = tree::parent_of(handle)?;
+        if tree::name_of(parent).as_deref() == Some(reorder::FRAME_GRID) {
+            return tree::name_of(handle);
+        }
+        handle = parent;
     }
-    seen.push(glyph);
-    logf!("tray glyph {:04X} is not one we hide", glyph as u32);
+    None
 }
 
-/// Codepoints [`note_unknown_glyph`] has already reported.
-static UNKNOWN_GLYPHS: Mutex<Vec<char>> = Mutex::new(Vec::new());
+/// Tray text blocks in an indicator's section that did not match when last read. Re-read every
+/// sweep by [`recheck_indicators`]: a text change raises no tree event.
+static WATCHED: Mutex<Vec<xamlom::InstanceHandle>> = Mutex::new(Vec::new());
+
+/// Re-reads each found indicator's glyph. The shell reuses an `IconView` for another indicator by
+/// changing its text (microphone → microphone + location → location), which raises no tree event,
+/// so this runs every sweep. A view that no longer matches is put back, forgotten and watched;
+/// watched views are offered to [`note_system_indicator`] again, so one that turns (back) into an
+/// indicator is hidden. Empty text (the icon is going away) decides nothing.
+///
+/// # Safety
+/// XAML UI thread only, and only once the event stream is quiet — see [`sweep`].
+unsafe fn recheck_indicators(diagnostics: &xamlom::IXamlDiagnostics) {
+    for indicator in indicators() {
+        let Some(found) = indicator.recorded() else {
+            continue;
+        };
+        let Some(text) = decorate::text_of(diagnostics, found.text_block) else {
+            // Gone from the tree: nothing to put back.
+            indicator.forget();
+            continue;
+        };
+        if text.is_empty() || indicator.matches(indicator.section, &text) {
+            continue;
+        }
+        let icon = restore::put_back_layout(diagnostics, found.icon);
+        let slot = if found.slot != found.icon {
+            restore::put_back_layout(diagnostics, found.slot)
+        } else {
+            None
+        };
+        let show = |outcome: Option<decorate::Restored>| match outcome {
+            Some(restored) => restored.to_string(),
+            None => "never hidden".to_owned(),
+        };
+        logf!(
+            "system {} indicator 0x{:x} now shows {} — no longer ours to hide: icon {}, slot {}",
+            indicator.what,
+            found.icon,
+            describe_text(&text),
+            show(icon),
+            show(slot)
+        );
+        indicator.forget();
+        let mut watched = lock(&WATCHED);
+        if !watched.contains(&found.text_block) {
+            watched.push(found.text_block);
+        }
+    }
+
+    let watched = lock(&WATCHED).clone();
+    for text_block in watched {
+        note_system_indicator(diagnostics, text_block);
+    }
+}
+
+/// A tray text for the log: codepoints, since most are private-use glyphs.
+fn describe_text(text: &str) -> String {
+    let codes: Vec<String> = text.chars().take(8).map(|c| format!("{:04X}", c as u32)).collect();
+    format!("[{}]", codes.join(" "))
+}
+
+/// Logs a tray text we do not hide, once per section and text: the diagnostic for a Windows build
+/// whose "microphone in use" glyph is missing from [`decorate::MIC_GLYPHS`].
+fn note_unknown_glyph(section: &str, text: &str) {
+    /// Cap on distinct texts logged.
+    const MAX_SEEN: usize = 48;
+
+    let key = format!("{section} {}", describe_text(text));
+    let mut seen = lock(&UNKNOWN_GLYPHS);
+    if seen.contains(&key) || seen.len() >= MAX_SEEN {
+        return;
+    }
+    logf!("tray glyph {key} is not one we hide");
+    seen.push(key);
+}
+
+/// Section-and-text keys [`note_unknown_glyph`] has already reported.
+static UNKNOWN_GLYPHS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 /// Re-applies each indicator's collapse (bounded by [`HIDE_MAX_RETRIES`]) once layout has measured it.
 ///
@@ -1188,7 +1313,7 @@ unsafe fn enforce_hidden(diagnostics: &xamlom::IXamlDiagnostics) {
         if indicator.retries.load(Ordering::SeqCst) >= HIDE_MAX_RETRIES {
             continue;
         }
-        let Some((icon, slot)) = indicator.recorded() else {
+        let Some(Found { icon, slot, .. }) = indicator.recorded() else {
             continue;
         };
         // Zero means layout has not run yet, and a collapse now would do nothing.

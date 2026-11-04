@@ -32,7 +32,7 @@ use windows_core::Interface;
 
 /// The tray's root panel; its children are the sections we reorder. A `Grid` up to 26200, a
 /// `StackPanel` from 26300.
-const FRAME_GRID: &str = "SystemTrayFrameGrid";
+pub(crate) const FRAME_GRID: &str = "SystemTrayFrameGrid";
 
 const STACK_PANEL: &str = "Windows.UI.Xaml.Controls.StackPanel";
 const GRID_TYPE: &str = "Windows.UI.Xaml.Controls.Grid";

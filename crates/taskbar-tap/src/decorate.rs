@@ -835,16 +835,16 @@ pub unsafe fn holds_our_strip(
 /// Automation name on the strip's root, how [`holds_our_strip`] recognises it. Never shown.
 pub const STRIP_NAME: &str = "AudioTrayStrip";
 
-/// Codepoints of Explorer's volume indicator (muted, speaker, four levels). Matched by glyph
-/// because the automation name is localised.
+/// Codepoints of Explorer's volume indicator (muted, speaker, four levels, disabled, bars), matched
+/// inside `ControlCenterButton` only. Matched by glyph because the automation name is localised.
 pub const VOLUME_GLYPHS: &[char] = &[
-    '\u{E74F}', '\u{E767}', '\u{E992}', '\u{E993}', '\u{E994}', '\u{E995}',
+    '\u{E74F}', '\u{E767}', '\u{E992}', '\u{E993}', '\u{E994}', '\u{E995}', '\u{EA85}', '\u{EBC5}',
 ];
 
-/// Codepoints of the shell's "microphone in use" indicator. Our input segment draws a
-/// microphone too; only a glyph inside a `SystemTray.IconView` counts (`note_system_indicator`).
-/// `note_unknown_glyph` logs unrecognised tray glyphs if this needs extending.
-pub const MIC_GLYPHS: &[char] = &['\u{E720}', '\u{EC71}', '\u{F12E}', '\u{E1D6}'];
+/// Codepoints of the shell's "microphone in use" indicator, matched inside `MainStack` only.
+/// "Microphone + location" (`F47F`) is deliberately absent: hiding it would hide the location
+/// warning too. `note_unknown_glyph` logs unrecognised tray glyphs if this needs extending.
+pub const MIC_GLYPHS: &[char] = &['\u{E361}', '\u{E720}', '\u{EC71}', '\u{F12E}', '\u{E1D6}'];
 
 /// Reads a `TextBlock`'s `Text`.
 ///

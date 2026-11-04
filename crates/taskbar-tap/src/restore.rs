@@ -85,6 +85,23 @@ pub unsafe fn remember_layout(diagnostics: &IXamlDiagnostics, handle: InstanceHa
     lock().layouts.push((handle, layout));
 }
 
+/// Puts one element's recorded layout back and forgets it, ahead of a full [`revert`]: for an
+/// indicator the shell has since reused for an icon we do not hide. `None` if it was never changed.
+///
+/// # Safety
+/// XAML UI thread only.
+pub unsafe fn put_back_layout(
+    diagnostics: &IXamlDiagnostics,
+    handle: InstanceHandle,
+) -> Option<decorate::Restored> {
+    let layout = {
+        let mut original = lock();
+        let index = original.layouts.iter().position(|&(known, _)| known == handle)?;
+        original.layouts.remove(index).1
+    };
+    Some(decorate::restore_layout(diagnostics, handle, layout))
+}
+
 /// Records the content we are about to displace from a presenter. Last-wins (the shell may
 /// rebuild its visual, and the newest is what goes back), but **never records our own strip**,
 /// or a redraw would lose the shell's visual for good.

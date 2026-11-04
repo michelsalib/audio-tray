@@ -207,8 +207,11 @@ Columns as found on 26200:
 | --- | --- |
 | 0 | `SystemTray.Stack#NotifyIconStack` (the `^` overflow button) |
 | 1 | `SystemTray.NotificationAreaIcons` ← **ours lives here** |
-| 2 | `SystemTray.Stack#MainStack` (keyboard layout) |
-| 3 | `SystemTray.Stack#NonActivatableStack` |
+| 2 | `SystemTray.Stack#MainStack` (privacy indicators: microphone, location, Studio Effects, Recall) |
+| 3 | `SystemTray.Stack#NonActivatableStack` (keyboard layout, plus IME mode icons) |
+
+This table used to call `MainStack` the keyboard layout; it is not (see "Telling the shell's tray
+icons apart" below).
 | 4 | `SystemTray.Stack#SecondaryClockStack` |
 | 5 | `SystemTray.OmniButton#ControlCenterButton` (wifi / volume / battery) |
 | 6 | `SystemTray.OmniButton#NotificationCenterButton` |
@@ -835,6 +838,100 @@ each mutation while `ActualWidth > 0`, bounded at 24 attempts.
 Verified by three consecutive Explorer-restart-and-inject cycles producing
 pixel-identical trays (gap 25px, matching the original wifi→volume spacing).
 
+## Telling the shell's tray icons apart — scope by section, then identify
+
+Picking the wrong element to hide has bitten this TAP before. A glyph match across the
+whole tray is not enough on its own. The reference for doing it properly is Windhawk's
+[Taskbar tray system icon tweaks](https://github.com/ramensoftware/windhawk-mods/blob/main/mods/taskbar-tray-system-icon-tweaks.wh.cpp)
+(m417z, read at v1.3.1, 2026-11-04). It hides volume, network, battery, microphone,
+location, Studio Effects, Recall, the language indicator and the bell, and it decides
+in two steps.
+
+**1. Scope by section first.** It starts from `SystemTrayFrameGrid`, takes a section by
+`x:Name`, and only then looks inside it. Each section holds a known set of icons:
+
+| Section (`x:Name` under `SystemTrayFrameGrid`) | What lives there |
+| --- | --- |
+| `MainStack` | privacy "in use" indicators: microphone, location, microphone + location, Studio Effects, Recall |
+| `NonActivatableStack` | the keyboard-layout indicator, and IME mode icons (half/full width, kana, …) |
+| `ControlCenterButton` | wifi/network, volume, battery |
+| `NotificationCenterButton` | the bell (and the clock) |
+
+The same codepoint can mean different things in different sections. `F8C1` (SysMicrophone) is
+one of the *network* glyphs inside `ControlCenterButton`, so an unscoped "microphone" match
+could collapse part of the Quick Settings button. Our own strip draws `E720` too (it lives in
+`NotificationAreaIcons`, which no hide rule should ever enter).
+
+**2. Then identify, by class where there is one, by glyph otherwise.** The paths:
+
+```
+MainStack > Content > IconStack > ItemsPresenter > StackPanel
+  > ContentPresenter > SystemTray.IconView#SystemTrayIcon
+      > ContainerGrid > ContentPresenter > ContentGrid
+          > SystemTray.TextIconContent > ContainerGrid > Base > TextBlock#InnerTextBlock
+
+NonActivatableStack > … > SystemTray.IconView#SystemTrayIcon
+      > ContainerGrid > ContentPresenter > ContentGrid > one of:
+          SystemTray.LanguageTextIconContent    ← the keyboard-layout indicator ("FRA")
+          SystemTray.LanguageImageIconContent   ← the same, drawn as an image
+          SystemTray.TextIconContent            ← IME mode icon (glyph)
+          SystemTray.ImageIconContent           ← IME mode icon (image)
+```
+
+- **The keyboard-layout indicator has no glyph.** Its text is a localised language
+  abbreviation, so it is recognised by its content *class* (`LanguageTextIconContent` /
+  `LanguageImageIconContent`), and it is the `IconView` that is collapsed. A glyph table cannot
+  find it.
+- **Everything else is matched by glyph:** the single character of `InnerTextBlock`. Text that is
+  not exactly one character is "unknown", and unknown is never hidden. Empty text means the icon
+  is about to disappear.
+
+**3. Re-decide when the glyph changes.** `MainStack` reuses one `IconView` across indicators. The
+microphone icon becomes "microphone + location" (`F47F`) and then location (`E37A`) in place. So
+Windhawk registers a `TextBlock.Text` property-changed callback on `InnerTextBlock`. It re-runs
+the decision on every change, and makes the view *visible* again when the new glyph is not one it
+hides.
+
+Until 2026-11-04 our TAP decided once. `note_system_indicator` matched the first character of
+any `SystemTray.IconView`'s text anywhere in the tray, and `enforce_hidden` kept re-collapsing
+the recorded view without re-reading it. A view reused for the location indicator would have
+stayed hidden. We cannot register a property-changed callback (no XAML from the visual-tree
+callback, and no delegate bindings), so the sweep does the equivalent:
+
+- Each `Indicator` names its section (`ControlCenterButton` for volume, `MainStack` for the
+  microphone). `section_of` climbs the recorded tree to the `SystemTrayFrameGrid` child, and a
+  glyph only counts in its own section. The text must be exactly one listed character.
+- `recheck_indicators` re-reads the found indicator's `InnerTextBlock` every sweep. If the text is
+  now something else (non-empty), it puts both elements back (`restore::put_back_layout`) and
+  forgets the indicator.
+- Text blocks in those sections that did not match are kept in `WATCHED` and re-offered every
+  sweep, so a view that turns (back) into the microphone is hidden again without a tree event.
+  This costs one `Text` read per watched icon per sweep (a handful).
+- Empty text decides nothing (the icon is going away), so a collapsed microphone view that the
+  shell reuses for the next recording session stays collapsed.
+- "Microphone + location" (`F47F`) is deliberately not hidden: there is no location setting, and
+  hiding it would hide the location warning too.
+
+Windhawk's glyph sets, for comparison with ours (`decorate.rs`):
+
+| Icon | Windhawk | Ours |
+| --- | --- | --- |
+| volume | `E74F E992 E993 E994 E995 EA85 EBC5` | `E74F E767 E992–E995` |
+| microphone | `E361 E720 EC71` | `E720 EC71 F12E E1D6` |
+| microphone + location | `F47F` | — |
+| location | `E37A` | — |
+| Studio Effects | `EABC` | — |
+| Recall | `EC83 EADD EB16 EF97 F1C6` (from `RecallIcons.ttf`) | — |
+| IME mode icons | `E4D7 E4D8 E5BF E97E E97F E980 E982 E983 E986–E988 EB90 EE41–EE45 EE75 EE76` | — |
+
+The IME and system tray glyphs come from Segoe Fluent and from
+`%SystemRoot%\SystemApps\MicrosoftWindows.Client.Core_cw5n1h2txyewy\SystemTray\Assets\AXPIcons.ttf`.
+
+**Rule for any new hide (keyboard layout included):** find the section by `x:Name` under the
+main taskbar's `SystemTrayFrameGrid` (`reorder::frame()`), identify by content class or by an
+exact one-character glyph within that section only, re-check on every sweep, and save the
+layout before collapsing (the "two traps" above still apply to the slot).
+
 ## Clicks cannot be synthesised onto the taskbar
 
 Pointer *movement* injected with `SendInput` works fine — the hover plate lights
@@ -1454,7 +1551,7 @@ FINDINGS.md records that hang as passing an `IInspectable` where `IGridStatics` 
 `IFrameworkElement*` (wrong vtable), not a slot miscount; the comment was corrected to match.
 
 ### decorate.rs: MIC_GLYPHS has several entries
-The shell has been seen drawing its "microphone in use" tray indicator with more than one codepoint (the plain microphone and a filled "active" variant), so `MIC_GLYPHS` lists several (E720, EC71, F12E, E1D6). If one is missing, hiding the system mic indicator silently fails. `note_unknown_glyph` logs any tray glyph it does not recognise, which is how to find a new one. Our own input segment also draws E720; only glyphs inside a `SystemTray.IconView` are treated as Explorer's.
+The shell has been seen drawing its "microphone in use" tray indicator with more than one codepoint (the plain microphone and a filled "active" variant), so `MIC_GLYPHS` lists several (E720, EC71, F12E, E1D6). If one is missing, hiding the system mic indicator silently fails. `note_unknown_glyph` logs any tray glyph it does not recognise, which is how to find a new one. Our own input segment also draws E720; only glyphs inside a `SystemTray.IconView` are treated as Explorer's. Since 2026-11-04 the match is also scoped to `MainStack` and re-checked every sweep; see "Telling the shell's tray icons apart".
 
 ### music/layout.rs: `roomy` threshold recalibrated to 122
 `Layout::for_width` used `strip >= 200` when three 26-epx transport buttons were in the budget. Once they moved to the thumbnail toolbar the same room for the remaining parts is 200 − 78 = 122. Keeping 200 would have put every shipped width since (162, then 150) on the cramped branch and shrunk the cover even though it had more room.

@@ -18,6 +18,9 @@
 //!                                  taskbar cannot be synthesised)
 //!   --taskbar-scroll <out|in> [notches]
 //!                                  post a strip scroll (the only way to drive touchpad deltas)
+//!   --keyboards [secs] [switch <device-substring>=<hkl> …]
+//!                                  keyboards and layouts, then which keyboard types (never the
+//!                                  key) and the foreground layout; with rules, switch per keyboard
 //!   --music-probe                  list SMTC sessions with their YouTube Music verdicts
 //!   --music-timeline [next|prev|toggle] [secs]
 //!                                  trace the followed session every 100 ms, optionally commanding it
@@ -187,6 +190,7 @@ pub fn run(args: &[String], backend: &WasapiBackend) -> Result<bool> {
             taskbar::post_scroll(flow, notches)?;
             println!("taskbar: posted a {notches} notch {flow:?} scroll to the running tray.");
         }
+        Some("--keyboards") => crate::keyboards::spike::run(&args[1..])?,
         Some("--music-probe") => music::probe()?,
         Some("--music-timeline") => {
             let skip = match args.get(1).map(String::as_str) {

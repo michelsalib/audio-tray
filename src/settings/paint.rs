@@ -588,6 +588,18 @@ fn draw_item(pen: &Pen, s: &Scene, items: &[Item], index: usize, item: &Item) {
             pen.icon(*icon, 22.0, r, p.text);
         }
         Kind::Icon(icon) => pen.icon(*icon, 20.0, r, p.text),
+        Kind::Field(text) => {
+            // Windows' focused text box: a control well with an accent line along its bottom.
+            pen.fill(r, 4.0, p.control);
+            pen.stroke(r, 4.0, 1.0, p.control_stroke);
+            pen.fill(R::new(r.x + 1.0, r.bottom() - 2.0, r.w - 2.0, 2.0), 1.0, p.accent);
+            let inner = R::new(r.x + 10.0, r.y, r.w - 20.0, r.h);
+            pen.clip(inner);
+            pen.text(text, Font::Body, inner, p.text, Align::Left);
+            let caret = inner.x + pen.gfx.measure(Font::Body, text).min(inner.w - 1.0);
+            pen.fill(R::new(caret, r.y + 8.0, 1.0, r.h - 16.0), 0.0, p.text);
+            pen.unclip();
+        }
     }
 }
 

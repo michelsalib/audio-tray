@@ -116,16 +116,23 @@ unsafe fn already_decorated(diagnostics: &xamlom::IXamlDiagnostics) -> bool {
 /// wires the new ones without double-wiring the old.
 static WIRED: Mutex<Vec<u64>> = Mutex::new(Vec::new());
 
-/// One of Explorer's own indicators that our strip replaces and therefore hides (the volume
-/// glyph, the "microphone in use" icon): found by glyph within its tray section, collapsed with
-/// its slot, restorable. See FINDINGS "Telling the shell's tray icons apart".
+/// One of Explorer's own indicators that audio-tray hides (the volume glyph, the "microphone in
+/// use" icon, the keyboard-layout indicator): found by glyph or by content class within its tray
+/// section, collapsed with its slot, restorable. See FINDINGS "Telling the shell's tray icons apart".
 struct Indicator {
     what: &'static str,
     /// `x:Name` of the `SystemTrayFrameGrid` child it lives in. The same codepoint can mean
     /// something else in another section.
     section: &'static str,
-    /// Codepoints that identify it. Names are localised; glyphs are not.
+    /// Codepoints that identify it. Names are localised; glyphs are not. Empty for an indicator
+    /// found by [`Self::classes`].
     glyphs: &'static [char],
+    /// Content classes (the `IconView`'s content, under `ContentGrid`) that identify it, for an
+    /// indicator with no glyph. Empty for one found by glyph.
+    classes: &'static [&'static str],
+    /// Hidden only once our strip is placed: the indicators the strip *replaces*. See FINDINGS
+    /// "Only touch the shell's UI once ours is up".
+    needs_strip: bool,
     /// Whether audio-tray asked for this one to be hidden.
     wanted: fn(&decorate::StripState) -> bool,
     /// Where it was found, once found.
@@ -137,27 +144,41 @@ struct Indicator {
     announced: std::sync::atomic::AtomicBool,
 }
 
-/// An indicator's elements: the glyph's `TextBlock` (re-read every sweep, since the shell reuses an
-/// `IconView` for another indicator by changing its text), the `IconView`, and the container
-/// holding its slot.
+/// An indicator's elements: what identified it (the glyph's `TextBlock`, re-read every sweep since
+/// the shell reuses an `IconView` for another indicator by changing its text; or the content
+/// element whose class matched), the `IconView`, and the container holding its slot.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct Found {
-    text_block: xamlom::InstanceHandle,
+    marker: xamlom::InstanceHandle,
     icon: xamlom::InstanceHandle,
     slot: xamlom::InstanceHandle,
 }
 
 impl Indicator {
+    /// One the strip replaces, found by glyph.
+    const fn by_glyph(
+        what: &'static str,
+        section: &'static str,
+        glyphs: &'static [char],
+        wanted: fn(&decorate::StripState) -> bool,
+    ) -> Self {
+        Self::new(what, section, glyphs, &[], true, wanted)
+    }
+
     const fn new(
         what: &'static str,
         section: &'static str,
         glyphs: &'static [char],
+        classes: &'static [&'static str],
+        needs_strip: bool,
         wanted: fn(&decorate::StripState) -> bool,
     ) -> Self {
         Self {
             what,
             section,
             glyphs,
+            classes,
+            needs_strip,
             wanted,
             slot: Mutex::new(None),
             retries: std::sync::atomic::AtomicU32::new(0),
@@ -195,14 +216,29 @@ impl Indicator {
 /// Enough to cover the replay burst without re-applying for the process lifetime.
 const HIDE_MAX_RETRIES: u32 = 24;
 
-static SYSTEM_VOLUME: Indicator = Indicator::new(
+static SYSTEM_VOLUME: Indicator = Indicator::by_glyph(
     "volume",
     "ControlCenterButton",
     decorate::VOLUME_GLYPHS,
     |s| s.hide_system_volume,
 );
 static SYSTEM_MIC: Indicator =
-    Indicator::new("microphone", "MainStack", decorate::MIC_GLYPHS, |s| s.hide_system_mic);
+    Indicator::by_glyph("microphone", "MainStack", decorate::MIC_GLYPHS, |s| s.hide_system_mic);
+/// The keyboard-layout indicator ("FRA"). It has no glyph, so it is found by its content class;
+/// the IME mode icons beside it (`SystemTray.TextIconContent` / `ImageIconContent`) are left
+/// alone. Not replaced by the strip, so hidden whenever the TAP is active, `buttons=0` included.
+static SYSTEM_LANGUAGE: Indicator = Indicator::new(
+    "keyboard layout",
+    "NonActivatableStack",
+    &[],
+    LANGUAGE_CONTENT,
+    false,
+    |s| s.hide_system_language,
+);
+
+/// The content classes of the keyboard-layout indicator: as text, or drawn as an image.
+const LANGUAGE_CONTENT: &[&str] =
+    &["SystemTray.LanguageTextIconContent", "SystemTray.LanguageImageIconContent"];
 
 /// The text's only character, if it is exactly one (how the shell draws a system icon).
 fn single_glyph(text: &str) -> Option<char> {
@@ -213,8 +249,8 @@ fn single_glyph(text: &str) -> Option<char> {
     }
 }
 
-fn indicators() -> [&'static Indicator; 2] {
-    [&SYSTEM_VOLUME, &SYSTEM_MIC]
+fn indicators() -> [&'static Indicator; 3] {
+    [&SYSTEM_VOLUME, &SYSTEM_MIC, &SYSTEM_LANGUAGE]
 }
 
 /// Set once the tray icons' automation names have been logged.
@@ -348,8 +384,8 @@ pub(crate) fn hand_over(data: &str) -> isize {
     // A switch that removes a shell edit (reorder, hiding an indicator) must undo what is already
     // applied, and only a full revert knows how: the sweep reverts and re-applies.
     let edits_changed = reorder::enabled() != reorder_before
-        || after.map(|s| (s.hide_system_volume, s.hide_system_mic))
-            != before.map(|s| (s.hide_system_volume, s.hide_system_mic));
+        || after.map(|s| (s.hide_system_volume, s.hide_system_mic, s.hide_system_language))
+            != before.map(|s| (s.hide_system_volume, s.hide_system_mic, s.hide_system_language));
     if was_active && edits_changed {
         REAPPLY_PENDING.store(true, Ordering::SeqCst);
     } else if was_active && after != before {
@@ -369,17 +405,23 @@ pub(crate) fn hand_over(data: &str) -> isize {
 static REAPPLY_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// The indicators are only ever found from an *add* event, which this Explorer will not replay
-/// (and a stand-down forgot them): offer the recorded tray-icon glyphs to the sweep again. Tray
-/// icons only: the queue is the tray island's, and other islands also have `InnerTextBlock`s.
+/// (and a stand-down forgot them): offer the recorded tray-icon glyphs and language contents to
+/// the sweep again. Tray icons only: the queues are the tray island's, and other islands also
+/// have `InnerTextBlock`s.
 fn requeue_tray_glyphs() {
-    let candidates: Vec<_> = tree::find_by_name("InnerTextBlock")
-        .into_iter()
-        .filter(|&text_block| ancestor_of_type(text_block, ICON_VIEW, 8).is_some())
+    let in_tray = |handle: &xamlom::InstanceHandle| ancestor_of_type(*handle, ICON_VIEW, 8).is_some();
+    let glyphs: Vec<_> = tree::find_by_name("InnerTextBlock").into_iter().filter(in_tray).collect();
+    let contents: Vec<_> = LANGUAGE_CONTENT
+        .iter()
+        .flat_map(|class| tree::find_by_type(class))
+        .filter(in_tray)
         .collect();
-    let mut queue = lock(&PENDING_GLYPHS);
-    for text_block in candidates {
-        if !queue.contains(&text_block) {
-            queue.push(text_block);
+    for (queue, found) in [(&PENDING_GLYPHS, glyphs), (&PENDING_CONTENTS, contents)] {
+        let mut queue = lock(queue);
+        for handle in found {
+            if !queue.contains(&handle) {
+                queue.push(handle);
+            }
         }
     }
 }
@@ -657,6 +699,13 @@ impl IVisualTreeServiceCallback_Impl for Tap_Impl {
                 }
             }
 
+            // A keyboard-layout indicator's content, identified by its class alone (the type name
+            // is in the event; the section is checked in the sweep, from the recorded tree).
+            if added && LANGUAGE_CONTENT.contains(&type_name.as_str()) {
+                enqueue(&PENDING_CONTENTS, element.handle);
+                lifecycle::set_sweep_pace(false);
+            }
+
             // Our own segments announced back. Children are reported before parents, so the
             // segment's hover plate is already recorded.
             if added {
@@ -712,6 +761,8 @@ pub(crate) unsafe fn stand_down() {
 /// Event handles the callback queued for the sweep (the callback may not touch XAML). Pushed only
 /// from the tray island's thread.
 static PENDING_GLYPHS: Mutex<Vec<xamlom::InstanceHandle>> = Mutex::new(Vec::new());
+/// Content elements whose class may identify an indicator ([`LANGUAGE_CONTENT`]).
+static PENDING_CONTENTS: Mutex<Vec<xamlom::InstanceHandle>> = Mutex::new(Vec::new());
 static PENDING_SEGMENTS: Mutex<Vec<(interact::Segment, String, xamlom::InstanceHandle)>> =
     Mutex::new(Vec::new());
 
@@ -813,6 +864,10 @@ unsafe fn sweep_claimed() {
     for text_block in drain(&PENDING_GLYPHS) {
         let _phase = watch::enter("sweep: note indicator");
         note_system_indicator(&diagnostics, text_block);
+    }
+    for content in drain(&PENDING_CONTENTS) {
+        let _phase = watch::enter("sweep: note indicator");
+        note_content_indicator(&diagnostics, content);
     }
 
     if REAPPLY_PENDING.swap(false, Ordering::SeqCst) {
@@ -1146,7 +1201,8 @@ unsafe fn attach_segment(
 /// Note one of Explorer's own indicators if this text block is it.
 ///
 /// Only *records* the slot, ungated; collapsing it is [`enforce_hidden`]'s job, gated on the
-/// strip. (The glyph is announced during the replay, long before our icon is decorated.)
+/// strip for the indicators it replaces. (The glyph is announced during the replay, long before
+/// our icon is decorated.)
 ///
 /// # Safety
 /// XAML UI thread only, and only once the event stream is quiet — see [`sweep`].
@@ -1166,6 +1222,11 @@ unsafe fn note_system_indicator(
         logf!("tray IconView 0x{icon:x} is in no recorded tray section — not matching it");
         return;
     };
+    // Only sections we hide a glyph from are worth the read (the language indicator's "FRA" is
+    // found by class, not text).
+    if !indicators().iter().any(|i| i.section == section && !i.glyphs.is_empty()) {
+        return;
+    }
     let Some(text) = decorate::text_of(diagnostics, text_block) else {
         lock(&WATCHED).retain(|&known| known != text_block);
         return;
@@ -1174,8 +1235,9 @@ unsafe fn note_system_indicator(
         .into_iter()
         .find(|i| (i.wanted)(&state) && i.matches(&section, &text));
     let Some(wanted) = found else {
-        // In a section we hide from, it may turn into one of ours later without a tree event.
-        if indicators().iter().any(|i| i.section == section) {
+        // In a section we hide a glyph from, it may turn into one of ours later without a tree
+        // event.
+        {
             let mut watched = lock(&WATCHED);
             if !watched.contains(&text_block) {
                 watched.push(text_block);
@@ -1186,25 +1248,115 @@ unsafe fn note_system_indicator(
     };
     lock(&WATCHED).retain(|&known| known != text_block);
     let glyph = single_glyph(&text).unwrap_or_default();
-
-    // The generated `ContentPresenter` around the icon keeps its layout box, so it must be
-    // collapsed too or a hole remains.
-    let slot = tree::parent_of(icon)
-        .filter(|&parent| {
-            tree::type_of(parent).as_deref() == Some("Windows.UI.Xaml.Controls.ContentPresenter")
-        })
-        .unwrap_or(icon);
-
+    let slot = slot_of(icon);
     if !wanted.announced.swap(true, Ordering::SeqCst) {
         logf!(
-            "system {} indicator found: glyph {:04X} in {section} IconView 0x{icon:x}, slot 0x{slot:x} (hidden only once our strip is placed)",
+            "system {} indicator found: glyph {:04X} in {section} IconView 0x{icon:x}, slot 0x{slot:x}{}",
             wanted.what,
-            glyph as u32
+            glyph as u32,
+            gate_note(wanted)
         );
     }
     // Remembered so it can be re-applied: a collapse before layout has measured it frees nothing.
-    wanted.record(Found { text_block, icon, slot });
+    wanted.record(Found { marker: text_block, icon, slot });
     enforce_hidden(diagnostics);
+}
+
+/// The container to collapse with an `IconView`: the generated `ContentPresenter` around it keeps
+/// its layout box, so it must be collapsed too or a hole remains.
+fn slot_of(icon: xamlom::InstanceHandle) -> xamlom::InstanceHandle {
+    tree::parent_of(icon)
+        .filter(|&parent| {
+            tree::type_of(parent).as_deref() == Some("Windows.UI.Xaml.Controls.ContentPresenter")
+        })
+        .unwrap_or(icon)
+}
+
+/// When a found indicator gets hidden, for its "found" log line.
+fn gate_note(indicator: &Indicator) -> &'static str {
+    if indicator.needs_strip {
+        " (hidden only once our strip is placed)"
+    } else {
+        ""
+    }
+}
+
+/// The indicator a content element identifies by its recorded class, with its `IconView`, if the
+/// view sits in that indicator's section. Reads only the recorded tree: no XAML call.
+fn content_indicator(
+    content: xamlom::InstanceHandle,
+) -> Option<(&'static Indicator, xamlom::InstanceHandle, String)> {
+    let class = tree::type_of(content)?;
+    let indicator = indicators().into_iter().find(|i| i.classes.contains(&class.as_str()))?;
+    // IconView > ContainerGrid > ContentPresenter > ContentGrid > content.
+    let icon = ancestor_of_type(content, ICON_VIEW, 6)?;
+    let section = section_of(icon)?;
+    (section == indicator.section).then_some((indicator, icon, section))
+}
+
+/// Note an indicator found by its content class (the keyboard-layout indicator) if this element is
+/// one. Like [`note_system_indicator`], it records, and [`enforce_hidden`] collapses.
+///
+/// # Safety
+/// XAML UI thread only, and only once the event stream is quiet — see [`sweep`].
+unsafe fn note_content_indicator(
+    diagnostics: &xamlom::IXamlDiagnostics,
+    content: xamlom::InstanceHandle,
+) {
+    let Some(state) = strip_state() else {
+        return;
+    };
+    let Some((indicator, icon, section)) = content_indicator(content) else {
+        logf!(
+            "content 0x{content:x} ({}) is not in its indicator's tray section — not hiding it",
+            tree::type_of(content).unwrap_or_default()
+        );
+        return;
+    };
+    if !(indicator.wanted)(&state) {
+        return;
+    }
+    let slot = slot_of(icon);
+    if !indicator.announced.swap(true, Ordering::SeqCst) {
+        logf!(
+            "system {} indicator found: {} in {section} IconView 0x{icon:x}, slot 0x{slot:x}{}",
+            indicator.what,
+            tree::type_of(content).unwrap_or_default(),
+            gate_note(indicator)
+        );
+    }
+    indicator.record(Found { marker: content, icon, slot });
+    enforce_hidden(diagnostics);
+}
+
+/// Put a found indicator's elements back and forget it: it no longer is what we hide.
+///
+/// # Safety
+/// XAML UI thread only, and only once the event stream is quiet — see [`sweep`].
+unsafe fn put_back_indicator(
+    diagnostics: &xamlom::IXamlDiagnostics,
+    indicator: &Indicator,
+    found: Found,
+    now: &str,
+) {
+    let icon = restore::put_back_layout(diagnostics, found.icon);
+    let slot = if found.slot != found.icon {
+        restore::put_back_layout(diagnostics, found.slot)
+    } else {
+        None
+    };
+    let show = |outcome: Option<decorate::Restored>| match outcome {
+        Some(restored) => restored.to_string(),
+        None => "never hidden".to_owned(),
+    };
+    logf!(
+        "system {} indicator 0x{:x} now {now} — no longer ours to hide: icon {}, slot {}",
+        indicator.what,
+        found.icon,
+        show(icon),
+        show(slot)
+    );
+    indicator.forget();
 }
 
 /// The `x:Name` of the `SystemTrayFrameGrid` child an element sits in (`MainStack`,
@@ -1238,7 +1390,11 @@ unsafe fn recheck_indicators(diagnostics: &xamlom::IXamlDiagnostics) {
         let Some(found) = indicator.recorded() else {
             continue;
         };
-        let Some(text) = decorate::text_of(diagnostics, found.text_block) else {
+        if !indicator.classes.is_empty() {
+            recheck_by_class(diagnostics, indicator, found);
+            continue;
+        }
+        let Some(text) = decorate::text_of(diagnostics, found.marker) else {
             // Gone from the tree: nothing to put back.
             indicator.forget();
             continue;
@@ -1246,34 +1402,47 @@ unsafe fn recheck_indicators(diagnostics: &xamlom::IXamlDiagnostics) {
         if text.is_empty() || indicator.matches(indicator.section, &text) {
             continue;
         }
-        let icon = restore::put_back_layout(diagnostics, found.icon);
-        let slot = if found.slot != found.icon {
-            restore::put_back_layout(diagnostics, found.slot)
-        } else {
-            None
-        };
-        let show = |outcome: Option<decorate::Restored>| match outcome {
-            Some(restored) => restored.to_string(),
-            None => "never hidden".to_owned(),
-        };
-        logf!(
-            "system {} indicator 0x{:x} now shows {} — no longer ours to hide: icon {}, slot {}",
-            indicator.what,
-            found.icon,
-            describe_text(&text),
-            show(icon),
-            show(slot)
-        );
-        indicator.forget();
+        put_back_indicator(diagnostics, indicator, found, &format!("shows {}", describe_text(&text)));
         let mut watched = lock(&WATCHED);
-        if !watched.contains(&found.text_block) {
-            watched.push(found.text_block);
+        if !watched.contains(&found.marker) {
+            watched.push(found.marker);
         }
     }
 
     let watched = lock(&WATCHED).clone();
     for text_block in watched {
         note_system_indicator(diagnostics, text_block);
+    }
+}
+
+/// [`recheck_indicators`] for an indicator found by content class, from the recorded tree alone
+/// (no XAML read): the `IconView` must still hold a content of one of its classes. A new content
+/// of the right class (the shell rebuilt it) is adopted; any other content puts the view back.
+/// The view coming back as the indicator later raises an add event, which finds it again.
+///
+/// # Safety
+/// XAML UI thread only, and only once the event stream is quiet — see [`sweep`].
+unsafe fn recheck_by_class(diagnostics: &xamlom::IXamlDiagnostics, indicator: &Indicator, found: Found) {
+    if tree::type_of(found.icon).is_none() {
+        // The view itself is gone: nothing to put back.
+        indicator.forget();
+        return;
+    }
+    let still = |content: xamlom::InstanceHandle| {
+        content_indicator(content).is_some_and(|(i, icon, _)| core::ptr::eq(i, indicator) && icon == found.icon)
+    };
+    if still(found.marker) {
+        return;
+    }
+    let replacement = indicator
+        .classes
+        .iter()
+        .flat_map(|class| tree::find_by_type(class))
+        .filter(|&content| still(content))
+        .max_by_key(|&content| tree::seq_of(content));
+    match replacement {
+        Some(content) => indicator.record(Found { marker: content, ..found }),
+        None => put_back_indicator(diagnostics, indicator, found, "holds other content"),
     }
 }
 
@@ -1306,10 +1475,12 @@ static UNKNOWN_GLYPHS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 /// # Safety
 /// XAML UI thread only, and only once the event stream is quiet — see [`sweep`].
 unsafe fn enforce_hidden(diagnostics: &xamlom::IXamlDiagnostics) {
-    if !strip_placed() {
-        return;
-    }
+    // Every caller runs behind the sweep's `live()` check; the strip gate is per indicator.
+    let placed = strip_placed();
     for indicator in indicators() {
+        if indicator.needs_strip && !placed {
+            continue;
+        }
         if indicator.retries.load(Ordering::SeqCst) >= HIDE_MAX_RETRIES {
             continue;
         }
@@ -1429,10 +1600,11 @@ unsafe fn decorate_icon(
     let revision = STRIP_REVISION.load(Ordering::SeqCst);
     let state = strip_state().unwrap_or_default();
     logf!(
-        "strip state: accent={:?} hidevolume={} hidemic={} out={:04X} in={:04X}",
+        "strip state: accent={:?} hidevolume={} hidemic={} hidelanguage={} out={:04X} in={:04X}",
         state.accent,
         state.hide_system_volume,
         state.hide_system_mic,
+        state.hide_system_language,
         state.output_glyph as u32,
         state.input_glyph as u32
     );

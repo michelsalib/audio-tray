@@ -65,6 +65,14 @@ pub(super) struct Model {
     pub open: Option<super::layout::Connector>,
     /// MPC-HC: `None` when it is not here, else whether it shares what it plays.
     pub mpc: Option<bool>,
+    /// The installed keyboard layouts, as `(handle, label)`.
+    pub layouts: Vec<(u64, String)>,
+    /// The interface paths of the keyboards connected now.
+    pub connected: Vec<String>,
+    /// The assigned keyboard being renamed, and its name so far.
+    pub renaming: Option<(usize, String)>,
+    /// Waiting for a key on the keyboard to add, with what to say about the last one pressed.
+    pub capture: Option<Option<String>>,
 }
 
 impl Model {
@@ -81,7 +89,24 @@ impl Model {
             open: None,
             edge_sleep: crate::integrations::edge::players_at_risk(),
             mpc: crate::integrations::mpc::shares_media(),
+            layouts: Vec::new(),
+            connected: Vec::new(),
+            renaming: None,
+            capture: None,
         }
+    }
+
+    /// Read the installed layouts and the connected keyboards again.
+    pub(super) fn read_keyboards(&mut self) {
+        let installed = crate::keyboards::layouts();
+        self.layouts = installed.iter().map(|layout| (layout.hkl, crate::keyboards::label(layout, &installed))).collect();
+        self.connected = crate::keyboards::keyboards().into_iter().map(|keyboard| keyboard.path).collect();
+    }
+
+    /// The layout for a keyboard just added: the first one no other keyboard types in, else the first.
+    pub(super) fn unused_layout(&self) -> Option<u64> {
+        let used: Vec<u64> = self.config.keyboards.assigned.iter().filter_map(|k| k.hkl()).collect();
+        self.layouts.iter().map(|(hkl, _)| *hkl).find(|hkl| !used.contains(hkl)).or_else(|| self.layouts.first().map(|(hkl, _)| *hkl))
     }
 
     /// The secret's last characters, when there is one: it is never shown whole.

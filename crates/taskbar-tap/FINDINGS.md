@@ -368,6 +368,12 @@ Finding the volume slot stays ungated and separate from collapsing it: the glyph
 is announced during the replay, long before our icon is decorated, so gating the
 *search* would mean never finding it even when the strip does appear.
 
+**The exception: the keyboard-layout indicator** (`hidelanguage`, added 2026-11-05). The strip
+does not replace it; the user hides it because audio-tray switches the layout per keyboard (see
+`docs/KEYBOARDS.md`), and Win+Space still works without it. So `Indicator::needs_strip` is
+`false` for it and `enforce_hidden` collapses it whenever the TAP is active (`live()`), with
+`buttons=0` (music tile only) included. Volume and microphone keep the strip gate.
+
 ## Turning it off — revert in place, never unload
 
 Unloading the DLL cannot do the undo, and does not need to.
@@ -926,6 +932,15 @@ Windhawk's glyph sets, for comparison with ours (`decorate.rs`):
 
 The IME and system tray glyphs come from Segoe Fluent and from
 `%SystemRoot%\SystemApps\MicrosoftWindows.Client.Core_cw5n1h2txyewy\SystemTray\Assets\AXPIcons.ttf`.
+
+**The keyboard-layout indicator (2026-11-05).** The tree callback queues any element whose
+type is `SystemTray.LanguageTextIconContent` / `LanguageImageIconContent` (`PENDING_CONTENTS`);
+the type name is in the event, so this costs no XAML call. The sweep climbs the recorded tree to
+the `IconView`, checks its section is `NonActivatableStack`, and records it like the glyph
+indicators (`note_content_indicator`). The re-check (`recheck_by_class`) also reads only the
+recorded tree: the view must still hold a content of a language class; a rebuilt one is adopted,
+anything else (an IME mode icon reusing the view) puts it back. The IME mode icons are never
+matched.
 
 **Rule for any new hide (keyboard layout included):** find the section by `x:Name` under the
 main taskbar's `SystemTrayFrameGrid` (`reorder::frame()`), identify by content class or by an

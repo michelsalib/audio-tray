@@ -34,6 +34,7 @@ mod icons;
 mod image;
 mod instance;
 mod integrations;
+mod keyboards;
 mod layered;
 mod music;
 mod osd;

@@ -342,6 +342,10 @@ fn init_data(icons: StripIcons, owner_pid: u32, payload: Payload) -> String {
     if !buttons {
         pairs.push(("buttons", "0".to_string()));
     }
+    // Not tied to the buttons: the strip does not replace the layout indicator. Off is the default.
+    if config.strip.hide_windows_language {
+        pairs.push(("hidelanguage", "1".to_string()));
+    }
     // The DLL path only matters to a handover's compatibility check, which comes by WM_COPYDATA
     // (no length cap); the injection's initialization data cannot spare its 70-odd characters.
     if payload == Payload::Handover {

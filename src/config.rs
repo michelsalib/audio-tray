@@ -32,6 +32,45 @@ pub struct Config {
     pub browser: Browser,
     /// MPC-HC's session: followed, or left out.
     pub mpc: Mpc,
+    /// A keyboard layout per physical keyboard — see [`crate::keyboards`].
+    pub keyboards: Keyboards,
+}
+
+/// Switching the keyboard layout by which keyboard is typed on. Off by default.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Keyboards {
+    pub enabled: bool,
+    /// Confirm each switch on the pill, like a new song.
+    pub show_readout: bool,
+    /// One per keyboard; a keyboard not listed switches nothing.
+    pub assigned: Vec<AssignedKeyboard>,
+}
+
+impl Default for Keyboards {
+    fn default() -> Self {
+        Self { enabled: false, show_readout: true, assigned: Vec::new() }
+    }
+}
+
+/// A keyboard and the layout it types in.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AssignedKeyboard {
+    /// Its Raw Input interface path, stable across reconnects (the session's handle is not).
+    pub device_path: String,
+    /// What the user calls it.
+    pub name: String,
+    /// The full layout handle, in hex (`0409040C`): never only the language. A layout uninstalled
+    /// since leaves the entry inert, not broken.
+    pub hkl: String,
+}
+
+impl AssignedKeyboard {
+    pub fn hkl(&self) -> Option<u64> {
+        let digits = self.hkl.trim().trim_start_matches("0x").trim_start_matches("0X");
+        u64::from_str_radix(digits, 16).ok()
+    }
 }
 
 /// The floating pill on a screen's edge.
@@ -206,6 +245,9 @@ pub struct Strip {
     pub hide_windows_volume: bool,
     /// Hide Windows' "microphone in use" icon, which the input button's red dot replaces.
     pub hide_windows_mic: bool,
+    /// Hide Windows' keyboard-layout indicator ("FRA"). Off by default: unlike the two above it is
+    /// not replaced by anything; Win+Space still switches. Needs the TAP (buttons or music tile).
+    pub hide_windows_language: bool,
     /// The mouse wheel changes the volume anywhere over the taskbar. Off: only over our buttons.
     pub scroll_anywhere: bool,
 }
@@ -217,6 +259,7 @@ impl Default for Strip {
             next_to_wifi: true,
             hide_windows_volume: true,
             hide_windows_mic: true,
+            hide_windows_language: false,
             scroll_anywhere: true,
         }
     }

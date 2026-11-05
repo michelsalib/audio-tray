@@ -320,6 +320,7 @@ fn pill_preview(backend: &WasapiBackend, args: &[String]) -> Result<()> {
         _ => PillAlign::Center,
     };
     config.size = if args.iter().any(|a| a == "small") { PillSize::Small } else { PillSize::Big };
+    config.announce_tracks |= args.iter().any(|a| a == "note");
     let secs: u64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(20);
     crate::pill::create(&config)?;
     let endpoint = |flow: Flow| -> Option<crate::hub::Endpoint> {
@@ -353,6 +354,40 @@ fn pill_preview(backend: &WasapiBackend, args: &[String]) -> Result<()> {
         let call = crate::hub::Call { channel: None, members: Vec::new(), self_muted: false, self_deafened: false, icon };
         state.calls.push((crate::hub::VoiceApp::Teams, call));
         state.media.clear();
+    }
+    // `cover`: the song's cover from %TEMP%\audio-tray-shots\cover1.png; `paused`: paused; `note`:
+    // its new-song note up.
+    if let Some(song) = state.media.first_mut() {
+        if args.iter().any(|a| a == "cover") {
+            song.cover = std::fs::read(std::env::temp_dir().join("audio-tray-shots").join("cover1.png")).ok().map(std::sync::Arc::new);
+        }
+        if args.iter().any(|a| a == "note") {
+            let notice = crate::hub::Notice::NewTrack { app_id: song.app_id.clone(), title: song.title.clone(), artist: song.artist.clone() };
+            state.notices.push((notice, std::time::Instant::now()));
+        }
+    }
+    // A paused session shows only beside a playing one: a second session, playing, under it.
+    if args.iter().any(|a| a == "paused") && !state.media.is_empty() {
+        let mut other = state.media[0].clone();
+        state.media[0].playing = false;
+        other.app_id = "preview-2".into();
+        other.app = "Spotify".into();
+        other.title = "Another song".into();
+        other.cover = std::fs::read(std::env::temp_dir().join("audio-tray-shots").join("cover2.png")).ok().map(std::sync::Arc::new);
+        if let Some(timeline) = other.timeline.as_mut() {
+            timeline.position = 60 * 10_000_000;
+        }
+        state.media.push(other);
+    }
+    // `crowd`: a Discord call of nine (initials, the third speaking), beside the song.
+    if args.iter().any(|a| a == "crowd") {
+        let members = ["Ana", "Ben", "Cy", "Dee", "Eli", "Fay", "Gus", "Hal", "Ivy"]
+            .iter()
+            .enumerate()
+            .map(|(i, name)| crate::hub::Member { id: i.to_string(), name: name.to_string(), avatar: None, speaking: i == 2, muted: false, me: i == 0 })
+            .collect();
+        let call = crate::hub::Call { channel: Some("General".into()), members, self_muted: false, self_deafened: false, icon: None };
+        state.calls.push((crate::hub::VoiceApp::Discord, call));
     }
     // `shots`: two invented sessions with covers from %TEMP%\audio-tray-shots (cover1.png,
     // cover2.png), for the website: nothing of anyone's.

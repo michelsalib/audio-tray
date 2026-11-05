@@ -6,9 +6,14 @@ use anyhow::{Context, Result};
 use windows::core::{w, Interface, PCWSTR};
 use windows::Win32::Foundation::{HMODULE, HWND, POINT};
 use windows::Win32::Graphics::Direct2D::Common::{
-    D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT, D2D_RECT_F, D2D_SIZE_U,
+    D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_BORDER_MODE_HARD, D2D1_COLOR_F, D2D1_PIXEL_FORMAT, D2D_RECT_F, D2D_SIZE_U,
 };
+use windows::Win32::Graphics::Direct2D::Common::D2D1_COMPOSITE_MODE_SOURCE_OVER;
 use windows::Win32::Graphics::Direct2D::{
+    CLSID_D2D1GaussianBlur, D2D1_BITMAP_OPTIONS, D2D1_BITMAP_OPTIONS_NONE, D2D1_BITMAP_OPTIONS_TARGET,
+    D2D1_BITMAP_PROPERTIES1, D2D1_DEVICE_CONTEXT_OPTIONS_NONE, D2D1_GAUSSIANBLUR_PROP_BORDER_MODE,
+    D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION, D2D1_INTERPOLATION_MODE_LINEAR, D2D1_PROPERTY_TYPE_ENUM,
+    D2D1_PROPERTY_TYPE_FLOAT,
     D2D1CreateFactory, ID2D1Bitmap1, ID2D1Device, ID2D1DeviceContext, ID2D1Factory1, ID2D1RenderTarget,
     D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, D2D1_BITMAP_PROPERTIES,
     ID2D1SolidColorBrush, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1_BITMAP_BRUSH_PROPERTIES1,
@@ -81,15 +86,51 @@ pub struct Gfx {
     formats: Vec<IDWriteTextFormat>,
     /// Pixels per DIP.
     pub scale: f32,
-    /// Images decoded and scaled down once, by a hash of their bytes: a repaint (a speaker
-    /// change, a tab update) uploads these instead of decoding every full-size cover again.
-    decoded: std::cell::RefCell<Vec<(u64, IWICBitmap)>>,
+    /// Images decoded, scaled down and uploaded once, by a hash of their bytes: a repaint (a
+    /// speaker change, a tab update) draws these instead of decoding every full-size cover again.
+    /// Bitmaps belong to the device, so every surface's context can draw them.
+    decoded: std::cell::RefCell<Vec<(u64, ID2D1Bitmap1)>>,
+    /// Covers blurred once, by their hash and deviation (in quarter pixels), for backdrops.
+    blurs: std::cell::RefCell<Vec<((u64, u32), ID2D1Bitmap1)>>,
+    /// A context of its own for drawing into those blurred bitmaps, outside any surface's draw.
+    offscreen: ID2D1DeviceContext,
 }
 
 /// How many decoded images are kept: the covers and faces on screen, with room to spare.
 const DECODED_KEPT: usize = 24;
+/// How many blurred covers are kept: one per card section, with room to spare.
+const BLURS_KEPT: usize = 8;
 /// The largest an image is ever drawn, in DIPs (the hover card's cover): decoded no bigger.
-const LARGEST_IMAGE: f32 = 64.0;
+const LARGEST_IMAGE: f32 = 80.0;
+
+/// A cache key for image bytes.
+fn hash_of(bytes: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Premultiplied BGRA at 96 DPI: a DIP of these bitmaps is one of their pixels, whatever DPI the
+/// image file states, so laying them out never depends on it.
+fn pixel_bitmap(options: D2D1_BITMAP_OPTIONS) -> D2D1_BITMAP_PROPERTIES1 {
+    D2D1_BITMAP_PROPERTIES1 {
+        pixelFormat: D2D1_PIXEL_FORMAT { format: DXGI_FORMAT_B8G8R8A8_UNORM, alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED },
+        dpiX: 96.0,
+        dpiY: 96.0,
+        bitmapOptions: options,
+        colorContext: std::mem::ManuallyDrop::new(None),
+    }
+}
+
+/// Keep `value` under `key` in `kept`, dropping the oldest past `most`.
+fn keep<K, V: Clone>(kept: &std::cell::RefCell<Vec<(K, V)>>, key: K, value: &V, most: usize) {
+    let mut kept = kept.borrow_mut();
+    if kept.len() >= most {
+        kept.remove(0);
+    }
+    kept.push((key, value.clone()));
+}
 
 impl Gfx {
     pub fn new(hwnd: HWND, scale: f32) -> Result<Self> {
@@ -120,7 +161,22 @@ impl Gfx {
             let dwrite: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED).context("DWriteCreateFactory")?;
             let wic: IWICImagingFactory =
                 CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER).context("WIC factory")?;
-            let mut gfx = Self { _d2d_factory: d2d_factory, _d2d_device: d2d_device, dcomp, _target: target, root, dwrite, wic, formats: Vec::new(), scale, decoded: Default::default() };
+            let offscreen = d2d_device.CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE).context("CreateDeviceContext")?;
+            offscreen.SetDpi(96.0, 96.0);
+            let mut gfx = Self {
+                _d2d_factory: d2d_factory,
+                _d2d_device: d2d_device,
+                dcomp,
+                _target: target,
+                root,
+                dwrite,
+                wic,
+                formats: Vec::new(),
+                scale,
+                decoded: Default::default(),
+                blurs: Default::default(),
+                offscreen,
+            };
             gfx.formats = vec![
                 gfx.format(w!("Segoe UI Variable Text"), DWRITE_FONT_WEIGHT_SEMI_BOLD, 13.0, false)?,
                 gfx.format(w!("Segoe UI Variable Text"), DWRITE_FONT_WEIGHT_NORMAL, 12.0, false)?,
@@ -201,26 +257,44 @@ impl Gfx {
         }
     }
 
-    /// PNG or JPEG bytes as a bitmap for `dc`, decoded once (see [`Gfx::decoded`]).
-    fn bitmap(&self, dc: &ID2D1DeviceContext, bytes: &[u8]) -> Result<ID2D1Bitmap1> {
-        use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        bytes.hash(&mut hasher);
-        let key = hasher.finish();
-        let cached = self.decoded.borrow().iter().find(|(k, _)| *k == key).map(|(_, b)| b.clone());
-        let decoded = match cached {
-            Some(decoded) => decoded,
-            None => {
-                let decoded = self.decode(bytes)?;
-                let mut kept = self.decoded.borrow_mut();
-                if kept.len() >= DECODED_KEPT {
-                    kept.remove(0);
-                }
-                kept.push((key, decoded.clone()));
-                decoded
-            }
+    /// PNG or JPEG bytes as a bitmap (see [`pixel_bitmap`]), decoded and uploaded once (see
+    /// [`Gfx::decoded`]).
+    fn bitmap(&self, bytes: &[u8]) -> Result<ID2D1Bitmap1> {
+        let key = hash_of(bytes);
+        if let Some((_, bitmap)) = self.decoded.borrow().iter().find(|(k, _)| *k == key) {
+            return Ok(bitmap.clone());
+        }
+        let decoded = self.decode(bytes)?;
+        let bitmap = unsafe { self.offscreen.CreateBitmapFromWicBitmap(&decoded, Some(&pixel_bitmap(D2D1_BITMAP_OPTIONS_NONE)))? };
+        keep(&self.decoded, key, &bitmap, DECODED_KEPT);
+        Ok(bitmap)
+    }
+
+    /// `bytes`' bitmap blurred by `deviation` of its pixels (to a quarter pixel), the same size,
+    /// drawn once (see [`Gfx::blurs`]).
+    fn blurred_bitmap(&self, bytes: &[u8], deviation: f32) -> Result<ID2D1Bitmap1> {
+        let key = (hash_of(bytes), (deviation * 4.0).round().max(0.0) as u32);
+        if let Some((_, bitmap)) = self.blurs.borrow().iter().find(|(k, _)| *k == key) {
+            return Ok(bitmap.clone());
+        }
+        let source = self.bitmap(bytes)?;
+        let dc = &self.offscreen;
+        let blurred = unsafe {
+            let target = dc.CreateBitmap(source.GetPixelSize(), None, 0, &pixel_bitmap(D2D1_BITMAP_OPTIONS_TARGET))?;
+            let effect = dc.CreateEffect(&CLSID_D2D1GaussianBlur)?;
+            effect.SetInput(0, &source, true);
+            let deviation = key.1 as f32 / 4.0;
+            effect.SetValue(D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION.0 as u32, D2D1_PROPERTY_TYPE_FLOAT, &deviation.to_le_bytes())?;
+            effect.SetValue(D2D1_GAUSSIANBLUR_PROP_BORDER_MODE.0 as u32, D2D1_PROPERTY_TYPE_ENUM, &(D2D1_BORDER_MODE_HARD.0 as u32).to_le_bytes())?;
+            dc.SetTarget(&target);
+            dc.BeginDraw();
+            dc.Clear(Some(&Rgba(0.0, 0.0, 0.0, 0.0).d2d()));
+            dc.DrawImage(&effect.GetOutput()?, None, None, D2D1_INTERPOLATION_MODE_LINEAR, D2D1_COMPOSITE_MODE_SOURCE_OVER);
+            dc.EndDraw(None, None).context("EndDraw (blur)")?;
+            target
         };
-        unsafe { Ok(dc.CreateBitmapFromWicBitmap(&decoded, None)?) }
+        keep(&self.blurs, key, &blurred, BLURS_KEPT);
+        Ok(blurred)
     }
 
     /// Decode, scaled down to the largest size the pill draws, in premultiplied BGRA.
@@ -316,12 +390,11 @@ impl Painter<'_> {
     /// `bytes` decoded and fitted (cover, centred) into a circle, or into a rounded square when
     /// `radius` is given. `false` when the image would not decode.
     pub fn image(&mut self, bytes: &[u8], x: f32, y: f32, size: f32, radius: Option<f32>) -> Result<bool> {
-        let Ok(bitmap) = self.gfx.bitmap(&self.dc, bytes) else {
+        let Ok(bitmap) = self.gfx.bitmap(bytes) else {
             return Ok(false);
         };
         unsafe {
-            // In DIPs at the bitmap's own DPI, which is the image file's (an icon rendered to PNG
-            // is not at the screen's): what the brush below is laid out in.
+            // In the bitmap's DIPs, its pixels (see `pixel_bitmap`): what the brush is laid out in.
             let dips = bitmap.GetSize();
             let (bw, bh) = (dips.width.max(0.01), dips.height.max(0.01));
             let fit = size / bw.min(bh);
@@ -337,6 +410,48 @@ impl Painter<'_> {
                 Some(r) => self.dc.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: rect(x, y, size, size), radiusX: r, radiusY: r }, &brush),
                 None => self.dc.FillEllipse(&ellipse(x + size / 2.0, y + size / 2.0, size / 2.0), &brush),
             }
+        }
+        Ok(true)
+    }
+
+    /// `bytes` blurred and scaled to cover the box `area` (centred), then `tint` over it, both
+    /// only inside `area` and the rounded `shape`: a cover as one section's backdrop. `blur` is
+    /// the Gaussian's deviation in DIPs of the area. `false` (nothing drawn) when the image would
+    /// not decode.
+    pub fn blurred(&mut self, bytes: &[u8], area: (f32, f32, f32, f32), (shape, radius): ((f32, f32, f32, f32), f32), blur: f32, tint: Rgba) -> Result<bool> {
+        let (x, y, w, h) = area;
+        let (sx, sy, sw, sh) = shape;
+        let Ok(bitmap) = self.gfx.bitmap(bytes) else {
+            return Ok(false);
+        };
+        unsafe {
+            // In the bitmap's DIPs, its pixels (see `pixel_bitmap`).
+            let size = bitmap.GetSize();
+            let (bw, bh) = (size.width.max(0.01), size.height.max(0.01));
+            // Past the area by 3 deviations all round: the blur fades the image's own edges into
+            // transparency, and that fade stays outside the clip.
+            let reach = 3.0 * blur;
+            let fit = ((w + 2.0 * reach) / bw).max((h + 2.0 * reach) / bh);
+            // Blurred at the bitmap's own (small) size, then scaled up: the deviation shrinks by
+            // the same factor, and the upscale smooths what is left.
+            let Ok(blurred) = self.gfx.blurred_bitmap(bytes, blur / fit) else {
+                return Ok(false);
+            };
+            let props = D2D1_BITMAP_BRUSH_PROPERTIES1 {
+                extendModeX: D2D1_EXTEND_MODE_CLAMP,
+                extendModeY: D2D1_EXTEND_MODE_CLAMP,
+                interpolationMode: D2D1_INTERPOLATION_MODE_LINEAR,
+            };
+            let brush = self.dc.CreateBitmapBrush(&blurred, Some(&props), None)?;
+            let (dx, dy) = (x + (w - bw * fit) / 2.0, y + (h - bh * fit) / 2.0);
+            brush.SetTransform(&(Matrix3x2 { M11: fit, M12: 0.0, M21: 0.0, M22: fit, M31: dx, M32: dy }));
+            let shape = D2D1_ROUNDED_RECT { rect: rect(sx, sy, sw, sh), radiusX: radius, radiusY: radius };
+            self.dc.PushAxisAlignedClip(&rect(x, y, w, h), D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+            self.dc.FillRoundedRectangle(&shape, &brush);
+            if let Ok(tint) = self.brush(tint) {
+                self.dc.FillRoundedRectangle(&shape, &tint);
+            }
+            self.dc.PopAxisAlignedClip();
         }
         Ok(true)
     }

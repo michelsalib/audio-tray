@@ -73,6 +73,8 @@ pub const WM_PILL_ACTION: u32 = WM_APP + 36;
 const WM_APPBAR: u32 = WM_APP + 37;
 /// `WM_MOUSELEAVE`, filed under UI::Controls in windows-rs.
 const WM_MOUSELEAVE: u32 = 0x02A3;
+/// `WM_DWMCOLORIZATIONCOLORCHANGED`: the accent changed (sent to top-level windows).
+const WM_DWMCOLORIZATIONCOLORCHANGED: u32 = 0x0320;
 const METER_TIMER: usize = 1;
 /// The microphone meter's rate while muted in a call: 10 Hz.
 const METER_MS: u32 = 100;
@@ -172,6 +174,10 @@ struct Pill {
     /// of the quiet pill and shrinks back into it.
     scene_size: (f32, f32),
     quiet_size: (f32, f32),
+    /// The last quiet pill's hover strip, along the edge in pixels (start, length). The card's
+    /// strip covers it too: a quiet column longer than the card would otherwise leave the pointer
+    /// outside both once the card opened, collapse it, and open it again, over and over.
+    quiet_strip: Option<(i32, i32)>,
     /// The soft highlight behind the button under the pointer, and which hit it is on.
     highlight: Option<IDCompositionVisual2>,
     hover_hit: Option<usize>,
@@ -209,6 +215,7 @@ pub fn create(config: &crate::config::Pill) -> Result<()> {
             listening_alerts: config.listening_alerts,
             devices: config.devices,
             size: config.size,
+            announce_tracks: config.announce_tracks,
             fullscreen: fullscreen_now(),
             ..Default::default()
         },
@@ -226,6 +233,7 @@ pub fn create(config: &crate::config::Pill) -> Result<()> {
         drawn_size: None,
         scene_size: (0.0, 0.0),
         quiet_size: if config.edge.vertical() { (6.0, 56.0) } else { (56.0, 6.0) },
+        quiet_strip: None,
         highlight: None,
         hover_hit: None,
         collapsing: false,
@@ -259,6 +267,8 @@ pub fn configure(config: &crate::config::Pill) {
         if moved {
             // Elsewhere, the same state is drawn again from scratch (another edge tucks another side).
             pill.quiet_size = if config.edge.vertical() { (6.0, 56.0) } else { (56.0, 6.0) };
+            // Its strip was on another edge or display.
+            pill.quiet_strip = None;
             pill.redraw();
         }
         pill.refresh();
@@ -382,6 +392,8 @@ impl Pill {
 
     /// Draw the shown state again from scratch: re-placed, and re-scaled for its display.
     fn redraw(&mut self) {
+        // The quiet strip is kept: a quiet view records its new one as it is shown, and an open
+        // card without it would shrink its strip and loop (see `quiet_strip`).
         let view = std::mem::replace(&mut self.view, View::Hidden);
         if let Err(e) = self.show(&view, Entrance::None) {
             eprintln!("pill: could not re-place ({e:#})");
@@ -465,8 +477,15 @@ impl Pill {
             SetWindowPos(self.hwnd, Some(HWND_TOPMOST), x, y, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW)?;
             if self.hoverable(view) {
                 // Centred on the pills, kept on the edge.
-                let strip = px(EDGE_H).max(len - lead);
-                let strip_at = (along + lead + (len - lead) / 2 - strip / 2).clamp(start, (end - strip).max(start));
+                let mut strip = px(EDGE_H).max(len - lead);
+                let mut strip_at = (along + lead + (len - lead) / 2 - strip / 2).clamp(start, (end - strip).max(start));
+                if !matches!(view, View::Music { card: true, .. }) {
+                    self.quiet_strip = Some((strip_at, strip));
+                } else if let Some((quiet_at, quiet)) = self.quiet_strip {
+                    let stop = (strip_at + strip).max(quiet_at + quiet);
+                    strip_at = strip_at.min(quiet_at);
+                    strip = stop - strip_at;
+                }
                 let (sx, sy, sw, sh) = match self.side {
                     PillEdge::Left => (work.left, strip_at, 2, strip),
                     PillEdge::Right => (work.right - 2, strip_at, 2, strip),
@@ -663,6 +682,9 @@ impl Pill {
             for &ring in &scene.rings {
                 keep.extend(ring_visuals(gfx, &holder, ring)?);
             }
+            for &bar in &scene.bars {
+                keep.push(bar_visual(gfx, &holder, bar)?);
+            }
             for &pulse in &scene.pulses {
                 keep.push(pulse_visual(gfx, &holder, pulse)?);
             }
@@ -852,7 +874,7 @@ fn ring_visuals(gfx: &Gfx, holder: &IDCompositionVisual2, ring: Ring) -> Result<
     let now = ring.fraction.clamp(0.0, 1.0) * 360.0;
     let rate = ring.rate * 360.0;
     for (clip_left, half_left) in [(false, true), (true, false)] {
-        let (half, _) = gfx.painted(size, size, |p| p.half_ring(cx, cy, ring.r, ring.stroke, draw::RING, half_left))?;
+        let (half, _) = gfx.painted(size, size, |p| p.half_ring(cx, cy, ring.r, ring.stroke, ring.color, half_left))?;
         let container = unsafe { gfx.dcomp.CreateVisual()? };
         unsafe {
             container.SetOffsetX2((ring.cx - reach) * scale)?;
@@ -881,6 +903,34 @@ fn ring_visuals(gfx: &Gfx, holder: &IDCompositionVisual2, ring: Ring) -> Result<
         keep.push(half);
     }
     Ok(keep)
+}
+
+/// A progress bar's filled part: the whole bar, painted once, behind a clip whose right side DWM
+/// moves from now to the end of the track.
+fn bar_visual(gfx: &Gfx, holder: &IDCompositionVisual2, bar: draw::Bar) -> Result<IDCompositionVisual2> {
+    let (visual, _) = gfx.painted(bar.w, bar.h, |p| p.round_rect(0.0, 0.0, bar.w, bar.h, bar.h / 2.0, bar.color))?;
+    let scale = gfx.scale;
+    let (w, now) = (bar.w * scale, bar.fraction.clamp(0.0, 1.0) * bar.w * scale);
+    unsafe {
+        visual.SetOffsetX2(bar.x * scale)?;
+        visual.SetOffsetY2(bar.y * scale)?;
+        let clip = gfx.dcomp.CreateRectangleClip()?;
+        clip.SetLeft2(0.0)?;
+        clip.SetTop2(0.0)?;
+        clip.SetBottom2(bar.h * scale)?;
+        let right = gfx.dcomp.CreateAnimation()?;
+        if bar.rate > 0.0 && now < w {
+            let speed = bar.rate * w;
+            right.AddCubic(0.0, now, speed, 0.0, 0.0)?;
+            right.End(((w - now) / speed) as f64, w)?;
+        } else {
+            right.AddCubic(0.0, now, 0.0, 0.0, 0.0)?;
+        }
+        clip.SetRight(&right)?;
+        visual.SetClip(&clip)?;
+        holder.AddVisual(&visual, false, None)?;
+    }
+    Ok(visual)
 }
 
 /// A green ring around a speaking face that swells and fades, over and over: one animation set
@@ -977,6 +1027,22 @@ fn cursor_in(hwnd: HWND) -> bool {
         && point.x < rect.right
         && point.y >= rect.top
         && point.y < rect.bottom
+}
+
+/// `WM_SETTINGCHANGE` for "ImmersiveColorSet": the accent or the theme changed.
+fn is_colour_set(lparam: LPARAM) -> bool {
+    lparam.0 != 0 && unsafe { windows::core::PCWSTR(lparam.0 as *const u16).to_string() }.is_ok_and(|area| area == "ImmersiveColorSet")
+}
+
+/// Forget the accent and paint the shown state again in the new one. Both windows get the
+/// broadcasts: one repaint.
+fn accent_repaint(hwnd: HWND) {
+    draw::accent_changed();
+    with_pill(|pill| {
+        if hwnd == pill.hwnd {
+            pill.redraw();
+        }
+    });
 }
 
 fn track_leave(hwnd: HWND) {
@@ -1078,6 +1144,15 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESUL
                 });
             }
             Some(LRESULT(0))
+        }
+        // The accent changed: the playing rings and bars are drawn in it.
+        WM_DWMCOLORIZATIONCOLORCHANGED => {
+            accent_repaint(hwnd);
+            None
+        }
+        WM_SETTINGCHANGE if is_colour_set(lparam) => {
+            accent_repaint(hwnd);
+            None
         }
         // Settings broadcasts arrive often and for anything: only a work-area change moves us.
         WM_SETTINGCHANGE if wparam.0 as u32 != SPI_SETWORKAREA.0 => None,

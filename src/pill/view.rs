@@ -75,6 +75,8 @@ pub struct SongNote {
     pub text: String,
     /// The player, brought to the front by a click.
     pub app_id: String,
+    /// The player's cover, shown in the note in place of the music glyph.
+    pub cover: Option<std::sync::Arc<Vec<u8>>>,
     pub notice: Notice,
 }
 
@@ -217,6 +219,7 @@ fn loudest(state: &State, inputs: Inputs) -> View {
             Notice::NewTrack { app_id, title, artist } => Some(SongNote {
                 text: if artist.trim().is_empty() { title.clone() } else { format!("{title} · {artist}") },
                 app_id: app_id.clone(),
+                cover: media.iter().find(|m| &m.app_id == app_id).and_then(|m| m.cover.clone()),
                 notice: notice.clone(),
             }),
             _ => None,

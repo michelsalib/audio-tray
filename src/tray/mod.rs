@@ -183,6 +183,8 @@ struct Tray {
     hub: crate::hub::State,
     /// Session-created notifications on the default output, and which output that is.
     sessions: Option<(crate::audio::DeviceId, sessions::Watch)>,
+    /// The per-keyboard layout switcher, while `[keyboards] enabled`.
+    keyboards: Option<crate::keyboards::Switcher>,
 }
 
 struct MuteWatch {
@@ -261,6 +263,8 @@ pub fn run(backend: WasapiBackend, settings: bool) -> Result<()> {
         println!("music: following YouTube Music");
     }
 
+    let keyboards = config.keyboards.enabled.then(|| crate::keyboards::Switcher::spawn(&config.keyboards)).flatten();
+
     TRAY.with(|cell| {
         *cell.borrow_mut() = Some(Tray {
             backend: Rc::new(backend),
@@ -276,6 +280,7 @@ pub fn run(backend: WasapiBackend, settings: bool) -> Result<()> {
             mute_pending: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             hub: crate::hub::State::default(),
             sessions: None,
+            keyboards,
         })
     });
     with_tray(Tray::refresh);
@@ -619,7 +624,7 @@ impl Tray {
         // The wheel needs only the hook; the rest of the strip, and the tile, a fresh injection.
         let drawn = |c: &Config| {
             let s = &c.strip;
-            (s.enabled, s.next_to_wifi, s.hide_windows_volume, s.hide_windows_mic, c.music.enabled, c.music.tile_style)
+            (s.enabled, s.next_to_wifi, s.hide_windows_volume, s.hide_windows_mic, s.hide_windows_language, c.music.enabled, c.music.tile_style)
         };
         if drawn(&before) != drawn(c) {
             self.apply_taskbar();
@@ -628,6 +633,14 @@ impl Tray {
         }
         if before.icons != self.config.icons {
             self.refresh();
+        }
+        if before.keyboards != self.config.keyboards {
+            let wanted = &self.config.keyboards;
+            match (&self.keyboards, wanted.enabled) {
+                (Some(switcher), true) => switcher.configure(wanted),
+                (None, true) => self.keyboards = crate::keyboards::Switcher::spawn(wanted),
+                (_, false) => self.keyboards = None,
+            }
         }
         // MPC-HC's session goes at once, and comes back with a fresh reading.
         if self.config.mpc.enabled != before.mpc.enabled {

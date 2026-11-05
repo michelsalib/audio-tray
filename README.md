@@ -56,6 +56,15 @@ A tiny Windows app for **audio awareness without opening anything** — a pill o
   hover away on the preview's toolbar. It is the app's *own* button, so launching adds no
   second icon, minimising still goes there, and it still drags to reorder. See
   [the YouTube Music tile](#the-youtube-music-tile).
+- **A keyboard layout for each keyboard** (opt-in, Settings > Keyboards) — type on the laptop's
+  AZERTY and it is AZERTY, pick up a QWERTY keyboard and the next keys are QWERTY, even when both
+  layouts belong to the same language. Add a keyboard by pressing a key on it. The pill shows
+  each change, Win+Space included, and Windows' own layout icon can be hidden from the taskbar.
+  - *Privacy:* only which keyboard a key comes from is read (Raw Input's device handle), never
+    the key itself; nothing is hooked, injected or logged.
+  - *Limits:* the first key after changing keyboards still types in the old layout (press Shift
+    first); a window running as administrator may not follow (Windows does not let a normal app
+    switch it); the lock screen is not covered.
 - **Falls back to a plain tray icon** if the taskbar controls cannot be drawn — an
   icon reflecting the current output device (speakers, headphones, headset, HDMI…),
   rendered from Segoe Fluent Icons and themed to your taskbar. Either button opens

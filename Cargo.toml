@@ -143,6 +143,10 @@ features = [
     "Win32_System_SystemInformation",
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_WinRT",
+    # Per-keyboard layouts (src/keyboards): Raw Input says which keyboard typed (device identity
+    # only, never the key), and the language names come from the locale API.
+    "Win32_UI_Input",
+    "Win32_Globalization",
 ]
 
 [build-dependencies]

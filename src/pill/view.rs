@@ -119,6 +119,7 @@ pub const GLYPH_MIC_OFF: char = '\u{F781}';
 pub const GLYPH_MIC: char = '\u{E720}';
 pub const GLYPH_SPEAKERS: char = '\u{E7F5}';
 pub const GLYPH_SONG: char = '\u{E8D6}';
+pub const GLYPH_KEYBOARD: char = '\u{E765}';
 
 /// Everything besides the hub state that the view depends on.
 #[derive(Clone, Copy, Default)]
@@ -187,7 +188,16 @@ fn loudest(state: &State, inputs: Inputs) -> View {
             action: Action::Dismiss(notice.clone()),
         };
     }
-
+    // A layout switch, for a moment: quieter than the above, so a compact pill or a fullscreen
+    // app keeps it to itself.
+    if let Some(notice @ Notice::KeyboardSwitched { keyboard, layout }) = newest(state, |n| matches!(n, Notice::KeyboardSwitched { .. })) {
+        return View::Banner {
+            level: Level::Normal,
+            glyph: GLYPH_KEYBOARD,
+            text: if keyboard.is_empty() { layout.clone() } else { format!("{keyboard} · {layout}") },
+            action: Action::Dismiss(notice.clone()),
+        };
+    }
 
     // The column and the card list the same sessions in the same order (paused ones too, to resume
     // them; the column dims them), so a disc is the row it opens on. With nothing playing at all
@@ -281,6 +291,23 @@ mod tests {
             input: Some(Endpoint { id: DeviceId("mic".into()), name: "Mic".into(), muted, icon: crate::icons::IconId::Microphone }),
             active_outputs: vec![],
         }));
+    }
+
+    #[test]
+    fn a_keyboard_switch_shows_briefly_over_the_music_but_not_over_a_warning() {
+        let mut state = State::default();
+        state.apply(Event::Media(vec![media(true)]));
+        state.apply(Event::KeyboardSwitched { keyboard: "K380".into(), layout: "US".into() });
+        assert!(matches!(decide(&state, on()), View::Banner { level: Level::Normal, glyph: GLYPH_KEYBOARD, ref text, .. } if text == "K380 · US"));
+        // Compact: a confirmation is not worth unfolding the pill for.
+        let compact = Inputs { size: crate::config::PillSize::Hidden, ..on() };
+        assert_eq!(decide(&state, compact), View::Idle { call: None, devices: None });
+        // A change by Win+Space on a keyboard with no name: the layout alone.
+        state.apply(Event::KeyboardSwitched { keyboard: String::new(), layout: "US".into() });
+        assert!(matches!(decide(&state, on()), View::Banner { ref text, .. } if text == "US"));
+        // Gone with its lifetime.
+        state.expire(std::time::Instant::now() + std::time::Duration::from_secs(2));
+        assert!(matches!(decide(&state, on()), View::Music { .. }));
     }
 
     #[test]

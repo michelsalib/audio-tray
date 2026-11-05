@@ -107,6 +107,9 @@ pub struct StripState {
     /// Collapse Explorer's "microphone in use" indicator, which our recording dot replaces.
     /// It only exists while recording, so it is found and hidden mid-session.
     pub hide_system_mic: bool,
+    /// Collapse Explorer's keyboard-layout indicator ("FRA"). Not replaced by the strip, so hidden
+    /// whether or not it is drawn.
+    pub hide_system_language: bool,
 }
 
 impl Default for StripState {
@@ -121,6 +124,7 @@ impl Default for StripState {
             accent_alpha: PILL_ALPHA,
             hide_system_volume: false,
             hide_system_mic: false,
+            hide_system_language: false,
         }
     }
 }
@@ -151,6 +155,7 @@ impl StripState {
                 }
                 "hidevolume" => state.hide_system_volume = flag(),
                 "hidemic" => state.hide_system_mic = flag(),
+                "hidelanguage" => state.hide_system_language = flag(),
                 _ => {}
             }
         }

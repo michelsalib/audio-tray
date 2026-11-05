@@ -30,7 +30,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetCursorPos, IsIconic, LoadCursorW, LoadIconW, PostMessageW,
     RegisterClassW, SetForegroundWindow, SetWindowPos, ShowWindow, CS_HREDRAW, CS_VREDRAW, IDC_ARROW, MINMAXINFO,
     SWP_NOACTIVATE, SWP_NOZORDER, SW_RESTORE, SW_SHOWNORMAL, WHEEL_DELTA, WINDOW_EX_STYLE, WM_APP, WM_DESTROY,
-    WM_ACTIVATE, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
+    WM_ACTIVATE, WM_CHAR, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
     WM_MOUSEWHEEL, WM_PAINT, WM_SETTINGCHANGE, WM_SIZE, WNDCLASSW, WS_OVERLAPPEDWINDOW,
 };
 
@@ -53,6 +53,11 @@ pub const RESTART: usize = 2;
 
 /// Posted to this window: something in [`INBOX`] to read.
 const WM_FOLLOW: u32 = WM_APP + 1;
+/// Posted to this window by the keyboard switcher's thread: a keyboard was typed on during a
+/// capture ([`crate::keyboards::take_captured`]).
+const WM_KEYBOARD_CAPTURED: u32 = WM_APP + 2;
+/// The longest name a keyboard can be given.
+const NAME_MAX: usize = 40;
 /// `WM_MOUSELEAVE`, filed under UI::Controls in windows-rs.
 const WM_MOUSELEAVE: u32 = 0x02A3;
 const CLASS: PCWSTR = w!("AudioTraySettings");
@@ -198,6 +203,7 @@ fn create(config: &Config) -> Result<()> {
     model.monitors = crate::win::monitors();
     model.status = crate::tray::hub_snapshot().map(|(_, state)| Status::of(&state)).unwrap_or_default();
     model.update = crate::update::pending_version();
+    model.read_keyboards();
     let mut window = Window {
         hwnd,
         gfx: Gfx::new()?,
@@ -332,12 +338,20 @@ impl Window {
 
     /// Act on a click on `target`; what comes back runs once the state is released.
     fn activate(&mut self, target: Target) -> Option<After> {
+        // A click anywhere else keeps the name being typed, as a field losing the focus does.
+        if self.model.renaming.is_some() && !matches!(target, Target::Button(Button::SaveName | Button::CancelRename)) {
+            self.save_name();
+        }
         match target {
             Target::Nav(page) => {
                 if self.model.page != page {
                     self.model.page = page;
                     self.model.expanded = None;
                     self.model.hint = None;
+                    self.stop_capture();
+                    if page == Page::Keyboards {
+                        self.model.read_keyboards();
+                    }
                     self.scroll = 0.0;
                     self.relayout();
                     self.invalidate();
@@ -371,6 +385,9 @@ impl Window {
                     Toggle::NextToWifi => &mut c.strip.next_to_wifi,
                     Toggle::HideVolume => &mut c.strip.hide_windows_volume,
                     Toggle::HideMic => &mut c.strip.hide_windows_mic,
+                    Toggle::HideLanguage => &mut c.strip.hide_windows_language,
+                    Toggle::Keyboards => &mut c.keyboards.enabled,
+                    Toggle::KeyboardReadout => &mut c.keyboards.show_readout,
                     Toggle::ScrollAnywhere => &mut c.strip.scroll_anywhere,
                     Toggle::Music => &mut c.music.enabled,
                     Toggle::Pill => &mut c.pill.enabled,
@@ -384,6 +401,10 @@ impl Window {
                 };
                 *flag = !*flag;
             }),
+            Target::Choice(Choice::KeyboardLayout(k), i) => {
+                let hkl = self.model.layouts.get(i)?.0;
+                self.set_layout(k, hkl);
+            }
             Target::Choice(choice, i) => {
                 let monitors: Vec<String> = self.model.monitors.iter().map(|m| m.name.clone()).collect();
                 self.change(|c| match choice {
@@ -394,6 +415,7 @@ impl Window {
                     Choice::BrowserTabs => c.browser.every_site = i == 0,
                     // Automatic, then each display.
                     Choice::Display => c.pill.monitor = i.checked_sub(1).and_then(|m| monitors.get(m).cloned()),
+                    Choice::KeyboardLayout(_) => {}
                 })
             }
             Target::Slot(i, edge, align) => {
@@ -488,6 +510,43 @@ impl Window {
             Button::Releases => return Some(Box::new(|| {
                 crate::win::shell_open("https://github.com/michelsalib/audio-tray/releases", None);
             })),
+            Button::AddKeyboard => {
+                crate::keyboards::capture(self.hwnd, WM_KEYBOARD_CAPTURED);
+                self.model.capture = Some(None);
+                self.model.read_keyboards();
+                self.relayout();
+                self.invalidate();
+            }
+            Button::CancelCapture => {
+                self.stop_capture();
+                self.relayout();
+                self.invalidate();
+            }
+            Button::RenameKeyboard(i) => {
+                let name = self.model.config.keyboards.assigned.get(i)?.name.clone();
+                self.model.renaming = Some((i, name));
+                self.relayout();
+                self.invalidate();
+            }
+            // Saved above, by any click.
+            Button::SaveName => self.save_name(),
+            Button::CancelRename => {
+                self.model.renaming = None;
+                self.relayout();
+                self.invalidate();
+            }
+            Button::RemoveKeyboard(i) => self.change(|c| {
+                if i < c.keyboards.assigned.len() {
+                    c.keyboards.assigned.remove(i);
+                }
+            }),
+            Button::NextLayout(k) => {
+                let current = self.model.config.keyboards.assigned.get(k)?.hkl();
+                let at = self.model.layouts.iter().position(|(hkl, _)| Some(*hkl) == current);
+                let next = at.map_or(0, |at| (at + 1) % self.model.layouts.len());
+                let hkl = self.model.layouts.get(next)?.0;
+                self.set_layout(k, hkl);
+            }
             Button::ConfigFolder => {
                 let dir = Config::path().ok().and_then(|p| p.parent().map(|d| d.to_path_buf()));
                 return Some(Box::new(move || {
@@ -499,6 +558,89 @@ impl Window {
             }
         }
         None
+    }
+
+    fn set_layout(&mut self, keyboard: usize, hkl: u64) {
+        self.change(|c| {
+            if let Some(entry) = c.keyboards.assigned.get_mut(keyboard) {
+                entry.hkl = format!("{hkl:08X}");
+            }
+        });
+    }
+
+    /// Keep the name being typed (an empty one keeps the old name).
+    fn save_name(&mut self) {
+        let Some((i, name)) = self.model.renaming.take() else {
+            return;
+        };
+        let name = name.trim().to_string();
+        if name.is_empty() {
+            self.relayout();
+            self.invalidate();
+            return;
+        }
+        self.change(|c| {
+            if let Some(entry) = c.keyboards.assigned.get_mut(i) {
+                entry.name = name;
+            }
+        });
+    }
+
+    fn stop_capture(&mut self) {
+        if self.model.capture.take().is_some() {
+            crate::keyboards::cancel_capture();
+        }
+    }
+
+    /// A character typed into the window: the name being typed takes it.
+    fn type_char(&mut self, unit: u16) -> bool {
+        if self.model.renaming.is_none() {
+            return false;
+        }
+        match unit {
+            0x0D => {
+                self.save_name();
+                return true;
+            }
+            0x1B => self.model.renaming = None,
+            // Other controls, and halves of a surrogate pair (no emoji in a keyboard's name).
+            0x00..=0x07 | 0x09..=0x1F | 0x7F | 0xD800..=0xDFFF => return true,
+            _ => {
+                let Some((_, text)) = self.model.renaming.as_mut() else {
+                    return false;
+                };
+                if unit == 0x08 {
+                    text.pop();
+                } else if text.chars().count() < NAME_MAX {
+                    text.extend(char::from_u32(u32::from(unit)));
+                }
+            }
+        }
+        self.relayout();
+        self.invalidate();
+        true
+    }
+
+    /// The switcher's answer to a capture: add the keyboard, or say it is already there.
+    fn captured(&mut self) {
+        let Some(captured) = crate::keyboards::take_captured() else {
+            return;
+        };
+        if self.model.capture.is_none() {
+            return;
+        }
+        if let Some(name) = captured.assigned {
+            self.model.capture = Some(Some(format!("That one is already here, as \"{name}\": press a key on another keyboard")));
+            self.relayout();
+            self.invalidate();
+            return;
+        }
+        self.model.capture = None;
+        self.model.read_keyboards();
+        let taken: Vec<String> = self.model.config.keyboards.assigned.iter().map(|k| k.name.clone()).collect();
+        let name = crate::keyboards::default_name(&captured.path, &captured.names, &taken);
+        let hkl = self.model.unused_layout().map(|hkl| format!("{hkl:08X}")).unwrap_or_default();
+        self.change(|c| c.keyboards.assigned.push(crate::config::AssignedKeyboard { device_path: captured.path, name, hkl }));
     }
 
     /// Read what the tray handed over.
@@ -666,7 +808,13 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESUL
             with_window(Window::follow);
             Some(LRESULT(0))
         }
+        WM_KEYBOARD_CAPTURED => {
+            with_window(Window::captured);
+            Some(LRESULT(0))
+        }
+        WM_CHAR => with_window(|w| w.type_char(wparam.0 as u16)).filter(|typed| *typed).map(|_| LRESULT(0)),
         WM_DESTROY => {
+            crate::keyboards::cancel_capture();
             HWND_OPEN.with(|h| h.set(0));
             WINDOW.with(|cell| {
                 if let Ok(mut window) = cell.try_borrow_mut() {

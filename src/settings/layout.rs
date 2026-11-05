@@ -65,18 +65,20 @@ pub(super) enum Page {
     Taskbar,
     Pill,
     Devices,
+    Keyboards,
     Connectors,
     About,
 }
 
 impl Page {
-    pub(super) const ALL: [Page; 5] = [Page::Taskbar, Page::Pill, Page::Devices, Page::Connectors, Page::About];
+    pub(super) const ALL: [Page; 6] = [Page::Taskbar, Page::Pill, Page::Devices, Page::Keyboards, Page::Connectors, Page::About];
 
     pub(super) fn title(self) -> &'static str {
         match self {
             Page::Taskbar => "Taskbar",
             Page::Pill => "Edge pill",
             Page::Devices => "Devices",
+            Page::Keyboards => "Keyboards",
             Page::Connectors => "Connectors",
             Page::About => "About",
         }
@@ -87,6 +89,7 @@ impl Page {
             Page::Taskbar => '\u{E75B}',
             Page::Pill => '\u{E7F4}',
             Page::Devices => '\u{E767}',
+            Page::Keyboards => '\u{E765}',
             Page::Connectors => '\u{E71B}',
             Page::About => '\u{E946}',
         }
@@ -102,6 +105,11 @@ pub(super) enum Toggle {
     NextToWifi,
     HideVolume,
     HideMic,
+    HideLanguage,
+    /// Switch the layout by keyboard.
+    Keyboards,
+    /// Show layout changes on the pill.
+    KeyboardReadout,
     ScrollAnywhere,
     Music,
     Pill,
@@ -126,6 +134,8 @@ pub(super) enum Choice {
     BrowserTabs,
     /// Automatic, then each display in [`crate::win::monitors`]' order.
     Display,
+    /// The layout of assigned keyboard `i`: the index is into [`super::model::Model::layouts`].
+    KeyboardLayout(usize),
 }
 
 /// A button (or a whole card that acts like one).
@@ -146,6 +156,15 @@ pub(super) enum Button {
     Releases,
     ConfigFolder,
     Quit,
+    /// Take the next keyboard typed on.
+    AddKeyboard,
+    CancelCapture,
+    RenameKeyboard(usize),
+    SaveName,
+    CancelRename,
+    RemoveKeyboard(usize),
+    /// The next installed layout, when they are too many for a segmented choice.
+    NextLayout(usize),
 }
 
 /// What a click lands on.
@@ -191,6 +210,8 @@ pub(super) enum Kind {
     Chip { icon: IconId, selected: bool, target: Target },
     /// A device's icon, in its card's glyph column (the earbuds are drawn, not a font's).
     Icon(IconId),
+    /// A text being typed, with the caret at its end.
+    Field(String),
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -329,10 +350,39 @@ impl Column<'_> {
                 self.toggle_in(row, row.right() - CARD_PAD, on, dim, toggle)
             }
             Control::Segments(labels, selected, choice) => self.segments_in(row, &labels, selected, dim, choice),
+            Control::Buttons(buttons) => self.buttons_in(row, &buttons),
         };
         let end = row.right() - CARD_PAD - if used > 0.0 { used + 16.0 } else { 0.0 };
         let x = row.x + CARD_TEXT_X;
         self.laid.push(R::new(x, row.y, end - x, ROW_H), Kind::Label { title: title.to_string(), desc, dim });
+        self.y += ROW_H;
+    }
+
+    /// Buttons right-aligned in `row`, in order; returns the room they take.
+    fn buttons_in(&mut self, row: R, buttons: &[(String, bool, Option<char>, Button)]) -> f32 {
+        let mut right = row.right() - CARD_PAD;
+        for (label, accent, glyph, button) in buttons.iter().rev() {
+            let w = button_width(self.measure, label, *glyph);
+            let r = R::new(right - w, row.y + (row.h - CONTROL_H) / 2.0, w, CONTROL_H);
+            let target = Target::Button(*button);
+            self.laid.push(r, Kind::Button { label: label.clone(), accent: *accent, glyph: *glyph, target });
+            self.laid.hits.push((r, target));
+            right -= w + 8.0;
+        }
+        row.right() - CARD_PAD - right - 8.0
+    }
+
+    /// A row whose title is being typed: the field, then its buttons.
+    fn field_row(&mut self, group: &mut Group, text: &str, buttons: Vec<(String, bool, Option<char>, Button)>) {
+        if group.rows > 0 {
+            self.laid.push(R::new(self.x, self.y, self.w, 1.0), Kind::Divider);
+        }
+        group.rows += 1;
+        let row = R::new(self.x, self.y, self.w, ROW_H);
+        let used = self.buttons_in(row, &buttons);
+        let x = row.x + CARD_TEXT_X;
+        let end = row.right() - CARD_PAD - used - 16.0;
+        self.laid.push(R::new(x, row.y + (ROW_H - CONTROL_H) / 2.0, (end - x).min(360.0), CONTROL_H), Kind::Field(text.to_string()));
         self.y += ROW_H;
     }
 
@@ -400,6 +450,8 @@ enum Control<'a> {
     Button(&'a str, bool, Option<char>, Button),
     Toggle(bool, Toggle),
     Segments(Vec<String>, usize, Choice),
+    /// Label, accent, glyph, what it does; laid out left to right.
+    Buttons(Vec<(String, bool, Option<char>, Button)>),
 }
 
 /// A connector, on its own card in Settings > Connectors.
@@ -432,6 +484,7 @@ pub(super) fn page(model: &Model, width: f32, measure: &dyn Fn(&str) -> f32) -> 
         Page::Taskbar => taskbar(&mut col, model),
         Page::Pill => pill(&mut col, model),
         Page::Devices => devices(&mut col, model),
+        Page::Keyboards => keyboards(&mut col, model),
         Page::Connectors => connectors(&mut col, model),
         Page::About => about(&mut col, model),
     }
@@ -485,6 +538,82 @@ fn taskbar(col: &mut Column, model: &Model) {
         !c.music.enabled,
         Choice::Tile,
     );
+}
+
+/// A segmented choice gives way to a button that steps through the layouts past this width.
+const LAYOUT_SEGMENTS_MAX_W: f32 = 520.0;
+
+fn keyboards(col: &mut Column, model: &Model) {
+    let c = &model.config;
+    let k = &c.keyboards;
+    col.toggle(
+        Some('\u{E765}'),
+        "A layout for each keyboard",
+        plain("Typing on a keyboard switches to its layout. Press Shift first: the first key still types in the old one"),
+        k.enabled,
+        false,
+        Toggle::Keyboards,
+    );
+    let off = !k.enabled;
+    col.toggle(None, "Show the layout on the pill", plain("When it changes, by keyboard or with Win+Space"), k.show_readout, off, Toggle::KeyboardReadout);
+    // Hidden by the code drawn into the taskbar, so it needs the buttons or the music tile.
+    let injects = c.injects();
+    let note = if injects { "Win+Space still switches layouts" } else { "Needs the taskbar's audio buttons or the music tile" };
+    col.toggle(None, "Hide Windows' keyboard layout icon", plain(note), c.strip.hide_windows_language, !injects, Toggle::HideLanguage);
+
+    col.section("Your keyboards");
+    let labels: Vec<String> = model.layouts.iter().map(|(_, label)| label.clone()).collect();
+    for (i, keyboard) in k.assigned.iter().enumerate() {
+        let mut group = col.group();
+        let connected = model.connected.iter().any(|path| path.eq_ignore_ascii_case(&keyboard.device_path));
+        let kind = crate::keyboards::connection(&keyboard.device_path).label();
+        let state = if connected { format!("{kind} · connected") } else { format!("{kind} · not connected") };
+        match &model.renaming {
+            Some((at, text)) if *at == i => col.field_row(
+                &mut group,
+                text,
+                vec![("Save".into(), true, None, Button::SaveName), ("Cancel".into(), false, None, Button::CancelRename)],
+            ),
+            _ => col.row(
+                &mut group,
+                None,
+                &keyboard.name,
+                Some((state, if connected { Tone::Good } else { Tone::Plain })),
+                off,
+                Control::Buttons(vec![
+                    ("Rename".into(), false, Some('\u{E8AC}'), Button::RenameKeyboard(i)),
+                    ("Remove".into(), false, Some('\u{E74D}'), Button::RemoveKeyboard(i)),
+                ]),
+            ),
+        }
+        let selected = keyboard.hkl().and_then(|hkl| model.layouts.iter().position(|(known, _)| *known == hkl));
+        let desc = match selected {
+            Some(_) => None,
+            None => Some(("Its layout is no longer installed: pick another".to_string(), Tone::Warn)),
+        };
+        let fits = labels.iter().map(|l| ((col.measure)(l) + 28.0).max(48.0)).sum::<f32>() <= LAYOUT_SEGMENTS_MAX_W.min(col.w - 200.0);
+        let control = if fits {
+            Control::Segments(labels.clone(), selected.unwrap_or(usize::MAX), Choice::KeyboardLayout(i))
+        } else {
+            let current = selected.map_or("Pick a layout", |at| labels[at].as_str()).to_string();
+            Control::Buttons(vec![(current, false, Some('\u{E8AB}'), Button::NextLayout(i))])
+        };
+        col.row(&mut group, None, "Layout", desc, off, control);
+        col.end_group(group);
+    }
+    if off {
+        col.card(Some('\u{E710}'), "Add a keyboard", plain("Turn on a layout for each keyboard first"), true, None);
+    } else if let Some(hint) = &model.capture {
+        let desc = match hint {
+            Some(hint) => (hint.clone(), Tone::Warn),
+            None => ("Only which keyboard it comes from is read, never the key".to_string(), Tone::Plain),
+        };
+        let card = col.card(Some('\u{E765}'), "Press a key on the keyboard to add…", Some(desc), false, None);
+        col.button_in(card, "Cancel", false, None, Button::CancelCapture);
+    } else {
+        let desc = if k.assigned.is_empty() { "Then press a key on it. Keyboards not added switch nothing" } else { "Then press a key on it" };
+        col.button_card(Some('\u{E710}'), "Add a keyboard", plain(desc), "Add", true, Button::AddKeyboard);
+    }
 }
 
 /// The labels for the places along `edge`.
@@ -924,6 +1053,73 @@ mod tests {
         assert_eq!(rows.len(), 5, "three steps, two keys");
         let beside = rows.iter().find(|r| r.contains(r.x, copy.y + copy.h / 2.0)).unwrap();
         assert!(beside.right() <= copy.x, "a row's text stops before its button");
+    }
+
+    fn keyboards_model() -> Model {
+        let mut m = model(Page::Keyboards);
+        m.config.keyboards.enabled = true;
+        let keyboard = |path: &str, name: &str, hkl: &str| crate::config::AssignedKeyboard { device_path: path.into(), name: name.into(), hkl: hkl.into() };
+        m.config.keyboards.assigned = vec![keyboard(r"\\?\ACPI#HPQ8002#x#{guid}", "Laptop", "040C040C"), keyboard(r"\\?\HID#VID_19F5&PID_2620#x#{guid}", "External", "0409040C")];
+        m.layouts = vec![(0x040C_040C, "AZERTY".into()), (0x0409_040C, "US".into())];
+        m.connected = vec![r"\\?\ACPI#HPQ8002#x#{guid}".into()];
+        m
+    }
+
+    #[test]
+    fn each_keyboard_picks_its_layout_and_shows_whether_it_is_connected() {
+        let m = keyboards_model();
+        for width in [500.0, 900.0, 2000.0] {
+            let laid = page(&m, width, &measure);
+            for item in &laid.items {
+                assert!(item.r.x >= 0.0 && item.r.right() <= width.max(200.0 + 2.0 * PAGE_PAD) + 0.5, "{item:?} overflows {width}");
+            }
+        }
+        let laid = page(&m, 900.0, &measure);
+        // The second keyboard is on US: its second segment is the selected one, and hits.
+        let us = laid.items.iter().find(|i| matches!(i.kind, Kind::Segment { target: Target::Choice(Choice::KeyboardLayout(1), 1), .. })).unwrap();
+        assert!(matches!(us.kind, Kind::Segment { selected: true, .. }));
+        assert_eq!(laid.hit(us.r.x + 4.0, us.r.y + 4.0), Some(Target::Choice(Choice::KeyboardLayout(1), 1)));
+        let states: Vec<String> = laid.items.iter().filter_map(|i| match &i.kind {
+            Kind::Label { desc: Some((desc, _)), .. } if desc.contains("connected") => Some(desc.clone()),
+            _ => None,
+        }).collect();
+        assert_eq!(states, ["Built-in · connected", "USB · not connected"]);
+        assert!(laid.hits.iter().any(|(_, t)| *t == Target::Button(Button::AddKeyboard)));
+    }
+
+    #[test]
+    fn too_many_layouts_step_through_a_button_instead() {
+        let mut m = keyboards_model();
+        m.layouts = (0..8).map(|i| (0x0409_0400 + i, format!("A rather long layout name {i}"))).collect();
+        let laid = page(&m, 900.0, &measure);
+        assert!(!laid.items.iter().any(|i| matches!(i.kind, Kind::Segment { target: Target::Choice(Choice::KeyboardLayout(_), _), .. })));
+        assert!(laid.hits.iter().any(|(_, t)| *t == Target::Button(Button::NextLayout(0))));
+        // The second keyboard's layout is not installed any more: said so.
+        assert!(laid.items.iter().any(|i| matches!(&i.kind, Kind::Label { desc: Some((d, Tone::Warn)), .. } if d.contains("no longer installed"))));
+    }
+
+    #[test]
+    fn a_name_being_typed_is_a_field_beside_its_buttons() {
+        let mut m = keyboards_model();
+        m.renaming = Some((0, "Lap".into()));
+        let laid = page(&m, 700.0, &measure);
+        let field = laid.items.iter().find(|i| matches!(&i.kind, Kind::Field(t) if t == "Lap")).unwrap().r;
+        let save = laid.items.iter().find(|i| matches!(i.kind, Kind::Button { target: Target::Button(Button::SaveName), .. })).unwrap().r;
+        assert!(field.right() <= save.x, "the field stops before Save");
+        assert!(!laid.hits.iter().any(|(_, t)| *t == Target::Button(Button::RenameKeyboard(0))));
+    }
+
+    #[test]
+    fn a_capture_waits_with_a_way_out_and_nothing_is_added_while_off() {
+        let mut m = keyboards_model();
+        m.capture = Some(None);
+        let laid = page(&m, 900.0, &measure);
+        assert!(laid.hits.iter().any(|(_, t)| *t == Target::Button(Button::CancelCapture)));
+        assert!(!laid.hits.iter().any(|(_, t)| *t == Target::Button(Button::AddKeyboard)));
+        m.capture = None;
+        m.config.keyboards.enabled = false;
+        let laid = page(&m, 900.0, &measure);
+        assert!(!laid.hits.iter().any(|(_, t)| matches!(t, Target::Button(Button::AddKeyboard) | Target::Choice(Choice::KeyboardLayout(_), _))));
     }
 
     #[test]

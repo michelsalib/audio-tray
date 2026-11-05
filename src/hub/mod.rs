@@ -141,6 +141,10 @@ pub enum Event {
     Integration { name: &'static str, connected: bool },
     /// Why an integration cannot connect, in a few words the user can act on (`None`: fixed).
     IntegrationProblem { name: &'static str, problem: Option<&'static str> },
+    /// The layout changed: switched because another keyboard was typed on, or by the user
+    /// (Win+Space). `keyboard` is the name of the one that typed last, empty when it has none
+    /// (see [`crate::keyboards`]).
+    KeyboardSwitched { keyboard: String, layout: String },
 }
 
 /// A short-lived notice the pill shows on top of the steady state.
@@ -152,6 +156,8 @@ pub enum Notice {
     Listening { app: String, user: String },
     /// A playing session moved on to a new track (the pill shows it when asked to).
     NewTrack { app_id: String, title: String, artist: String },
+    /// The layout is now `layout`, on `keyboard` (empty: no name to give).
+    KeyboardSwitched { keyboard: String, layout: String },
 }
 
 impl Notice {
@@ -161,6 +167,8 @@ impl Notice {
             Notice::AudioMoved { .. } => Some(std::time::Duration::from_secs(5)),
             Notice::Listening { .. } => None,
             Notice::NewTrack { .. } => Some(std::time::Duration::from_secs(4)),
+            // A glance while typing: short, and replaced by the next switch.
+            Notice::KeyboardSwitched { .. } => Some(std::time::Duration::from_millis(1500)),
         }
     }
 }
@@ -298,6 +306,10 @@ impl State {
                     self.problems.push((name, problem));
                 }
                 before != problem
+            }
+            Event::KeyboardSwitched { keyboard, layout } => {
+                self.push_notice(Notice::KeyboardSwitched { keyboard, layout });
+                true
             }
         }
     }

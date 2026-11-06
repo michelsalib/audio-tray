@@ -71,6 +71,9 @@ const WM_ENDPOINT_VOLUME: u32 = WM_APP + 32;
 /// Check that the icon survived an Explorer restart (`wParam`: attempt number); see
 /// [`Tray::ensure_icon`].
 const WM_ICON_CHECK: u32 = WM_APP + 33;
+/// From the wheel hook: a wheel over the taskbar missed the icon slot, which may have moved;
+/// re-read it. (`WM_APP + 40` is the TAP's.)
+const WM_ICON_RECT_CHECK: u32 = WM_APP + 41;
 
 /// The receiver window's timer for the next timed notice (`osd::TIMER_ID` is the other one).
 const NOTICE_TIMER: usize = 0x4E54;
@@ -239,8 +242,6 @@ pub fn run(backend: WasapiBackend, settings: bool) -> Result<()> {
     let icon = build_tray(&backend, &config)?;
     TrayIconEvent::set_event_handler(Some(on_tray_event));
     let _notifications = notify::register()?;
-    // Without the strip the wheel works over our icon only: the taskbar is Windows' again.
-    hook::set_scroll_anywhere(config.strip.enabled && config.strip.scroll_anywhere);
     let _wheel = hook::WheelHook::spawn();
 
     let devices = backend.enumerate_flow(Flow::Output).map(|d| d.len()).unwrap_or(0);
@@ -430,6 +431,10 @@ fn handle(msg: Queued) {
         }
         WM_APPLY_SCROLL => {
             with_tray(Tray::apply_scroll);
+        }
+        WM_ICON_RECT_CHECK => {
+            with_tray(|tray| tray.refresh_icon_rect());
+            hook::rect_checked();
         }
         WM_TIMER => {
             with_tray(|tray| tray.osd.tick());
@@ -621,15 +626,13 @@ impl Tray {
             crate::integrations::reconfigure(&before, c);
         }
         crate::pill::configure(&c.pill);
-        // The wheel needs only the hook; the rest of the strip, and the tile, a fresh injection.
+        // The strip and the tile need a fresh injection.
         let drawn = |c: &Config| {
             let s = &c.strip;
             (s.enabled, s.next_to_wifi, s.hide_windows_volume, s.hide_windows_mic, s.hide_windows_language, c.music.enabled, c.music.tile_style)
         };
         if drawn(&before) != drawn(c) {
             self.apply_taskbar();
-        } else if before.strip.scroll_anywhere != c.strip.scroll_anywhere {
-            hook::set_scroll_anywhere(c.strip.enabled && c.strip.scroll_anywhere);
         }
         if before.icons != self.config.icons {
             self.refresh();
@@ -670,7 +673,6 @@ impl Tray {
         if self.config.injects() {
             taskbar::apply_at_startup(Current::read(&self.backend, &self.config).strip_icons());
         }
-        hook::set_scroll_anywhere(self.config.strip.enabled && self.config.strip.scroll_anywhere);
         self.music = None;
         self.music = crate::music::spawn(&self.config.music, self.config.tile_shown());
     }

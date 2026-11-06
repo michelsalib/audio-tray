@@ -388,7 +388,6 @@ impl Window {
                     Toggle::HideLanguage => &mut c.strip.hide_windows_language,
                     Toggle::Keyboards => &mut c.keyboards.enabled,
                     Toggle::KeyboardReadout => &mut c.keyboards.show_readout,
-                    Toggle::ScrollAnywhere => &mut c.strip.scroll_anywhere,
                     Toggle::Music => &mut c.music.enabled,
                     Toggle::Pill => &mut c.pill.enabled,
                     Toggle::PillDevices => &mut c.pill.devices,

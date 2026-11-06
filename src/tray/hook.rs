@@ -63,13 +63,6 @@ impl Drop for WheelHook {
 /// which splits it into the two buttons.
 static ICON_RECT: Mutex<Option<RECT>> = Mutex::new(None);
 
-/// `[strip] scroll_anywhere`, read at startup.
-static SCROLL_ANYWHERE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
-
-pub fn set_scroll_anywhere(on: bool) {
-    SCROLL_ANYWHERE.store(on, std::sync::atomic::Ordering::Relaxed);
-}
-
 /// Record the icon's slot; returns whether it moved.
 pub(super) fn set_icon_rect(rect: Option<RECT>) -> bool {
     let mut held = ICON_RECT.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -86,55 +79,87 @@ unsafe extern "system" fn mouse_hook(code: i32, wparam: WPARAM, lparam: LPARAM) 
     if code >= 0 && wparam.0 as u32 == WM_MOUSEWHEEL {
         let info = unsafe { &*(lparam.0 as *const MSLLHOOKSTRUCT) };
         let delta = (info.mouseData >> 16) as i16;
-        if delta != 0 && unsafe { point_over_tray(info.pt) } {
-            let flow = crate::taskbar::flow_code(flow_at(info.pt));
-            // Swallowed only when the tray took it: so the shell does not also scroll, and so
-            // XAML never sees it — which keeps the TAP's wheel handler from acting twice.
-            // A touchpad's scroll reaches this hook too, as wheel input: tagged by its steps.
-            let source = if crate::win::touchpad_delta(delta.into()) { 0 } else { crate::taskbar::SCROLL_FROM_WHEEL };
-            if super::post(WM_TASKBAR_SCROLL, flow | source, delta as isize) {
-                return LRESULT(1);
+        match if delta != 0 { unsafe { wheel_target(info.pt) } } else { Target::Elsewhere } {
+            Target::Ours => {
+                let flow = crate::taskbar::flow_code(flow_at(info.pt));
+                // Swallowed only when the tray took it: so the shell does not also scroll, and so
+                // XAML never sees it — which keeps the TAP's wheel handler from acting twice.
+                // A touchpad's scroll reaches this hook too, as wheel input: tagged by its steps.
+                let source = if crate::win::touchpad_delta(delta.into()) { 0 } else { crate::taskbar::SCROLL_FROM_WHEEL };
+                if super::post(WM_TASKBAR_SCROLL, flow | source, delta as isize) {
+                    return LRESULT(1);
+                }
             }
+            // Maybe over the buttons after all: the slot is only re-read now and then, and the
+            // icons move whenever another app's do. Have the tray look again for the next notch.
+            Target::TaskbarOutsideSlot => {
+                if !RECT_CHECK_PENDING.swap(true, std::sync::atomic::Ordering::Relaxed)
+                    && !super::post(super::WM_ICON_RECT_CHECK, 0, 0)
+                {
+                    RECT_CHECK_PENDING.store(false, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+            Target::Elsewhere => {}
         }
     }
     unsafe { CallNextHookEx(None, code, wparam, lparam) }
 }
 
 /// Which endpoint a wheel at this screen point belongs to: the strip's two buttons split the
-/// icon slot at its midpoint (32 epx halves, see the TAP's `decorate`); anywhere else, and with
-/// no strip, the output.
+/// icon slot at its midpoint (32 epx halves, see the TAP's `decorate`); with no strip, the output.
 fn flow_at(pt: POINT) -> Flow {
     if !crate::taskbar::buttons_up() {
         return Flow::Output;
     }
     match icon_rect() {
-        Some(slot) if in_slot(pt) && pt.x >= (slot.left + slot.right) / 2 => Flow::Input,
+        Some(slot) if pt.x >= (slot.left + slot.right) / 2 => Flow::Input,
         _ => Flow::Output,
     }
 }
 
-/// Is the screen point over the taskbar / notification area (incl. the Win11 tray overflow)?
-unsafe fn point_over_tray(pt: POINT) -> bool {
-    let hwnd = unsafe { WindowFromPoint(pt) };
-    if hwnd.is_invalid() {
-        return false;
-    }
-    let root: HWND = unsafe { GetAncestor(hwnd, GA_ROOT) };
-    let anywhere = SCROLL_ANYWHERE.load(std::sync::atomic::Ordering::Relaxed);
-    wheel_belongs_to_tray(&crate::win::class_name(root), crate::taskbar::buttons_up(), in_slot(pt), anywhere)
+/// A [`super::WM_ICON_RECT_CHECK`] is on its way: one is enough however fast the wheel turns.
+static RECT_CHECK_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The tray has re-read the slot.
+pub(super) fn rect_checked() {
+    RECT_CHECK_PENDING.store(false, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// Whether a wheel over a window of `class` is ours. A `Xaml_WindowedPopupClass` is any XAML
-/// popup in any app; it only counts over our own strip (whose hover tooltip is one). Without
-/// `anywhere` (`[strip] scroll_anywhere = false`) the taskbar counts only over our icon slot.
-fn wheel_belongs_to_tray(class: &str, strip_up: bool, over_slot: bool, anywhere: bool) -> bool {
-    match class {
-        "Shell_TrayWnd" | "Shell_SecondaryTrayWnd" | "NotifyIconOverflowWindow" | "TopLevelWindowForOverflowXamlIsland" => {
-            anywhere || over_slot
-        }
-        "Xaml_WindowedPopupClass" => strip_up && over_slot,
-        _ => false,
+/// Where a wheel at a screen point lands, for the hook.
+enum Target {
+    /// Over our audio icons.
+    Ours,
+    /// Over the taskbar or its overflow, but not where the icon slot was last seen.
+    TaskbarOutsideSlot,
+    Elsewhere,
+}
+
+unsafe fn wheel_target(pt: POINT) -> Target {
+    let hwnd = unsafe { WindowFromPoint(pt) };
+    if hwnd.is_invalid() {
+        return Target::Elsewhere;
     }
+    let root: HWND = unsafe { GetAncestor(hwnd, GA_ROOT) };
+    let class = crate::win::class_name(root);
+    if in_slot(pt) && wheel_belongs_to_tray(&class, crate::taskbar::buttons_up()) {
+        Target::Ours
+    } else if is_taskbar(&class) {
+        Target::TaskbarOutsideSlot
+    } else {
+        Target::Elsewhere
+    }
+}
+
+/// The taskbars and the notification area's overflow.
+fn is_taskbar(class: &str) -> bool {
+    matches!(class, "Shell_TrayWnd" | "Shell_SecondaryTrayWnd" | "NotifyIconOverflowWindow" | "TopLevelWindowForOverflowXamlIsland")
+}
+
+/// Whether a wheel over our icon slot, in a window of `class`, is ours: the slot must be showing,
+/// not covered by another app. A `Xaml_WindowedPopupClass` is any XAML popup in any app; it only
+/// counts while our strip is up (its hover tooltip is one).
+fn wheel_belongs_to_tray(class: &str, strip_up: bool) -> bool {
+    is_taskbar(class) || (class == "Xaml_WindowedPopupClass" && strip_up)
 }
 
 fn in_slot(pt: POINT) -> bool {
@@ -146,18 +171,11 @@ mod tests {
     use super::wheel_belongs_to_tray;
 
     #[test]
-    fn only_our_strip_claims_a_xaml_popup() {
-        assert!(wheel_belongs_to_tray("Shell_TrayWnd", false, false, true));
-        assert!(wheel_belongs_to_tray("Xaml_WindowedPopupClass", true, true, true));
-        assert!(!wheel_belongs_to_tray("Xaml_WindowedPopupClass", true, false, true), "another app's popup");
-        assert!(!wheel_belongs_to_tray("Xaml_WindowedPopupClass", false, true, true), "no strip up");
-        assert!(!wheel_belongs_to_tray("Chrome_WidgetWin_1", true, true, true));
-    }
-
-    #[test]
-    fn without_anywhere_only_our_slot_takes_the_wheel() {
-        assert!(!wheel_belongs_to_tray("Shell_TrayWnd", true, false, false));
-        assert!(wheel_belongs_to_tray("Shell_TrayWnd", true, true, false));
-        assert!(wheel_belongs_to_tray("Shell_TrayWnd", false, true, false), "plain icon");
+    fn the_slot_counts_only_in_the_taskbar_or_our_popup() {
+        assert!(wheel_belongs_to_tray("Shell_TrayWnd", true));
+        assert!(wheel_belongs_to_tray("Shell_TrayWnd", false), "plain icon");
+        assert!(wheel_belongs_to_tray("Xaml_WindowedPopupClass", true));
+        assert!(!wheel_belongs_to_tray("Xaml_WindowedPopupClass", false), "no strip up");
+        assert!(!wheel_belongs_to_tray("Chrome_WidgetWin_1", true), "another app over the slot");
     }
 }

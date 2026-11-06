@@ -110,7 +110,6 @@ pub(super) enum Toggle {
     Keyboards,
     /// Show layout changes on the pill.
     KeyboardReadout,
-    ScrollAnywhere,
     Music,
     Pill,
     PillDevices,
@@ -515,7 +514,6 @@ fn taskbar(col: &mut Column, model: &Model) {
     col.toggle(None, "Next to Wi-Fi", plain("Move the notification icons between the keyboard layout and Wi-Fi"), c.strip.next_to_wifi, off, Toggle::NextToWifi);
     col.toggle(None, "Hide Windows' volume icon", plain("The output button does its job"), c.strip.hide_windows_volume, off, Toggle::HideVolume);
     col.toggle(None, "Hide Windows' microphone icon", plain("The input button's red dot says an app is listening"), c.strip.hide_windows_mic, off, Toggle::HideMic);
-    col.toggle(None, "Scroll anywhere on the taskbar", plain("The mouse wheel changes the volume over the whole taskbar, not only the buttons"), c.strip.scroll_anywhere, off, Toggle::ScrollAnywhere);
     col.section("Music");
     col.toggle(
         Some('\u{EC4F}'),

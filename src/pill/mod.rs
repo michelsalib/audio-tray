@@ -95,6 +95,9 @@ const COLLAPSE_SECONDS: f64 = 0.14;
 const HIGHLIGHT_SECONDS: f64 = 0.09;
 /// One-shot: the card's collapse has played.
 const COLLAPSE_TIMER: usize = 2;
+/// One-shot: look at the fullscreen state again after an appbar notification.
+const FULLSCREEN_TIMER: usize = 3;
+const FULLSCREEN_RECHECK_MS: u32 = 1000;
 /// One beat of the speaking pulse.
 const PULSE_SECONDS: f64 = 1.1;
 
@@ -357,6 +360,9 @@ impl Pill {
         if self.collapsing {
             return;
         }
+        // Asked each time rather than kept from the appbar notifications: a state read at logon
+        // (reported busy) or a lost "closed" notification would otherwise hide the pill for good.
+        self.inputs.fullscreen = fullscreen_now();
         let state = self.last.clone();
         self.follow_meter(&state);
         let mut next = view::decide(&state, self.inputs);
@@ -1136,13 +1142,24 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESUL
             Some(LRESULT(0))
         }
         WM_APPBAR => {
-            // ABN_FULLSCREENAPP = 2; lParam says opening (non-zero) or closing.
+            // ABN_FULLSCREENAPP = 2. Its lParam (opening or closing) is per taskbar, so with several
+            // displays the last one to arrive is not the answer: refresh asks Windows, now and once
+            // more a moment later in case its state trails the notification.
             if wparam.0 == 2 {
                 with_pill(|pill| {
-                    pill.inputs.fullscreen = lparam.0 != 0 || fullscreen_now();
                     pill.refresh();
+                    unsafe { SetTimer(Some(pill.hwnd), FULLSCREEN_TIMER, FULLSCREEN_RECHECK_MS, None) };
                 });
             }
+            Some(LRESULT(0))
+        }
+        WM_TIMER if wparam.0 == FULLSCREEN_TIMER => {
+            with_pill(|pill| {
+                unsafe {
+                    let _ = KillTimer(Some(pill.hwnd), FULLSCREEN_TIMER);
+                }
+                pill.refresh();
+            });
             Some(LRESULT(0))
         }
         // The accent changed: the playing rings and bars are drawn in it.

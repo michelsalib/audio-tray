@@ -1,4 +1,4 @@
-//! The scroll readout: the level bar that appears next to the taskbar buttons while the
+//! The scroll readout: the level bar that appears above the taskbar buttons while the
 //! wheel is turning.
 //!
 //! Shows the endpoint's glyph, level bar and number; holds for [`HOLD`] after the last
@@ -42,8 +42,10 @@ pub(crate) const TIMER_ID: usize = 0x05D;
 const PANEL_W: f32 = 128.0;
 const PANEL_H: f32 = 32.0;
 const RADIUS: f32 = 6.0;
-/// Standoff between the icon slot and the readout.
-const GAP: f32 = 6.0;
+/// Standoff between the taskbar (or the icon) and the readout: Windows' flyouts' 12.
+const GAP: f32 = 12.0;
+/// Nearest the readout comes to the sides of the work area.
+const MARGIN: f32 = 12.0;
 const GLYPH_CX: f32 = 20.0; // centre of the leading glyph
 const GLYPH_PX: f32 = 15.0;
 const TRACK_X0: f32 = 34.0; // track's left edge
@@ -249,24 +251,17 @@ impl Osd {
         }
     }
 
-    /// Where the readout goes: right of the icon slot, centred on it, or left if there is no room.
+    /// Where the readout goes: off the taskbar, on the desktop side of it, centred on the icon
+    /// slot, as Windows' own flyouts sit. Beside the slot it would cover Wi-Fi and the clock.
     fn place(&self, anchor: Option<RECT>) -> (i32, i32) {
-        let gap = (GAP * self.scale).round() as i32;
         let slot = anchor.unwrap_or_else(|| {
             let mut cursor = POINT::default();
             let _ = unsafe { GetCursorPos(&mut cursor) };
             RECT { left: cursor.x, top: cursor.y, right: cursor.x, bottom: cursor.y }
         });
-        let mon = monitor_rect(slot);
-        let y = slot.top + (slot.bottom - slot.top - self.height) / 2;
-        let mut x = slot.right + gap;
-        if x + self.width > mon.right {
-            x = slot.left - gap - self.width;
-        }
-        (
-            x.clamp(mon.left, (mon.right - self.width).max(mon.left)),
-            y.clamp(mon.top, (mon.bottom - self.height).max(mon.top)),
-        )
+        let (mon, work) = monitor_rects(slot);
+        let px = |dips: f32| (dips * self.scale).round() as i32;
+        placement(slot, mon, work, (self.width, self.height), px(GAP), px(MARGIN))
     }
 }
 
@@ -335,25 +330,94 @@ pub(crate) fn preview(
     Ok(())
 }
 
-/// Bounds of the display `rect` sits on, else the primary screen.
-fn monitor_rect(rect: RECT) -> RECT {
+/// The readout's top-left for a `size` panel anchored on `slot`, on a display of bounds `mon` and
+/// work area `work`. A slot outside the work area is on the taskbar: the readout goes `gap` past
+/// the taskbar's inner edge, centred on the slot along it. A slot inside it (the overflow popup,
+/// the pointer) gets the readout `gap` above it. Kept `margin` inside the work area.
+fn placement(slot: RECT, mon: RECT, work: RECT, (w, h): (i32, i32), gap: i32, margin: i32) -> (i32, i32) {
+    let cx = (slot.left + slot.right) / 2 - w / 2;
+    let cy = (slot.top + slot.bottom) / 2 - h / 2;
+    let (x, y) = if slot.top >= work.bottom {
+        (cx, work.bottom - gap - h)
+    } else if slot.bottom <= work.top {
+        (cx, work.top + gap)
+    } else if slot.left >= work.right {
+        (work.right - gap - w, cy)
+    } else if slot.right <= work.left {
+        (work.left + gap, cy)
+    } else {
+        (cx, slot.top - gap - h)
+    };
+    // A work area missing (or smaller than the panel) falls back to the display.
+    let area = if work.right - work.left >= w + 2 * margin && work.bottom - work.top >= h + 2 * margin { work } else { mon };
+    (
+        x.clamp(area.left + margin, (area.right - margin - w).max(area.left)),
+        y.clamp(area.top + margin, (area.bottom - margin - h).max(area.top)),
+    )
+}
+
+/// Bounds and work area of the display `rect` sits on, else the primary screen (twice).
+fn monitor_rects(rect: RECT) -> (RECT, RECT) {
     let monitor = unsafe { MonitorFromRect(&rect, MONITOR_DEFAULTTONEAREST) };
     let mut info = MONITORINFO {
         cbSize: std::mem::size_of::<MONITORINFO>() as u32,
         ..Default::default()
     };
     if unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
-        return info.rcMonitor;
+        return (info.rcMonitor, info.rcWork);
     }
-    RECT {
+    let screen = RECT {
         left: 0,
         top: 0,
         right: unsafe { GetSystemMetrics(SM_CXSCREEN) },
         bottom: unsafe { GetSystemMetrics(SM_CYSCREEN) },
-    }
+    };
+    (screen, screen)
 }
 
 /// A pass-through: the readout is click-through and its timer is handled by whoever pumps it.
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     DefWindowProcW(hwnd, msg, wp, lp)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::placement;
+    use windows::Win32::Foundation::RECT;
+
+    const fn rect(left: i32, top: i32, right: i32, bottom: i32) -> RECT {
+        RECT { left, top, right, bottom }
+    }
+
+    /// 1920×1200 at 150 %, a 72 px taskbar at the bottom; the panel 192×48, gap 18, margin 18.
+    const MON: RECT = rect(0, 0, 1920, 1200);
+    const SIZE: (i32, i32) = (192, 48);
+
+    #[test]
+    fn above_a_bottom_taskbar_centred_on_the_buttons() {
+        let work = rect(0, 0, 1920, 1128);
+        let slot = rect(1575, 1128, 1683, 1200);
+        assert_eq!(placement(slot, MON, work, SIZE, 18, 18), (1629 - 96, 1128 - 18 - 48));
+    }
+
+    #[test]
+    fn kept_off_the_screen_edge() {
+        let work = rect(0, 0, 1920, 1128);
+        let slot = rect(1850, 1128, 1900, 1200);
+        assert_eq!(placement(slot, MON, work, SIZE, 18, 18).0, 1920 - 18 - 192);
+    }
+
+    #[test]
+    fn below_a_top_taskbar() {
+        let work = rect(0, 72, 1920, 1200);
+        let slot = rect(1575, 0, 1683, 72);
+        assert_eq!(placement(slot, MON, work, SIZE, 18, 18), (1533, 72 + 18));
+    }
+
+    #[test]
+    fn above_an_icon_in_the_overflow() {
+        let work = rect(0, 0, 1920, 1128);
+        let slot = rect(1500, 1000, 1548, 1048);
+        assert_eq!(placement(slot, MON, work, SIZE, 18, 18), (1524 - 96, 1000 - 18 - 48));
+    }
 }

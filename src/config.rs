@@ -248,8 +248,6 @@ pub struct Strip {
     /// Hide Windows' keyboard-layout indicator ("FRA"). Off by default: unlike the two above it is
     /// not replaced by anything; Win+Space still switches. Needs the TAP (buttons or music tile).
     pub hide_windows_language: bool,
-    /// The mouse wheel changes the volume anywhere over the taskbar. Off: only over our buttons.
-    pub scroll_anywhere: bool,
 }
 
 impl Default for Strip {
@@ -260,7 +258,6 @@ impl Default for Strip {
             hide_windows_volume: true,
             hide_windows_mic: true,
             hide_windows_language: false,
-            scroll_anywhere: true,
         }
     }
 }

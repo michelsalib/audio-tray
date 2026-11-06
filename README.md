@@ -44,7 +44,7 @@ A tiny Windows app for **audio awareness without opening anything** — a pill o
   Bluetooth devices that report one.
 - **Scroll** over a button — mouse wheel or touchpad — to change *that* endpoint's
   volume: the output button for playback, the input button for the microphone. A level
-  bar appears next to the buttons while you scroll and fades away three seconds after
+  bar appears above the buttons while you scroll and fades away three seconds after
   the last change.
 - **A red dot on the mic** whenever an app is recording — on the input button, on the
   flyout's microphone glyph, and on the level bar. It follows the same record Windows'
@@ -184,7 +184,6 @@ enabled = false             # the audio buttons in the tray, drawn by injecting 
 next_to_wifi = true         # move the tray icons between the language indicator and wifi
 hide_windows_volume = true  # hide Windows' volume icon (the output button replaces it)
 hide_windows_mic = true     # hide Windows' "microphone in use" icon (the red dot replaces it)
-scroll_anywhere = true      # wheel over the whole taskbar sets the volume; false = our buttons only
 ```
 
 All of these are in the **Settings** window (the gear in the flyout's footer), where they apply

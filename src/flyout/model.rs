@@ -92,6 +92,18 @@ pub(super) struct Voice {
     pub muted: bool,
 }
 
+/// What the panel gives up when it would not fit the screen, in this order: the apps list folds
+/// to its header, then Now Playing shows one card at a time, then (the user having opened the
+/// apps list) the list shows fewer rows, scrolled with the wheel.
+#[derive(Clone, Copy, Default, PartialEq, Debug)]
+pub(super) struct Fit {
+    pub apps_folded: bool,
+    /// One Now Playing card ([`Model::page`]) with a pager under it.
+    pub carousel: bool,
+    /// App rows shown at once from [`Model::apps_scroll`]; `None` shows them all.
+    pub apps_rows: Option<usize>,
+}
+
 /// Everything the flyout paints, plus the outcome flags the caller reads back when it
 /// closes. No live audio handles — see the module docs.
 pub(super) struct Model {
@@ -103,6 +115,15 @@ pub(super) struct Model {
     pub voice: Option<Voice>,
     pub update: Option<String>, // staged update's version, if any → the footer's restart button
     pub notice: Option<&'static str>, // taskbar integration trouble, one line above the footer
+    /// The user opened (`Some(true)`) or folded (`Some(false)`) the apps list; `None` leaves it
+    /// to [`Fit`].
+    pub apps_open: Option<bool>,
+    /// What the panel gives up to fit the screen, set by [`super::layout::fit`].
+    pub fit: Fit,
+    /// The Now Playing card a carousel shows.
+    pub page: usize,
+    /// The first app row shown while the list shows fewer rows than it has ([`Fit::apps_rows`]).
+    pub apps_scroll: usize,
     // outcome, accumulated while the flyout is open
     pub quit: bool,
     pub restart: bool,
@@ -120,6 +141,10 @@ impl Model {
             groups,
             update,
             notice: None,
+            apps_open: None,
+            fit: Fit::default(),
+            page: 0,
+            apps_scroll: 0,
             quit: false,
             restart: false,
             settings: false,
@@ -137,10 +162,11 @@ pub(super) const ART_DIP: f32 = 52.0;
 /// holds a track's sprite.
 pub(super) fn from_hub(state: &crate::hub::State, art_px: u32, icon_px: u32, old: &[NowPlaying]) -> (Vec<NowPlaying>, Vec<AppRow>, Option<Voice>) {
     let all = state.all_media();
+    let continues = |m: &crate::hub::Media, o: &NowPlaying| o.app_id == m.app_id || crate::hub::names::same_title(&o.title, &m.title);
     let mut shown: Vec<&crate::hub::Media> = all
         .iter()
         .copied()
-        .filter(|m| m.playing || old.iter().any(|o| o.app_id == m.app_id))
+        .filter(|m| m.playing || old.iter().any(|o| continues(m, o)))
         .take(crate::hub::MAX_SHOWN)
         .collect();
     if shown.is_empty() {
@@ -168,13 +194,20 @@ pub(super) fn from_hub(state: &crate::hub::State, art_px: u32, icon_px: u32, old
         }
     }).collect();
     // Cards already shown keep their place; one whose session went away stays, paused, so the
-    // next card never slides under the pointer while the panel is open.
-    let fresh: Vec<NowPlaying> = now_playing;
-    let mut now_playing: Vec<NowPlaying> = old
-        .iter()
-        .map(|o| fresh.iter().find(|n| n.app_id == o.app_id).cloned().unwrap_or_else(|| NowPlaying { playing: false, ..o.clone() }))
-        .collect();
-    now_playing.extend(fresh.into_iter().filter(|n| !old.iter().any(|o| o.app_id == n.app_id)));
+    // next card never slides under the pointer while the panel is open. The same track coming
+    // back from another source (Edge's SMTC session giving way to the extension's tab) takes
+    // that card over rather than show twice.
+    let mut fresh: Vec<NowPlaying> = now_playing;
+    let mut now_playing: Vec<NowPlaying> = Vec::with_capacity(old.len() + fresh.len());
+    for o in old {
+        let new_source = |n: &NowPlaying| !old.iter().any(|o| o.app_id == n.app_id) && crate::hub::names::same_title(&n.title, &o.title);
+        let card = match fresh.iter().position(|n| n.app_id == o.app_id).or_else(|| fresh.iter().position(new_source)) {
+            Some(i) => fresh.remove(i),
+            None => NowPlaying { playing: false, ..o.clone() },
+        };
+        now_playing.push(card);
+    }
+    now_playing.extend(fresh);
     let apps = state
         .sessions
         .iter()
@@ -255,4 +288,56 @@ pub(super) fn build_groups(backend: &WasapiBackend, config: &Config) -> Vec<Grou
         });
     }
     groups
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hub::{Event, Media, State};
+
+    fn media(app_id: &str, title: &str, playing: bool) -> Media {
+        Media {
+            app_id: app_id.into(),
+            app: "Twitch".into(),
+            title: title.into(),
+            artist: "otplol_".into(),
+            playing,
+            cover: None,
+            timeline: None,
+            skip: false,
+            video: true,
+        }
+    }
+
+    fn cards(state: &State, old: &[NowPlaying]) -> Vec<NowPlaying> {
+        from_hub(state, 52, 20, old).0
+    }
+
+    /// Edge's SMTC session is shown first, then the extension's tab for the same stream arrives
+    /// and the hub hides the SMTC one: the open panel's card follows the tab, not shown twice.
+    #[test]
+    fn a_track_moving_to_another_source_keeps_one_card() {
+        let mut state = State::default();
+        state.apply(Event::Media(vec![media("MSEdge", "WORLDS - T1 vs KC", true)]));
+        let open = cards(&state, &[]);
+        assert_eq!(open.len(), 1);
+
+        state.apply(Event::BrowserMedia { host: Some(7), media: vec![media("browser:7:2:0", "WORLDS - T1 vs KC", true)] });
+        let now = cards(&state, &open);
+        let ids: Vec<&str> = now.iter().map(|c| c.app_id.as_str()).collect();
+        assert_eq!(ids, ["browser:7:2:0"]);
+        assert!(now[0].playing);
+    }
+
+    /// A session that went away with nothing to replace it stays, paused, in its place.
+    #[test]
+    fn a_vanished_session_stays_paused_while_the_panel_is_open() {
+        let mut state = State::default();
+        state.apply(Event::Media(vec![media("A", "One", true), media("B", "Two", true)]));
+        let open = cards(&state, &[]);
+        state.apply(Event::Media(vec![media("B", "Two", true)]));
+        let now = cards(&state, &open);
+        let shown: Vec<(&str, bool)> = now.iter().map(|c| (c.app_id.as_str(), c.playing)).collect();
+        assert_eq!(shown, [("A", false), ("B", true)]);
+    }
 }

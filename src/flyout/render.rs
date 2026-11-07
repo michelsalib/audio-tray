@@ -49,10 +49,34 @@ pub(super) fn render_page(ctx: &Ctx, elems: &[LaidElem], out: &mut [u8]) {
 
     for le in elems {
         match le.elem {
-            Elem::Header(text) => {
+            Elem::AppsHeader => {
+                let model = ctx.model;
+                let base = le.top as f32 + le.height as f32 - hdr_px * 0.55;
                 if let Some(f) = font_sb {
-                    let base = le.top as f32 + le.height as f32 - hdr_px * 0.55;
-                    cv.draw_text(f, hdr_px, (d(HEADER_X) as f32, base), TEXT, 1.0, text);
+                    cv.draw_text(f, hdr_px, (d(HEADER_X) as f32, base), TEXT, 1.0, "Apps");
+                }
+                // The count says what folding hides; a list cut short says which rows it shows.
+                let all = model.apps.len();
+                let shown = super::layout::shown_apps(model);
+                let count = match all {
+                    _ if !model.fit.apps_folded && shown.len() < all => format!("{}–{} of {all}", shown.start + 1, shown.end),
+                    1 => "1 app".to_string(),
+                    n => format!("{n} apps"),
+                };
+                header_fold(&mut cv, scale, w, base, hdr_px, !model.fit.apps_folded, &count, font);
+            }
+            Elem::Pager => {
+                let n = ctx.model.now_playing.len();
+                let cy = (le.top + le.height / 2) as f32;
+                let r = PIP_D * scale / 2.0;
+                for i in 0..n {
+                    let cx = super::layout::pip_center_x(w, scale, n, i);
+                    if i == ctx.model.page {
+                        let half = PIP_ON_W * scale / 2.0;
+                        cv.fill_round_rect(Rect::new(cx - half, cy - r, cx + half, cy + r), r, accent, 1.0);
+                    } else {
+                        cv.fill_round_rect(Rect::new(cx - r, cy - r, cx + r, cy + r), r, TEXT, 0.35);
+                    }
                 }
             }
             Elem::GroupHeader { group } => {
@@ -64,17 +88,7 @@ pub(super) fn render_page(ctx: &Ctx, elems: &[LaidElem], out: &mut [u8]) {
                 // More than one device: a count and a chevron say the list folds.
                 if g.devices.len() > 1 {
                     let expanded = ctx.model.expanded.get(group).copied().unwrap_or(false);
-                    let cpx = (CHEVRON_PX * scale).round() as u32;
-                    let right = w as f32 - RIGHT_PAD * scale;
-                    if let Ok((rgba, gw, gh)) = icons::render_glyph(if expanded { GLYPH_UP } else { GLYPH_DOWN }, cpx, TEXT) {
-                        cv.blit((right - gw as f32).round() as i32, (base - hdr_px * 0.36 - gh as f32 / 2.0).round() as i32, &rgba, gw, gh, 0.8);
-                    }
-                    if let Some(f) = font {
-                        let px = 12.5 * scale;
-                        let text = format!("{} devices", g.devices.len());
-                        let tw = measure(f, px, &text);
-                        cv.draw_text(f, px, (right - cpx as f32 - 8.0 * scale - tw, base), TEXT, 0.62, &text);
-                    }
+                    header_fold(&mut cv, scale, w, base, hdr_px, expanded, &format!("{} devices", g.devices.len()), font);
                 }
             }
             Elem::NowPlaying { index } => {
@@ -417,6 +431,19 @@ pub(super) fn compose(ctx: &Ctx, hit: &Interaction, elems: &[LaidElem], base: &[
                 let ry1 = (le.top + le.height) as f32 - 1.0;
                 cv.fill_round_rect(Rect::new(mx, ry0, w as f32 - mx, ry1), d(ROW_RADIUS) as f32, TEXT, HOVER_A);
             }
+            Elem::Pager => {
+                if let Some(i) = hit.hover_pip.filter(|&i| hovered && i != ctx.model.page) {
+                    let n = ctx.model.now_playing.len();
+                    let (cx, cy) = (super::layout::pip_center_x(w, scale, n, i), (le.top + le.height / 2) as f32);
+                    let r = PIP_D * scale / 2.0;
+                    cv.fill_round_rect(Rect::new(cx - r, cy - r, cx + r, cy + r), r, TEXT, 0.5);
+                }
+            }
+            Elem::AppsHeader if hovered => {
+                let ry0 = le.top as f32 + 4.0 * scale;
+                let ry1 = (le.top + le.height) as f32 - 2.0;
+                cv.fill_round_rect(Rect::new(mx, ry0, w as f32 - mx, ry1), d(ROW_RADIUS) as f32, TEXT, HOVER_A);
+            }
             Elem::GroupHeader { group } if hovered && groups[group].devices.len() > 1 => {
                 let ry0 = le.top as f32 + 4.0 * scale;
                 let ry1 = (le.top + le.height) as f32 - 2.0;
@@ -460,6 +487,22 @@ pub(super) fn compose(ctx: &Ctx, hit: &Interaction, elems: &[LaidElem], base: &[
             }
             _ => {}
         }
+    }
+}
+
+/// A folding header's right-hand side: `count` in secondary text, then a chevron pointing the
+/// way a click goes. `base` is the header label's baseline.
+#[allow(clippy::too_many_arguments)]
+fn header_fold(cv: &mut Canvas, scale: f32, w: i32, base: f32, hdr_px: f32, open: bool, count: &str, font: Option<&FontVec>) {
+    let cpx = (CHEVRON_PX * scale).round() as u32;
+    let right = w as f32 - RIGHT_PAD * scale;
+    if let Ok((rgba, gw, gh)) = icons::render_glyph(if open { GLYPH_UP } else { GLYPH_DOWN }, cpx, TEXT) {
+        cv.blit((right - gw as f32).round() as i32, (base - hdr_px * 0.36 - gh as f32 / 2.0).round() as i32, &rgba, gw, gh, 0.8);
+    }
+    if let Some(f) = font {
+        let px = 12.5 * scale;
+        let tw = measure(f, px, count);
+        cv.draw_text(f, px, (right - cpx as f32 - 8.0 * scale - tw, base), TEXT, 0.62, count);
     }
 }
 

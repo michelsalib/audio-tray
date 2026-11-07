@@ -6,8 +6,6 @@ use crate::audio::{DeviceId, Flow};
 use crate::config::Config;
 use crate::icons::IconId;
 
-use super::layout::View;
-
 pub(super) struct DeviceRow {
     pub id: DeviceId,
     pub label: String,
@@ -103,11 +101,9 @@ pub(super) struct Model {
     pub now_playing: Vec<NowPlaying>,
     pub apps: Vec<AppRow>,
     pub voice: Option<Voice>,
-    pub view: View, // which screen is shown (main panel / an icon picker)
     pub update: Option<String>, // staged update's version, if any → the footer's restart button
     pub notice: Option<&'static str>, // taskbar integration trouble, one line above the footer
     // outcome, accumulated while the flyout is open
-    pub config_changed: bool,
     pub quit: bool,
     pub restart: bool,
     /// Open the settings window once the flyout has closed.
@@ -122,10 +118,8 @@ impl Model {
             apps: Vec::new(),
             voice: None,
             groups,
-            view: View::Main,
             update,
             notice: None,
-            config_changed: false,
             quit: false,
             restart: false,
             settings: false,

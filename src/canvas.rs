@@ -118,24 +118,6 @@ impl<'a> Canvas<'a> {
         }
     }
 
-    /// Opaquely copy a same-size page buffer shifted horizontally by `dx`, clipped (for slides).
-    pub(crate) fn blit_shift(&mut self, page: &[u8], dx: i32) {
-        let (w, h) = (self.w, self.h);
-        let x_lo = dx.max(0);
-        let x_hi = (w + dx).min(w);
-        if x_lo >= x_hi {
-            return;
-        }
-        for y in 0..h {
-            let row = (y * w) as usize * 4;
-            for x in x_lo..x_hi {
-                let di = row + x as usize * 4;
-                let si = row + (x - dx) as usize * 4;
-                self.buf[di..di + 4].copy_from_slice(&page[si..si + 4]);
-            }
-        }
-    }
-
     /// Draw a text run in `col` at `alpha`, sized to em `px`, starting at pen position
     /// `at` = (pen-x, baseline-y) in px. Advances glyph by glyph.
     pub(crate) fn draw_text(&mut self, font: &FontVec, px: f32, at: (f32, f32), col: [u8; 3], alpha: f32, text: &str) {

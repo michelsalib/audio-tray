@@ -74,12 +74,22 @@ pub struct Endpoint {
     pub icon: crate::icons::IconId,
 }
 
-/// The default endpoints and which outputs exist, so a vanished default can be told from a switch.
+/// An active device a flow can switch to.
+#[derive(Clone, PartialEq, Debug)]
+pub struct Choice {
+    pub id: DeviceId,
+    pub name: String,
+    pub icon: crate::icons::IconId,
+}
+
+/// The default endpoints and the active devices of each flow, in Windows' order: the pill lists
+/// them, and a vanished default is told from a switch.
 #[derive(Clone, PartialEq, Debug, Default)]
 pub struct Endpoints {
     pub output: Option<Endpoint>,
     pub input: Option<Endpoint>,
-    pub active_outputs: Vec<DeviceId>,
+    pub outputs: Vec<Choice>,
+    pub inputs: Vec<Choice>,
 }
 
 /// One app's audio session on the default output (the mixer's row).
@@ -250,7 +260,7 @@ impl State {
             }
             Event::Endpoints(endpoints) => {
                 if let (Some(old), Some(new)) = (&self.endpoints.output, &endpoints.output) {
-                    if old.id != new.id && !endpoints.active_outputs.contains(&old.id) {
+                    if old.id != new.id && !endpoints.outputs.iter().any(|c| c.id == old.id) {
                         self.push_notice(Notice::AudioMoved { to: new.name.clone(), from: old.name.clone() });
                     }
                 }
@@ -451,7 +461,8 @@ mod tests {
         Event::Endpoints(Endpoints {
             output: Some(endpoint(output)),
             input: None,
-            active_outputs: active.iter().map(|id| DeviceId(id.to_string())).collect(),
+            outputs: active.iter().map(|id| Choice { id: DeviceId(id.to_string()), name: id.to_string(), icon: crate::icons::IconId::Speakers }).collect(),
+            inputs: Vec::new(),
         })
     }
 

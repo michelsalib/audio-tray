@@ -1,8 +1,8 @@
 //! A custom Windows-11-style flyout, modelled on the system sound flyout: an
 //! acrylic-blurred, rounded, dark surface with an accent "pill" on the selected row.
 //!
-//! Volume sliders, mute toggles, device switching, an icon picker and a footer (settings,
-//! update, quit), hand-painted into a layered window and hit-tested by hand. Modal via mouse
+//! Volume sliders, mute toggles, device switching and a footer (settings, update, quit),
+//! hand-painted into a layered window and hit-tested by hand. Modal via mouse
 //! capture, like a menu.
 //!
 //! This module is the controller: it owns the modal pump and delegates to [`model`],
@@ -16,7 +16,6 @@ mod window;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
 
 use windows::Win32::Foundation::{LPARAM, POINT};
 use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, VK_ESCAPE};
@@ -31,10 +30,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use crate::audio::wasapi::{Meter, VolumeWatch, WasapiBackend};
 use crate::audio::Flow;
 use crate::config::Config;
-use crate::icons::IconId;
 
-use crate::canvas::Canvas;
-use layout::{ActionKind, Elem, LaidElem, View};
+use layout::{ActionKind, Elem};
 use model::{build_groups, Model};
 use theme::{accent_rgb, TRACK_X0};
 use window::Surface;
@@ -43,7 +40,6 @@ use window::Surface;
 #[derive(Default)]
 pub struct Outcome {
     pub quit: bool,
-    pub config_changed: bool,
     /// Relaunch the already-updated exe and exit.
     pub restart: bool,
     /// Open the settings window.
@@ -65,40 +61,21 @@ const WM_FLYOUT_CLOSE: u32 = WM_APP + 11;
 // ~30 fps peak-meter sampling.
 const METER_TIMER_ID: usize = 1;
 const METER_INTERVAL_MS: u32 = 33;
-// The screen slide's timer (10 ms is the Win32 floor); frames are placed by elapsed time.
-const ANIM_TIMER_ID: usize = 2;
-const ANIM_INTERVAL_MS: u32 = 10;
-const ANIM_SECS: f32 = 0.14;
 // Per-tick fall-off of the displayed peak: instant attack, gentle release (a VU-meter feel).
 const METER_DECAY: f32 = 0.82;
 // Volume change per wheel notch, applied proportionally so sub-notch touchpad deltas are smooth.
 const SCROLL_STEP: f32 = 0.02;
 
 /// Transient pointer-interaction state: what the cursor is over, and any in-flight
-/// press/drag. Cleared on every relayout and screen change (see [`Flyout::reset_hover`]).
+/// press/drag. Cleared on every relayout (see [`Flyout::reset_hover`]).
 #[derive(Default)]
 struct Interaction {
     hover: Option<usize>,
-    hover_pencil: bool,        // the cursor is over the hovered device row's edit pencil
-    hover_back: bool,          // the cursor is over the picker's back button
-    hover_chip: Option<usize>, // chip index the cursor is over, within the icon grid
     hover_footer: Option<ActionKind>, // which footer action the cursor is over, if any
     hover_media: Option<usize>, // the Now Playing transport button under the cursor
     hover_voice: bool,          // the cursor is over the voice panel's mute button
     drag: Option<usize>,       // index into elems of the slider being dragged
     pending: Option<usize>,    // index pressed on button-down, acted on button-up
-}
-
-/// A slide between two screens, in flight, advanced by [`ANIM_TIMER_ID`] ticks. Never animate
-/// in a blocking loop: with the mouse captured, the cursor freezes while the pump sleeps.
-struct Transition {
-    to: View,
-    elems: Vec<LaidElem>, // the destination screen's layout, adopted when the slide lands
-    src: Vec<u8>,         // the outgoing screen, as it looked when the slide started
-    dst: Vec<u8>,         // the incoming screen, rendered once up front
-    frame: Vec<u8>,       // scratch the two are composited into, reused every tick
-    forward: bool,        // drilling in (new screen enters from the right) vs backing out
-    start: Instant,
 }
 
 /// The flyout controller: borrowed services, render context, [`Model`], [`Interaction`],
@@ -114,7 +91,6 @@ struct Flyout<'a> {
     watches: Vec<Option<VolumeWatch>>, // per-group volume/mute change subscriptions
     meters: Vec<Option<Meter>>,        // per-group live peak meters (polled on a timer)
     vol_dirty: Arc<AtomicBool>,        // shared coalescing flag for the volume callbacks
-    anim: Option<Transition>,          // the in-flight screen slide, if any
     hub_seen: u64,                     // the hub generation the media/apps/voice rows show
 }
 
@@ -124,24 +100,13 @@ pub fn show(
     config: &mut Config,
     anchor: Option<Anchor>,
 ) -> Outcome {
-    unsafe { show_inner(backend, config, anchor, false) }
-}
-
-/// Dev preview: open straight onto the first output device's icon-picker screen.
-#[cfg(feature = "dev")]
-pub fn show_icons_preview(
-    backend: &WasapiBackend,
-    config: &mut Config,
-    anchor: Option<Anchor>,
-) -> Outcome {
-    unsafe { show_inner(backend, config, anchor, true) }
+    unsafe { show_inner(backend, config, anchor) }
 }
 
 unsafe fn show_inner(
     backend: &WasapiBackend,
     config: &mut Config,
     anchor: Option<Anchor>,
-    start_icons: bool,
 ) -> Outcome {
     // Centred above the tray icon, else at the cursor; that monitor sets scale and work area.
     let (cx, bottom) = match anchor {
@@ -172,7 +137,6 @@ unsafe fn show_inner(
         watches: Vec::new(),
         meters: Vec::new(),
         vol_dirty: Arc::new(AtomicBool::new(false)),
-        anim: None,
         hub_seen: 0,
     };
     fly.load_hub();
@@ -182,11 +146,6 @@ unsafe fn show_inner(
     let bottom = if anchor.is_some() { bottom - gap } else { bottom };
     fly.surface.base_cx = cx;
     fly.surface.base_bottom = bottom.min(fly.surface.wa.bottom - fly.surface.margin);
-
-    // Dev preview: jump straight to the first output device's icon picker.
-    if start_icons && fly.model.groups.first().is_some_and(|g| !g.devices.is_empty()) {
-        fly.model.view = View::IconPicker { group: 0, dev: 0 };
-    }
 
     fly.rebuild_layout();
     fly.surface.reposition();
@@ -216,12 +175,7 @@ unsafe fn show_inner(
             quit = true;
             break;
         }
-        // Mid-slide, `elems` still describes the outgoing screen, so pointer input is dropped;
-        // Escape and capture loss still dismiss.
-        let sliding = fly.anim.is_some();
         match msg.message {
-            WM_MOUSEMOVE | WM_LBUTTONDOWN | WM_LBUTTONUP | WM_RBUTTONDOWN | WM_MOUSEWHEEL
-                if sliding => {}
             WM_MOUSEMOVE => {
                 let (mx, my) = mouse_xy(msg.lParam);
                 if let Some(si) = fly.hit.drag {
@@ -270,7 +224,7 @@ unsafe fn show_inner(
                 let (mx, my) = mouse_xy(msg.lParam);
                 if layout::inside(fly.surface.width, fly.surface.height, mx, my) {
                     if let Some(i) = layout::elem_at(&fly.surface.elems, my) {
-                        if fly.hit.pending == Some(i) && fly.activate(i, mx, my) {
+                        if fly.hit.pending == Some(i) && fly.activate(i, mx) {
                             break 'pump;
                         }
                     }
@@ -292,7 +246,6 @@ unsafe fn show_inner(
             }
             WM_VOL_CHANGED => fly.refresh_volumes(),
             // Only our own timers: the tray's message window has timers too, and they must be dispatched.
-            WM_TIMER if msg.hwnd == fly.surface.hwnd && msg.wParam.0 == ANIM_TIMER_ID => fly.tick_transition(),
             WM_TIMER if msg.hwnd == fly.surface.hwnd => fly.tick_meters(),
             WM_KEYDOWN if msg.wParam.0 as u16 == VK_ESCAPE.0 => break 'pump,
             WM_FLYOUT_CLOSE => break 'pump, // lost capture (Start menu, Alt-Tab, …)
@@ -304,9 +257,6 @@ unsafe fn show_inner(
     }
 
     let _ = KillTimer(Some(fly.surface.hwnd), METER_TIMER_ID);
-    if fly.anim.is_some() {
-        let _ = KillTimer(Some(fly.surface.hwnd), ANIM_TIMER_ID); // dismissed mid-slide
-    }
     fly.watches.clear(); // unregister the volume callbacks before the window goes away
     fly.meters.clear(); // release the peak-meter interfaces too
     let _ = ReleaseCapture();
@@ -317,7 +267,6 @@ unsafe fn show_inner(
     }
     Outcome {
         quit: fly.model.quit,
-        config_changed: fly.model.config_changed,
         restart: fly.model.restart,
         settings: fly.model.settings,
     }
@@ -359,10 +308,10 @@ impl Flyout<'_> {
 
     /// The hub moved on while the panel is open: repaint its rows, resizing if they came or went.
     fn follow_hub(&mut self) {
-        if crate::tray::hub_generation() == self.hub_seen || self.anim.is_some() {
+        if crate::tray::hub_generation() == self.hub_seen {
             return;
         }
-        if self.load_hub() && self.model.view == View::Main {
+        if self.load_hub() {
             self.resize();
         } else {
             self.render_base();
@@ -412,13 +361,12 @@ impl Flyout<'_> {
         self.surface.flush();
     }
 
-    /// Size the panel, lay out the current view and allocate buffers; clears hit state. The size
-    /// fits every screen, so navigating never resizes the window.
+    /// Size the panel, lay it out and allocate buffers; clears hit state.
     fn rebuild_layout(&mut self) {
         self.reset_hover();
         self.surface.width = layout::content_width(&self.model, self.scale);
-        self.surface.height = layout::panel_height(&self.model, self.scale, self.surface.width);
-        let (elems, _) = layout::build_view(&self.model, self.scale, self.surface.width, self.model.view, self.surface.height);
+        let (elems, height) = layout::build_view(&self.model, self.scale);
+        self.surface.height = height;
         self.surface.elems = elems;
         let bytes = (self.surface.width * self.surface.height * 4) as usize;
         self.surface.base = vec![0u8; bytes];
@@ -457,8 +405,7 @@ impl Flyout<'_> {
         self.surface.flush();
     }
 
-    /// The slider under the cursor, else the first output slider; `None` on a screen without
-    /// sliders (the icon picker).
+    /// The slider under the cursor, else the first output slider; `None` when there is none.
     fn scroll_target_group(&self, cy: i32) -> Option<usize> {
         if let Some(i) = layout::elem_at(&self.surface.elems, cy) {
             if let Elem::Slider { group } = self.surface.elems[i].elem {
@@ -527,8 +474,7 @@ impl Flyout<'_> {
                 base_changed = true;
             }
         }
-        // Mid-slide the transition paints.
-        if (changed || base_changed) && self.anim.is_none() {
+        if changed || base_changed {
             if base_changed {
                 self.render_base();
             }
@@ -566,10 +512,6 @@ impl Flyout<'_> {
                 }
             }
         }
-        // Mid-slide the transition paints.
-        if self.anim.is_some() {
-            return;
-        }
         // Only a mute flip touches `base` (the glyph); volume ticks (frequent with mic auto-gain) just recompose.
         if mute_changed {
             self.render_base();
@@ -605,7 +547,7 @@ impl Flyout<'_> {
     }
 
     /// Act on a click at button-up. Returns true if the flyout should close.
-    fn activate(&mut self, i: usize, mx: i32, my: i32) -> bool {
+    fn activate(&mut self, i: usize, mx: i32) -> bool {
         match self.surface.elems[i].elem {
             Elem::GroupHeader { group } => {
                 if self.model.groups[group].devices.len() > 1 {
@@ -659,48 +601,23 @@ impl Flyout<'_> {
                 false
             }
             Elem::Device { group, dev } => {
-                if layout::over_pencil(self.surface.width, self.scale, mx) {
-                    // Slide to the device's dedicated icon-picker screen.
-                    self.navigate(View::IconPicker { group, dev }, true);
-                } else {
-                    let id = self.model.groups[group].devices[dev].id.clone();
-                    if self.model.groups[group].default_id.as_ref() != Some(&id) {
-                        if let Err(e) = self.backend.set_default_of(&id) {
-                            eprintln!("switch failed: {e:#}");
-                        }
-                        for row in &mut self.model.groups[group].devices {
-                            row.selected = row.id == id;
-                        }
-                        self.model.groups[group].level =
-                            self.backend.volume_of(&id).unwrap_or(self.model.groups[group].level);
-                        self.model.groups[group].muted = self.backend.is_muted(&id).unwrap_or(false);
-                        self.model.groups[group].default_id = Some(id);
-                        self.rewatch(group); // follow volume/mute of the new default
-                        self.sync_strip();
-                        self.render_base();
-                        self.compose();
-                        self.surface.flush();
+                let id = self.model.groups[group].devices[dev].id.clone();
+                if self.model.groups[group].default_id.as_ref() != Some(&id) {
+                    if let Err(e) = self.backend.set_default_of(&id) {
+                        eprintln!("switch failed: {e:#}");
                     }
-                }
-                false
-            }
-            Elem::PickerHeader { .. } => {
-                // The back arrow slides back (the picker's choice is cancelled).
-                if layout::over_back(self.scale, mx) {
-                    self.navigate(View::Main, false);
-                }
-                false
-            }
-            Elem::IconGrid { group, dev } => {
-                // Clicking an icon validates the choice: persist it, then slide back.
-                if let Some(ci) = layout::grid_chip_at(self.surface.width, self.scale, mx, my, self.surface.elems[i].top) {
-                    let icon = IconId::ALL[ci];
-                    let id = self.model.groups[group].devices[dev].id.0.clone();
-                    self.model.groups[group].devices[dev].icon = icon;
-                    self.config.set_icon(id, icon);
-                    self.model.config_changed = true; // saved by the caller, once, on close
+                    for row in &mut self.model.groups[group].devices {
+                        row.selected = row.id == id;
+                    }
+                    self.model.groups[group].level =
+                        self.backend.volume_of(&id).unwrap_or(self.model.groups[group].level);
+                    self.model.groups[group].muted = self.backend.is_muted(&id).unwrap_or(false);
+                    self.model.groups[group].default_id = Some(id);
+                    self.rewatch(group); // follow volume/mute of the new default
                     self.sync_strip();
-                    self.navigate(View::Main, false);
+                    self.render_base();
+                    self.compose();
+                    self.surface.flush();
                 }
                 false
             }
@@ -726,84 +643,11 @@ impl Flyout<'_> {
         }
     }
 
-    /// Start a horizontal slide to `to` (`forward`: new screen enters from the right). Returns
-    /// after the first frame; [`ANIM_TIMER_ID`] drives the rest (see [`Transition`]).
-    fn navigate(&mut self, to: View, forward: bool) {
-        let (w, h) = (self.surface.width, self.surface.height);
-        let n = (w * h * 4) as usize;
-        // Outgoing screen: reuse the current composed frame (keeps its slider fills etc.).
-        let src = self.surface.buf.clone();
-        let (elems, _) = layout::build_view(&self.model, self.scale, w, to, h);
-        let mut dst = vec![0u8; n];
-        render::render_page(&self.ctx(), &elems, &mut dst);
-        self.anim = Some(Transition {
-            to,
-            elems,
-            src,
-            dst,
-            frame: vec![0u8; n],
-            forward,
-            start: Instant::now(),
-        });
-        unsafe { SetTimer(Some(self.surface.hwnd), ANIM_TIMER_ID, ANIM_INTERVAL_MS, None) };
-        self.tick_transition(); // put the first frame up without waiting for a tick
-    }
-
-    /// Draw the slide at its elapsed-time position, and adopt the destination once it lands.
-    fn tick_transition(&mut self) {
-        let Some(mut anim) = self.anim.take() else {
-            return;
-        };
-        let (w, h) = (self.surface.width, self.surface.height);
-        let t = (anim.start.elapsed().as_secs_f32() / ANIM_SECS).clamp(0.0, 1.0);
-        let ease = 1.0 - (1.0 - t) * (1.0 - t); // ease-out quad
-        let off = (ease * w as f32).round() as i32;
-        // Forward: old slides left out, new enters from the right; back is the mirror.
-        let (dx_src, dx_dst) = if anim.forward { (-off, w - off) } else { (off, off - w) };
-        {
-            let mut cv = Canvas::new(&mut anim.frame, w, h);
-            cv.clear();
-            cv.blit_shift(&anim.src, dx_src);
-            cv.blit_shift(&anim.dst, dx_dst);
-        }
-        self.surface.present(&anim.frame, self.surface.x, self.surface.y, 255);
-        if t >= 1.0 {
-            self.land(anim);
-        } else {
-            self.anim = Some(anim);
-        }
-    }
-
-    /// The slide has arrived: adopt the destination screen and go back to normal painting.
-    fn land(&mut self, anim: Transition) {
-        let _ = unsafe { KillTimer(Some(self.surface.hwnd), ANIM_TIMER_ID) };
-        let n = (self.surface.width * self.surface.height * 4) as usize;
-        self.model.view = anim.to;
-        self.surface.elems = anim.elems;
-        self.reset_hover();
-        self.surface.base = vec![0u8; n];
-        self.surface.buf = vec![0u8; n];
-        // The pointer may not move again soon; pick up what it is over now.
-        self.sync_hover_to_cursor();
-        self.render_base();
-        self.compose();
-        self.surface.flush();
-    }
-
     /// Recompute what the pointer is over at client `(mx, my)`; returns whether to repaint.
     fn set_hover(&mut self, mx: i32, my: i32) -> bool {
         let inside = layout::inside(self.surface.width, self.surface.height, mx, my);
         let hover = if inside { layout::elem_at(&self.surface.elems, my) } else { None };
         let kind = hover.map(|i| self.surface.elems[i].elem);
-        let on_pencil = matches!(kind, Some(Elem::Device { .. }))
-            && layout::over_pencil(self.surface.width, self.scale, mx);
-        let on_back = matches!(kind, Some(Elem::PickerHeader { .. })) && layout::over_back(self.scale, mx);
-        let on_chip = match (kind, hover) {
-            (Some(Elem::IconGrid { .. }), Some(i)) => {
-                layout::grid_chip_at(self.surface.width, self.scale, mx, my, self.surface.elems[i].top)
-            }
-            _ => None,
-        };
         let on_footer = match kind {
             Some(Elem::Footer) => layout::footer_hit(&self.model, self.surface.width, self.scale, mx),
             _ => None,
@@ -817,18 +661,12 @@ impl Flyout<'_> {
         };
         let on_voice = matches!(kind, Some(Elem::Voice)) && layout::over_voice_button(self.surface.width, self.scale, mx);
         let changed = hover != self.hit.hover
-            || on_pencil != self.hit.hover_pencil
-            || on_back != self.hit.hover_back
-            || on_chip != self.hit.hover_chip
             || on_footer != self.hit.hover_footer
             || on_media != self.hit.hover_media
             || on_voice != self.hit.hover_voice;
         self.hit.hover_media = on_media;
         self.hit.hover_voice = on_voice;
         self.hit.hover = hover;
-        self.hit.hover_pencil = on_pencil;
-        self.hit.hover_back = on_back;
-        self.hit.hover_chip = on_chip;
         self.hit.hover_footer = on_footer;
         changed
     }
@@ -841,7 +679,7 @@ impl Flyout<'_> {
         }
     }
 
-    /// Render the current view's static layer into the surface's `base` buffer. Slider
+    /// Render the panel's static layer into the surface's `base` buffer. Slider
     /// fill/thumb/value and hover live in [`Self::compose`].
     fn render_base(&mut self) {
         let mut base = vec![0u8; (self.surface.width * self.surface.height * 4) as usize];

@@ -5,7 +5,7 @@
 use anyhow::Result;
 
 use super::gfx::{Font, Gfx, Painter, Rgba};
-use super::view::{CallPill, Device, Devices, Level, SongNote, View};
+use super::view::{CallPill, Device, Devices, Fan, Level, SongNote, View};
 use crate::audio::Flow;
 use crate::config::PillEdge;
 use crate::hub::Member;
@@ -24,8 +24,14 @@ pub enum Hit {
     CallLeave,
     /// A new song's note: bring the player to the front.
     Song,
-    /// A device button: switch that flow to its next device.
+    /// A device button: hovered, fans its row out (see [`Hit::Choice`]); clicked with nothing to
+    /// fan (or on the card), switches that flow to its next device.
     Device(crate::audio::Flow),
+    /// A disc of a fanned-out device row, by its place in [`super::view::Fan::choices`]: make it
+    /// the default.
+    Choice(crate::audio::Flow, usize),
+    /// The rest of a fanned-out row: keeps it open between its discs.
+    Fan(crate::audio::Flow),
     /// Anywhere on the scene: the view's [`super::view::Action`], or the call's mute.
     Whole,
 }
@@ -424,15 +430,68 @@ fn device_count(devices: &Devices) -> usize {
     usize::from(devices.output.is_some()) + usize::from(devices.input.is_some())
 }
 
-/// The output then the input, as round buttons along the pill from `start`.
+/// Where the output's then the input's row starts along the pill, from `start`.
+fn device_rows(devices: &Devices, start: f32, m: Metrics) -> impl Iterator<Item = (Flow, &Device, f32)> {
+    [(Flow::Output, &devices.output), (Flow::Input, &devices.input)]
+        .into_iter()
+        .filter_map(|(flow, device)| device.as_ref().map(|d| (flow, d)))
+        .enumerate()
+        .map(move |(i, (flow, device))| (flow, device, start + i as f32 * m.dev_step))
+}
+
+/// The output then the input, as round buttons along the pill from `start`; a fanned-out row is
+/// left to [`fan_row`].
 fn device_column(p: &mut Painter, frame: &Frame, devices: &Devices, start: f32, hits: &mut Vec<([f32; 4], Hit)>, m: Metrics) -> Result<()> {
-    let mut along = start;
-    for (flow, device) in [(Flow::Output, &devices.output), (Flow::Input, &devices.input)] {
-        let Some(device) = device else { continue };
+    let fanned = devices.fan.as_ref().map(|f| f.flow);
+    for (flow, device, along) in device_rows(devices, start, m) {
+        if Some(flow) == fanned {
+            continue;
+        }
         let (cx, cy) = frame.pt(along + m.dev_step / 2.0, m.col / 2.0);
         device_button(p, flow, device, cx, cy, m)?;
         hits.push((frame.rect(along, 0.0, m.dev_step, m.col), Hit::Device(flow)));
-        along += m.dev_step;
+    }
+    Ok(())
+}
+
+/// How far a fanned-out row's discs reach from the edge (its name tag goes beyond).
+fn fan_depth(fan: &Fan, m: Metrics) -> f32 {
+    m.col + m.dev_step * (fan.choices.len() as f32 - 1.0)
+}
+
+/// A device row fanned out at `along`: every device of the flow on one capsule reaching away from
+/// the edge, the current one ringed in the accent, and the pointed one's name beyond the last.
+#[allow(clippy::too_many_arguments)]
+fn fan_row(p: &mut Painter, frame: &Frame, fan: &Fan, current: &Device, along: f32, tag_w: f32, m: Metrics, hits: &mut Vec<([f32; 4], Hit)>, spots: &mut Vec<(usize, [f32; 4])>) -> Result<()> {
+    let mid = m.col / 2.0;
+    let depth = fan_depth(fan, m);
+    let step = m.dev_step;
+    tucked(p, frame.edge, frame.rect(along, 0.0, step, depth), step / 2.0, NORMAL_BG)?;
+    for (k, choice) in fan.choices.iter().enumerate() {
+        let across = mid + k as f32 * step;
+        let (cx, cy) = frame.pt(along + step / 2.0, across);
+        let is_current = choice.id == fan.current;
+        let other = Device { icon: choice.icon, name: choice.name.clone(), muted: false, recording: false };
+        device_button(p, fan.flow, if is_current { current } else { &other }, cx, cy, m)?;
+        if is_current {
+            p.ring(cx, cy, m.dev_r + 2.5, 2.0, ring_playing())?;
+        }
+        // Tiled across the row, the first from the edge: no gap that would close the fan.
+        let from = if k == 0 { 0.0 } else { across - step / 2.0 };
+        hits.push((frame.rect(along, from, step, across + step / 2.0 - from), Hit::Choice(fan.flow, k)));
+        let r = m.dev_r + 2.0;
+        spots.push((hits.len() - 1, [cx - r, cy - r, 2.0 * r, 2.0 * r]));
+    }
+    hits.push((frame.rect(along, 0.0, step, depth), Hit::Fan(fan.flow)));
+    if let Some(choice) = fan.named.and_then(|i| fan.choices.get(i)).filter(|_| tag_w > 0.0) {
+        let [tx, ty, tw, th] = if frame.edge.vertical() {
+            frame.rect(along + (step - TAG_H) / 2.0, depth + 6.0, TAG_H, tag_w)
+        } else {
+            let (cx, _) = frame.pt(along + step / 2.0, 0.0);
+            [(cx - tag_w / 2.0).clamp(0.0, (frame.w - tag_w).max(0.0)), depth + 6.0, tag_w, TAG_H]
+        };
+        p.round_rect(tx, ty, tw, th, TAG_H / 2.0, NORMAL_BG)?;
+        p.text(&choice.name, Font::Small, (tx + 10.0, ty, tw - 20.0, th), WHITE)?;
     }
     Ok(())
 }
@@ -522,7 +581,12 @@ fn stack(gfx: &Gfx, m: Metrics, media: &[crate::hub::Media], call: Option<&CallP
     let len = lead + pills_len + if place.note_after { note_room } else { 0.0 };
     // A speaker's name tag goes beside a column, under a row.
     let tag = call_layout.as_ref().filter(|l| l.tag_w > 0.0).map_or(0.0, |l| if vertical { l.tag_w } else { TAG_H } + 6.0);
-    let depth = (col + tag).max(if song.is_some() { note_depth } else { 0.0 });
+    // A fanned-out device row reaches further, its pointed device's name beyond (as the speaker's).
+    let fan = devices.and_then(|d| d.fan.as_ref());
+    let fan_name = fan.filter(|_| m.words).and_then(|f| f.named.and_then(|i| f.choices.get(i)));
+    let fan_tag_w = fan_name.map_or(0.0, |c| gfx.measure(Font::Small, &c.name).min(220.0) + 20.0);
+    let fan_reach = fan.map_or(0.0, |f| fan_depth(f, m) + if fan_tag_w > 0.0 { 6.0 + if vertical { fan_tag_w } else { TAG_H } } else { 0.0 });
+    let depth = (col + tag).max(if song.is_some() { note_depth } else { 0.0 }).max(fan_reach);
     let (w, h) = if vertical { (depth, len) } else { (len, depth) };
     let frame = Frame { edge: place.edge, w };
     let mut hits = Vec::new();
@@ -586,6 +650,12 @@ fn stack(gfx: &Gfx, m: Metrics, media: &[crate::hub::Media], call: Option<&CallP
         if let Some(devices) = devices {
             tucked(p, place.edge, frame.rect(starts[2], 0.0, devices_len, col), col / 2.0, QUIET_BG)?;
             device_column(p, &frame, devices, starts[2] + pad, &mut hits, m)?;
+            if let Some(fan) = fan {
+                let row = device_rows(devices, starts[2] + pad, m).find(|(flow, ..)| *flow == fan.flow);
+                if let Some((_, current, along)) = row {
+                    fan_row(p, &frame, fan, current, along, fan_tag_w, m, &mut hits, &mut spots)?;
+                }
+            }
         }
         Ok(())
     })?;

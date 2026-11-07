@@ -27,10 +27,7 @@ pub(super) const ROW_MARGIN: f32 = 4.0; // side margin of the row highlight/pill
 pub(super) const ROW_RADIUS: f32 = 4.0; // corner radius of the row highlight
 pub(super) const PILL_W: f32 = 3.0; // accent selection-indicator pill width
 pub(super) const PILL_H: f32 = 16.0; // accent selection-indicator pill height
-pub(super) const PENCIL_W: f32 = 42.0; // right-hand space reserved for the edit affordance (label stops here)
-pub(super) const PENCIL_BTN: f32 = 30.0; // the pencil's round hover-button diameter
-pub(super) const PENCIL_RIGHT: f32 = 9.0; // gap from the panel's right edge to the button
-pub(super) const BATTERY_W: f32 = 96.0; // right-hand space reserved on battery rows (fits battery + hover pencil)
+pub(super) const BATTERY_W: f32 = 80.0; // right-hand space reserved on battery rows (the readout + RIGHT_PAD)
 // slider geometry
 pub(super) const TRACK_X0: f32 = 52.0; // track left edge
 pub(super) const VALUE_W: f32 = 46.0; // reserved right area for the percentage
@@ -57,29 +54,14 @@ pub(super) const FOOTER_GAP: f32 = 8.0; // minimum gap between the left item and
 pub(super) const DIVIDER_A: f32 = 0.14; // footer hairline (below ~0.1 it vanishes into the acrylic)
 pub(super) const FOOTER_SHADE: [u8; 3] = [0x00, 0x00, 0x00]; // the strip sits a shade darker than the body
 pub(super) const FOOTER_SHADE_A: f32 = 0.18;
-// icon-picker page (a dedicated screen you slide to from a device's edit pencil)
-pub(super) const PICKER_HEADER_H: f32 = 46.0; // back-arrow + device-name title row
-pub(super) const BACK_LEFT: f32 = 7.0; // left inset of the back button
-pub(super) const BACK_BTN: f32 = 32.0; // back button's round hover target diameter
-pub(super) const BACK_GLYPH_PX: f32 = 16.0; // back chevron glyph size
-pub(super) const TITLE_PX: f32 = 15.0; // picker title (device name) em size
-// wrapping icon grid
-pub(super) const GRID_CHIP: f32 = 44.0; // one icon cell (square)
-pub(super) const GRID_GAP: f32 = 8.0; // gap between cells (both axes)
-pub(super) const GRID_X: f32 = 14.0; // grid side inset (used to size columns)
-pub(super) const GRID_TOP_PAD: f32 = 4.0; // gap above the first grid row
-pub(super) const GRID_BOTTOM_PAD: f32 = 10.0; // gap below the last grid row
-pub(super) const GRID_ICON_RATIO: f32 = 0.55; // glyph size inside a cell
 
 // Fluent glyphs painted directly (not from the built-in IconId set).
 const GLYPH_VOLUME: char = '\u{E767}';
 const GLYPH_MUTE: char = '\u{E74F}';
 pub(super) const GLYPH_MIC: char = '\u{E720}';
 pub(super) const GLYPH_MIC_OFF: char = '\u{EC54}';
-pub(super) const GLYPH_EDIT: char = '\u{E70F}';
 pub(super) const GLYPH_SETTINGS: char = '\u{E713}';
 pub(super) const GLYPH_CANCEL: char = '\u{E711}';
-pub(super) const GLYPH_BACK: char = '\u{E72B}'; // Back (leftward arrow) — the picker's cancel affordance
 pub(super) const GLYPH_UPDATE: char = '\u{E72C}'; // Refresh (circular arrow) — restart-to-update button
 
 // Colours (RGB); alpha applied at blend time.
@@ -87,7 +69,7 @@ pub(crate) const RECORDING: [u8; 3] = [0xE8, 0x11, 0x23]; // the "an app is reco
 pub(crate) const TINT: [u8; 3] = [0x2C, 0x2C, 0x2C]; // panel base (semi-transparent, acrylic shows through)
 pub(crate) const TINT_A: f32 = 0.82;
 pub(crate) const TEXT: [u8; 3] = [0xFF, 0xFF, 0xFF]; // primary text + glyphs
-pub(super) const DARK_GLYPH: [u8; 3] = [0x12, 0x16, 0x1C]; // icon colour on a solid accent chip
+pub(super) const DARK_GLYPH: [u8; 3] = [0x12, 0x16, 0x1C]; // glyph colour on a solid accent disc
 pub(super) const HOVER_A: f32 = 0.06; // white overlay for hover
 pub(super) const SEL_A: f32 = 0.09; // white overlay for the selected row
 

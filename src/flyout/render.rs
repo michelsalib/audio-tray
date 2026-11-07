@@ -1,17 +1,14 @@
 //! Painting the flyout: turn the display [`Model`] + a laid-out screen into pixels.
 //!
-//! [`render_page`] paints a screen's static layer; [`compose`] copies it and overlays what
-//! changes without a relayout (slider fill and glow, hover, battery and pencil).
+//! [`render_page`] paints the panel's static layer; [`compose`] copies it and overlays what
+//! changes without a relayout (slider fill and glow, hover).
 
 use ab_glyph::FontVec;
 
-use crate::icons::{self, IconId};
+use crate::icons;
 
 use crate::canvas::{fit_label, lerp3, measure, Canvas, Rect};
-use super::layout::{
-    footer_btn_center_x, footer_buttons, footer_item_right, grid_metrics, pencil_center_x,
-    ActionKind, Elem, LaidElem,
-};
+use super::layout::{footer_btn_center_x, footer_buttons, footer_item_right, ActionKind, Elem, LaidElem};
 use super::model::Model;
 use super::theme::*;
 use super::Interaction;
@@ -31,7 +28,7 @@ impl<'a> Ctx<'a> {
     }
 }
 
-/// Render a screen's static layer into `out`; used for the base layer and for slide frames.
+/// Render the panel's static layer into `out`.
 pub(super) fn render_page(ctx: &Ctx, elems: &[LaidElem], out: &mut [u8]) {
     let scale = ctx.scale;
     let accent = ctx.accent;
@@ -267,49 +264,14 @@ pub(super) fn render_page(ctx: &Ctx, elems: &[LaidElem], out: &mut [u8]) {
                 }
                 if let Some(f) = font {
                     let base = cy as f32 + text_px * 0.34;
-                    // Truncate so the name never runs under the battery or pencil.
-                    let reserve = if row.battery.is_some() { BATTERY_W } else { PENCIL_W };
+                    // Truncate so the name never runs under the battery.
+                    let reserve = if row.battery.is_some() { BATTERY_W } else { RIGHT_PAD };
                     let max_w = w as f32 - d(TEXT_X) as f32 - reserve * scale;
                     let label = fit_label(f, text_px, &row.label, max_w);
                     cv.draw_text(f, text_px, (d(TEXT_X) as f32, base), TEXT, 1.0, &label);
                 }
-                // Battery and pencil depend on hover, so `compose` draws them.
-            }
-            Elem::PickerHeader { group, dev } => {
-                let cy_i = le.top + le.height / 2;
-                // The back chevron, centred in its button on the left.
-                let bpx = (BACK_GLYPH_PX * scale).round() as u32;
-                if let Ok((rgba, gw, gh)) = icons::render_glyph(GLYPH_BACK, bpx, TEXT) {
-                    let bx = ((BACK_LEFT + BACK_BTN / 2.0) * scale).round() as i32 - gw as i32 / 2;
-                    cv.blit(bx, cy_i - gh as i32 / 2, &rgba, gw, gh, 1.0);
-                }
-                // The device name as the screen title.
-                if let Some(f) = font_sb {
-                    let title_px = TITLE_PX * scale;
-                    let base = cy_i as f32 + title_px * 0.34;
-                    let max_w = w as f32 - d(TEXT_X) as f32 - RIGHT_PAD * scale;
-                    let title = fit_label(f, title_px, &groups[group].devices[dev].label, max_w);
-                    cv.draw_text(f, title_px, (d(TEXT_X) as f32, base), TEXT, 1.0, &title);
-                }
-            }
-            Elem::IconGrid { group, dev } => {
-                let sel_icon = groups[group].devices[dev].icon;
-                let (cols, left, chip, step) = grid_metrics(w, scale);
-                let gy0 = le.top + (GRID_TOP_PAD * scale).round() as i32;
-                let inner = (chip as f32 * GRID_ICON_RATIO).round() as u32;
-                let r = d(8.0) as f32;
-                for (idx, icon) in IconId::ALL.iter().enumerate() {
-                    let cx0 = left + (idx as i32 % cols) * step;
-                    let cy0 = gy0 + (idx as i32 / cols) * step;
-                    let selected = *icon == sel_icon;
-                    let (bg, a) = if selected { (accent, 1.0) } else { (TEXT, 0.06) };
-                    cv.fill_round_rect(Rect::new(cx0 as f32, cy0 as f32, (cx0 + chip) as f32, (cy0 + chip) as f32), r, bg, a);
-                    let gcol = if selected { DARK_GLYPH } else { TEXT };
-                    if let Ok((rgba, gw, gh)) = icon.render(inner, gcol) {
-                        let ox = cx0 + (chip - gw as i32) / 2;
-                        let oy = cy0 + (chip - gh as i32) / 2;
-                        cv.blit(ox, oy, &rgba, gw, gh, 1.0);
-                    }
+                if let Some(pct) = row.battery {
+                    draw_battery(&mut cv, scale, w as f32 - RIGHT_PAD * scale, cy as f32, pct, font);
                 }
             }
             Elem::Footer => {
@@ -367,13 +329,9 @@ pub(super) fn compose(ctx: &Ctx, hit: &Interaction, elems: &[LaidElem], base: &[
     let scale = ctx.scale;
     let accent = ctx.accent;
     let (w, h) = (ctx.width, ctx.height);
-    let panel_w = ctx.width;
     let d = |v: f32| (v * scale).round() as i32;
     let groups = &ctx.model.groups;
     let hover = hit.hover;
-    let hover_pencil = hit.hover_pencil;
-    let hover_back = hit.hover_back;
-    let hover_chip = hit.hover_chip;
     let font = ui_font();
     let mx = d(ROW_MARGIN) as f32;
     let mut cv = Canvas::new(buf, w, h);
@@ -449,36 +407,15 @@ pub(super) fn compose(ctx: &Ctx, hit: &Interaction, elems: &[LaidElem], base: &[
         }
     }
 
-    // Right-hand affordances + hover highlights. A hovered device row adds the pencil and
-    // shifts its battery left to make room.
+    // Hover highlights and the buttons' hover discs.
     for (idx, le) in elems.iter().enumerate() {
         let hovered = hover == Some(idx);
         match le.elem {
-            Elem::Device { group, dev } => {
-                let dev_row = &groups[group].devices[dev];
-                let cy = (le.top + le.height / 2) as f32;
-                if hovered {
-                    // Whole-row highlight (selected row already carries one in base).
-                    if !dev_row.selected {
-                        let ry0 = le.top as f32 + 1.0;
-                        let ry1 = (le.top + le.height) as f32 - 1.0;
-                        cv.fill_round_rect(Rect::new(mx, ry0, w as f32 - mx, ry1), d(ROW_RADIUS) as f32, TEXT, HOVER_A);
-                    }
-                    if let Some(pct) = dev_row.battery {
-                        let pencil_left = pencil_center_x(panel_w, scale) - PENCIL_BTN * scale / 2.0;
-                        draw_battery(&mut cv, scale, pencil_left - 6.0 * scale, cy, pct, font);
-                    }
-                    // Round button behind the pencil, only when the pencil is hovered.
-                    if hover_pencil {
-                        let r = PENCIL_BTN * scale / 2.0;
-                        let cxp = pencil_center_x(panel_w, scale);
-                        cv.fill_round_rect(Rect::new(cxp - r, cy - r, cxp + r, cy + r), r, TEXT, 0.10);
-                    }
-                    let a = if hover_pencil { 1.0 } else { 0.85 };
-                    draw_pencil(&mut cv, scale, panel_w, cy, a);
-                } else if let Some(pct) = dev_row.battery {
-                    draw_battery(&mut cv, scale, panel_w as f32 - RIGHT_PAD * scale, cy, pct, font);
-                }
+            // Whole-row highlight (a selected row already carries one in base).
+            Elem::Device { group, dev } if hovered && !groups[group].devices[dev].selected => {
+                let ry0 = le.top as f32 + 1.0;
+                let ry1 = (le.top + le.height) as f32 - 1.0;
+                cv.fill_round_rect(Rect::new(mx, ry0, w as f32 - mx, ry1), d(ROW_RADIUS) as f32, TEXT, HOVER_A);
             }
             Elem::GroupHeader { group } if hovered && groups[group].devices.len() > 1 => {
                 let ry0 = le.top as f32 + 4.0 * scale;
@@ -498,26 +435,6 @@ pub(super) fn compose(ctx: &Ctx, hit: &Interaction, elems: &[LaidElem], base: &[
                 let cxb = super::layout::voice_button_center_x(w, scale);
                 let r = VOICE_BTN * scale / 2.0;
                 cv.fill_round_rect(Rect::new(cxb - r, cy - r, cxb + r, cy + r), r, TEXT, 0.08);
-            }
-            Elem::PickerHeader { .. } if hovered && hover_back => {
-                // Round hover button behind the back arrow.
-                let cy = (le.top + le.height / 2) as f32;
-                let cxb = (BACK_LEFT + BACK_BTN / 2.0) * scale;
-                let r = BACK_BTN * scale / 2.0;
-                cv.fill_round_rect(Rect::new(cxb - r, cy - r, cxb + r, cy + r), r, TEXT, 0.10);
-            }
-            Elem::IconGrid { group, dev } => {
-                // Brighten the chip under the cursor (accent chips lighten a touch too).
-                if let Some(ci) = hover_chip.filter(|_| hovered) {
-                    let (cols, left, chip, step) = grid_metrics(w, scale);
-                    let gy0 = le.top + (GRID_TOP_PAD * scale).round() as i32;
-                    let cx0 = left + (ci as i32 % cols) * step;
-                    let cy0 = gy0 + (ci as i32 / cols) * step;
-                    let r = d(8.0) as f32;
-                    let selected = IconId::ALL[ci] == groups[group].devices[dev].icon;
-                    let a = if selected { 0.14 } else { 0.10 };
-                    cv.fill_round_rect(Rect::new(cx0 as f32, cy0 as f32, (cx0 + chip) as f32, (cy0 + chip) as f32), r, TEXT, a);
-                }
             }
             // Only the hovered footer item lights up, never the whole strip.
             Elem::Footer if hovered => {
@@ -558,17 +475,6 @@ fn ring(cv: &mut Canvas, cx: f32, cy: f32, r: f32, stroke: f32, col: [u8; 3]) {
                 cv.fill_round_rect(Rect::new(x as f32, y as f32, x as f32 + 1.0, y as f32 + 1.0), 0.0, col, coverage);
             }
         }
-    }
-}
-
-/// Draw the trailing "edit icon" pencil on a device row, centred on its button.
-fn draw_pencil(cv: &mut Canvas, scale: f32, panel_w: i32, cy: f32, alpha: f32) {
-    let size = (16.0 * scale).round() as u32;
-    if let Ok((rgba, gw, gh)) = icons::render_glyph(GLYPH_EDIT, size, TEXT) {
-        let cx = pencil_center_x(panel_w, scale);
-        let x = (cx - gw as f32 / 2.0).round() as i32;
-        let y = (cy - gh as f32 / 2.0).round() as i32;
-        cv.blit(x, y, &rgba, gw, gh, alpha);
     }
 }
 

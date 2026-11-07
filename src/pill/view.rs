@@ -1,7 +1,8 @@
 //! What the pill shows, decided from the hub state alone: pure, so the precedence rules are
 //! tested without a window. Louder states win: an alert over a warning over a call over music.
 
-use crate::hub::{Call, Media, Member, Notice, State, VoiceApp};
+use crate::audio::{DeviceId, Flow};
+use crate::hub::{Call, Choice, Media, Member, Notice, State, VoiceApp};
 
 /// How loud a state is; sets the colours and whether clicks pass through.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -50,19 +51,56 @@ pub struct Device {
     pub recording: bool,
 }
 
-/// The output and input on the pill, clicked to switch to the next device.
+/// The output and input on the pill. Hovering one fans its row out into every active device of
+/// that flow, to pick from; a flow with a single device is clicked to cycle (or mute) instead.
 #[derive(Clone, PartialEq, Debug, Default)]
 pub struct Devices {
     pub output: Option<Device>,
     pub input: Option<Device>,
+    pub fan: Option<Fan>,
+}
+
+/// A device row fanned out under the pointer.
+#[derive(Clone, PartialEq, Debug)]
+pub struct Fan {
+    pub flow: Flow,
+    /// The current device first, then the others in Windows' order. While the fan stays open the
+    /// order is kept ([`Fan::keep_order`]), so a pick never moves a disc under the pointer.
+    pub choices: Vec<Choice>,
+    pub current: DeviceId,
+    /// The choice whose name shows beside the row, by its place in `choices`.
+    pub named: Option<usize>,
+}
+
+impl Fan {
+    /// Lay the choices out as `old` had them: the ones still there in their places, new ones after.
+    pub fn keep_order(&mut self, old: &Fan) {
+        let mut kept: Vec<Choice> = old.choices.iter().filter_map(|o| self.choices.iter().find(|n| n.id == o.id).cloned()).collect();
+        kept.extend(self.choices.iter().filter(|n| !old.choices.iter().any(|o| o.id == n.id)).cloned());
+        self.choices = kept;
+        self.named = self.named.filter(|&i| i < self.choices.len());
+    }
 }
 
 impl Devices {
-    fn of(state: &State) -> Option<Self> {
+    fn of(state: &State, fan: Option<(Flow, Option<usize>)>) -> Option<Self> {
         let device = |e: &crate::hub::Endpoint, recording: bool| Device { icon: e.icon, name: e.name.clone(), muted: e.muted, recording };
+        let fan = fan.and_then(|(flow, named)| {
+            let (current, list) = match flow {
+                Flow::Output => (state.endpoints.output.as_ref(), &state.endpoints.outputs),
+                Flow::Input => (state.endpoints.input.as_ref(), &state.endpoints.inputs),
+            };
+            let current = current?.id.clone();
+            if list.len() < 2 {
+                return None;
+            }
+            let choices: Vec<Choice> = list.iter().filter(|c| c.id == current).chain(list.iter().filter(|c| c.id != current)).cloned().collect();
+            Some(Fan { flow, named: named.filter(|&i| i < choices.len()), choices, current })
+        });
         let devices = Self {
             output: state.endpoints.output.as_ref().map(|e| device(e, false)),
             input: state.endpoints.input.as_ref().map(|e| device(e, state.mic_live())),
+            fan,
         };
         (devices.output.is_some() || devices.input.is_some()).then_some(devices)
     }
@@ -107,6 +145,21 @@ impl View {
         }
     }
 
+    /// The fanned-out device row, if one is shown.
+    pub fn fan(&self) -> Option<&Fan> {
+        match self {
+            View::Idle { devices: Some(d), .. } | View::Music { devices: Some(d), .. } => d.fan.as_ref(),
+            _ => None,
+        }
+    }
+
+    pub fn fan_mut(&mut self) -> Option<&mut Fan> {
+        match self {
+            View::Idle { devices: Some(d), .. } | View::Music { devices: Some(d), .. } => d.fan.as_mut(),
+            _ => None,
+        }
+    }
+
     /// Whether clicks pass through to whatever is underneath: quiet states, unless they carry the
     /// devices (which are buttons).
     pub fn click_through(&self) -> bool {
@@ -135,6 +188,8 @@ pub struct Inputs {
     pub listening_alerts: bool,
     /// Show the output and input on the quiet states.
     pub devices: bool,
+    /// The device row fanned out under the pointer, and which of its choices to name.
+    pub fan: Option<(Flow, Option<usize>)>,
     /// How much shows at rest (`Hidden`: everything short of a warning collapses to the sliver).
     pub size: crate::config::PillSize,
     /// Show a new song's title for a moment.
@@ -209,7 +264,9 @@ fn loudest(state: &State, inputs: Inputs) -> View {
     } else {
         Vec::new()
     };
-    let devices = if inputs.devices { Devices::of(state) } else { None };
+    // The card shows its own device row: no fan there.
+    let fan = inputs.fan.filter(|_| media.is_empty() || !inputs.hover);
+    let devices = if inputs.devices { Devices::of(state, fan) } else { None };
     let call = call_pill(state);
     if media.is_empty() {
         View::Idle { call, devices }
@@ -268,7 +325,6 @@ fn call_pill(state: &State) -> Option<CallPill> {
 mod tests {
     use super::*;
     use crate::hub::{Endpoint, Endpoints, Event};
-    use crate::audio::DeviceId;
 
     fn media(playing: bool) -> Media {
         Media {
@@ -292,7 +348,7 @@ mod tests {
         state.apply(Event::Endpoints(Endpoints {
             output: None,
             input: Some(Endpoint { id: DeviceId("mic".into()), name: "Mic".into(), muted, icon: crate::icons::IconId::Microphone }),
-            active_outputs: vec![],
+            ..Default::default()
         }));
     }
 
@@ -413,6 +469,53 @@ mod tests {
             View::Idle { devices: Some(devices), .. } => assert!(devices.input.is_some_and(|d| d.muted)),
             other => panic!("{other:?}"),
         }
+    }
+
+    fn outputs(current: &str, ids: &[&str]) -> State {
+        let choice = |id: &str| Choice { id: DeviceId(id.into()), name: id.into(), icon: crate::icons::IconId::Speakers };
+        let mut state = State::default();
+        state.apply(Event::Endpoints(Endpoints {
+            output: Some(Endpoint { id: DeviceId(current.into()), name: current.into(), muted: false, icon: crate::icons::IconId::Speakers }),
+            outputs: ids.iter().map(|id| choice(id)).collect(),
+            ..Default::default()
+        }));
+        state
+    }
+
+    fn fan_of(view: View) -> Option<Fan> {
+        match view {
+            View::Idle { devices: Some(devices), .. } | View::Music { devices: Some(devices), .. } => devices.fan,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    fn ids(fan: &Fan) -> Vec<&str> {
+        fan.choices.iter().map(|c| c.id.0.as_str()).collect()
+    }
+
+    #[test]
+    fn a_hovered_device_fans_out_with_the_current_one_first() {
+        let state = outputs("b", &["a", "b", "c"]);
+        let fan = fan_of(decide(&state, Inputs { devices: true, fan: Some((Flow::Output, Some(0))), ..on() })).expect("fanned");
+        assert_eq!(ids(&fan), ["b", "a", "c"]);
+        assert_eq!(fan.current, DeviceId("b".into()));
+        assert_eq!(fan_of(decide(&state, Inputs { devices: true, ..on() })), None, "not hovered");
+        assert_eq!(fan_of(decide(&state, Inputs { devices: true, fan: Some((Flow::Input, None)), ..on() })), None, "no input");
+        let single = outputs("a", &["a"]);
+        assert_eq!(fan_of(decide(&single, Inputs { devices: true, fan: Some((Flow::Output, None)), ..on() })), None, "nothing to pick");
+    }
+
+    #[test]
+    fn a_pick_keeps_the_discs_where_they_were() {
+        let fanned = Inputs { devices: true, fan: Some((Flow::Output, Some(2))), ..on() };
+        let old = fan_of(decide(&outputs("b", &["a", "b", "c"]), fanned)).expect("fanned");
+        // "c" picked, and "d" plugged in meanwhile.
+        let mut new = fan_of(decide(&outputs("c", &["a", "b", "c", "d"]), fanned)).expect("fanned");
+        assert_eq!(ids(&new), ["c", "a", "b", "d"]);
+        new.keep_order(&old);
+        assert_eq!(ids(&new), ["b", "a", "c", "d"]);
+        assert_eq!(new.current, DeviceId("c".into()));
+        assert_eq!(new.named, Some(2), "still on the picked one");
     }
 
     #[test]

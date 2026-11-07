@@ -1,6 +1,6 @@
 /*
  * Audio Tray: tells Audio Tray (https://github.com/michelsalib/audio-tray) who is in your voice
- * channel, who is talking and whether you are muted, and lets its edge pill toggle your mute.
+ * channel, who is talking and whether you are muted, and lets its edge pill toggle your mute or leave the channel.
  */
 
 import definePlugin, { PluginNative } from "@utils/types";
@@ -12,6 +12,7 @@ const Native = VencordNative.pluginHelpers.AudioTray as PluginNative<typeof impo
 const VoiceStateStore = findStoreLazy("VoiceStateStore");
 const MediaEngineStore = findStoreLazy("MediaEngineStore");
 const VoiceActions = findByPropsLazy("toggleSelfMute");
+const ChannelActions = findByPropsLazy("disconnect", "selectVoiceChannel");
 
 /** Who is talking in the current channel. */
 const speaking = new Set<string>();
@@ -67,6 +68,7 @@ async function commands() {
             const command = JSON.parse(line);
             if (command.type === "toggleMute") VoiceActions.toggleSelfMute();
             else if (command.type === "setMute" && MediaEngineStore.isSelfMute() !== command.muted) VoiceActions.toggleSelfMute();
+            else if (command.type === "disconnect") ChannelActions.disconnect();
         } catch { }
     }
 }

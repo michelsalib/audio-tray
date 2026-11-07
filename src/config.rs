@@ -248,6 +248,11 @@ pub struct Strip {
     /// Hide Windows' keyboard-layout indicator ("FRA"). Off by default: unlike the two above it is
     /// not replaced by anything; Win+Space still switches. Needs the TAP (buttons or music tile).
     pub hide_windows_language: bool,
+    /// What a left click on the output or input button does.
+    pub left_click: LeftClick,
+    /// Switching devices (a button's or the pill's click) stops once on the last device, muted,
+    /// before going back to the first.
+    pub mute_in_cycle: bool,
 }
 
 impl Default for Strip {
@@ -258,8 +263,24 @@ impl Default for Strip {
             hide_windows_volume: true,
             hide_windows_mic: true,
             hide_windows_language: false,
+            left_click: LeftClick::Switch,
+            mute_in_cycle: true,
         }
     }
+}
+
+/// A left click on a taskbar audio button.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LeftClick {
+    /// Step that flow to its next device (with one muted stop before the wrap, unless
+    /// [`Strip::mute_in_cycle`] is off).
+    #[default]
+    Switch,
+    /// Mute or unmute that flow's default device.
+    Mute,
+    /// Open Audio Tray's panel, as a right click does.
+    Panel,
 }
 
 /// Following YouTube Music and drawing it into the taskbar. On by default: it does nothing

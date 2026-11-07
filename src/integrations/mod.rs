@@ -319,6 +319,15 @@ pub fn set_muted(app: VoiceApp, muted: bool) {
     }
 }
 
+/// Leave the call in a voice app. Only Discord can be told to; Teams' hang-up is left to Teams.
+pub fn leave_call(app: VoiceApp) {
+    match app {
+        VoiceApp::Discord if discord_rpc::connected() => discord_rpc::leave_channel(),
+        VoiceApp::Discord => discord(|server| server.send(r#"{"type":"disconnect"}"#)),
+        VoiceApp::Teams => eprintln!("integrations: leaving a Teams call is not supported"),
+    }
+}
+
 /// A command for a browser tab (`id` is the part after [`browser::APP_ID_PREFIX`]):
 /// `toggle` plays or pauses its media, `focus` brings the tab and its window to the front.
 pub fn browser_command(id: &str, command: &str) {

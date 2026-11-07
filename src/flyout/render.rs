@@ -188,8 +188,24 @@ pub(super) fn render_page(ctx: &Ctx, elems: &[LaidElem], out: &mut [u8]) {
                 let col = if row.muted { accent } else { TEXT };
                 let glyph = if row.muted { GLYPH_APP_MUTED } else { GLYPH_APP };
                 let gpx = (16.0 * scale).round() as u32;
-                if let Ok((rgba, gw, gh)) = icons::render_glyph(glyph, gpx, col) {
-                    cv.blit(d(ICON_X) + 2, cy_i - gh as i32 / 2, &rgba, gw, gh, 1.0);
+                match &row.icon {
+                    // The app's own icon, centred where the glyph would be; muted, faded under a
+                    // small mute badge (still the spot that toggles it).
+                    Some(sprite) => {
+                        let px = (APP_ICON_DIP * scale).round() as i32;
+                        let (ix, iy) = (d(ICON_X) + 2 + d(8.0) - px / 2, cy_i - px / 2);
+                        cv.blit(ix, iy, sprite, px as u32, px as u32, if row.muted { 0.35 } else { 1.0 });
+                        if row.muted {
+                            if let Ok((rgba, gw, gh)) = icons::render_glyph(GLYPH_APP_MUTED, (11.0 * scale).round() as u32, accent) {
+                                cv.blit(ix + px - gw as i32 / 2 - d(2.0), iy + px - gh as i32 / 2 - d(2.0), &rgba, gw, gh, 1.0);
+                            }
+                        }
+                    }
+                    None => {
+                        if let Ok((rgba, gw, gh)) = icons::render_glyph(glyph, gpx, col) {
+                            cv.blit(d(ICON_X) + 2, cy_i - gh as i32 / 2, &rgba, gw, gh, 1.0);
+                        }
+                    }
                 }
                 if let Some(f) = font {
                     let px = 13.0 * scale;

@@ -13,7 +13,8 @@
 //! {"type":"speaking","id":"1","speaking":true}
 //! {"type":"selfMute","muted":true}
 //! ```
-//! App → plugin: `{"type":"toggleMute"}`, `{"type":"setMute","muted":false}`.
+//! App → plugin: `{"type":"toggleMute"}`, `{"type":"setMute","muted":false}`,
+//! `{"type":"disconnect"}` (leave the voice channel).
 
 
 use std::sync::Arc;

@@ -53,6 +53,35 @@ pub(super) struct AppRow {
     pub app: String,
     pub level: f32,
     pub muted: bool,
+    /// The app's icon as a ready sprite ([`app_icon`]); `None` draws the generic glyph.
+    pub icon: Option<std::sync::Arc<Vec<u8>>>,
+}
+
+impl AppRow {
+    pub(super) fn of(session: &crate::hub::AppSession, icon_px: u32) -> Self {
+        Self { app: session.app.clone(), level: session.volume, muted: session.muted, icon: app_icon(session.pid, icon_px) }
+    }
+}
+
+/// The icon of process `pid`'s program, `px` square, as a sprite: extracted once per program and
+/// size, since the hub re-lists the sessions on every change.
+fn app_icon(pid: u32, px: u32) -> Option<std::sync::Arc<Vec<u8>>> {
+    use std::collections::HashMap;
+    type Cache = HashMap<(String, u32), Option<std::sync::Arc<Vec<u8>>>>;
+    thread_local! {
+        static CACHE: std::cell::RefCell<Cache> = Default::default();
+    }
+    let exe = crate::win::process_exe(pid)?;
+    CACHE.with(|cache| {
+        cache
+            .borrow_mut()
+            .entry((exe.clone(), px))
+            .or_insert_with(|| {
+                let png = crate::image::exe_icon_png(&exe, px).ok()?;
+                crate::image::sprite(&png, px, 0.0).ok().map(std::sync::Arc::new)
+            })
+            .clone()
+    })
 }
 
 /// The voice panel: a call an integration reports, or a meeting app holding the microphone.
@@ -112,7 +141,7 @@ pub(super) const ART_DIP: f32 = 52.0;
 /// lives, paused or not: a card vanishing on pause would slide the next one under the pointer.
 /// `art_px` is the cover's size at the panel's scale; decoding is skipped when `old` already
 /// holds a track's sprite.
-pub(super) fn from_hub(state: &crate::hub::State, art_px: u32, old: &[NowPlaying]) -> (Vec<NowPlaying>, Vec<AppRow>, Option<Voice>) {
+pub(super) fn from_hub(state: &crate::hub::State, art_px: u32, icon_px: u32, old: &[NowPlaying]) -> (Vec<NowPlaying>, Vec<AppRow>, Option<Voice>) {
     let all = state.all_media();
     let mut shown: Vec<&crate::hub::Media> = all
         .iter()
@@ -155,7 +184,7 @@ pub(super) fn from_hub(state: &crate::hub::State, art_px: u32, old: &[NowPlaying
     let apps = state
         .sessions
         .iter()
-        .map(|s| AppRow { app: s.app.clone(), level: s.volume, muted: s.muted })
+        .map(|s| AppRow::of(s, icon_px))
         .collect();
     let voice = match state.call() {
         Some((app, call)) => Some(Voice {

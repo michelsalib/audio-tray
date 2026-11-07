@@ -385,6 +385,7 @@ impl Window {
                     Toggle::NextToWifi => &mut c.strip.next_to_wifi,
                     Toggle::HideVolume => &mut c.strip.hide_windows_volume,
                     Toggle::HideMic => &mut c.strip.hide_windows_mic,
+                    Toggle::MuteInCycle => &mut c.strip.mute_in_cycle,
                     Toggle::HideLanguage => &mut c.strip.hide_windows_language,
                     Toggle::Keyboards => &mut c.keyboards.enabled,
                     Toggle::KeyboardReadout => &mut c.keyboards.show_readout,
@@ -408,6 +409,7 @@ impl Window {
                 let monitors: Vec<String> = self.model.monitors.iter().map(|m| m.name.clone()).collect();
                 self.change(|c| match choice {
                     Choice::Tile => c.music.tile_style = [TileStyle::Off, TileStyle::Cover, TileStyle::Full][i.min(2)],
+                    Choice::LeftClick => c.strip.left_click = layout::LEFT_CLICKS[i.min(2)],
                     Choice::PillSize => c.pill.size = [PillSize::Hidden, PillSize::Small, PillSize::Big][i.min(2)],
                     Choice::Edge => c.pill.edge = layout::EDGES[i.min(2)],
                     Choice::Align => c.pill.align = layout::ALIGNS[i.min(2)],

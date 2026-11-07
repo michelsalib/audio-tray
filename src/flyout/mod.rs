@@ -332,11 +332,12 @@ impl Flyout<'_> {
     /// mixer straight from the sessions). Returns whether the panel's rows changed shape.
     fn load_hub(&mut self) -> bool {
         let art_px = (model::ART_DIP * self.scale).round() as u32;
+        let icon_px = (theme::APP_ICON_DIP * self.scale).round() as u32;
         let shape = |m: &Model| (m.now_playing.len(), m.voice.is_some(), m.apps.len());
         let before = shape(&self.model);
         match crate::tray::hub_snapshot() {
             Some((generation, state)) => {
-                let (now_playing, apps, voice) = model::from_hub(&state, art_px, &self.model.now_playing);
+                let (now_playing, apps, voice) = model::from_hub(&state, art_px, icon_px, &self.model.now_playing);
                 self.model.now_playing = now_playing;
                 // Mid-drag, keep the level under the finger.
                 if self.hit.drag.is_none() {
@@ -349,7 +350,7 @@ impl Flyout<'_> {
                 self.model.apps = crate::audio::sessions::list()
                     .unwrap_or_default()
                     .into_iter()
-                    .map(|s| model::AppRow { app: s.app, level: s.volume, muted: s.muted })
+                    .map(|s| model::AppRow::of(&s, icon_px))
                     .collect();
             }
         }
@@ -387,6 +388,9 @@ impl Flyout<'_> {
         if let Err(e) = crate::audio::sessions::set_volume(&row.app, level) {
             eprintln!("flyout: could not set {}'s volume ({e:#})", row.app);
         }
+        // The hub re-lists sessions only when one opens: without this its old level would come
+        // back with the next hub change.
+        crate::audio::sessions::CHANGED.post();
     }
 
     /// A press on an app's row: its glyph toggles the mute, the rest starts a drag.
@@ -397,6 +401,7 @@ impl Flyout<'_> {
             if let Err(e) = crate::audio::sessions::set_muted(&row.app, row.muted) {
                 eprintln!("flyout: could not mute {} ({e:#})", row.app);
             }
+            crate::audio::sessions::CHANGED.post();
             self.render_base();
         } else if (mx as f32) >= (theme::APP_TRACK_X0 - 10.0) * self.scale {
             self.hit.drag = Some(elem);
@@ -433,14 +438,21 @@ impl Flyout<'_> {
         }
     }
 
-    /// Adjust volume for a wheel notch at client-y `cy` (see [`Self::scroll_target_group`]).
+    /// Adjust volume for a wheel notch at client-y `cy`: the app whose row it is over, else the
+    /// endpoint [`Self::scroll_target_group`] picks.
     fn scroll_volume(&mut self, cy: i32, delta: i16) {
-        let Some(group) = self.scroll_target_group(cy) else {
-            return;
-        };
         let notches = delta as f32 / WHEEL_DELTA as f32;
-        let level = (self.model.groups[group].level + notches * SCROLL_STEP).clamp(0.0, 1.0);
-        self.set_group_level(group, level);
+        let over = layout::elem_at(&self.surface.elems, cy).map(|i| self.surface.elems[i].elem);
+        if let Some(Elem::AppSlider { app }) = over {
+            let level = (self.model.apps[app].level + notches * SCROLL_STEP).clamp(0.0, 1.0);
+            self.set_app_level(app, level);
+        } else {
+            let Some(group) = self.scroll_target_group(cy) else {
+                return;
+            };
+            let level = (self.model.groups[group].level + notches * SCROLL_STEP).clamp(0.0, 1.0);
+            self.set_group_level(group, level);
+        }
         self.compose();
         self.surface.flush();
     }

@@ -55,6 +55,8 @@ pub enum Action {
     /// Toggle the user's mute: in the voice app, or on the default microphone.
     ToggleMute(Option<VoiceApp>),
     Unmute(Option<VoiceApp>),
+    /// Leave the call in the voice app.
+    LeaveCall(VoiceApp),
     /// Mute the default microphone (the "is listening" alert).
     MuteMicrophone,
     /// Bring the app or tab behind a media session (its app id) to the front.
@@ -609,7 +611,7 @@ impl Pill {
                     _ if spot.is_some() => Highlight::Disc,
                     Hit::Focus(_) if !card => return Ok(None),
                     Hit::Focus(_) => Highlight::Outline,
-                    Hit::Device(_) | Hit::CallMute if w < 2.0 * h => Highlight::Disc,
+                    Hit::Device(_) | Hit::CallMute | Hit::CallLeave if w < 2.0 * h => Highlight::Disc,
                     Hit::Media(..) => Highlight::Square,
                     _ => Highlight::Pill,
                 };
@@ -849,6 +851,11 @@ impl Pill {
             }
             (View::Idle { call: Some(call), .. } | View::Music { call: Some(call), .. }, Some(Hit::CallMute)) => {
                 act(Action::ToggleMute(call.app))
+            }
+            (View::Music { call: Some(call), .. }, Some(Hit::CallLeave)) => {
+                if let Some(app) = call.app {
+                    act(Action::LeaveCall(app));
+                }
             }
             (View::Banner { action, .. }, Some(_)) => match (action, right) {
                 // Right click only dismisses.

@@ -259,6 +259,16 @@ pub fn set_mute(mute: Option<bool>) {
     }
 }
 
+/// Leave the voice channel the user is in. Discord answers with `VOICE_CHANNEL_SELECT`, which
+/// ends the call on the pill.
+pub fn leave_channel() {
+    let Some(pipe) = shared().lock().unwrap_or_else(|p| p.into_inner()).pipe.clone() else { return };
+    let request = json!({ "cmd": "SELECT_VOICE_CHANNEL", "args": { "channel_id": null }, "nonce": nonce() });
+    if let Err(e) = pipe.write_frame(1, &request) {
+        eprintln!("discord: could not leave the channel ({e:#})");
+    }
+}
+
 fn nonce() -> String {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     NEXT.fetch_add(1, std::sync::atomic::Ordering::SeqCst).to_string()

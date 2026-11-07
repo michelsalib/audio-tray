@@ -139,6 +139,14 @@ pub fn site_in_window(window_title: &str, title: &str, artist: &str) -> Option<S
     (!site.is_empty() && site.chars().count() <= 24 && !site.contains("Microsoft")).then_some(site)
 }
 
+/// Whether two sources' titles name the same track: equal but for case and spacing, since a
+/// browser's SMTC session and its tab's page do not always agree on those. Empty never matches.
+pub fn same_title(a: &str, b: &str) -> bool {
+    let words = |s: &str| s.split_whitespace().map(str::to_lowercase).collect::<Vec<_>>();
+    let a = words(a);
+    !a.is_empty() && a == words(b)
+}
+
 fn mentions_in(segment: &str, needle: &str) -> bool {
     !needle.trim().is_empty() && segment.to_lowercase().contains(&needle.to_lowercase())
 }
@@ -155,6 +163,13 @@ pub fn is_voice_app(name: &str, app: VoiceApp) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn titles_match_whatever_their_case_and_spacing() {
+        assert!(same_title("WORLDS - T1 vs KC", "worlds -  T1 vs KC "));
+        assert!(!same_title("WORLDS - T1 vs KC", "WORLDS - T1 vs G2"));
+        assert!(!same_title(" ", ""), "no title is not a match");
+    }
 
     #[test]
     fn names_come_from_every_kind_of_identifier() {

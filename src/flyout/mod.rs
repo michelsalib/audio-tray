@@ -74,6 +74,8 @@ struct Interaction {
     hover_footer: Option<ActionKind>, // which footer action the cursor is over, if any
     hover_media: Option<usize>, // the Now Playing transport button under the cursor
     hover_voice: bool,          // the cursor is over the voice panel's mute button
+    hover_pip: Option<usize>,   // the carousel pip under the cursor
+    wheel: i32,                 // wheel travel not yet turned into a page or a row (touchpads send bits)
     drag: Option<usize>,       // index into elems of the slider being dragged
     pending: Option<usize>,    // index pressed on button-down, acted on button-up
 }
@@ -242,7 +244,9 @@ unsafe fn show_inner(
                 let raw = (msg.wParam.0 >> 16) as u16 as i16 as i32;
                 let delta = crate::win::volume_delta(raw, crate::win::touchpad_delta(raw)) as i16;
                 let (_, sy) = mouse_xy(msg.lParam);
-                fly.scroll_volume(sy - fly.surface.y, delta);
+                if !fly.wheel_rows(sy - fly.surface.y, raw) {
+                    fly.scroll_volume(sy - fly.surface.y, delta);
+                }
             }
             WM_VOL_CHANGED => fly.refresh_volumes(),
             // Only our own timers: the tray's message window has timers too, and they must be dispatched.
@@ -287,6 +291,12 @@ impl Flyout<'_> {
         match crate::tray::hub_snapshot() {
             Some((generation, state)) => {
                 let (now_playing, apps, voice) = model::from_hub(&state, art_px, icon_px, &self.model.now_playing);
+                // Cards keep their slots (see `from_hub`), so the carousel stays on its card; on
+                // opening, it starts on the first one playing.
+                if self.model.now_playing.is_empty() {
+                    self.model.page = now_playing.iter().position(|np| np.playing).unwrap_or(0);
+                }
+                self.model.page = self.model.page.min(now_playing.len().saturating_sub(1));
                 self.model.now_playing = now_playing;
                 // Mid-drag, keep the level under the finger.
                 if self.hit.drag.is_none() {
@@ -361,11 +371,59 @@ impl Flyout<'_> {
         self.surface.flush();
     }
 
+    /// The wheel over a carousel turns its page; over an apps list cut short, it scrolls the
+    /// list. Returns whether it did, else the wheel sets the volume as anywhere else.
+    fn wheel_rows(&mut self, cy: i32, raw: i32) -> bool {
+        let kind = layout::elem_at(&self.surface.elems, cy).map(|i| self.surface.elems[i].elem);
+        let pages = matches!(kind, Some(Elem::NowPlaying { .. } | Elem::Pager)) && layout::carousel(&self.model);
+        let rows = matches!(kind, Some(Elem::AppSlider { .. })) && layout::shown_apps(&self.model).len() < self.model.apps.len();
+        if !pages && !rows {
+            self.hit.wheel = 0;
+            return false;
+        }
+        const NOTCH: i32 = 120; // WHEEL_DELTA
+        self.hit.wheel += raw;
+        let steps = self.hit.wheel / NOTCH;
+        self.hit.wheel %= NOTCH;
+        // Wheel down (negative) goes forward: the next card, the rows below.
+        if pages {
+            let n = self.model.now_playing.len() as i32;
+            self.turn_page((self.model.page as i32 - steps).rem_euclid(n) as usize);
+        } else if steps != 0 {
+            let shown = layout::shown_apps(&self.model);
+            let last_first = self.model.apps.len() - shown.len();
+            self.model.apps_scroll = (shown.start as i32 - steps).clamp(0, last_first as i32) as usize;
+            // Same height, other rows: no refit needed, but the rows are laid out anew.
+            let wheel = self.hit.wheel;
+            self.resize();
+            self.hit.wheel = wheel;
+        }
+        true
+    }
+
+    /// Show Now Playing card `page` in the carousel.
+    fn turn_page(&mut self, page: usize) {
+        if page == self.model.page {
+            return;
+        }
+        self.model.page = page;
+        for le in &mut self.surface.elems {
+            if let Elem::NowPlaying { index } = &mut le.elem {
+                *index = page;
+            }
+        }
+        self.render_base();
+        self.compose();
+        self.surface.flush();
+    }
+
     /// Size the panel, lay it out and allocate buffers; clears hit state.
     fn rebuild_layout(&mut self) {
         self.reset_hover();
         self.surface.width = layout::content_width(&self.model, self.scale);
-        let (elems, height) = layout::build_view(&self.model, self.scale);
+        // Room above the anchor, down from the work area's top.
+        let max_h = self.surface.base_bottom - (self.surface.wa.top + self.surface.margin);
+        let (elems, height) = layout::fit(&mut self.model, self.scale, max_h);
         self.surface.height = height;
         self.surface.elems = elems;
         let bytes = (self.surface.width * self.surface.height * 4) as usize;
@@ -556,6 +614,17 @@ impl Flyout<'_> {
                 }
                 false
             }
+            Elem::AppsHeader => {
+                self.model.apps_open = Some(self.model.fit.apps_folded);
+                self.resize();
+                false
+            }
+            Elem::Pager => {
+                if let Some(i) = layout::pip_at(self.surface.width, self.scale, self.model.now_playing.len(), mx) {
+                    self.turn_page(i);
+                }
+                false
+            }
             Elem::NowPlaying { index } => {
                 use crate::music::smtc::Command;
                 let Some(app_id) = self.model.now_playing.get(index).map(|np| np.app_id.clone()) else {
@@ -660,10 +729,16 @@ impl Flyout<'_> {
             _ => None,
         };
         let on_voice = matches!(kind, Some(Elem::Voice)) && layout::over_voice_button(self.surface.width, self.scale, mx);
+        let on_pip = match kind {
+            Some(Elem::Pager) => layout::pip_at(self.surface.width, self.scale, self.model.now_playing.len(), mx),
+            _ => None,
+        };
         let changed = hover != self.hit.hover
             || on_footer != self.hit.hover_footer
             || on_media != self.hit.hover_media
-            || on_voice != self.hit.hover_voice;
+            || on_voice != self.hit.hover_voice
+            || on_pip != self.hit.hover_pip;
+        self.hit.hover_pip = on_pip;
         self.hit.hover_media = on_media;
         self.hit.hover_voice = on_voice;
         self.hit.hover = hover;

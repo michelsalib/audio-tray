@@ -385,13 +385,13 @@ impl State {
         let now = std::time::Instant::now();
         let app_has_session = |tab: &Media| {
             let same_app = |app: &str| !app.is_empty() && app == tab.app;
-            self.media.iter().any(|m| !is_browser_session(m) && (same_app(&m.app) || m.title == tab.title))
+            self.media.iter().any(|m| !is_browser_session(m) && (same_app(&m.app) || names::same_title(&m.title, &tab.title)))
                 || self.gone.iter().any(|(app, at)| same_app(app) && now.duration_since(*at) < APP_GRACE)
         };
         let smtc = self
             .media
             .iter()
-            .filter(|m| !(is_browser_session(m) && self.browser.iter().any(|b| b.title == m.title)));
+            .filter(|m| !(is_browser_session(m) && self.browser.iter().any(|b| names::same_title(&b.title, &m.title))));
         let tabs = self.browser.iter().filter(|b| !app_has_session(b));
         smtc.chain(tabs).collect()
     }

@@ -5,7 +5,7 @@
 use ab_glyph::FontVec;
 
 use crate::canvas::measure;
-use super::model::Model;
+use super::model::{Fit, Model};
 use super::theme::*;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -39,13 +39,16 @@ impl ActionKind {
 
 #[derive(Clone, Copy)]
 pub(super) enum Elem {
-    Header(&'static str),
     /// A device section's header: clicking it shows or hides the devices that are not selected.
     GroupHeader { group: usize },
     /// One media session the pill shows, with transport buttons ([`media_button_at`]).
     NowPlaying { index: usize },
+    /// Under a Now Playing carousel: a pip per card, the shown one lit ([`pip_at`]).
+    Pager,
     /// The call: who is in it, and the user's mute ([`over_voice_button`]).
     Voice,
+    /// The apps list's header: clicking it folds or opens the list.
+    AppsHeader,
     /// One app's volume in the mixer.
     AppSlider { app: usize },
     Slider { group: usize },
@@ -96,8 +99,13 @@ pub(super) fn content_width(model: &Model, scale: f32) -> i32 {
 pub(super) fn build_view(model: &Model, scale: f32) -> (Vec<LaidElem>, i32) {
     let d = |v: f32| (v * scale).round() as i32;
     let mut kinds: Vec<Elem> = Vec::new();
-    for index in 0..model.now_playing.len() {
-        kinds.push(Elem::NowPlaying { index });
+    if carousel(model) {
+        kinds.push(Elem::NowPlaying { index: model.page.min(model.now_playing.len() - 1) });
+        kinds.push(Elem::Pager);
+    } else {
+        for index in 0..model.now_playing.len() {
+            kinds.push(Elem::NowPlaying { index });
+        }
     }
     if model.voice.is_some() {
         kinds.push(Elem::Voice);
@@ -112,9 +120,11 @@ pub(super) fn build_view(model: &Model, scale: f32) -> (Vec<LaidElem>, i32) {
         }
     }
     if !model.apps.is_empty() {
-        kinds.push(Elem::Header("Apps"));
-        for app in 0..model.apps.len() {
-            kinds.push(Elem::AppSlider { app });
+        kinds.push(Elem::AppsHeader);
+        if !model.fit.apps_folded {
+            for app in shown_apps(model) {
+                kinds.push(Elem::AppSlider { app });
+            }
         }
     }
     if model.notice.is_some() {
@@ -132,8 +142,9 @@ pub(super) fn build_view(model: &Model, scale: f32) -> (Vec<LaidElem>, i32) {
         }
         let height = match elem {
             // Later headers get a larger top gap to separate groups.
-            Elem::Header(_) | Elem::GroupHeader { .. } => d(if i == 0 { HEADER_FIRST_H } else { HEADER_H }),
+            Elem::GroupHeader { .. } | Elem::AppsHeader => d(if i == 0 { HEADER_FIRST_H } else { HEADER_H }),
             Elem::NowPlaying { .. } => d(NOW_PLAYING_H),
+            Elem::Pager => d(PAGER_H),
             Elem::Voice => d(VOICE_H),
             Elem::AppSlider { .. } => d(APP_H),
             Elem::Slider { .. } => d(SLIDER_H),
@@ -148,6 +159,60 @@ pub(super) fn build_view(model: &Model, scale: f32) -> (Vec<LaidElem>, i32) {
     let ends_flush = matches!(elems.last().map(|le| le.elem), Some(Elem::Footer));
     let total = y + if ends_flush { 0 } else { d(PAD_V) };
     (elems, total)
+}
+
+/// Lay out the panel no taller than `max_h`, giving up what [`Fit`] lists in its order until it
+/// fits; sets [`Model::fit`]. The apps list folds only if the user has not opened it, and its
+/// rows are cut only if they have. When nothing fits, the last try (the smallest) stands.
+pub(super) fn fit(model: &mut Model, scale: f32, max_h: i32) -> (Vec<LaidElem>, i32) {
+    let open = model.apps_open;
+    let mut tries = vec![Fit { apps_folded: open == Some(false), ..Fit::default() }];
+    if open.is_none() {
+        tries.push(Fit { apps_folded: true, ..Fit::default() });
+    }
+    let folded = open != Some(true);
+    tries.push(Fit { apps_folded: folded, carousel: true, apps_rows: None });
+    if !folded {
+        tries.extend((1..model.apps.len()).rev().map(|n| Fit { apps_folded: false, carousel: true, apps_rows: Some(n) }));
+    }
+    let mut laid = None;
+    for f in tries {
+        model.fit = f;
+        let view = build_view(model, scale);
+        if view.1 <= max_h {
+            return view;
+        }
+        laid = Some(view);
+    }
+    laid.expect("at least one try")
+}
+
+/// Whether Now Playing shows as a carousel: asked for, and more than one card to page through.
+pub(super) fn carousel(model: &Model) -> bool {
+    model.fit.carousel && model.now_playing.len() > 1
+}
+
+/// The app rows on show: all, or [`Fit::apps_rows`] of them from [`Model::apps_scroll`].
+pub(super) fn shown_apps(model: &Model) -> std::ops::Range<usize> {
+    let all = model.apps.len();
+    match model.fit.apps_rows {
+        Some(rows) if rows < all => {
+            let first = model.apps_scroll.min(all - rows);
+            first..first + rows
+        }
+        _ => 0..all,
+    }
+}
+
+/// Horizontal centre (px) of pip `i` of `n`, the row centred in the panel.
+pub(super) fn pip_center_x(width: i32, scale: f32, n: usize, i: usize) -> f32 {
+    let span = (n.max(1) - 1) as f32 * PIP_STEP * scale;
+    width as f32 / 2.0 - span / 2.0 + i as f32 * PIP_STEP * scale
+}
+
+/// Which of `n` pips is under `mx`: each owns the half-step either side of its centre.
+pub(super) fn pip_at(width: i32, scale: f32, n: usize, mx: i32) -> Option<usize> {
+    (0..n).find(|&i| ((mx as f32) - pip_center_x(width, scale, n, i)).abs() <= PIP_STEP * scale / 2.0)
 }
 
 /// The footer's round icon buttons, rightmost first: the settings gear, then restart-to-update
@@ -204,6 +269,8 @@ pub(super) fn elem_at(elems: &[LaidElem], y: i32) -> Option<usize> {
             Elem::Slider { .. }
                 | Elem::GroupHeader { .. }
                 | Elem::NowPlaying { .. }
+                | Elem::Pager
+                | Elem::AppsHeader
                 | Elem::Voice
                 | Elem::AppSlider { .. }
                 | Elem::Device { .. }
@@ -309,6 +376,112 @@ mod tests {
         assert_eq!(devices(&m), vec![1], "folded: the selected one only");
         m.expanded[0] = true;
         assert_eq!(devices(&m), vec![0, 1, 2]);
+    }
+
+    /// A panel with `cards` Now Playing cards and `apps` apps.
+    fn busy(cards: usize, apps: usize) -> Model {
+        use crate::flyout::model::{AppRow, NowPlaying};
+        let mut m = model(vec![output_group(vec![dev("Speakers", None)])], None);
+        m.now_playing = (0..cards)
+            .map(|i| NowPlaying {
+                app_id: format!("p{i}"),
+                title: format!("Track {i}"),
+                artist: String::new(),
+                app: String::new(),
+                playing: true,
+                live: false,
+                skip: true,
+                video: false,
+                art: None,
+            })
+            .collect();
+        m.apps = (0..apps).map(|i| AppRow { app: format!("app{i}"), level: 1.0, muted: false, icon: None }).collect();
+        m
+    }
+
+    fn count(elems: &[LaidElem], pred: impl Fn(&Elem) -> bool) -> usize {
+        elems.iter().filter(|le| pred(&le.elem)).count()
+    }
+
+    #[test]
+    fn a_panel_that_fits_gives_up_nothing() {
+        let mut m = busy(4, 6);
+        let (elems, h) = fit(&mut m, 1.0, 10_000);
+        assert_eq!(m.fit, Fit::default());
+        assert_eq!(count(&elems, |e| matches!(e, Elem::NowPlaying { .. })), 4);
+        assert_eq!(count(&elems, |e| matches!(e, Elem::AppSlider { .. })), 6);
+        assert_eq!(h, build_view(&m, 1.0).1);
+    }
+
+    /// Too tall: the apps list folds first, then Now Playing turns into a carousel.
+    #[test]
+    fn a_tall_panel_folds_the_apps_then_pages_the_players() {
+        let mut m = busy(4, 6);
+        m.fit = Fit::default();
+        let full = build_view(&m, 1.0).1;
+        m.fit = Fit { apps_folded: true, ..Fit::default() };
+        let folded = build_view(&m, 1.0).1;
+
+        let (elems, h) = fit(&mut m, 1.0, full - 1);
+        assert_eq!(m.fit, Fit { apps_folded: true, ..Fit::default() });
+        assert!(h < full);
+        assert_eq!(count(&elems, |e| matches!(e, Elem::AppSlider { .. })), 0);
+        assert_eq!(count(&elems, |e| matches!(e, Elem::AppsHeader)), 1, "the header stays, to open it");
+
+        let (elems, h) = fit(&mut m, 1.0, folded - 1);
+        assert_eq!(m.fit, Fit { apps_folded: true, carousel: true, apps_rows: None });
+        assert!(h < folded);
+        assert_eq!(count(&elems, |e| matches!(e, Elem::NowPlaying { .. })), 1);
+        assert_eq!(count(&elems, |e| matches!(e, Elem::Pager)), 1);
+        assert!(matches!(elems.last().unwrap().elem, Elem::Footer));
+    }
+
+    /// The user opened the apps list on a short screen: the players page, then the list shows
+    /// fewer rows, from its scroll position.
+    #[test]
+    fn an_opened_apps_list_is_cut_short_rather_than_folded() {
+        let mut m = busy(4, 6);
+        m.apps_open = Some(true);
+        m.fit = Fit { carousel: true, ..Fit::default() };
+        let paged = build_view(&m, 1.0).1;
+        let (elems, h) = fit(&mut m, 1.0, paged - (2.5 * APP_H) as i32);
+        assert!(h <= paged - (2.5 * APP_H) as i32);
+        assert_eq!(m.fit, Fit { apps_folded: false, carousel: true, apps_rows: Some(3) });
+        let apps: Vec<usize> = elems.iter().filter_map(|le| match le.elem { Elem::AppSlider { app } => Some(app), _ => None }).collect();
+        assert_eq!(apps, [0, 1, 2]);
+
+        m.apps_scroll = 99;
+        assert_eq!(shown_apps(&m), 3..6, "scrolling stops at the last row");
+    }
+
+    #[test]
+    fn a_folded_apps_list_stays_folded_with_room_to_spare() {
+        let mut m = busy(1, 3);
+        m.apps_open = Some(false);
+        let (elems, _) = fit(&mut m, 1.0, 10_000);
+        assert!(m.fit.apps_folded);
+        assert_eq!(count(&elems, |e| matches!(e, Elem::AppSlider { .. })), 0);
+    }
+
+    #[test]
+    fn one_card_is_never_a_carousel() {
+        let mut m = busy(1, 0);
+        m.fit.carousel = true;
+        let (elems, _) = build_view(&m, 1.0);
+        assert_eq!(count(&elems, |e| matches!(e, Elem::Pager)), 0);
+    }
+
+    #[test]
+    fn pips_are_hit_where_they_are_painted() {
+        for scale in [1.0_f32, 1.5, 2.0] {
+            for n in 2..=4 {
+                for i in 0..n {
+                    let x = pip_center_x(400, scale, n, i).round() as i32;
+                    assert_eq!(pip_at(400, scale, n, x), Some(i));
+                }
+                assert_eq!(pip_at(400, scale, n, 10), None);
+            }
+        }
     }
 
     #[test]
@@ -432,13 +605,13 @@ mod tests {
     }
 
     #[test]
-    fn elem_at_skips_non_actionable_headers() {
-        // A header (non-actionable) followed by a device row.
+    fn elem_at_skips_non_actionable_rows() {
+        // A notice (non-actionable) followed by a device row.
         let elems = vec![
-            LaidElem { elem: Elem::Header("Output"), top: 0, height: 40 },
+            LaidElem { elem: Elem::Note, top: 0, height: 40 },
             LaidElem { elem: Elem::Device { group: 0, dev: 0 }, top: 40, height: 60 },
         ];
-        assert_eq!(elem_at(&elems, 20), None); // inside the header band
+        assert_eq!(elem_at(&elems, 20), None); // inside the notice
         assert_eq!(elem_at(&elems, 70), Some(1)); // inside the device row
         assert_eq!(elem_at(&elems, 500), None); // past the end
     }

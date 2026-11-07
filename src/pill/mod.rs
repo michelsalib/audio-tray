@@ -63,6 +63,8 @@ pub enum Action {
     Focus(String),
     /// Switch this flow to its next device, as the taskbar button's click does.
     CycleDevice(crate::audio::Flow),
+    /// Make this device the flow's default (picked in a fanned-out device row).
+    SetDevice(crate::audio::Flow, crate::audio::DeviceId),
     /// Change this flow's volume by so many wheel notches.
     Volume(crate::audio::Flow, f32),
     Acknowledge(crate::hub::Notice),
@@ -378,6 +380,12 @@ impl Pill {
             kept.extend(new.iter().filter(|n| !old.iter().any(|o| o.app_id == n.app_id)).cloned());
             *new = kept;
         }
+        // Likewise a fanned-out device row keeps its discs in place while it stays open.
+        if let (Some(new), Some(old)) = (next.fan_mut(), self.view.fan()) {
+            if new.flow == old.flow {
+                new.keep_order(old);
+            }
+        }
         // Same state, same hover strip: nothing to repaint.
         let resized = self.drawn_size != Some(self.inputs.size);
         if next == self.view && self.gfx.is_some() && self.hoverable(&next) == self.edge_up && !resized {
@@ -588,8 +596,9 @@ impl Pill {
     fn set_highlight(&mut self, index: Option<usize>, pressed: bool) {
         let Some(gfx) = self.gfx.as_ref() else { return };
         let Some(holder) = self._visuals.first() else { return };
-        // A whole-scene target (a banner, the call) is a button in itself: no spot to light.
-        let index = index.filter(|&i| !matches!(self.hits.get(i), Some((_, Hit::Whole)) | None));
+        // A whole-scene target (a banner, the call) is a button in itself, and a fanned row's
+        // background no button at all: no spot to light.
+        let index = index.filter(|&i| !matches!(self.hits.get(i), Some((_, Hit::Whole | Hit::Fan(_))) | None));
         if index == self.hover_hit && !pressed {
             return;
         }
@@ -611,7 +620,7 @@ impl Pill {
                     _ if spot.is_some() => Highlight::Disc,
                     Hit::Focus(_) if !card => return Ok(None),
                     Hit::Focus(_) => Highlight::Outline,
-                    Hit::Device(_) | Hit::CallMute | Hit::CallLeave if w < 2.0 * h => Highlight::Disc,
+                    Hit::Device(_) | Hit::Choice(..) | Hit::CallMute | Hit::CallLeave if w < 2.0 * h => Highlight::Disc,
                     Hit::Media(..) => Highlight::Square,
                     _ => Highlight::Pill,
                 };
@@ -823,6 +832,30 @@ impl Pill {
         self.refresh();
     }
 
+    /// Fan out the device row under the pointer (hit `index`), naming the disc it is on; close it
+    /// when the pointer is elsewhere. The card has its own device row.
+    fn follow_fan(&mut self, index: Option<usize>) {
+        if matches!(self.view, View::Music { card: true, .. }) {
+            return;
+        }
+        let fan = match index.map(|i| self.hits[i].1) {
+            // Just opened: the current device comes first.
+            Some(Hit::Device(flow)) => Some((flow, Some(0))),
+            Some(Hit::Choice(flow, i)) => Some((flow, Some(i))),
+            // Between two discs: as it was.
+            Some(Hit::Fan(flow)) => self.inputs.fan.filter(|(f, _)| *f == flow),
+            _ => None,
+        };
+        self.set_fan(fan);
+    }
+
+    fn set_fan(&mut self, fan: Option<(crate::audio::Flow, Option<usize>)>) {
+        if self.inputs.fan != fan {
+            self.inputs.fan = fan;
+            self.refresh();
+        }
+    }
+
     /// What is under client pixel `(x, y)`.
     fn hit_at(&self, x: i32, y: i32) -> Option<Hit> {
         self.hit_index(x, y).map(|i| self.hits[i].1)
@@ -832,6 +865,12 @@ impl Pill {
         let hit = self.hit_at(x, y);
         match (&self.view, hit) {
             (_, Some(Hit::Device(flow))) => act(Action::CycleDevice(flow)),
+            // Another device of a fanned row; the current one is already the default.
+            (view, Some(Hit::Choice(flow, i))) => {
+                if let Some(choice) = view.fan().and_then(|f| f.choices.get(i).filter(|c| c.id != f.current)) {
+                    act(Action::SetDevice(flow, choice.id.clone()));
+                }
+            }
             (View::Music { media, .. }, Some(Hit::Focus(i))) => {
                 if let Some(m) = media.get(i) {
                     act(Action::Focus(m.app_id.clone()));
@@ -1090,6 +1129,7 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESUL
                     }
                     let index = pill.hit_index(x, y);
                     pill.set_highlight(index, false);
+                    pill.follow_fan(index);
                 }
             });
             Some(LRESULT(0))
@@ -1109,6 +1149,7 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESUL
                 // Moving between the strip and the card is not leaving.
                 if !cursor_in(pill.hwnd) {
                     pill.set_highlight(None, false);
+                    pill.set_fan(None);
                 }
                 if !cursor_in(pill.hwnd) && !cursor_in(pill.edge) {
                     pill.set_hover(false);
@@ -1134,7 +1175,7 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESUL
                 if hwnd != pill.hwnd || unsafe { !ScreenToClient(pill.hwnd, &mut point).as_bool() } {
                     return;
                 }
-                if let Some(Hit::Device(flow)) = pill.hit_at(point.x, point.y) {
+                if let Some(Hit::Device(flow) | Hit::Choice(flow, _) | Hit::Fan(flow)) = pill.hit_at(point.x, point.y) {
                     act(Action::Volume(flow, delta as f32 / WHEEL_DELTA as f32));
                 }
             });

@@ -566,13 +566,6 @@ fn open_flyout(anchor: Option<flyout::Anchor>) {
         // Teams may have handed over its token while the panel was open: the tray's copy has it.
         config.teams.token = tray.config.teams.token.take();
         tray.config = config;
-        if outcome.config_changed {
-            if let Err(e) = tray.config.save() {
-                eprintln!("save config failed: {e:#}");
-            }
-            tray.refresh();
-            crate::settings::sync(&tray.config);
-        }
         if outcome.restart {
             restart_app(&tray.backend, &tray.config);
         }
@@ -816,6 +809,11 @@ impl Tray {
                     eprintln!("pill: could not switch the {flow:?} device ({e:#})");
                 }
             }
+            Action::SetDevice(flow, id) => {
+                if let Err(e) = self.switch_to(flow, &id) {
+                    eprintln!("pill: could not switch the {flow:?} device ({e:#})");
+                }
+            }
             Action::Volume(flow, notches) => {
                 if let Err(e) = self.backend.nudge_volume(flow, notches * SCROLL_STEP) {
                     eprintln!("pill: could not change the {flow:?} volume ({e:#})");
@@ -826,6 +824,17 @@ impl Tray {
                 self.hub_changed();
             }
         }
+    }
+
+    /// Make `id` the default for `flow`, as picked on the pill. Its mute is left as it is.
+    fn switch_to(&mut self, flow: Flow, id: &crate::audio::DeviceId) -> Result<()> {
+        let devices = self.backend.enumerate_flow(flow)?;
+        // Unplugged since the pill listed it: nothing to switch to.
+        let Some(device) = devices.iter().find(|d| &d.id == id) else { return Ok(()) };
+        self.preview_strip(flow, Some(self.config.icon_of(device)), false);
+        self.backend.set_default_of(id)?;
+        self.refresh();
+        Ok(())
     }
 
     /// Mute or unmute the default microphone. Its volume watch brings the change back round.
@@ -1282,23 +1291,24 @@ pub(crate) fn set_teams_token(token: String) {
 }
 
 
-/// The defaults and the active outputs, for the hub.
+/// The defaults and every active device, for the hub.
 fn read_endpoints(backend: &WasapiBackend, config: &Config) -> crate::hub::Endpoints {
-    let endpoint = |flow: Flow| -> Option<crate::hub::Endpoint> {
-        let id = backend.default_of(flow).ok().flatten()?;
-        let device = backend.enumerate_flow(flow).ok()?.into_iter().find(|d| d.id == id)?;
-        let icon = config.icon_of(&device);
-        let muted = backend.is_muted(&id).unwrap_or(false);
-        Some(crate::hub::Endpoint { id, name: device.friendly_name, muted, icon })
+    let read = |flow: Flow| -> (Option<crate::hub::Endpoint>, Vec<crate::hub::Choice>) {
+        let devices = backend.enumerate_flow(flow).unwrap_or_default();
+        let choices = devices
+            .iter()
+            .map(|d| crate::hub::Choice { id: d.id.clone(), name: d.friendly_name.clone(), icon: config.icon_of(d) })
+            .collect();
+        let default = backend.default_of(flow).ok().flatten().and_then(|id| {
+            let device = devices.iter().find(|d| d.id == id)?;
+            let muted = backend.is_muted(&id).unwrap_or(false);
+            Some(crate::hub::Endpoint { icon: config.icon_of(device), name: device.friendly_name.clone(), muted, id })
+        });
+        (default, choices)
     };
-    crate::hub::Endpoints {
-        output: endpoint(Flow::Output),
-        input: endpoint(Flow::Input),
-        active_outputs: backend
-            .enumerate_flow(Flow::Output)
-            .map(|devices| devices.into_iter().map(|d| d.id).collect())
-            .unwrap_or_default(),
-    }
+    let (output, outputs) = read(Flow::Output);
+    let (input, inputs) = read(Flow::Input);
+    crate::hub::Endpoints { output, input, outputs, inputs }
 }
 
 /// The glyphs for the current defaults.

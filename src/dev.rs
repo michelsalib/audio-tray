@@ -5,7 +5,7 @@
 //!   --list                         defaults by role, and every active device
 //!   --set <q> / --set-icon <q> <IconId>
 //!                                  switch the default output / store a device's icon
-//!   --flyout [icons|update]        preview the panel (icons = the picker, update = fake a staged update)
+//!   --flyout [update]              preview the panel (update = fake a staged update)
 //!   --pill-preview <left|right|top> <start|center|end> [secs] [small] [earbuds] [live] [shots] [call]
 //!                                  the edge pill alone there, with a song and the devices
 //!   --settings-preview [page]      the settings window alone (taskbar, pill, devices, connectors,
@@ -43,23 +43,16 @@ use crate::{flyout, music, osd, taskbar, tray, update};
 pub fn run(args: &[String], backend: &WasapiBackend) -> Result<bool> {
     match args.first().map(String::as_str) {
         Some("--flyout") => {
-            // `icons` opens on the first device's picker; `update` fakes a staged update.
+            // `update` fakes a staged update.
             let mut config = Config::load();
             let outcome = match args.get(1).map(String::as_str) {
-                Some("icons") => flyout::show_icons_preview(backend, &mut config, None),
                 Some("update") => {
                     update::set_pending_version("9.9.9");
                     flyout::show(backend, &mut config, None)
                 }
                 _ => flyout::show(backend, &mut config, None),
             };
-            if outcome.config_changed {
-                config.save()?;
-            }
-            println!(
-                "flyout: closed (config_changed={}, quit={}, restart={})",
-                outcome.config_changed, outcome.quit, outcome.restart
-            );
+            println!("flyout: closed (quit={}, restart={})", outcome.quit, outcome.restart);
         }
         Some("--pill-preview") => pill_preview(backend, &args[1..])?,
         Some("--settings-preview") => crate::settings::preview(&Config::load(), args.get(1).map_or("", String::as_str)),

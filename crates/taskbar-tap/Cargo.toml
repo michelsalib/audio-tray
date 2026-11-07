@@ -62,4 +62,4 @@ features = [
 # tells a TAP that shipped with this exe from one left behind by a failed update.
 # See build.rs — the version is read from the root manifest, not from this crate's
 # own `0.0.0`.
-winresource = "0.1.31"
+winresource = "0.1.34"

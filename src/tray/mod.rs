@@ -12,7 +12,8 @@
 //! is borrowed across its modal loop, so draining is re-enabled for it, and [`next_message`] holds
 //! back what has to wait for it to close.
 //!
-//! Left click on a strip segment cycles that endpoint ([`Tray::taskbar_action`]); right click, or
+//! Left click on a strip segment cycles that endpoint ([`Tray::taskbar_action`]), mutes it or
+//! opens the flyout, as `[strip] left_click` says ([`on_action`]); right click, or
 //! either click on the plain icon when there is no strip, opens the flyout. Scrolling a button
 //! changes that endpoint's volume: the wheel through [`hook`], a precision touchpad through the
 //! TAP, both as [`WM_TASKBAR_SCROLL`]; the level is shown by [`crate::osd`].
@@ -35,7 +36,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use crate::audio::wasapi::WasapiBackend;
 use crate::audio::{mic, notify, sessions, Flow};
-use crate::config::Config;
+use crate::config::{Config, LeftClick};
 use crate::flyout;
 use crate::icons::IconId;
 use crate::osd::Osd;
@@ -471,13 +472,24 @@ fn on_action(action: Action) {
     if !click_allowed(&action) {
         return;
     }
-    if action == Action::OpenPanel {
+    // A segment's left click does what `[strip] left_click` says.
+    let click = with_tray(|tray| tray.config.strip.left_click).unwrap_or_default();
+    let segment = match action {
+        Action::CycleOutput => Some(Flow::Output),
+        Action::CycleInput => Some(Flow::Input),
+        _ => None,
+    };
+    if action == Action::OpenPanel || (segment.is_some() && click == LeftClick::Panel) {
         // No anchor: the strip's rect is not ours to know; the flyout uses its default place.
         return open_flyout(None);
     }
     with_tray(|tray| {
+        let done = match segment {
+            Some(flow) if click == LeftClick::Mute => tray.toggle_endpoint_mute(flow),
+            _ => tray.taskbar_action(action),
+        };
         // Never propagated: COM against endpoints that can vanish mid-click must not end the loop.
-        if let Err(e) = tray.taskbar_action(action) {
+        if let Err(e) = done {
             eprintln!("taskbar: {action:?} failed ({e:#})");
             // The strip may be previewing a switch that failed: put the truth back.
             tray.strip = None;
@@ -776,6 +788,7 @@ impl Tray {
             }
             Action::Unmute(Some(app)) => crate::integrations::set_muted(app, false),
             Action::Unmute(None) => self.set_microphone_muted(false),
+            Action::LeaveCall(app) => crate::integrations::leave_call(app),
             Action::MuteMicrophone => self.set_microphone_muted(true),
             Action::Focus(app_id) => {
                 if let Some(tab) = app_id.strip_prefix(crate::integrations::browser::APP_ID_PREFIX) {
@@ -999,15 +1012,28 @@ impl Tray {
         }
     }
 
+    /// Mute or unmute `flow`'s default device: a segment's left click under
+    /// [`LeftClick::Mute`]. Like the cycle, the strip shows it before the audio work.
+    fn toggle_endpoint_mute(&mut self, flow: Flow) -> Result<()> {
+        let Some(id) = self.backend.default_of(flow)? else { return Ok(()) };
+        let muted = !self.backend.is_muted(&id)?;
+        self.preview_strip(flow, None, muted);
+        self.backend.set_muted(&id, muted)?;
+        // A mute raises no endpoint notification: this is the strip's update.
+        self.refresh();
+        Ok(())
+    }
+
     /// Act on a click from the injected strip.
     ///
-    /// Left click steps that endpoint around a cycle of the active devices, each unmuted, plus
+    /// Left click (under the default [`LeftClick::Switch`]) steps that endpoint around a cycle of the active devices, each unmuted, plus
     /// one muted stop on the last device before the wrap:
     ///
     /// ```text
     /// device 1 → device 2 → … → device N → device N, muted → device 1 → …
     /// ```
     ///
+    /// With `[strip] mute_in_cycle` off there is no muted stop: device N wraps to device 1.
     /// Every device stop is unmuted: arriving on a muted device unmutes it, and stepping off the
     /// muted stop takes the mute with it, so the cycle never leaves a muted device behind.
     fn taskbar_action(&mut self, action: Action) -> Result<()> {
@@ -1044,8 +1070,8 @@ impl Tray {
         // Which device the click lands on, or `None` for the muted stop.
         let next = match at {
             Some(i) if muted => Some((i + 1) % devices.len()),
-            Some(i) if i + 1 == devices.len() => None,
-            Some(i) => Some(i + 1),
+            Some(i) if i + 1 == devices.len() && self.config.strip.mute_in_cycle => None,
+            Some(i) => Some((i + 1) % devices.len()),
             None => Some(0),
         };
 

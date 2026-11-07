@@ -2,7 +2,7 @@
 //! DIPs. No Win32 here, so it stays unit-testable; text is measured through a function the caller
 //! passes in.
 
-use crate::config::{PillAlign, PillEdge, PillSize, TileStyle};
+use crate::config::{LeftClick, PillAlign, PillEdge, PillSize, TileStyle};
 use crate::icons::IconId;
 
 use super::model::{Model, Tone};
@@ -102,6 +102,8 @@ pub(super) enum Toggle {
     /// Follow MPC-HC's session.
     Mpc,
     Strip,
+    /// The device rotation's muted stop.
+    MuteInCycle,
     NextToWifi,
     HideVolume,
     HideMic,
@@ -126,6 +128,8 @@ pub(super) enum Toggle {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum Choice {
     Tile,
+    /// What a left click on a taskbar audio button does: [`LEFT_CLICKS`].
+    LeftClick,
     PillSize,
     Edge,
     Align,
@@ -511,6 +515,22 @@ fn taskbar(col: &mut Column, model: &Model) {
         Toggle::Strip,
     );
     let off = !c.strip.enabled;
+    col.segments(
+        "Left click on a button",
+        plain("What the output or input button does"),
+        &["Switch device", "Mute", "Open panel"],
+        LEFT_CLICKS.iter().position(|l| *l == c.strip.left_click).unwrap_or(0),
+        off,
+        Choice::LeftClick,
+    );
+    col.toggle(
+        None,
+        "Mute after the last device",
+        plain("Clicking goes through each device, then mutes, then starts over"),
+        c.strip.mute_in_cycle,
+        off || c.strip.left_click != LeftClick::Switch,
+        Toggle::MuteInCycle,
+    );
     col.toggle(None, "Next to Wi-Fi", plain("Move the notification icons between the keyboard layout and Wi-Fi"), c.strip.next_to_wifi, off, Toggle::NextToWifi);
     col.toggle(None, "Hide Windows' volume icon", plain("The output button does its job"), c.strip.hide_windows_volume, off, Toggle::HideVolume);
     col.toggle(None, "Hide Windows' microphone icon", plain("The input button's red dot says an app is listening"), c.strip.hide_windows_mic, off, Toggle::HideMic);
@@ -623,6 +643,7 @@ pub(super) fn align_labels(edge: PillEdge) -> [&'static str; 3] {
     }
 }
 
+pub(super) const LEFT_CLICKS: [LeftClick; 3] = [LeftClick::Switch, LeftClick::Mute, LeftClick::Panel];
 pub(super) const EDGES: [PillEdge; 3] = [PillEdge::Left, PillEdge::Top, PillEdge::Right];
 pub(super) const ALIGNS: [PillAlign; 3] = [PillAlign::Start, PillAlign::Center, PillAlign::End];
 

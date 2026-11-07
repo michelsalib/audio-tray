@@ -27,7 +27,7 @@ A tiny Windows app for **audio awareness without opening anything** — a pill o
   is animated by the compositor, not the app.
 - **Integrations** (optional, each can be off): Discord through its own local RPC with your own
   Discord application, no client mod (who is in the call with their avatars, who is talking, your
-  mute, click to mute; or through a [Vencord plugin](integrations/vencord/README.md)), Teams
+  mute, click to mute, hang up from the pill's card; or through a [Vencord plugin](integrations/vencord/README.md)), Teams
   (meeting and mute: through its local API, or, where an admin turned that off, by reading the
   meeting window's mic button through UI Automation), and a
   [browser extension](integrations/browser/README.md) that shows every tab playing media (two
@@ -36,7 +36,8 @@ A tiny Windows app for **audio awareness without opening anything** — a pill o
   notification area, one for output and one for input, each showing that device's own icon.
   Windows' own volume and "microphone in use" icons are hidden, since the buttons say the same
   thing. Without them, Audio Tray is a plain tray icon. See [taskbar controls](#taskbar-controls).
-- **Left-click** either button to switch that endpoint to the next device;
+- **Left-click** either button to switch that endpoint to the next device (or, as chosen in
+  Settings > Taskbar, to mute it or to open the flyout);
   **right-click** for a compact acrylic flyout that replaces the native sound flyout:
   what is playing (with transport controls), your call, output **and** input volume,
   mute/unmute, the default output and input device (the other devices fold away until you
@@ -96,7 +97,7 @@ input:
 
 | Action | Result |
 |--------|--------|
-| Left-click a button | Switch that endpoint to the next device |
+| Left-click a button | Switch that endpoint to the next device; or mute/unmute it, or open the flyout (Settings > Taskbar, `[strip] left_click = "switch"`, `"mute"` or `"panel"`). Switching stops once on the last device muted before wrapping, unless `[strip] mute_in_cycle = false` |
 | Right-click a button | Open the Audio Tray control flyout (volume, mute, switch output/input, pick icon, Settings, Quit) |
 | Scroll a button (wheel or touchpad) | Adjust that endpoint's volume, 2% per notch, with a level bar beside the buttons |
 | Scroll elsewhere on the taskbar | Adjust the output volume |
@@ -196,7 +197,7 @@ file by hand, they and the integrations are read when Audio Tray starts.
 
 Audio Tray's notification-area presence is two buttons — output and input — drawn
 directly into the taskbar. Left-click either one to cycle that endpoint to the next
-device; right-click opens the flyout. Two icons of Windows' own are hidden because the
+device (or to mute it, or open the flyout: Settings > Taskbar); right-click opens the flyout. Two icons of Windows' own are hidden because the
 buttons say the same thing: the volume icon, which the output button duplicates, and the
 "microphone in use" icon, which the input button's red recording dot replaces. Both come
 back when the buttons do not — nothing of Windows' is taken away until the strip is

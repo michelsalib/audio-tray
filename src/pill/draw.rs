@@ -20,6 +20,8 @@ pub enum Hit {
     Focus(usize),
     /// The call: toggle the user's mute (in the voice app, else the microphone).
     CallMute,
+    /// The card's hang-up button: leave the voice channel (only for a call an app reports).
+    CallLeave,
     /// A new song's note: bring the player to the front.
     Song,
     /// A device button: switch that flow to its next device.
@@ -198,6 +200,7 @@ const GLYPH_PAUSE: char = '\u{E769}';
 const GLYPH_NEXT: char = '\u{E893}';
 const GLYPH_MIC: char = '\u{E720}';
 const GLYPH_MIC_OFF: char = '\u{F781}';
+const GLYPH_HANG_UP: char = '\u{E778}';
 const GLYPH_MUSIC: char = '\u{EC4F}';
 const GLYPH_VIDEO: char = '\u{E714}';
 
@@ -337,8 +340,11 @@ pub fn scene(gfx: &Gfx, view: &View, small: bool, place: Place) -> Result<Option
                     )
                 })
                 .collect();
-            if call.is_some() {
+            if let Some(call) = call {
                 hits.push(([w - 54.0, call_top + 8.0, 40.0, 40.0], Hit::CallMute));
+                if leaves(call) {
+                    hits.push(([w - 54.0 - LEAVE_STEP, call_top + 8.0, 40.0, 40.0], Hit::CallLeave));
+                }
             }
             let (content, _) = gfx.painted(w, h, |p| {
                 tucked(p, edge, [0.0, 0.0, w, h], 18.0, NORMAL_BG)?;
@@ -698,6 +704,14 @@ fn face_lines(call: &CallPill) -> usize {
 
 /// The card's call row at `top`: overlapping faces (everyone, four to a line), the channel (or
 /// app) and who is talking, and the mute.
+/// How far left of the mute button the hang-up button sits.
+const LEAVE_STEP: f32 = 40.0;
+
+/// Whether the card offers to leave the call: only where the app can be told to (Discord).
+fn leaves(call: &CallPill) -> bool {
+    call.app == Some(crate::hub::VoiceApp::Discord)
+}
+
 fn call_row(p: &mut Painter, call: &CallPill, w: f32, top: f32) -> Result<()> {
     const FACE: f32 = 28.0;
     for (line, members) in call.members.chunks(CARD_FACES_PER_LINE).enumerate() {
@@ -718,7 +732,7 @@ fn call_row(p: &mut Painter, call: &CallPill, w: f32, top: f32) -> Result<()> {
     }
     let x = if call.members.is_empty() { x + FACE } else { x };
     let text_x = x + FACE * 0.3 + 8.0;
-    let text_w = w - text_x - 62.0;
+    let text_w = w - text_x - 62.0 - if leaves(call) { LEAVE_STEP } else { 0.0 };
     let title = match (call.app, &call.channel) {
         (Some(app), Some(channel)) => format!("{} · {channel}", app.label()),
         (Some(app), None) => app.label().to_string(),
@@ -735,6 +749,11 @@ fn call_row(p: &mut Painter, call: &CallPill, w: f32, top: f32) -> Result<()> {
     p.text(&title, Font::Title, (text_x, top + 8.0, text_w, 20.0), WHITE)?;
     p.text(&status, Font::Small, (text_x, top + 28.0, text_w, 16.0), DIM_WHITE)?;
     let (bx, by) = (w - 34.0, top + 28.0);
+    if leaves(call) {
+        let lx = bx - LEAVE_STEP;
+        p.circle(lx, by, 16.0, ALERT_BG)?;
+        p.text(&GLYPH_HANG_UP.to_string(), Font::Icons, (lx - 16.0, by - 16.0, 32.0, 32.0), WHITE)?;
+    }
     p.circle(bx, by, 16.0, if call.muted { Rgba::hex(0x5A5A5A, 1.0) } else { Rgba::hex(0x3A3A3A, 1.0) })?;
     p.text(&(if call.muted { GLYPH_MIC_OFF } else { GLYPH_MIC }).to_string(), Font::Icons, (bx - 16.0, by - 16.0, 32.0, 32.0), WHITE)
 }

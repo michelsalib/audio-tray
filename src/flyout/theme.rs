@@ -193,6 +193,7 @@ pub(super) const VOICE_H: f32 = 60.0;
 pub(super) const FACE_DIP: f32 = 26.0; // a face in the voice panel
 pub(super) const VOICE_BTN: f32 = 36.0; // the voice panel's mute button
 pub(super) const APP_H: f32 = 40.0; // one app in the mixer
+pub(super) const APP_ICON_DIP: f32 = 20.0; // an app's own icon, in its row's glyph column
 pub(super) const APP_TRACK_X0: f32 = 170.0; // where an app's slider starts (its name sits before)
 pub(super) const CHEVRON_PX: f32 = 12.0; // a section header's expand chevron
 pub(super) const GLYPH_PREVIOUS: char = '\u{E892}';

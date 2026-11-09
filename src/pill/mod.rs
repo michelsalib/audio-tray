@@ -514,6 +514,7 @@ impl Pill {
             self.edge_up = self.hoverable(view);
         }
         gfx.commit()?;
+        let lit = self.hover_hit.and_then(|i| self.hits.get(i).copied());
         self.hits = scene.hits;
         self.spots = scene.spots;
         self._visuals = visuals;
@@ -521,10 +522,11 @@ impl Pill {
         if !matches!(view, View::Music { card: true, .. }) {
             self.quiet_size = (scene.w, scene.h);
         }
-        // The highlight went with the old visuals: put it back under a pointer that stayed put.
+        // The highlight went with the old visuals: put it back under a pointer that stayed put, at
+        // once when on the same button (a repaint for someone speaking must not blink it).
         self.highlight = None;
         self.hover_hit = None;
-        self.rehover();
+        self.rehover(lit);
         Ok(())
     }
 
@@ -592,8 +594,8 @@ impl Pill {
     }
 
     /// Put the soft highlight on hit `index` (or take it away): fading in under a hovering
-    /// pointer, springing in brighter on a press.
-    fn set_highlight(&mut self, index: Option<usize>, pressed: bool) {
+    /// pointer (unless `fade` is off), springing in on a press.
+    fn set_highlight(&mut self, index: Option<usize>, pressed: bool, fade: bool) {
         let Some(gfx) = self.gfx.as_ref() else { return };
         let Some(holder) = self._visuals.first() else { return };
         // A whole-scene target (a banner, the call) is a button in itself, and a fanned row's
@@ -647,7 +649,7 @@ impl Pill {
                 })?;
                 visual.SetOffsetX2(px)?;
                 visual.SetOffsetY2(py)?;
-                if !pressed {
+                if !pressed && fade {
                     let fade = gfx.dcomp.CreateAnimation()?;
                     ease_out(&fade, 0.0, 1.0, HIGHLIGHT_SECONDS)?;
                     let effect = gfx.dcomp.CreateEffectGroup()?;
@@ -668,15 +670,17 @@ impl Pill {
         }
     }
 
-    /// Light whatever button is under the pointer now (after a repaint).
-    fn rehover(&mut self) {
+    /// Light whatever button is under the pointer now (after a repaint). `lit` was lit before it:
+    /// still there, the light comes back without fading in again.
+    fn rehover(&mut self, lit: Option<([f32; 4], Hit)>) {
         let mut point = POINT::default();
         if unsafe { GetCursorPos(&mut point) }.is_err() || !cursor_in(self.hwnd) {
             return;
         }
         if unsafe { ScreenToClient(self.hwnd, &mut point) }.as_bool() {
             let index = self.hit_index(point.x, point.y);
-            self.set_highlight(index, false);
+            let same = lit.is_some() && index.map(|i| self.hits[i]) == lit;
+            self.set_highlight(index, false, !same);
         }
     }
 
@@ -1000,14 +1004,12 @@ fn pulse_visual(gfx: &Gfx, holder: &IDCompositionVisual2, pulse: draw::Pulse) ->
         grow.SetCenterX2(reach * scale)?;
         grow.SetCenterY2(reach * scale)?;
         let swell = gfx.dcomp.CreateAnimation()?;
-        swell.AddCubic(0.0, 1.0, ((SWELL - 1.0) as f64 / PULSE_SECONDS) as f32, 0.0, 0.0)?;
-        swell.AddRepeat(PULSE_SECONDS, PULSE_SECONDS)?;
+        beat(&swell, 1.0, SWELL - 1.0)?;
         grow.SetScaleX(&swell)?;
         grow.SetScaleY(&swell)?;
         visual.SetTransform(&grow)?;
         let fade = gfx.dcomp.CreateAnimation()?;
-        fade.AddCubic(0.0, 0.9, (-0.9 / PULSE_SECONDS) as f32, 0.0, 0.0)?;
-        fade.AddRepeat(PULSE_SECONDS, PULSE_SECONDS)?;
+        beat(&fade, 0.9, -0.9)?;
         let effect = gfx.dcomp.CreateEffectGroup()?;
         effect.SetOpacity(&fade)?;
         visual.SetEffect(&effect)?;
@@ -1015,6 +1017,23 @@ fn pulse_visual(gfx: &Gfx, holder: &IDCompositionVisual2, pulse: draw::Pulse) ->
         holder.AddVisual(&visual, false, None)?;
     }
     Ok(visual)
+}
+
+/// A ramp from `from` by `by` over each [`PULSE_SECONDS`], repeated forever, in step with one
+/// beat shared by every pulse since the app started: a repaint (another face speaking) picks the
+/// pulses up where they were instead of restarting them all from the first frame.
+fn beat(animation: &IDCompositionAnimation, from: f32, by: f32) -> Result<()> {
+    static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let phase = EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs_f64() % PULSE_SECONDS;
+    let slope = (by as f64 / PULSE_SECONDS) as f32;
+    // What is left of the current beat, then whole beats from the next one on.
+    let next = PULSE_SECONDS - phase;
+    unsafe {
+        animation.AddCubic(0.0, from + slope * phase as f32, slope, 0.0, 0.0)?;
+        animation.AddCubic(next, from, slope, 0.0, 0.0)?;
+        animation.AddRepeat(next + PULSE_SECONDS, PULSE_SECONDS)?;
+    }
+    Ok(())
 }
 
 /// An angle that holds at `start` for `wait` seconds, then grows at `rate` per second until 180,
@@ -1128,7 +1147,7 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESUL
                         pill.cancel_collapse();
                     }
                     let index = pill.hit_index(x, y);
-                    pill.set_highlight(index, false);
+                    pill.set_highlight(index, false, true);
                     pill.follow_fan(index);
                 }
             });
@@ -1139,7 +1158,7 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESUL
             with_pill(|pill| {
                 if hwnd == pill.hwnd {
                     let index = pill.hit_index(x, y);
-                    pill.set_highlight(index, true);
+                    pill.set_highlight(index, true, true);
                 }
             });
             Some(LRESULT(0))
@@ -1148,7 +1167,7 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESUL
             with_pill(|pill| {
                 // Moving between the strip and the card is not leaving.
                 if !cursor_in(pill.hwnd) {
-                    pill.set_highlight(None, false);
+                    pill.set_highlight(None, false, true);
                     pill.set_fan(None);
                 }
                 if !cursor_in(pill.hwnd) && !cursor_in(pill.edge) {

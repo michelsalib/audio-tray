@@ -12,8 +12,9 @@
 //! ```
 //!
 //! Features are numbered per device: the root feature (index 0) gives a feature id's index.
-//! Devices are 1..=6 on a receiver. Logitech devices on Bluetooth are not here: Windows reports
-//! those itself (the parent module).
+//! Devices are 1..=6 on a receiver. A device on its USB cable (a mouse charging) speaks HID++
+//! itself, as device `FF`, and answers to every other number too: it is asked once. Logitech
+//! devices on Bluetooth are not here: Windows reports those itself (the parent module).
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -32,8 +33,11 @@ pub(super) const VENDOR: u16 = 0x046D;
 const VENDOR_PAGE: u16 = 0xFF00;
 const SHORT: u16 = 1;
 const LONG: u16 = 2;
+/// The device number of a device on its cable; a receiver's are 1..=6.
+const WIRED: u8 = 0xFF;
 
 /// Feature ids.
+const DEVICE_INFO: u16 = 0x0003;
 const DEVICE_NAME: u16 = 0x0005;
 const BATTERY_STATUS: u16 = 0x1000;
 const BATTERY_VOLTAGE: u16 = 0x1001;
@@ -49,6 +53,9 @@ const REPLY_TIMEOUT: Duration = Duration::from_millis(500);
 /// What a device said of itself, kept: its name and features do not change.
 #[derive(Clone)]
 struct Known {
+    /// What tells it from another device: its serial (unit id), else its name. A receiver can
+    /// answer for the same device in several slots.
+    identity: String,
     name: String,
     kind: BatteryKind,
     /// The battery feature it has, and its index; `None` when it has none.
@@ -59,8 +66,8 @@ struct Known {
 #[derive(Default)]
 pub(super) struct Cache(HashMap<String, Known>);
 
-/// Every connected device on every receiver plugged in that reports a battery; `None` when no
-/// receiver is plugged in.
+/// Every connected device on every receiver plugged in (or device on its cable) that reports a
+/// battery; `None` when none is plugged in.
 pub(super) fn read(cache: &mut Cache) -> Option<Vec<Battery>> {
     let receivers = receivers();
     if receivers.is_empty() {
@@ -69,8 +76,16 @@ pub(super) fn read(cache: &mut Cache) -> Option<Vec<Battery>> {
     let mut list = Vec::new();
     for (key, (short, long)) in receivers {
         let Some(mut port) = (unsafe { Port::open(&short, long.as_ref()) }) else { continue };
-        for device in 1..=6u8 {
-            list.extend(unsafe { port.battery(&key, device, cache) });
+        // A receiver answers device FF with an error; a device on its cable, as itself.
+        let devices = if unsafe { port.ping(WIRED) }.is_some() { WIRED..=WIRED } else { 1..=6 };
+        // Should a receiver still answer for one device under several numbers, list it once.
+        let mut seen = std::collections::HashSet::new();
+        for device in devices {
+            if let Some((battery, identity)) = unsafe { port.battery(&key, device, cache) } {
+                if seen.insert(identity) {
+                    list.push(battery);
+                }
+            }
         }
     }
     Some(list)
@@ -170,11 +185,11 @@ impl Port {
         })
     }
 
-    /// The device's battery, when it is connected and has one.
-    unsafe fn battery(&mut self, receiver: &str, device: u8, cache: &mut Cache) -> Option<Battery> {
+    /// The device's battery, when it is connected and has one, with its identity.
+    unsafe fn battery(&mut self, receiver: &str, device: u8, cache: &mut Cache) -> Option<(Battery, String)> {
         let id = format!("HIDPP\\{receiver}\\{device}");
         // Off, asleep or never paired: the receiver answers for it, with an error.
-        self.request(device, 0, 1, &[0, 0, 0x5A])?;
+        self.ping(device)?;
         let known = match cache.0.get(&id) {
             Some(known) => known.clone(),
             None => {
@@ -185,7 +200,7 @@ impl Port {
         };
         let (feature, index) = known.battery?;
         match self.level(device, feature, index) {
-            Some(level) => Some(Battery { id, name: known.name, kind: known.kind, level }),
+            Some(level) => Some((Battery { id, name: known.name, kind: known.kind, level }, known.identity)),
             None => {
                 // Another device paired in its place, maybe: learn it again next time.
                 cache.0.remove(&id);
@@ -196,7 +211,7 @@ impl Port {
 
     /// Its name, kind and battery feature; `None` if it stopped answering.
     unsafe fn discover(&mut self, device: u8) -> Option<Known> {
-        let mut known = Known { name: "Logitech device".to_string(), kind: BatteryKind::Other, battery: None };
+        let mut known = Known { identity: String::new(), name: "Logitech device".to_string(), kind: BatteryKind::Other, battery: None };
         let names = self.feature(device, DEVICE_NAME)?;
         if names != 0 {
             if let Some(name) = self.name(device, names) {
@@ -206,6 +221,12 @@ impl Port {
                 known.kind = kind(reply[4]);
             }
         }
+        known.identity = match self.feature(device, DEVICE_INFO)? {
+            0 => None,
+            // get_device_info: entity count, then the 4-byte unit id.
+            info => self.request(device, info, 0, &[]).and_then(|reply| unit_id(&reply)),
+        }
+        .unwrap_or_else(|| known.name.clone());
         for feature in BATTERIES {
             let index = self.feature(device, feature)?;
             if index != 0 {
@@ -214,6 +235,11 @@ impl Port {
             }
         }
         Some(known)
+    }
+
+    /// The root feature's ping: answered by a device that is there and awake.
+    unsafe fn ping(&mut self, device: u8) -> Option<Vec<u8>> {
+        self.request(device, 0, 1, &[0, 0, 0x5A])
     }
 
     /// A feature's index on the device: 0 when it lacks it, `None` if it did not answer.
@@ -333,6 +359,12 @@ fn answers(report: &[u8], device: u8, index: u8, tag: u8) -> Option<bool> {
     None
 }
 
+/// `DEVICE_INFO`'s unit id (the device's serial), as hex; `None` when it has none (all zeros).
+fn unit_id(reply: &[u8]) -> Option<String> {
+    let id = reply.get(5..9)?;
+    id.iter().any(|&b| b != 0).then(|| id.iter().map(|b| format!("{b:02X}")).collect())
+}
+
 /// `DEVICE_NAME`'s device type.
 fn kind(device_type: u8) -> BatteryKind {
     match device_type {
@@ -409,6 +441,13 @@ mod tests {
         assert_eq!(voltage_percent(3811), 50);
         assert_eq!(voltage_percent(3684), 13);
         assert_eq!(voltage_percent(3400), 0);
+    }
+
+    #[test]
+    fn the_unit_id_is_the_serial_after_the_entity_count() {
+        assert_eq!(unit_id(&[0x11, 1, 2, 0x0A, 3, 0xDE, 0xAD, 0xBE, 0xEF, 1, 2]).as_deref(), Some("DEADBEEF"));
+        assert_eq!(unit_id(&[0x11, 1, 2, 0x0A, 3, 0, 0, 0, 0, 1, 2]), None);
+        assert_eq!(unit_id(&[0x11, 1, 2, 0x0A]), None);
     }
 
     #[test]

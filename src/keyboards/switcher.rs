@@ -45,7 +45,7 @@ pub struct Switcher {
 /// What the switcher acts on, shared with the tray (which replaces it when settings change).
 struct Rules {
     show_readout: bool,
-    /// `(device path, name, layout)`.
+    /// `(device path, name, layout)`: one per path, so a keyboard with several connections has several.
     assigned: Vec<(String, String, u64)>,
 }
 
@@ -129,7 +129,8 @@ fn configure(config: &Keyboards) {
     let assigned = config
         .assigned
         .iter()
-        .filter_map(|keyboard| Some((keyboard.device_path.clone(), keyboard.name.clone(), keyboard.hkl()?)))
+        .filter_map(|keyboard| Some((keyboard, keyboard.hkl()?)))
+        .flat_map(|(keyboard, hkl)| keyboard.paths().map(move |path| (path.to_owned(), keyboard.name.clone(), hkl)))
         .collect();
     *RULES.lock().unwrap_or_else(|p| p.into_inner()) = Rules { show_readout: config.show_readout, assigned };
 }

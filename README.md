@@ -59,7 +59,9 @@ A tiny Windows app for **audio awareness without opening anything** — a pill o
   [the YouTube Music tile](#the-youtube-music-tile).
 - **A keyboard layout for each keyboard** (opt-in, Settings > Keyboards) — type on the laptop's
   AZERTY and it is AZERTY, pick up a QWERTY keyboard and the next keys are QWERTY, even when both
-  layouts belong to the same language. Add a keyboard by pressing a key on it. The pill shows
+  layouts belong to the same language. Add a keyboard by pressing a key on it; one that also
+  connects by cable, receiver or Bluetooth gets each way added to its card, as Windows sees
+  each as a different keyboard. The pill shows
   each change, Win+Space included, and Windows' own layout icon can be hidden from the taskbar.
   - *Privacy:* only which keyboard a key comes from is read (Raw Input's device handle), never
     the key itself; nothing is hooked, injected or logged.

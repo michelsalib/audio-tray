@@ -59,6 +59,10 @@ impl Default for Keyboards {
 pub struct AssignedKeyboard {
     /// Its Raw Input interface path, stable across reconnects (the session's handle is not).
     pub device_path: String,
+    /// The same keyboard's other connections (its cable, its receiver, Bluetooth): each is another
+    /// interface path, and nothing in the paths says they are one keyboard.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub more_paths: Vec<String>,
     /// What the user calls it.
     pub name: String,
     /// The full layout handle, in hex (`0409040C`): never only the language. A layout uninstalled
@@ -67,6 +71,27 @@ pub struct AssignedKeyboard {
 }
 
 impl AssignedKeyboard {
+    /// Every interface path it types through, the first one first.
+    pub fn paths(&self) -> impl Iterator<Item = &str> {
+        std::iter::once(self.device_path.as_str()).chain(self.more_paths.iter().map(String::as_str))
+    }
+
+    pub fn has(&self, path: &str) -> bool {
+        self.paths().any(|known| known.eq_ignore_ascii_case(path))
+    }
+
+    /// Forget its `at`th path, in [`Self::paths`]' order. The last one stays.
+    pub fn remove_path(&mut self, at: usize) {
+        if self.more_paths.is_empty() {
+            return;
+        }
+        if at == 0 {
+            self.device_path = self.more_paths.remove(0);
+        } else if at <= self.more_paths.len() {
+            self.more_paths.remove(at - 1);
+        }
+    }
+
     pub fn hkl(&self) -> Option<u64> {
         let digits = self.hkl.trim().trim_start_matches("0x").trim_start_matches("0X");
         u64::from_str_radix(digits, 16).ok()

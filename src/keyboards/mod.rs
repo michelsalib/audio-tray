@@ -181,6 +181,20 @@ pub fn connection(path: &str) -> Connection {
     }
 }
 
+/// The vendor and product ids in an interface path, `19F5:2620`: what tells a keyboard's cable from
+/// its receiver, both "USB". A Bluetooth LE path writes `VID&02046d` (a source byte, then the id).
+pub fn vid_pid(path: &str) -> Option<String> {
+    let upper = path.to_uppercase();
+    let after = |tag: &str, len: usize| -> Option<String> {
+        let at = upper.find(tag)? + tag.len();
+        let id = upper.get(at..at + len)?;
+        id.chars().all(|c| c.is_ascii_hexdigit()).then(|| id[len - 4..].to_owned())
+    };
+    let vid = after("VID_", 4).or_else(|| after("VID&", 6))?;
+    let pid = after("PID_", 4).or_else(|| after("PID&", 4))?;
+    Some(format!("{vid}:{pid}"))
+}
+
 fn devpkey(fmtid: u128, pid: u32) -> DEVPROPKEY {
     DEVPROPKEY { fmtid: GUID::from_u128(fmtid), pid }
 }
@@ -443,6 +457,14 @@ mod tests {
         assert_eq!(connection(usb), Connection::Usb);
         assert_eq!(connection(laptop), Connection::BuiltIn);
         assert_eq!(connection(r"\\?\HID#{00001812-0000-1000-8000-00805f9b34fb}_Dev_VID&02046d_PID&b02e#a&1&0&0000#{884b96c3-56ef-11d1-bc8c-00a0c91405dd}"), Connection::Bluetooth);
+    }
+
+    #[test]
+    fn a_connection_is_told_apart_by_its_vendor_and_product() {
+        assert_eq!(vid_pid(r"\\?\HID#VID_19F5&PID_2620&MI_01#9&eb2c70e&0&0000#{884b96c3-56ef-11d1-bc8c-00a0c91405dd}").as_deref(), Some("19F5:2620"));
+        let ble = r"\\?\HID#{00001812-0000-1000-8000-00805f9b34fb}_Dev_VID&023151_PID&4013_REV&0105_f4ee259529b5&Col01#9&2e05b8ff&0&0000#{884b96c3-56ef-11d1-bc8c-00a0c91405dd}";
+        assert_eq!(vid_pid(ble).as_deref(), Some("3151:4013"));
+        assert_eq!(vid_pid(r"\\?\ACPI#HPQ8002#4&102e92db&0#{884b96c3-56ef-11d1-bc8c-00a0c91405dd}"), None);
     }
 
     #[test]

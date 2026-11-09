@@ -69,10 +69,13 @@ A tiny Windows app for **audio awareness without opening anything** — a pill o
     first); a window running as administrator may not follow (Windows does not let a normal app
     switch it); the lock screen is not covered.
 - **Battery levels** of your keyboard, mouse, headset and other wireless devices (Settings >
-  Batteries) — every connected Bluetooth device that reports one, in a Batteries section of the
-  flyout and under the tray icon's tooltip. When one runs low (20% by default), the pill warns in
-  amber and Windows shows a notification, once until it is charged again. Each of these can be
-  turned off. Nothing polls: Windows says when a level changes or a device connects.
+  Batteries) — every connected Bluetooth device that reports one, the devices paired to a
+  Logitech receiver (LIGHTSPEED, Unifying, Bolt) and a Razer BlackShark V2 Pro on its receiver, in
+  a Batteries section of the flyout and under
+  the tray icon's tooltip. When one runs low (20% by default), the pill warns in amber and Windows
+  shows a notification, once until it is charged again. Each of these can be turned off. Windows
+  says when a Bluetooth level changes or a device connects; a receiver's devices are asked every
+  two minutes while it is plugged in.
   - *Limits:* devices on a vendor's own USB receiver (Logitech Bolt/Unifying, most gaming
     headsets) keep their level to their vendor's app; a paired device out of range is not listed.
 - **Falls back to a plain tray icon** if the taskbar controls cannot be drawn — an

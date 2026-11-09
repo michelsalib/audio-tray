@@ -49,6 +49,10 @@ pub(super) enum Elem {
     Voice,
     /// The apps list's header: clicking it folds or opens the list.
     AppsHeader,
+    /// The Batteries section's header.
+    BatteriesHeader,
+    /// One device's battery: its kind, name and level.
+    Battery { index: usize },
     /// One app's volume in the mixer.
     AppSlider { app: usize },
     Slider { group: usize },
@@ -85,6 +89,9 @@ pub(super) fn content_width(model: &Model, scale: f32) -> i32 {
             max_w = max_w.max(TEXT_X * scale + mw(font, text_px, &row.label) + reserve * scale);
         }
     }
+    for b in &model.batteries {
+        max_w = max_w.max(TEXT_X * scale + mw(font, text_px, &b.name) + BATTERY_W * scale);
+    }
     // Wide enough for the footer's label and buttons on one line.
     max_w = max_w.max(footer_min_width(model, scale));
     // An app's slider needs room after its name.
@@ -119,6 +126,10 @@ pub(super) fn build_view(model: &Model, scale: f32) -> (Vec<LaidElem>, i32) {
             kinds.push(Elem::Device { group: gi, dev: di });
         }
     }
+    if !model.batteries.is_empty() {
+        kinds.push(Elem::BatteriesHeader);
+        kinds.extend((0..model.batteries.len()).map(|index| Elem::Battery { index }));
+    }
     if !model.apps.is_empty() {
         kinds.push(Elem::AppsHeader);
         if !model.fit.apps_folded {
@@ -142,13 +153,13 @@ pub(super) fn build_view(model: &Model, scale: f32) -> (Vec<LaidElem>, i32) {
         }
         let height = match elem {
             // Later headers get a larger top gap to separate groups.
-            Elem::GroupHeader { .. } | Elem::AppsHeader => d(if i == 0 { HEADER_FIRST_H } else { HEADER_H }),
+            Elem::GroupHeader { .. } | Elem::AppsHeader | Elem::BatteriesHeader => d(if i == 0 { HEADER_FIRST_H } else { HEADER_H }),
             Elem::NowPlaying { .. } => d(NOW_PLAYING_H),
             Elem::Pager => d(PAGER_H),
             Elem::Voice => d(VOICE_H),
             Elem::AppSlider { .. } => d(APP_H),
             Elem::Slider { .. } => d(SLIDER_H),
-            Elem::Device { .. } => d(ITEM_H),
+            Elem::Device { .. } | Elem::Battery { .. } => d(ITEM_H),
             Elem::Footer => d(FOOTER_H),
             Elem::Note => d(NOTE_H),
         };
@@ -338,6 +349,7 @@ mod tests {
             icon: IconId::Speakers,
             selected: false,
             battery,
+            container: None,
         }
     }
 

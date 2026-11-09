@@ -56,6 +56,25 @@ fn tooltip_for(device: &str) -> String {
     format!("{device} — {TRAY_MARKER}")
 }
 
+/// The tooltip Windows shows holds 127 UTF-16 units (the rest of its 128 is cut, with no NUL).
+const TOOLTIP_MAX: usize = 127;
+
+/// The tooltip: the device and the marker on the first line, then a line per battery while they
+/// fit. Lowest first, so the one that needs charging is the one that shows.
+fn tooltip_text(device: &str, batteries: &[crate::hub::Battery]) -> String {
+    let mut text = tooltip_for(device);
+    let mut by_level: Vec<&crate::hub::Battery> = batteries.iter().collect();
+    by_level.sort_by_key(|b| b.level);
+    for b in by_level {
+        let line = format!("\n{}: {}%", b.name, b.level);
+        if text.encode_utf16().count() + line.encode_utf16().count() > TOOLTIP_MAX {
+            break;
+        }
+        text.push_str(&line);
+    }
+    text
+}
+
 /// The tooltip the icon is *registered* with. **Do not change it**: Windows keys the icon's
 /// "always show on the taskbar" choice on the exe path plus this string, and a new string drops
 /// every user's icon (and with it the strip) into the overflow. See docs/NOTES.md.
@@ -189,6 +208,10 @@ struct Tray {
     sessions: Option<(crate::audio::DeviceId, sessions::Watch)>,
     /// The per-keyboard layout switcher, while `[keyboards] enabled`.
     keyboards: Option<crate::keyboards::Switcher>,
+    /// The battery source, while `[batteries] enabled`.
+    batteries: Option<crate::batteries::Watch>,
+    /// The default output's name, the tooltip's first line.
+    tooltip_device: String,
 }
 
 struct MuteWatch {
@@ -266,6 +289,10 @@ pub fn run(backend: WasapiBackend, settings: bool) -> Result<()> {
     }
 
     let keyboards = config.keyboards.enabled.then(|| crate::keyboards::Switcher::spawn(&config.keyboards)).flatten();
+    let batteries = if config.batteries.enabled { crate::batteries::Watch::spawn() } else { None };
+    crate::pill::set_batteries(config.batteries.enabled && config.batteries.pill_alert, config.batteries.enabled && config.batteries.pill_card);
+    let mut hub = crate::hub::State::default();
+    hub.set_low_battery_at(config.batteries.warn_at());
 
     TRAY.with(|cell| {
         *cell.borrow_mut() = Some(Tray {
@@ -280,9 +307,11 @@ pub fn run(backend: WasapiBackend, settings: bool) -> Result<()> {
             scroll: ScrollTotals::default(),
             mute_watches: Vec::new(),
             mute_pending: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            hub: crate::hub::State::default(),
+            hub,
             sessions: None,
             keyboards,
+            batteries,
+            tooltip_device: String::new(),
         })
     });
     with_tray(Tray::refresh);
@@ -606,7 +635,8 @@ impl Tray {
         self.rearm_mute_watches();
         self.push_strip(state.strip_icons());
         self.refresh_icon_rect();
-        if let Err(e) = state.output.apply_to(&self.icon) {
+        self.tooltip_device = state.output.name.clone();
+        if let Err(e) = state.output.apply_to(&self.icon, &self.tooltip()) {
             eprintln!("tray: could not update the icon, will retry when the taskbar is back ({e:#})");
         }
         self.report_endpoints();
@@ -642,6 +672,7 @@ impl Tray {
         if before.icons != self.config.icons {
             self.refresh();
         }
+        self.configure_batteries(&before.batteries);
         if before.keyboards != self.config.keyboards {
             let wanted = &self.config.keyboards;
             match (&self.keyboards, wanted.enabled) {
@@ -711,7 +742,9 @@ impl Tray {
     /// Fold every queued hub event into the state the surfaces render.
     fn fold_events(&mut self) {
         let mut changed = false;
+        let mut batteries = false;
         for event in crate::hub::take() {
+            batteries |= matches!(event, crate::hub::Event::Batteries(_));
             // Teams on the microphone means a meeting: the moment to connect its integration.
             if let crate::hub::Event::MicUsers(users) = &event {
                 crate::integrations::teams_on_mic(users.iter().any(|u| crate::hub::names::app_name(u) == "Teams"));
@@ -727,9 +760,68 @@ impl Tray {
             }
             changed |= self.hub.apply(event);
         }
+        if batteries {
+            self.follow_batteries();
+        }
         if changed {
             self.hub_changed();
         }
+    }
+
+    /// The levels moved: the tooltip follows, and a battery that just went low gets its Windows
+    /// notification.
+    fn follow_batteries(&mut self) {
+        self.apply_tooltip();
+        let low = std::mem::take(&mut self.hub.fresh_low);
+        let b = &self.config.batteries;
+        if !(b.enabled && b.toast) {
+            return;
+        }
+        for battery in low {
+            let title = format!("{} battery low", battery.name);
+            let body = format!("{}% left. Time to charge it.", battery.level);
+            if let Err(e) = crate::toast::show(&title, &body) {
+                eprintln!("batteries: could not show the notification ({e:#})");
+            }
+        }
+    }
+
+    /// The tooltip as it stands: the default output, then the levels when they are shown there.
+    fn tooltip(&self) -> String {
+        let b = &self.config.batteries;
+        let shown: &[crate::hub::Battery] = if b.enabled && b.tooltip { &self.hub.batteries } else { &[] };
+        tooltip_text(&self.tooltip_device, shown)
+    }
+
+    fn apply_tooltip(&self) {
+        if self.tooltip_device.is_empty() {
+            return; // not read yet: `refresh` sets it with the icon
+        }
+        if let Err(e) = self.icon.set_tooltip(Some(&self.tooltip())) {
+            eprintln!("tray: could not update the tooltip ({e:#})");
+        }
+    }
+
+    /// Start or stop the battery source, and carry the battery settings to the hub and the pill.
+    fn configure_batteries(&mut self, before: &crate::config::Batteries) {
+        let b = self.config.batteries.clone();
+        if b == *before {
+            return;
+        }
+        match (self.batteries.is_some(), b.enabled) {
+            (false, true) => self.batteries = crate::batteries::Watch::spawn(),
+            (true, false) => {
+                self.batteries = None;
+                self.hub.batteries.clear();
+            }
+            _ => {}
+        }
+        crate::pill::set_batteries(b.enabled && b.pill_alert, b.enabled && b.pill_card);
+        self.hub.set_low_battery_at(b.warn_at());
+        // Warned under the new threshold: the pill shows it; no toast for a settings change.
+        self.hub.fresh_low.clear();
+        self.apply_tooltip();
+        self.hub_changed();
     }
 
     /// The hub state changed: bring the surfaces in line, and arm the next notice's expiry.
@@ -1181,7 +1273,8 @@ fn build_tray(backend: &WasapiBackend, config: &Config) -> Result<TrayIcon> {
             .with_icon(icon_image(initial_icon)?)
             .build();
         let failure = match built {
-            Ok(tray) => match Endpoint::read(backend, config, Flow::Output).apply_to(&tray) {
+            // Before the hub has any battery: the device alone, until the first `refresh`.
+            Ok(tray) => match Endpoint::read(backend, config, Flow::Output).apply_with_name(&tray) {
                 Ok(()) => {
                     if attempt > 1 {
                         println!("tray: registered on attempt {attempt}");
@@ -1226,10 +1319,15 @@ impl Endpoint {
         }
     }
 
-    /// Put this endpoint on the notification icon: its glyph and its tooltip.
-    fn apply_to(&self, tray: &TrayIcon) -> Result<()> {
+    /// [`Self::apply_to`] with its name alone as the tooltip.
+    fn apply_with_name(&self, tray: &TrayIcon) -> Result<()> {
+        self.apply_to(tray, &tooltip_for(&self.name))
+    }
+
+    /// Put this endpoint on the notification icon: its glyph, and `tooltip` (its name and the rest).
+    fn apply_to(&self, tray: &TrayIcon, tooltip: &str) -> Result<()> {
         tray.set_icon(Some(icon_image(self.icon)?))?;
-        tray.set_tooltip(Some(&tooltip_for(&self.name)))?;
+        tray.set_tooltip(Some(tooltip))?;
         println!("refresh: default \"{}\" -> icon {:?}", self.name, self.icon);
         Ok(())
     }
@@ -1407,6 +1505,18 @@ mod tests {
         assert_eq!(scroll.take(), [0.0, 0.0]);
         assert!(scroll.add(5, 120), "a new batch after the apply; unknown codes count as input");
         assert_eq!(scroll.take(), [0.0, 1.0]);
+    }
+
+    #[test]
+    fn the_tooltip_keeps_its_marker_and_lists_the_lowest_battery_first_while_it_fits() {
+        let battery = |name: &str, level: u8| crate::hub::Battery { id: name.into(), name: name.into(), kind: crate::hub::BatteryKind::Other, level };
+        let text = tooltip_text("Speakers", &[battery("Keyboard", 96), battery("Mouse", 12)]);
+        assert_eq!(text, "Speakers — Audio Tray\nMouse: 12%\nKeyboard: 96%");
+        let many: Vec<_> = (0..20).map(|i| battery(&format!("A device with a long name {i}"), i)).collect();
+        let text = tooltip_text("Speakers", &many);
+        assert!(text.starts_with("Speakers — Audio Tray\n"));
+        assert!(text.encode_utf16().count() <= TOOLTIP_MAX);
+        assert!(text.contains("name 0: 0%"), "the lowest is kept");
     }
 
     #[test]

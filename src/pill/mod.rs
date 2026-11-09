@@ -137,9 +137,9 @@ fn entrance(shown: &View, next: &View) -> Entrance {
         return Entrance::Slide;
     }
     let shape = |view: &View| match view {
-        View::Idle { call, devices } => (0, call.as_ref().map(|c| c.members.len() + 1), devices.is_some(), false),
-        View::Music { media, card, call, devices, .. } => (media.len(), call.as_ref().map(|c| c.members.len() + 1), devices.is_some(), *card),
-        _ => (0, None, false, false),
+        View::Idle { call, devices } => (0, call.as_ref().map(|c| c.members.len() + 1), devices.is_some(), false, 0),
+        View::Music { media, card, call, devices, batteries, .. } => (media.len(), call.as_ref().map(|c| c.members.len() + 1), devices.is_some(), *card, batteries.len().div_ceil(2)),
+        _ => (0, None, false, false, 0),
     };
     if shape(shown) != shape(next) {
         Entrance::Grow
@@ -256,6 +256,18 @@ pub fn update(state: &State) {
     with_pill(|pill| {
         pill.last = state.clone();
         pill.refresh();
+    });
+}
+
+/// Warn of a low battery (`[batteries] pill_alert`), and list the levels on the card
+/// (`[batteries] pill_card`): kept with the other battery settings.
+pub fn set_batteries(alerts: bool, card: bool) {
+    with_pill(|pill| {
+        if (pill.inputs.battery_alerts, pill.inputs.battery_card) != (alerts, card) {
+            pill.inputs.battery_alerts = alerts;
+            pill.inputs.battery_card = card;
+            pill.refresh();
+        }
     });
 }
 

@@ -68,6 +68,13 @@ A tiny Windows app for **audio awareness without opening anything** — a pill o
   - *Limits:* the first key after changing keyboards still types in the old layout (press Shift
     first); a window running as administrator may not follow (Windows does not let a normal app
     switch it); the lock screen is not covered.
+- **Battery levels** of your keyboard, mouse, headset and other wireless devices (Settings >
+  Batteries) — every connected Bluetooth device that reports one, in a Batteries section of the
+  flyout and under the tray icon's tooltip. When one runs low (20% by default), the pill warns in
+  amber and Windows shows a notification, once until it is charged again. Each of these can be
+  turned off. Nothing polls: Windows says when a level changes or a device connects.
+  - *Limits:* devices on a vendor's own USB receiver (Logitech Bolt/Unifying, most gaming
+    headsets) keep their level to their vendor's app; a paired device out of range is not listed.
 - **Falls back to a plain tray icon** if the taskbar controls cannot be drawn — an
   icon reflecting the current output device (speakers, headphones, headset, HDMI…),
   rendered from Segoe Fluent Icons and themed to your taskbar. Either button opens
@@ -132,6 +139,8 @@ Developer and diagnostic modes are built only with `cargo build --features dev` 
 ```
 audio-tray --list     print the current defaults + all active devices
 audio-tray --set <q>  switch default output to a device by name substring or id
+audio-tray --batteries [secs]
+                      the connected devices' battery levels, then each change for secs
 audio-tray --music-probe
                       list every media session with its app id, and which one matched
 audio-tray --music-timeline
@@ -162,6 +171,15 @@ size = "big"                # at rest: "hidden" (the sliver), "small" or "big"; 
 edge = "left"               # the screen edge it hugs: "left", "right" or "top"
 align = "center"            # where along it: "start" (top, or left), "center" or "end"
 # monitor = '\\.\DISPLAY2'  # which display; unset = the one at that edge of the desktop
+
+[batteries]
+enabled = true              # follow the battery levels of wireless devices
+flyout = true               # a Batteries section in the flyout
+tooltip = true              # the levels under the tray icon's tooltip
+pill_card = true            # the levels on the pill's card, when you hover it
+pill_alert = true           # an amber warning on the pill when one runs low
+toast = true                # a Windows notification when one runs low
+low_at = 20                 # low is at or under this (%)
 
 [discord]
 enabled = true              # Discord: RPC when client_id/client_secret are set, and the Vencord pipe

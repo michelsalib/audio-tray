@@ -13,6 +13,8 @@
 //!   --vol <up|down|get>            nudge or read the default output volume by one scroll notch
 //!   --osd [out|in] [level%]        preview the scroll readout beside the cursor until it fades
 //!   --mic [secs]                   who holds the microphone, then watch it change
+//!   --batteries [secs]             the connected devices' battery levels, then each change
+//!   --battery-toast               the low-battery Windows notification, with a made-up device
 //!   --meter                        sample the default output+input peak meters for 4 s
 //!   --taskbar-click <out|in|panel> post a strip gesture to the running tray (clicks on the
 //!                                  taskbar cannot be synthesised)
@@ -183,6 +185,8 @@ pub fn run(args: &[String], backend: &WasapiBackend) -> Result<bool> {
             taskbar::post_scroll(flow, notches)?;
             println!("taskbar: posted a {notches} notch {flow:?} scroll to the running tray.");
         }
+        Some("--batteries") => crate::batteries::trace(args.get(1).and_then(|s| s.parse().ok()).unwrap_or(0)),
+        Some("--battery-toast") => crate::toast::show("G705 Mouse battery low", "12% left. Time to charge it.")?,
         Some("--keyboards") => crate::keyboards::spike::run(&args[1..])?,
         Some("--music-probe") => music::probe()?,
         Some("--music-timeline") => {

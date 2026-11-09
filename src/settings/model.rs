@@ -34,6 +34,8 @@ pub(super) struct Status {
     pub discord_problem: Option<&'static str>,
     pub teams_problem: Option<&'static str>,
     pub notice: Option<&'static str>,
+    /// The connected devices that report a battery.
+    pub batteries: Vec<crate::hub::Battery>,
 }
 
 impl Status {
@@ -43,6 +45,7 @@ impl Status {
             discord_problem: state.problem(crate::integrations::discord_rpc::NAME),
             teams_problem: state.problem(crate::integrations::teams::NAME),
             notice: crate::taskbar::current_notice(),
+            batteries: state.batteries.clone(),
         }
     }
 }

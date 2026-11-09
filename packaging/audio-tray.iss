@@ -86,6 +86,10 @@ Name: "{autoprograms}\{#AppName}"; Filename: "{app}\{#AppExeName}"
 ; user keeps the "autostart" task ticked.
 Name: "{userstartup}\{#AppName}"; Filename: "{app}\{#AppExeName}"; Tasks: autostart
 
+[Registry]
+; The name notifications show under, which the app registers itself (src/toast.rs): gone with it.
+Root: HKCU; Subkey: "Software\Classes\AppUserModelId\MichelSalib.AudioTray"; Flags: uninsdeletekey dontcreatekey
+
 [Run]
 ; Offer to launch right after an interactive install; skipped for silent
 ; (winget / CI) installs.

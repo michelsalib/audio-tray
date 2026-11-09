@@ -85,6 +85,9 @@ features = [
     # The battery watch (src/batteries.rs): a DeviceWatcher wakes it when a level or a connection
     # changes, so nothing polls.
     "Devices_Enumeration",
+    # The devices on a Logitech or Razer receiver (src/batteries/hid.rs): its HID collections'
+    # usages and report lengths, and its feature reports.
+    "Win32_Devices_HumanInterfaceDevice",
     # The low-battery Windows notification (src/toast.rs).
     "UI_Notifications",
     "Data_Xml_Dom",

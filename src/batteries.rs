@@ -10,9 +10,18 @@
 //!
 //! A paired device out of range keeps its last level, days old: only connected ones are listed.
 //!
-//! Nothing polls. [`Watch`] keeps a `DeviceWatcher` on the Bluetooth nodes asking for those two
-//! properties; any change to them wakes its thread, which reads everything again and reports it
-//! to the hub when it changed.
+//! Nothing polls the Bluetooth ones. [`Watch`] keeps a `DeviceWatcher` on the Bluetooth nodes
+//! asking for those two properties; any change to them wakes its thread, which reads everything
+//! again and reports it to the hub when it changed.
+//!
+//! The devices on a Logitech receiver ([`hidpp`]) and Razer headsets on theirs ([`razer`]) are
+//! other sources: Windows knows nothing of them, so they are asked, and nothing says when their
+//! level moves. More watchers wake the thread when such a receiver comes or goes; while one is
+//! plugged in, it reads again every [`POLL`] as well.
+
+mod hid;
+mod hidpp;
+mod razer;
 
 use std::collections::HashMap;
 
@@ -27,7 +36,7 @@ use windows::Win32::Devices::Properties::{
     DEVPKEY_DeviceContainer_Category, DEVPKEY_Device_ContainerId, DEVPKEY_Device_FriendlyName, DEVPROPTYPE,
     DEVPROP_TYPE_BOOLEAN, DEVPROP_TYPE_BYTE, DEVPROP_TYPE_GUID, DEVPROP_TYPE_STRING, DEVPROP_TYPE_STRING_LIST,
 };
-use windows::Win32::Foundation::{CloseHandle, DEVPROPKEY, HANDLE, WAIT_OBJECT_0};
+use windows::Win32::Foundation::{CloseHandle, DEVPROPKEY, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
 use windows::Win32::System::Threading::{CreateEventW, SetEvent, WaitForMultipleObjects, WaitForSingleObject, INFINITE};
 
@@ -42,16 +51,42 @@ const CONNECTED: DEVPROPKEY = DEVPROPKEY { fmtid: GUID::from_u128(0x83DA_6326_97
 const WATCHED: [&str; 2] = ["{104EA319-6EE2-4701-BD47-8DDBF425BBE5} 2", "{83DA6326-97A6-4088-9453-A1923F573B29} 15"];
 /// The Bluetooth nodes: every one the facts above sit on.
 const WATCH_FILTER: &str = r#"System.Devices.DeviceInstanceId:~<"BTH""#;
+/// The vendors whose receivers are asked: their HID interfaces are watched for one plugged in or out.
+const RECEIVER_VENDORS: [u16; 2] = [hidpp::VENDOR, razer::VENDOR];
 
 /// How long the thread lets a burst of changes settle before reading (a connection updates
 /// several nodes, one after the other).
 const SETTLE_MS: u32 = 400;
+/// How often a receiver's devices are asked again: a level moves slowly, and a device switched
+/// on shows up within this.
+const POLL: std::time::Duration = std::time::Duration::from_secs(120);
+/// After a change, how soon they are asked once more: a receiver plugged in (or switched to this
+/// PC) finds its devices a few seconds after it appears.
+const RECHECK: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Every connected device that reports a battery, by name. Best-effort: empty on any failure.
 pub fn read() -> Vec<Battery> {
-    let mut list = unsafe { collect() }.unwrap_or_default();
-    list.sort_by_key(|b| b.name.to_lowercase());
-    list
+    Sources::default().read().0
+}
+
+/// Where levels come from, and what they remember between reads.
+#[derive(Default)]
+struct Sources {
+    logitech: hidpp::Cache,
+}
+
+impl Sources {
+    /// Every level, and whether a receiver is plugged in (whose devices must be polled).
+    fn read(&mut self) -> (Vec<Battery>, bool) {
+        let mut list = unsafe { collect() }.unwrap_or_default();
+        let mut polled = false;
+        for receivers in [hidpp::read(&mut self.logitech), razer::read()] {
+            polled |= receivers.is_some();
+            list.extend(receivers.unwrap_or_default());
+        }
+        list.sort_by_key(|b| b.name.to_lowercase());
+        (list, polled)
+    }
 }
 
 /// What one node says about its device.
@@ -237,6 +272,11 @@ impl Event {
         unsafe { CreateEventW(None, false, false, None) }.ok().map(|h| Event(h.0 as isize))
     }
 
+    /// Manual-reset, as overlapped I/O wants.
+    fn manual() -> Option<Self> {
+        unsafe { CreateEventW(None, true, false, None) }.ok().map(|h| Event(h.0 as isize))
+    }
+
     fn handle(&self) -> HANDLE {
         HANDLE(self.0 as *mut _)
     }
@@ -281,48 +321,63 @@ impl Drop for Watch {
 }
 
 /// The watch thread: report, then wait for a change (or `stop`), let it settle, and report again
-/// if anything moved. `report` hears each new list.
+/// if anything moved. While a receiver is plugged in, the wait also ends on a timer. `report`
+/// hears each new list.
 fn serve(stop: &Event, mut report: impl FnMut(Vec<Battery>)) {
     // The watcher's callbacks come on the thread pool; this thread only needs COM for creating it.
     unsafe {
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
     }
     let Some(changed) = Event::new().map(std::sync::Arc::new) else { return };
-    let watcher = match watch(changed.clone()) {
-        Ok(watcher) => Some(watcher),
-        Err(e) => {
-            eprintln!("batteries: cannot watch for changes, reading once ({e:#})");
-            None
+    let mut watchers = Vec::new();
+    let receivers = RECEIVER_VENDORS.map(|vendor| (hid::watch_filter(vendor), DeviceInformationKind::DeviceInterface, &[][..]));
+    for (filter, kind, props) in std::iter::once((WATCH_FILTER.to_string(), DeviceInformationKind::Device, &WATCHED[..])).chain(receivers) {
+        match watch(&filter, kind, props, changed.clone()) {
+            Ok(watcher) => watchers.push(watcher),
+            Err(e) => eprintln!("batteries: cannot watch {filter} for changes ({e:#})"),
         }
-    };
-    let mut last = read();
+    }
+    let mut sources = Sources::default();
+    let (mut last, mut polled) = sources.read();
     report(last.clone());
+    let mut soon = true;
     loop {
-        let woke = unsafe { WaitForMultipleObjects(&[stop.handle(), changed.handle()], false, INFINITE) };
-        if woke != windows::Win32::Foundation::WAIT_EVENT(WAIT_OBJECT_0.0 + 1) {
+        let wait = match (polled, soon) {
+            (false, _) => INFINITE,
+            (true, true) => RECHECK.as_millis() as u32,
+            (true, false) => POLL.as_millis() as u32,
+        };
+        let woke = unsafe { WaitForMultipleObjects(&[stop.handle(), changed.handle()], false, wait) };
+        if woke == windows::Win32::Foundation::WAIT_EVENT(WAIT_OBJECT_0.0 + 1) {
+            // Let the rest of the burst land; stop still ends it at once.
+            if unsafe { WaitForSingleObject(stop.handle(), SETTLE_MS) } == WAIT_OBJECT_0 {
+                break;
+            }
+            soon = true;
+        } else if woke == WAIT_TIMEOUT {
+            soon = false;
+        } else {
             break;
         }
-        // Let the rest of the burst land; stop still ends it at once.
-        if unsafe { WaitForSingleObject(stop.handle(), SETTLE_MS) } == WAIT_OBJECT_0 {
-            break;
-        }
-        let now = read();
+        let (now, receivers) = sources.read();
+        polled = receivers;
         if now != last {
             last = now;
             report(last.clone());
         }
     }
-    if let Some(watcher) = watcher {
+    for watcher in watchers {
         let _ = watcher.Stop();
     }
 }
 
-/// A watcher on the Bluetooth nodes that sets `changed` on any change to [`WATCHED`]. Its first
-/// enumeration (every node, once) is let through as well: one read, after it settles.
-fn watch(changed: std::sync::Arc<Event>) -> windows::core::Result<DeviceWatcher> {
-    let props: Vec<HSTRING> = WATCHED.iter().map(|p| HSTRING::from(*p)).collect();
+/// A watcher that sets `changed` on any change to the devices `filter` picks, or to `props` of
+/// theirs. Its first enumeration (every one, once) is let through as well: one read, after it
+/// settles.
+fn watch(filter: &str, kind: DeviceInformationKind, props: &[&str], changed: std::sync::Arc<Event>) -> windows::core::Result<DeviceWatcher> {
+    let props: Vec<HSTRING> = props.iter().map(|p| HSTRING::from(*p)).collect();
     let props = windows_collections::IIterable::<HSTRING>::from(props);
-    let watcher = DeviceInformation::CreateWatcherWithKindAqsFilterAndAdditionalProperties(&HSTRING::from(WATCH_FILTER), &props, DeviceInformationKind::Device)?;
+    let watcher = DeviceInformation::CreateWatcherWithKindAqsFilterAndAdditionalProperties(&HSTRING::from(filter), &props, kind)?;
     let poke = move || unsafe {
         WAKES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let _ = SetEvent(changed.handle());

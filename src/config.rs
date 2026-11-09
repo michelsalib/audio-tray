@@ -34,6 +34,48 @@ pub struct Config {
     pub mpc: Mpc,
     /// A keyboard layout per physical keyboard — see [`crate::keyboards`].
     pub keyboards: Keyboards,
+    /// Battery levels of wireless devices — see [`crate::batteries`].
+    pub batteries: Batteries,
+}
+
+/// The battery levels of keyboards, mice, headsets and the like, and where they show.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Batteries {
+    /// Follow the levels at all.
+    pub enabled: bool,
+    /// A section in the flyout listing each device.
+    pub flyout: bool,
+    /// The levels under the tray icon's tooltip.
+    pub tooltip: bool,
+    /// The levels on the edge pill's card, under the devices.
+    pub pill_card: bool,
+    /// A warning on the edge pill when one goes low.
+    pub pill_alert: bool,
+    /// A Windows notification when one goes low.
+    pub toast: bool,
+    /// Low is at or under this (%).
+    pub low_at: u8,
+}
+
+impl Default for Batteries {
+    fn default() -> Self {
+        Self { enabled: true, flyout: true, tooltip: true, pill_card: true, pill_alert: true, toast: true, low_at: 20 }
+    }
+}
+
+impl Batteries {
+    /// The low-battery thresholds offered in Settings.
+    pub const LOW_LEVELS: [u8; 4] = [10, 15, 20, 30];
+
+    /// The level the hub warns at; 0 when nothing would show a warning.
+    pub fn warn_at(&self) -> u8 {
+        if self.enabled && (self.pill_alert || self.toast) {
+            self.low_at.min(100)
+        } else {
+            0
+        }
+    }
 }
 
 /// Switching the keyboard layout by which keyboard is typed on. Off by default.

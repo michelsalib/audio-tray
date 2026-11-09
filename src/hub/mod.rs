@@ -129,6 +129,71 @@ pub struct Call {
     pub icon: Option<std::sync::Arc<Vec<u8>>>,
 }
 
+/// What a device with a battery is, for its glyph.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BatteryKind {
+    Keyboard,
+    Mouse,
+    Headset,
+    Speaker,
+    Gamepad,
+    Phone,
+    Pen,
+    Other,
+}
+
+impl BatteryKind {
+    /// From the device container's category, as Windows files it (`Input.Keyboard`,
+    /// `Communication.Headset.Bluetooth`, `Audio.Headphone`…).
+    pub fn from_category(category: &str) -> Self {
+        let c = category.to_ascii_lowercase();
+        let has = |word: &str| c.contains(word);
+        if has("keyboard") {
+            BatteryKind::Keyboard
+        } else if has("mouse") || has("touchpad") || has("pointing") {
+            BatteryKind::Mouse
+        } else if has("gam") || has("joystick") || has("controller") {
+            BatteryKind::Gamepad
+        } else if has("pen") || has("stylus") {
+            BatteryKind::Pen
+        } else if has("headset") || has("headphone") || has("earbud") || has("hands") {
+            BatteryKind::Headset
+        } else if has("speaker") || has("audio") {
+            BatteryKind::Speaker
+        } else if has("phone") {
+            BatteryKind::Phone
+        } else {
+            BatteryKind::Other
+        }
+    }
+
+    /// Its Segoe Fluent Icons glyph.
+    pub fn glyph(self) -> char {
+        match self {
+            BatteryKind::Keyboard => '\u{E765}',
+            BatteryKind::Mouse => '\u{E962}',
+            BatteryKind::Headset => '\u{E7F6}',
+            BatteryKind::Speaker => '\u{E7F5}',
+            BatteryKind::Gamepad => '\u{E7FC}',
+            BatteryKind::Phone => '\u{E8EA}',
+            BatteryKind::Pen => '\u{EDC6}',
+            BatteryKind::Other => '\u{E702}',
+        }
+    }
+}
+
+/// A connected device that reports its battery.
+#[derive(Clone, PartialEq, Debug)]
+pub struct Battery {
+    /// Its device container (`{GUID}`, upper case): one physical device, whatever nodes it has.
+    /// An audio endpoint's own container id matches it.
+    pub id: String,
+    pub name: String,
+    pub kind: BatteryKind,
+    /// 0..=100.
+    pub level: u8,
+}
+
 /// Every fact any source can report.
 #[derive(Clone, PartialEq, Debug)]
 pub enum Event {
@@ -155,6 +220,8 @@ pub enum Event {
     /// (Win+Space). `keyboard` is the name of the one that typed last, empty when it has none
     /// (see [`crate::keyboards`]).
     KeyboardSwitched { keyboard: String, layout: String },
+    /// Every connected device that reports a battery, by name (see [`crate::batteries`]).
+    Batteries(Vec<Battery>),
 }
 
 /// A short-lived notice the pill shows on top of the steady state.
@@ -168,6 +235,8 @@ pub enum Notice {
     NewTrack { app_id: String, title: String, artist: String },
     /// The layout is now `layout`, on `keyboard` (empty: no name to give).
     KeyboardSwitched { keyboard: String, layout: String },
+    /// A device's battery went low ([`State::low_battery_at`]).
+    LowBattery { name: String, kind: BatteryKind, level: u8 },
 }
 
 impl Notice {
@@ -179,6 +248,8 @@ impl Notice {
             Notice::NewTrack { .. } => Some(std::time::Duration::from_secs(4)),
             // A glance while typing: short, and replaced by the next switch.
             Notice::KeyboardSwitched { .. } => Some(std::time::Duration::from_millis(1500)),
+            // Long enough to be seen on coming back to the desk; the flyout keeps the level.
+            Notice::LowBattery { .. } => Some(std::time::Duration::from_secs(12)),
         }
     }
 }
@@ -205,7 +276,19 @@ pub struct State {
     announced: Option<String>,
     /// Shown newest last; each with when it started.
     pub notices: Vec<(Notice, std::time::Instant)>,
+    /// Every connected device that reports a battery.
+    pub batteries: Vec<Battery>,
+    /// A battery at or under this level (%) is low; 0 warns of none. Set from the config.
+    pub low_battery_at: u8,
+    /// The devices already warned of, until they charge back past [`RECHARGED`].
+    low_warned: Vec<String>,
+    /// Devices that just went low, for the tray to raise a Windows notification about.
+    pub fresh_low: Vec<Battery>,
 }
+
+/// Points above [`State::low_battery_at`] a battery must charge back to before it can warn again:
+/// a level wobbling at the threshold warns once.
+pub const RECHARGED: u8 = 5;
 
 impl State {
     /// Why integration `name` cannot connect, if it cannot.
@@ -321,7 +404,40 @@ impl State {
                 self.push_notice(Notice::KeyboardSwitched { keyboard, layout });
                 true
             }
+            Event::Batteries(batteries) => {
+                let warned = self.warn_low(&batteries);
+                replace(&mut self.batteries, batteries) || warned
+            }
         }
+    }
+
+    /// Raise a notice for each battery that just went low; returns whether any did.
+    fn warn_low(&mut self, batteries: &[Battery]) -> bool {
+        let at = self.low_battery_at;
+        let mut warned = false;
+        for b in batteries {
+            if at > 0 && b.level <= at {
+                if !self.low_warned.contains(&b.id) {
+                    self.low_warned.push(b.id.clone());
+                    self.push_notice(Notice::LowBattery { name: b.name.clone(), kind: b.kind, level: b.level });
+                    self.fresh_low.push(b.clone());
+                    warned = true;
+                }
+            } else if b.level > at.saturating_add(RECHARGED) {
+                self.low_warned.retain(|id| *id != b.id);
+            }
+        }
+        warned
+    }
+
+    /// Change the low-battery level, and warn now of a battery already under the new one.
+    pub fn set_low_battery_at(&mut self, at: u8) -> bool {
+        if self.low_battery_at == at {
+            return false;
+        }
+        self.low_battery_at = at;
+        let batteries = self.batteries.clone();
+        self.warn_low(&batteries)
     }
 
     /// A new song's notice, unless that title was just announced (through another source).
@@ -581,6 +697,58 @@ mod tests {
         assert!(state.all_media().is_empty(), "the tab does not show alone in the gap");
         state.apply(Event::Media(vec![app("ytm!App", "New song")]));
         assert_eq!(state.all_media()[0].app_id, "ytm!App");
+    }
+
+    fn battery(id: &str, level: u8) -> Battery {
+        Battery { id: id.into(), name: id.into(), kind: BatteryKind::Mouse, level }
+    }
+
+    fn lows(state: &State) -> Vec<u8> {
+        state.notices.iter().filter_map(|(n, _)| match n {
+            Notice::LowBattery { level, .. } => Some(*level),
+            _ => None,
+        }).collect()
+    }
+
+    #[test]
+    fn a_low_battery_warns_once_until_it_charges_back() {
+        let mut state = State::default();
+        state.set_low_battery_at(20);
+        state.apply(Event::Batteries(vec![battery("mouse", 40)]));
+        assert!(state.notices.is_empty());
+        assert!(state.apply(Event::Batteries(vec![battery("mouse", 20)])));
+        assert_eq!(lows(&state), [20]);
+        assert_eq!(state.fresh_low.len(), 1);
+        state.notices.clear();
+        // Wobbling around the threshold, and draining further: no second warning.
+        for level in [19, 22, 18, 10] {
+            state.apply(Event::Batteries(vec![battery("mouse", level)]));
+        }
+        assert!(state.notices.is_empty());
+        // Charged past the margin, then low again: warned again.
+        state.apply(Event::Batteries(vec![battery("mouse", 20 + RECHARGED + 1)]));
+        state.apply(Event::Batteries(vec![battery("mouse", 15)]));
+        assert_eq!(lows(&state), [15]);
+    }
+
+    #[test]
+    fn no_warning_when_off_and_a_lower_threshold_warns_at_once() {
+        let mut state = State::default();
+        state.apply(Event::Batteries(vec![battery("kb", 5)]));
+        assert!(state.notices.is_empty(), "0 warns of nothing");
+        assert!(state.set_low_battery_at(10));
+        assert_eq!(lows(&state), [5]);
+        assert!(!state.set_low_battery_at(10), "unchanged");
+    }
+
+    #[test]
+    fn categories_name_the_kind() {
+        assert_eq!(BatteryKind::from_category("Input.Keyboard"), BatteryKind::Keyboard);
+        assert_eq!(BatteryKind::from_category("Input.Mouse"), BatteryKind::Mouse);
+        assert_eq!(BatteryKind::from_category("Communication.Headset.Bluetooth"), BatteryKind::Headset);
+        assert_eq!(BatteryKind::from_category("Input.Gaming"), BatteryKind::Gamepad);
+        assert_eq!(BatteryKind::from_category("Audio.Speaker"), BatteryKind::Speaker);
+        assert_eq!(BatteryKind::from_category("Other"), BatteryKind::Other);
     }
 
     #[test]

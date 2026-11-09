@@ -122,7 +122,9 @@ unsafe fn show_inner(
     let (scale, work_area) = crate::win::monitor_at(POINT { x: cx, y: bottom });
     let accent = accent_rgb();
 
-    let groups = build_groups(backend, config);
+    let batteries = model::batteries_now(config);
+    let groups = build_groups(backend, config, &batteries);
+    let batteries = model::in_section(config, batteries);
     let update = crate::update::pending_version();
 
     let mut fly = Flyout {
@@ -132,6 +134,7 @@ unsafe fn show_inner(
         accent,
         model: Model {
             notice: crate::taskbar::current_notice(),
+            batteries,
             ..Model::new(groups, update)
         },
         hit: Interaction::default(),
@@ -286,7 +289,7 @@ impl Flyout<'_> {
     fn load_hub(&mut self) -> bool {
         let art_px = (model::ART_DIP * self.scale).round() as u32;
         let icon_px = (theme::APP_ICON_DIP * self.scale).round() as u32;
-        let shape = |m: &Model| (m.now_playing.len(), m.voice.is_some(), m.apps.len());
+        let shape = |m: &Model| (m.now_playing.len(), m.voice.is_some(), m.apps.len(), m.batteries.len());
         let before = shape(&self.model);
         match crate::tray::hub_snapshot() {
             Some((generation, state)) => {
@@ -303,6 +306,9 @@ impl Flyout<'_> {
                     self.model.apps = apps;
                 }
                 self.model.voice = voice;
+                if self.config.batteries.enabled {
+                    model::follow_batteries(&mut self.model, self.config, &state.batteries);
+                }
                 self.hub_seen = generation;
             }
             None => {

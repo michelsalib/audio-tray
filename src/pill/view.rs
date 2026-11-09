@@ -23,7 +23,8 @@ pub enum View {
     /// A column of pills: the art of each playing session in its progress ring, then the call,
     /// then the devices, each shown when there is one. On hover (`card`), a card with a row per
     /// session (and the call's).
-    Music { media: Vec<Media>, card: bool, call: Option<CallPill>, devices: Option<Devices>, song: Option<SongNote> },
+    /// The card also lists the battery levels, when asked.
+    Music { media: Vec<Media>, card: bool, call: Option<CallPill>, devices: Option<Devices>, song: Option<SongNote>, batteries: Vec<BatteryChip> },
     /// A one-line banner: warnings, alerts and notices.
     Banner { level: Level, glyph: char, text: String, action: Action },
 }
@@ -106,6 +107,16 @@ impl Devices {
     }
 }
 
+/// A device's battery level, on the card.
+#[derive(Clone, PartialEq, Debug)]
+pub struct BatteryChip {
+    pub glyph: char,
+    pub name: String,
+    pub level: u8,
+    /// At or under the low-battery level.
+    pub low: bool,
+}
+
 /// A new song, shown for a moment above the pills.
 #[derive(Clone, PartialEq, Debug)]
 pub struct SongNote {
@@ -175,6 +186,8 @@ pub const GLYPH_MIC: char = '\u{E720}';
 pub const GLYPH_SPEAKERS: char = '\u{E7F5}';
 pub const GLYPH_SONG: char = '\u{E8D6}';
 pub const GLYPH_KEYBOARD: char = '\u{E765}';
+/// Battery1: a sliver left.
+pub const GLYPH_BATTERY_LOW: char = '\u{E851}';
 
 /// Everything besides the hub state that the view depends on.
 #[derive(Clone, Copy, Default)]
@@ -194,6 +207,10 @@ pub struct Inputs {
     pub size: crate::config::PillSize,
     /// Show a new song's title for a moment.
     pub announce_tracks: bool,
+    /// Warn when a device's battery goes low.
+    pub battery_alerts: bool,
+    /// List the battery levels on the card.
+    pub battery_card: bool,
 }
 
 /// The state to show.
@@ -245,6 +262,17 @@ fn loudest(state: &State, inputs: Inputs) -> View {
             action: Action::Dismiss(notice.clone()),
         };
     }
+    // A battery going low: amber, for a while.
+    if inputs.battery_alerts {
+        if let Some(notice @ Notice::LowBattery { name, level, .. }) = newest(state, |n| matches!(n, Notice::LowBattery { .. })) {
+            return View::Banner {
+                level: Level::Warn,
+                glyph: GLYPH_BATTERY_LOW,
+                text: format!("{name} battery low · {level}%"),
+                action: Action::Dismiss(notice.clone()),
+            };
+        }
+    }
     // A layout switch, for a moment: quieter than the above, so a compact pill or a fullscreen
     // app keeps it to itself.
     if let Some(notice @ Notice::KeyboardSwitched { keyboard, layout }) = newest(state, |n| matches!(n, Notice::KeyboardSwitched { .. })) {
@@ -281,7 +309,14 @@ fn loudest(state: &State, inputs: Inputs) -> View {
             }),
             _ => None,
         });
-        View::Music { media, card: inputs.hover, call, devices, song }
+        // The card lists the levels; low ones in amber, as the warning would be.
+        let batteries = if inputs.hover && inputs.battery_card {
+            let low_at = state.low_battery_at;
+            state.batteries.iter().map(|b| BatteryChip { glyph: b.kind.glyph(), name: b.name.clone(), level: b.level, low: b.level <= low_at }).collect()
+        } else {
+            Vec::new()
+        };
+        View::Music { media, card: inputs.hover, call, devices, song, batteries }
     }
 }
 
@@ -350,6 +385,33 @@ mod tests {
             input: Some(Endpoint { id: DeviceId("mic".into()), name: "Mic".into(), muted, icon: crate::icons::IconId::Microphone }),
             ..Default::default()
         }));
+    }
+
+    #[test]
+    fn a_low_battery_warns_only_when_asked() {
+        let mut state = State::default();
+        state.set_low_battery_at(20);
+        let mouse = crate::hub::Battery { id: "{M}".into(), name: "G705".into(), kind: crate::hub::BatteryKind::Mouse, level: 12 };
+        state.apply(Event::Batteries(vec![mouse]));
+        let asked = decide(&state, Inputs { battery_alerts: true, ..on() });
+        assert!(matches!(&asked, View::Banner { level: Level::Warn, text, .. } if text == "G705 battery low · 12%"), "{asked:?}");
+        assert!(!matches!(decide(&state, on()), View::Banner { .. }));
+    }
+
+    #[test]
+    fn the_card_lists_the_levels_only_when_asked() {
+        let mut state = State::default();
+        state.apply(Event::Media(vec![media(true)]));
+        state.set_low_battery_at(20);
+        let battery = |name: &str, level: u8| crate::hub::Battery { id: name.into(), name: name.into(), kind: crate::hub::BatteryKind::Mouse, level };
+        state.apply(Event::Batteries(vec![battery("Keyboard", 96), battery("Mouse", 20)]));
+        let levels = |inputs: Inputs| match decide(&state, inputs) {
+            View::Music { batteries, .. } => batteries.iter().map(|b| (b.level, b.low)).collect::<Vec<_>>(),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(levels(Inputs { hover: true, battery_card: true, ..on() }), [(96, false), (20, true)], "low at the level itself");
+        assert!(levels(Inputs { hover: true, ..on() }).is_empty(), "not asked");
+        assert!(levels(Inputs { battery_card: true, ..on() }).is_empty(), "the card only");
     }
 
     #[test]
@@ -539,7 +601,7 @@ mod tests {
     fn quiet_states_let_clicks_through() {
         assert!(View::Idle { call: None, devices: None }.click_through());
         assert!(!View::Idle { call: None, devices: Some(Devices::default()) }.click_through(), "the devices are buttons");
-        assert!(View::Music { media: vec![media(true)], card: false, call: None, devices: None, song: None }.click_through());
-        assert!(!View::Music { media: vec![media(true)], card: true, call: None, devices: None, song: None }.click_through());
+        assert!(View::Music { media: vec![media(true)], card: false, call: None, devices: None, song: None, batteries: Vec::new() }.click_through());
+        assert!(!View::Music { media: vec![media(true)], card: true, call: None, devices: None, song: None, batteries: Vec::new() }.click_through());
     }
 }

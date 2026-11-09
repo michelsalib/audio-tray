@@ -86,6 +86,7 @@ dependencies = [
  "tungstenite",
  "ureq",
  "windows",
+ "windows-collections",
  "windows-core",
  "windows-numerics",
  "winresource",

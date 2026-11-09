@@ -201,7 +201,10 @@ fn create(config: &Config) -> Result<()> {
     let mut model = Model::new(config.clone());
     model.read_devices(&backend);
     model.monitors = crate::win::monitors();
-    model.status = crate::tray::hub_snapshot().map(|(_, state)| Status::of(&state)).unwrap_or_default();
+    // The preview has no tray: its batteries are read here.
+    model.status = crate::tray::hub_snapshot()
+        .map(|(_, state)| Status::of(&state))
+        .unwrap_or_else(|| Status { batteries: crate::batteries::read(), ..Default::default() });
     model.update = crate::update::pending_version();
     model.read_keyboards();
     let mut window = Window {
@@ -398,6 +401,12 @@ impl Window {
                     Toggle::Mpc => &mut c.mpc.enabled,
                     Toggle::Discord => &mut c.discord.enabled,
                     Toggle::Teams => &mut c.teams.enabled,
+                    Toggle::Batteries => &mut c.batteries.enabled,
+                    Toggle::BatteryFlyout => &mut c.batteries.flyout,
+                    Toggle::BatteryTooltip => &mut c.batteries.tooltip,
+                    Toggle::BatteryPillCard => &mut c.batteries.pill_card,
+                    Toggle::BatteryPill => &mut c.batteries.pill_alert,
+                    Toggle::BatteryToast => &mut c.batteries.toast,
                 };
                 *flag = !*flag;
             }),
@@ -416,6 +425,10 @@ impl Window {
                     Choice::BrowserTabs => c.browser.every_site = i == 0,
                     // Automatic, then each display.
                     Choice::Display => c.pill.monitor = i.checked_sub(1).and_then(|m| monitors.get(m).cloned()),
+                    Choice::LowBattery => {
+                        let levels = crate::config::Batteries::LOW_LEVELS;
+                        c.batteries.low_at = levels[i.min(levels.len() - 1)];
+                    }
                     Choice::KeyboardLayout(_) => {}
                 })
             }

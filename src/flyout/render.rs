@@ -288,6 +288,26 @@ pub(super) fn render_page(ctx: &Ctx, elems: &[LaidElem], out: &mut [u8]) {
                     draw_battery(&mut cv, scale, w as f32 - RIGHT_PAD * scale, cy as f32, pct, font);
                 }
             }
+            Elem::BatteriesHeader => {
+                let base = le.top as f32 + le.height as f32 - hdr_px * 0.55;
+                if let Some(f) = font_sb {
+                    cv.draw_text(f, hdr_px, (d(HEADER_X) as f32, base), TEXT, 1.0, "Batteries");
+                }
+            }
+            Elem::Battery { index } => {
+                let b = &ctx.model.batteries[index];
+                let cy = le.top + le.height / 2;
+                if let Ok((rgba, gw, gh)) = icons::render_glyph(b.kind.glyph(), icon_px, TEXT) {
+                    cv.blit(d(ICON_X), cy - gh as i32 / 2, &rgba, gw, gh, 1.0);
+                }
+                if let Some(f) = font {
+                    let base = cy as f32 + text_px * 0.34;
+                    let max_w = w as f32 - d(TEXT_X) as f32 - BATTERY_W * scale;
+                    let label = fit_label(f, text_px, &b.name, max_w);
+                    cv.draw_text(f, text_px, (d(TEXT_X) as f32, base), TEXT, 1.0, &label);
+                }
+                draw_battery(&mut cv, scale, w as f32 - RIGHT_PAD * scale, cy as f32, b.level, font);
+            }
             Elem::Footer => {
                 // A darker strip under a hairline; it reaches the bottom edge, so its fill follows the corners.
                 let top = le.top as f32;
@@ -531,9 +551,10 @@ fn draw_battery(cv: &mut Canvas, scale: f32, right: f32, cy: f32, pct: u8, font:
     if let Some(f) = font {
         cv.draw_text(f, px, (right - tw, cy + px * 0.34), TEXT, DIM, &text);
     }
-    // Segoe Fluent battery levels: Battery0 (E850, empty) … Battery10 (E85A, full).
+    // Segoe Fluent battery levels: Battery0 (E850, empty) … Battery9 (E859); full is Battery10,
+    // apart at E83F (E85A is BatteryCharging0).
     let level = ((pct as f32 / 10.0).round() as u32).min(10);
-    let glyph = char::from_u32(0xE850 + level).unwrap_or('\u{E850}');
+    let glyph = if level == 10 { '\u{E83F}' } else { char::from_u32(0xE850 + level).unwrap_or('\u{E850}') };
     let size = (20.0 * scale).round() as u32;
     let gap = 5.0 * scale;
     if let Ok((rgba, gw, gh)) = icons::render_glyph(glyph, size, TEXT) {

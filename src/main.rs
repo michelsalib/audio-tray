@@ -24,6 +24,7 @@ use windows::Win32::UI::HiDpi::{
 };
 
 mod audio;
+mod batteries;
 mod canvas;
 mod config;
 #[cfg(feature = "dev")]
@@ -42,6 +43,7 @@ mod pill;
 mod secrets;
 mod settings;
 mod taskbar;
+mod toast;
 mod tray;
 mod update;
 mod wait;

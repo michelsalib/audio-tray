@@ -11,7 +11,9 @@ pub(super) struct DeviceRow {
     pub label: String,
     pub icon: IconId,
     pub selected: bool,
-    pub battery: Option<u8>, // Bluetooth battery 0..=100, if the device reports one
+    pub battery: Option<u8>, // battery 0..=100, if the device reports one (see crate::batteries)
+    /// The device container, which its battery is found by.
+    pub container: Option<String>,
 }
 
 pub(super) struct Group {
@@ -124,6 +126,8 @@ pub(super) struct Model {
     pub page: usize,
     /// The first app row shown while the list shows fewer rows than it has ([`Fit::apps_rows`]).
     pub apps_scroll: usize,
+    /// The Batteries section: every connected device that reports one, when it is shown.
+    pub batteries: Vec<crate::hub::Battery>,
     // outcome, accumulated while the flyout is open
     pub quit: bool,
     pub restart: bool,
@@ -145,6 +149,7 @@ impl Model {
             fit: Fit::default(),
             page: 0,
             apps_scroll: 0,
+            batteries: Vec::new(),
             quit: false,
             restart: false,
             settings: false,
@@ -238,17 +243,46 @@ pub(super) fn from_hub(state: &crate::hub::State, art_px: u32, icon_px: u32, old
     (now_playing, apps, voice)
 }
 
+/// The batteries as the hub has them, or (the `--flyout` preview, no tray) as read now. None while
+/// they are not followed.
+pub(super) fn batteries_now(config: &Config) -> Vec<crate::hub::Battery> {
+    if !config.batteries.enabled {
+        return Vec::new();
+    }
+    match crate::tray::hub_snapshot() {
+        Some((_, state)) => state.batteries,
+        None => crate::batteries::read(),
+    }
+}
+
+/// The devices the Batteries section lists: all of them, when it is shown.
+pub(super) fn in_section(config: &Config, batteries: Vec<crate::hub::Battery>) -> Vec<crate::hub::Battery> {
+    if config.batteries.enabled && config.batteries.flyout {
+        batteries
+    } else {
+        Vec::new()
+    }
+}
+
+/// Bring the open panel's levels in line with the hub's: the section and the device rows.
+pub(super) fn follow_batteries(model: &mut Model, config: &Config, batteries: &[crate::hub::Battery]) {
+    model.batteries = in_section(config, batteries.to_vec());
+    for group in &mut model.groups {
+        for row in &mut group.devices {
+            if let Some(container) = &row.container {
+                row.battery = batteries.iter().find(|b| b.id.eq_ignore_ascii_case(container)).map(|b| b.level);
+            }
+        }
+    }
+}
+
 /// Read the current output + input state into display groups. Groups with no devices are
-/// omitted (e.g. a machine with no microphone shows no Input section).
-pub(super) fn build_groups(backend: &WasapiBackend, config: &Config) -> Vec<Group> {
-    // Bluetooth battery levels keyed by ContainerId — enumerated once for all devices.
-    let batteries = crate::audio::battery::levels();
+/// omitted (e.g. a machine with no microphone shows no Input section). A device row carries its
+/// battery from `batteries`, matched by container.
+pub(super) fn build_groups(backend: &WasapiBackend, config: &Config, batteries: &[crate::hub::Battery]) -> Vec<Group> {
     let battery_of = |container: &Option<String>| -> Option<u8> {
         let c = container.as_ref()?;
-        batteries
-            .iter()
-            .find(|(id, _)| id.eq_ignore_ascii_case(c))
-            .map(|(_, pct)| *pct)
+        batteries.iter().find(|b| b.id.eq_ignore_ascii_case(c)).map(|b| b.level)
     };
 
     let mut groups = Vec::new();
@@ -271,7 +305,7 @@ pub(super) fn build_groups(backend: &WasapiBackend, config: &Config) -> Vec<Grou
                 let icon = config.icon_of(&d);
                 let selected = default_id.as_ref() == Some(&d.id);
                 let battery = battery_of(&d.container_id);
-                DeviceRow { id: d.id, label: d.friendly_name, icon, selected, battery }
+                DeviceRow { id: d.id, label: d.friendly_name, icon, selected, battery, container: d.container_id }
             })
             .collect();
         // Only the input side can be "recording"; an output group's dot would be nonsense.

@@ -65,19 +65,21 @@ pub(super) enum Page {
     Taskbar,
     Pill,
     Devices,
+    Batteries,
     Keyboards,
     Connectors,
     About,
 }
 
 impl Page {
-    pub(super) const ALL: [Page; 6] = [Page::Taskbar, Page::Pill, Page::Devices, Page::Keyboards, Page::Connectors, Page::About];
+    pub(super) const ALL: [Page; 7] = [Page::Taskbar, Page::Pill, Page::Devices, Page::Batteries, Page::Keyboards, Page::Connectors, Page::About];
 
     pub(super) fn title(self) -> &'static str {
         match self {
             Page::Taskbar => "Taskbar",
             Page::Pill => "Edge pill",
             Page::Devices => "Devices",
+            Page::Batteries => "Batteries",
             Page::Keyboards => "Keyboards",
             Page::Connectors => "Connectors",
             Page::About => "About",
@@ -89,6 +91,7 @@ impl Page {
             Page::Taskbar => '\u{E75B}',
             Page::Pill => '\u{E7F4}',
             Page::Devices => '\u{E767}',
+            Page::Batteries => '\u{E83F}',
             Page::Keyboards => '\u{E765}',
             Page::Connectors => '\u{E71B}',
             Page::About => '\u{E946}',
@@ -117,6 +120,13 @@ pub(super) enum Toggle {
     PillDevices,
     AnnounceTracks,
     ListeningAlerts,
+    /// Follow battery levels.
+    Batteries,
+    BatteryFlyout,
+    BatteryTooltip,
+    BatteryPillCard,
+    BatteryPill,
+    BatteryToast,
     Browser,
     /// Follow site `i` of [`crate::integrations::browser::SITES`] when not every site is.
     Site(usize),
@@ -137,6 +147,8 @@ pub(super) enum Choice {
     BrowserTabs,
     /// Automatic, then each display in [`crate::win::monitors`]' order.
     Display,
+    /// The low-battery level: [`crate::config::Batteries::LOW_LEVELS`].
+    LowBattery,
     /// The layout of assigned keyboard `i`: the index is into [`super::model::Model::layouts`].
     KeyboardLayout(usize),
 }
@@ -491,6 +503,7 @@ pub(super) fn page(model: &Model, width: f32, measure: &dyn Fn(&str) -> f32) -> 
         Page::Taskbar => taskbar(&mut col, model),
         Page::Pill => pill(&mut col, model),
         Page::Devices => devices(&mut col, model),
+        Page::Batteries => batteries(&mut col, model),
         Page::Keyboards => keyboards(&mut col, model),
         Page::Connectors => connectors(&mut col, model),
         Page::About => about(&mut col, model),
@@ -795,6 +808,43 @@ fn devices(col: &mut Column, model: &Model) {
     }
     col.section("Windows");
     col.link(Some('\u{E713}'), "Windows sound settings", plain("Volume levels, device properties, spatial sound"), '\u{E8A7}', Button::SoundSettings);
+}
+
+fn batteries(col: &mut Column, model: &Model) {
+    let b = &model.config.batteries;
+    col.toggle(
+        Some('\u{E83F}'),
+        "Battery levels",
+        plain("Keyboards, mice, headsets and other wireless devices that report one"),
+        b.enabled,
+        false,
+        Toggle::Batteries,
+    );
+    let off = !b.enabled;
+    col.section("Where they show");
+    col.toggle(None, "In the panel", plain("A Batteries section under the audio devices"), b.flyout, off, Toggle::BatteryFlyout);
+    col.toggle(None, "In the tray icon's tooltip", plain("Lowest first"), b.tooltip, off, Toggle::BatteryTooltip);
+    let pill_off = !model.config.pill.enabled;
+    let card_note = if pill_off { "Needs the edge pill" } else { "Under the devices, when you hover it" };
+    col.toggle(None, "On the edge pill's card", plain(card_note), b.pill_card, off || pill_off, Toggle::BatteryPillCard);
+    col.section("When one runs low");
+    let labels: Vec<String> = crate::config::Batteries::LOW_LEVELS.iter().map(|level| format!("{level}%")).collect();
+    let at = crate::config::Batteries::LOW_LEVELS.iter().position(|level| *level == b.low_at).unwrap_or(2);
+    col.segments("Low at", plain("At or under this level"), &labels, at, off, Choice::LowBattery);
+    let pill_note = if pill_off { "Needs the edge pill" } else { "Amber, for a few seconds" };
+    col.toggle(None, "Warn on the edge pill", plain(pill_note), b.pill_alert, off || pill_off, Toggle::BatteryPill);
+    col.toggle(None, "Windows notification", plain("Once, until it is charged again"), b.toast, off, Toggle::BatteryToast);
+    col.section("Connected now");
+    let batteries = &model.status.batteries;
+    if batteries.is_empty() {
+        let why = if off { "Turned off" } else { "Bluetooth keyboards, mice and headsets report one once connected" };
+        col.card(None, "No device reports a battery", plain(why), true, None);
+    }
+    for battery in batteries {
+        let card = col.card(Some(battery.kind.glyph()), battery.name.clone(), None, off, None);
+        let r = R::new(card.right() - CARD_PAD - 140.0, card.y, 140.0, CARD_H);
+        col.laid.push(r, Kind::Value(format!("{}%", battery.level)));
+    }
 }
 
 /// The icons for device `device`, wrapping, in a card under its own.

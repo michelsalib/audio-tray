@@ -5,7 +5,7 @@
 use anyhow::Result;
 
 use super::gfx::{Font, Gfx, Painter, Rgba};
-use super::view::{CallPill, Device, Devices, Fan, Level, SongNote, View};
+use super::view::{BatteryChip, CallPill, Device, Devices, Fan, Level, SongNote, View};
 use crate::audio::Flow;
 use crate::config::PillEdge;
 use crate::hub::Member;
@@ -279,8 +279,8 @@ pub fn scene(gfx: &Gfx, view: &View, small: bool, place: Place) -> Result<Option
             Scene { w, h, lead: 0.0, content, rings: Vec::new(), bars: Vec::new(), pulses: Vec::new(), hits: Vec::new(), spots: Vec::new() }
         }
         View::Idle { call, devices } => stack(gfx, m, &[], call.as_ref(), devices.as_ref(), None, place)?,
-        View::Music { media, card: false, call, devices, song } => stack(gfx, m, media, call.as_ref(), devices.as_ref(), song.as_ref(), place)?,
-        View::Music { media, card: true, call, devices, .. } => {
+        View::Music { media, card: false, call, devices, song, .. } => stack(gfx, m, media, call.as_ref(), devices.as_ref(), song.as_ref(), place)?,
+        View::Music { media, card: true, call, devices, batteries, .. } => {
             // The call's row, one row per session with its own controls, a row of devices.
             const CALL_ROW: f32 = 60.0;
             /// A session's cover, and its margin all round: the row is the cover and its margins,
@@ -298,12 +298,15 @@ pub fn scene(gfx: &Gfx, view: &View, small: bool, place: Place) -> Result<Option
             let row_end = |i: usize| tops.get(i + 1).copied().unwrap_or(call_top);
             // After a call, its own bottom padding; right after a session, the devices' separator
             // where the sessions' are (on the row's last line), or nothing, the card's end.
-            let rows_h = match (call.is_some(), devices.is_some()) {
+            // The devices and the levels below follow the rows alike.
+            let follows = devices.is_some() || !batteries.is_empty();
+            let rows_h = match (call.is_some(), follows) {
                 (true, _) => call_top + call_h + 4.0,
                 (false, true) => call_top + 2.0,
                 (false, false) => call_top,
             };
-            let h = rows_h + devices.as_ref().map_or(0.0, |_| DEVICES_ROW);
+            let batteries_top = rows_h + devices.as_ref().map_or(0.0, |_| DEVICES_ROW);
+            let h = batteries_top + if batteries.is_empty() { 0.0 } else { batteries.len().div_ceil(2) as f32 * BATTERY_LINE + 10.0 };
             let text_x = ART_MARGIN + ART + 12.0;
             let text_w = w - text_x - 16.0;
             // The three transport buttons always, in their places; previous/next greyed out where they
@@ -360,7 +363,7 @@ pub fn scene(gfx: &Gfx, view: &View, small: bool, place: Place) -> Result<Option
                 // Each section ends on the separator line below it, wherever that is drawn.
                 for (i, m) in media.iter().enumerate() {
                     let top = if i == 0 { 0.0 } else { tops[i] - 1.0 };
-                    let bottom = match (i + 1 == media.len(), call.is_some(), devices.is_some()) {
+                    let bottom = match (i + 1 == media.len(), call.is_some(), follows) {
                         (false, ..) | (true, true, _) => row_end(i) - 1.0,
                         (true, false, true) => rows_h - 3.0,
                         (true, false, false) => h,
@@ -401,6 +404,15 @@ pub fn scene(gfx: &Gfx, view: &View, small: bool, place: Place) -> Result<Option
                 if let Some(devices) = devices {
                     p.round_rect(0.0, rows_h - 3.0, w, 1.0, 0.0, Rgba::hex(0xFFFFFF, 0.10))?;
                     device_row(p, devices, rows_h, w, &mut hits)?;
+                }
+                if !batteries.is_empty() {
+                    // Under the devices, a separator; right after the rows, theirs.
+                    if devices.is_some() {
+                        p.round_rect(0.0, batteries_top - 1.0, w, 1.0, 0.0, Rgba::hex(0xFFFFFF, 0.10))?;
+                    } else {
+                        p.round_rect(0.0, rows_h - 3.0, w, 1.0, 0.0, Rgba::hex(0xFFFFFF, 0.10))?;
+                    }
+                    battery_lines(gfx, p, batteries, batteries_top + 4.0, w)?;
                 }
                 Ok(())
             })?;
@@ -505,6 +517,26 @@ fn device_row(p: &mut Painter, devices: &Devices, top: f32, w: f32, hits: &mut V
         device_button(p, flow, device, x + 20.0, top + 22.0, BIG)?;
         p.text(&device.name, Font::Small, (x + 42.0, top + 8.0, half - 48.0, 28.0), DIM_WHITE)?;
         hits.push(([x, top, half, 44.0], Hit::Device(flow)));
+    }
+    Ok(())
+}
+
+/// A line of battery levels on the card: two to a line.
+const BATTERY_LINE: f32 = 30.0;
+
+/// The battery levels, two to a line: the kind's glyph, the name, the level (amber when low).
+fn battery_lines(gfx: &Gfx, p: &mut Painter, batteries: &[BatteryChip], top: f32, w: f32) -> Result<()> {
+    let half = (w - 16.0) / 2.0;
+    for (i, battery) in batteries.iter().enumerate() {
+        let x = 8.0 + (i % 2) as f32 * half;
+        let y = top + (i / 2) as f32 * BATTERY_LINE;
+        let color = if battery.low { WARN_BG } else { DIM_WHITE };
+        p.text(&battery.glyph.to_string(), Font::IconsSmall, (x + 8.0, y, 20.0, BATTERY_LINE), color)?;
+        let level = format!("{}%", battery.level);
+        let level_w = gfx.measure(Font::Small, &level) + 2.0;
+        let level_x = x + half - 10.0 - level_w;
+        p.text(&battery.name, Font::Small, (x + 32.0, y, level_x - x - 38.0, BATTERY_LINE), DIM_WHITE)?;
+        p.text(&level, Font::Small, (level_x, y, level_w, BATTERY_LINE), if battery.low { WARN_BG } else { WHITE })?;
     }
     Ok(())
 }

@@ -58,6 +58,9 @@ sha2 = "0.11"
 toml = "1.2.1"
 tray-icon = "0.26.1"
 windows-core = "0.61"
+# IIterable, the form the battery watcher's property list takes (src/batteries.rs); the version
+# `windows` 0.61 uses, already built as its dependency.
+windows-collections = "0.2"
 # Matrix3x2 and Vector2, which Direct2D takes (the pill); the version `windows` 0.61 uses.
 windows-numerics = "0.2"
 # The Discord pipe and the Teams socket speak JSON.
@@ -79,6 +82,12 @@ features = [
     # IAsyncOperation::get, and the collection the session manager hands back.
     "Foundation",
     "Foundation_Collections",
+    # The battery watch (src/batteries.rs): a DeviceWatcher wakes it when a level or a connection
+    # changes, so nothing polls.
+    "Devices_Enumeration",
+    # The low-battery Windows notification (src/toast.rs).
+    "UI_Notifications",
+    "Data_Xml_Dom",
     "Win32_System_Com",
     "Win32_System_Com_StructuredStorage",
     "Win32_System_Variant",

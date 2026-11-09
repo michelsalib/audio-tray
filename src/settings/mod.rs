@@ -511,9 +511,13 @@ impl Window {
             Button::Releases => return Some(Box::new(|| {
                 crate::win::shell_open("https://github.com/michelsalib/audio-tray/releases", None);
             })),
-            Button::AddKeyboard => {
+            Button::AddKeyboard | Button::AddConnection(_) => {
                 crate::keyboards::capture(self.hwnd, WM_KEYBOARD_CAPTURED);
                 self.model.capture = Some(None);
+                self.model.capture_into = match button {
+                    Button::AddConnection(i) => Some(i),
+                    _ => None,
+                };
                 self.model.read_keyboards();
                 self.relayout();
                 self.invalidate();
@@ -536,9 +540,17 @@ impl Window {
                 self.relayout();
                 self.invalidate();
             }
-            Button::RemoveKeyboard(i) => self.change(|c| {
-                if i < c.keyboards.assigned.len() {
-                    c.keyboards.assigned.remove(i);
+            Button::RemoveKeyboard(i) => {
+                self.stop_capture();
+                self.change(|c| {
+                    if i < c.keyboards.assigned.len() {
+                        c.keyboards.assigned.remove(i);
+                    }
+                })
+            }
+            Button::RemoveConnection(i, j) => self.change(|c| {
+                if let Some(keyboard) = c.keyboards.assigned.get_mut(i) {
+                    keyboard.remove_path(j);
                 }
             }),
             Button::NextLayout(k) => {
@@ -591,6 +603,7 @@ impl Window {
         if self.model.capture.take().is_some() {
             crate::keyboards::cancel_capture();
         }
+        self.model.capture_into = None;
     }
 
     /// A character typed into the window: the name being typed takes it.
@@ -630,18 +643,34 @@ impl Window {
         if self.model.capture.is_none() {
             return;
         }
+        let into = self.model.capture_into;
         if let Some(name) = captured.assigned {
-            self.model.capture = Some(Some(format!("That one is already here, as \"{name}\": press a key on another keyboard")));
+            let mine = into.and_then(|i| self.model.config.keyboards.assigned.get(i)).is_some_and(|k| k.has(&captured.path));
+            let hint = if mine {
+                format!("That connection is already part of \"{name}\": connect it another way, then press a key")
+            } else {
+                format!("That one is already here, as \"{name}\": press a key on another keyboard")
+            };
+            self.model.capture = Some(Some(hint));
             self.relayout();
             self.invalidate();
             return;
         }
         self.model.capture = None;
+        self.model.capture_into = None;
         self.model.read_keyboards();
+        if let Some(i) = into {
+            self.change(|c| {
+                if let Some(keyboard) = c.keyboards.assigned.get_mut(i) {
+                    keyboard.more_paths.push(captured.path);
+                }
+            });
+            return;
+        }
         let taken: Vec<String> = self.model.config.keyboards.assigned.iter().map(|k| k.name.clone()).collect();
         let name = crate::keyboards::default_name(&captured.path, &captured.names, &taken);
         let hkl = self.model.unused_layout().map(|hkl| format!("{hkl:08X}")).unwrap_or_default();
-        self.change(|c| c.keyboards.assigned.push(crate::config::AssignedKeyboard { device_path: captured.path, name, hkl }));
+        self.change(|c| c.keyboards.assigned.push(crate::config::AssignedKeyboard { device_path: captured.path, name, hkl, ..Default::default() }));
     }
 
     /// Read what the tray handed over.

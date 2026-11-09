@@ -73,6 +73,8 @@ pub(super) struct Model {
     pub renaming: Option<(usize, String)>,
     /// Waiting for a key on the keyboard to add, with what to say about the last one pressed.
     pub capture: Option<Option<String>>,
+    /// The keyboard a capture adds a connection to; `None` adds a new keyboard.
+    pub capture_into: Option<usize>,
 }
 
 impl Model {
@@ -93,6 +95,7 @@ impl Model {
             connected: Vec::new(),
             renaming: None,
             capture: None,
+            capture_into: None,
         }
     }
 

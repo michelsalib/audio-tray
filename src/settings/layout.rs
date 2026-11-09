@@ -166,6 +166,10 @@ pub(super) enum Button {
     SaveName,
     CancelRename,
     RemoveKeyboard(usize),
+    /// Take the next keyboard typed on as another connection of this one.
+    AddConnection(usize),
+    /// Forget a keyboard's connection: `(keyboard, connection)`.
+    RemoveConnection(usize, usize),
     /// The next installed layout, when they are too many for a segmented choice.
     NextLayout(usize),
 }
@@ -583,9 +587,16 @@ fn keyboards(col: &mut Column, model: &Model) {
     let labels: Vec<String> = model.layouts.iter().map(|(_, label)| label.clone()).collect();
     for (i, keyboard) in k.assigned.iter().enumerate() {
         let mut group = col.group();
-        let connected = model.connected.iter().any(|path| path.eq_ignore_ascii_case(&keyboard.device_path));
-        let kind = crate::keyboards::connection(&keyboard.device_path).label();
-        let state = if connected { format!("{kind} · connected") } else { format!("{kind} · not connected") };
+        let is_connected = |path: &str| model.connected.iter().any(|known| known.eq_ignore_ascii_case(path));
+        let paths: Vec<&str> = keyboard.paths().collect();
+        let now = paths.iter().copied().find(|path| is_connected(path));
+        let connected = now.is_some();
+        let kind = |path: &str| crate::keyboards::connection(path).label();
+        let state = match now {
+            Some(path) => format!("{} · connected", kind(path)),
+            None if paths.len() == 1 => format!("{} · not connected", kind(paths[0])),
+            None => "Not connected".to_string(),
+        };
         match &model.renaming {
             Some((at, text)) if *at == i => col.field_row(
                 &mut group,
@@ -617,6 +628,21 @@ fn keyboards(col: &mut Column, model: &Model) {
             Control::Buttons(vec![(current, false, Some('\u{E8AB}'), Button::NextLayout(i))])
         };
         col.row(&mut group, None, "Layout", desc, off, control);
+        // Its connections, once it has more than one: each can go on its own.
+        if paths.len() > 1 {
+            for (j, path) in paths.iter().enumerate() {
+                let title = match crate::keyboards::vid_pid(path) {
+                    Some(id) => format!("{} · {id}", kind(path)),
+                    None => kind(path).to_string(),
+                };
+                let state = if is_connected(path) { ("Connected".to_string(), Tone::Good) } else { ("Not connected".to_string(), Tone::Plain) };
+                col.row(&mut group, None, &title, Some(state), off, Control::Buttons(vec![("Remove".into(), false, Some('\u{E74D}'), Button::RemoveConnection(i, j))]));
+            }
+        }
+        let capturing_here = model.capture.is_some() && model.capture_into == Some(i);
+        let control = if off || model.capture.is_some() { Control::None } else { Control::Button("Add", false, Some('\u{E710}'), Button::AddConnection(i)) };
+        let desc = if capturing_here { "Press a key on it, connected the new way…" } else { "Its cable, receiver or Bluetooth: each is told apart" };
+        col.row(&mut group, None, "Another connection", Some((desc.to_string(), if capturing_here { Tone::Warn } else { Tone::Plain })), off, control);
         col.end_group(group);
     }
     if off {
@@ -626,7 +652,11 @@ fn keyboards(col: &mut Column, model: &Model) {
             Some(hint) => (hint.clone(), Tone::Warn),
             None => ("Only which keyboard it comes from is read, never the key".to_string(), Tone::Plain),
         };
-        let card = col.card(Some('\u{E765}'), "Press a key on the keyboard to add…", Some(desc), false, None);
+        let title = match model.capture_into.and_then(|i| k.assigned.get(i)) {
+            Some(keyboard) => format!("Press a key on \u{201C}{}\u{201D}, connected the new way…", keyboard.name),
+            None => "Press a key on the keyboard to add…".to_string(),
+        };
+        let card = col.card(Some('\u{E765}'), title, Some(desc), false, None);
         col.button_in(card, "Cancel", false, None, Button::CancelCapture);
     } else {
         let desc = if k.assigned.is_empty() { "Then press a key on it. Keyboards not added switch nothing" } else { "Then press a key on it" };
@@ -1077,7 +1107,7 @@ mod tests {
     fn keyboards_model() -> Model {
         let mut m = model(Page::Keyboards);
         m.config.keyboards.enabled = true;
-        let keyboard = |path: &str, name: &str, hkl: &str| crate::config::AssignedKeyboard { device_path: path.into(), name: name.into(), hkl: hkl.into() };
+        let keyboard = |path: &str, name: &str, hkl: &str| crate::config::AssignedKeyboard { device_path: path.into(), name: name.into(), hkl: hkl.into(), ..Default::default() };
         m.config.keyboards.assigned = vec![keyboard(r"\\?\ACPI#HPQ8002#x#{guid}", "Laptop", "040C040C"), keyboard(r"\\?\HID#VID_19F5&PID_2620#x#{guid}", "External", "0409040C")];
         m.layouts = vec![(0x040C_040C, "AZERTY".into()), (0x0409_040C, "US".into())];
         m.connected = vec![r"\\?\ACPI#HPQ8002#x#{guid}".into()];
@@ -1104,6 +1134,50 @@ mod tests {
         }).collect();
         assert_eq!(states, ["Built-in · connected", "USB · not connected"]);
         assert!(laid.hits.iter().any(|(_, t)| *t == Target::Button(Button::AddKeyboard)));
+    }
+
+    #[test]
+    fn a_keyboard_with_several_connections_lists_each_and_is_connected_by_any() {
+        let mut m = keyboards_model();
+        let cable = r"\\?\HID#VID_3151&PID_4015&MI_00#x#{guid}";
+        let ble = r"\\?\HID#{00001812-0000-1000-8000-00805f9b34fb}_Dev_VID&023151_PID&4013#x#{guid}";
+        m.config.keyboards.assigned[1].more_paths = vec![cable.into(), ble.into()];
+        m.connected.push(cable.into());
+        let laid = page(&m, 900.0, &measure);
+        let titles: Vec<&str> = laid.items.iter().filter_map(|i| match &i.kind {
+            Kind::Label { title, .. } => Some(title.as_str()),
+            _ => None,
+        }).collect();
+        for title in ["USB · 19F5:2620", "USB · 3151:4015", "Bluetooth · 3151:4013"] {
+            assert!(titles.contains(&title), "{title} in {titles:?}");
+        }
+        // The laptop has one connection: no list for it.
+        assert!(!laid.hits.iter().any(|(_, t)| matches!(t, Target::Button(Button::RemoveConnection(0, _)))));
+        assert!(laid.hits.iter().any(|(_, t)| *t == Target::Button(Button::RemoveConnection(1, 2))));
+        assert!(laid.hits.iter().any(|(_, t)| *t == Target::Button(Button::AddConnection(0))));
+        assert!(laid.items.iter().any(|i| matches!(&i.kind, Kind::Label { desc: Some((d, Tone::Good)), .. } if d == "USB · connected")));
+        for width in [500.0, 2000.0] {
+            for item in &page(&m, width, &measure).items {
+                assert!(item.r.x >= 0.0 && item.r.right() <= width.max(200.0 + 2.0 * PAGE_PAD) + 0.5, "{item:?} overflows {width}");
+            }
+        }
+        // While a key is awaited, no other capture can start.
+        m.capture = Some(None);
+        m.capture_into = Some(1);
+        let laid = page(&m, 900.0, &measure);
+        assert!(!laid.hits.iter().any(|(_, t)| matches!(t, Target::Button(Button::AddConnection(_)))));
+    }
+
+    #[test]
+    fn a_keyboard_forgets_one_connection_but_keeps_its_last() {
+        let mut k = crate::config::AssignedKeyboard { device_path: "a".into(), more_paths: vec!["b".into(), "c".into()], ..Default::default() };
+        k.remove_path(0);
+        assert_eq!(k.paths().collect::<Vec<_>>(), ["b", "c"]);
+        k.remove_path(1);
+        assert_eq!(k.paths().collect::<Vec<_>>(), ["b"]);
+        k.remove_path(0);
+        assert_eq!(k.paths().collect::<Vec<_>>(), ["b"]);
+        assert!(k.has("B"));
     }
 
     #[test]

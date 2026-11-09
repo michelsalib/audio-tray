@@ -278,7 +278,9 @@ public static class HidProbe {
             c.Short = new Reader(hs, sf.InLen); c.Long = hl != null ? new Reader(hl, lf.InLen) : null;
             c.W = new FileStream(c.WH, FileAccess.Write, 1, false);
             try {
-                for (byte dev = 1; dev <= 6; dev++) {
+                // FF: a device on its USB cable (a receiver answers it with an error); 1-6: a receiver's.
+                byte[] devs = { 0xFF, 1, 2, 3, 4, 5, 6 };
+                foreach (byte dev in devs) {
                     byte[] ping = Req(c, dev, 0, 1, 0, 0, 0x5A);
                     if (ping == null) { L(string.Format("  dev {0}: no answer", dev)); continue; }
                     if (IsErr(ping)) { L(string.Format("  dev {0}: error {1}", dev, Hex(ping, 7))); continue; }
@@ -297,6 +299,11 @@ public static class HidProbe {
                         }
                         byte[] ty = Req(c, dev, nameIdx, 2);
                         L(string.Format("    name: \"{0}\"  type: {1}", name.ToString().TrimEnd('\0'), ty != null && !IsErr(ty) ? ty[4].ToString() + " (0 kb, 3 mouse, 8 headset)" : "?"));
+                    }
+                    byte infoIdx = Feature(c, dev, 0x0003);
+                    if (infoIdx != 0) {
+                        byte[] info = Req(c, dev, infoIdx, 0);
+                        L(string.Format("    0x0003 DEVICE_INFO idx {0}: {1}  (unit id = bytes 5-8)", infoIdx, Hex(info, 20)));
                     }
                     ushort[] ids = { 0x1000, 0x1001, 0x1004, 0x1F20 };
                     foreach (ushort id in ids) {

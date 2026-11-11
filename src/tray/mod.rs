@@ -242,7 +242,19 @@ fn with_tray<R>(f: impl FnOnce(&mut Tray) -> R) -> Option<R> {
 /// Build the tray icon and run the message loop until the user quits; `settings` opens the settings
 /// window once it is up.
 pub fn run(backend: WasapiBackend, settings: bool) -> Result<()> {
-    let config = Config::load();
+    let mut config = Config::load();
+    // The pill where it was put on the screens plugged in now; a config from before places were
+    // remembered keeps its place for them.
+    let displays = crate::win::displays();
+    let first = config.pill.places.is_empty();
+    if first {
+        config.pill.remember(&displays);
+    }
+    if config.pill.recall(&displays) || first {
+        if let Err(e) = config.save() {
+            eprintln!("pill: could not save its place ({e:#})");
+        }
+    }
 
     // First: everything below posts here, and the TAP needs a receiver before the strip exists.
     let window = taskbar::create_receiver(Some(wndproc))?;
@@ -651,6 +663,12 @@ impl Tray {
         };
         // Teams hands its token to the tray, never to the window.
         config.teams.token = self.config.teams.token.clone();
+        // The tray keeps the pill's places; the window's copy may be older.
+        config.pill.places = self.config.pill.places.clone();
+        let place = |c: &Config| (c.pill.edge, c.pill.align, c.pill.monitor.clone());
+        if place(&config) != place(&self.config) {
+            config.pill.remember(&crate::win::displays());
+        }
         let before = std::mem::replace(&mut self.config, config);
         if let Err(e) = self.config.save() {
             eprintln!("save config failed: {e:#}");
@@ -914,6 +932,16 @@ impl Tray {
             Action::Acknowledge(notice) => {
                 self.hub.acknowledge(&notice);
                 self.hub_changed();
+            }
+            Action::DisplaysChanged => {
+                if self.config.pill.recall(&crate::win::displays()) {
+                    println!("pill: back where it was on these displays");
+                    if let Err(e) = self.config.save() {
+                        eprintln!("pill: could not save its place ({e:#})");
+                    }
+                    crate::pill::configure(&self.config.pill);
+                    crate::settings::sync(&self.config);
+                }
             }
         }
     }

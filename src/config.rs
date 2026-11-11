@@ -161,6 +161,64 @@ pub struct Pill {
     pub size: PillSize,
     /// A new song shows its title for a moment, as a device change does.
     pub announce_tracks: bool,
+    /// Where the pill was placed on each set of displays, so plugging a desk's screens back puts
+    /// it back; the fields above are the place in use. See [`Pill::remember`].
+    pub places: Vec<PillPlace>,
+}
+
+/// A place chosen for the pill while one set of displays was connected.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PillPlace {
+    /// The displays connected, by their stable ids ([`crate::win::Monitor::id`]), sorted.
+    pub displays: Vec<String>,
+    pub edge: PillEdge,
+    pub align: PillAlign,
+    /// The display it was on, by its stable id; `None` for automatic.
+    pub monitor: Option<String>,
+}
+
+/// Sets of displays remembered: more than anyone's desks; the oldest goes first.
+const MAX_PLACES: usize = 12;
+
+impl Pill {
+    /// Keep the place in use for the displays connected now: `monitors` as [`crate::win::monitors`]
+    /// lists them, `(stable id, device name)`.
+    pub fn remember(&mut self, monitors: &[(String, String)]) {
+        let displays = setup(monitors);
+        if displays.is_empty() {
+            return;
+        }
+        let monitor = self.monitor.as_ref().and_then(|name| monitors.iter().find(|(_, n)| n == name)).map(|(id, _)| id.clone());
+        self.places.retain(|p| p.displays != displays);
+        self.places.push(PillPlace { displays, edge: self.edge, align: self.align, monitor });
+        let extra = self.places.len().saturating_sub(MAX_PLACES);
+        self.places.drain(..extra);
+    }
+
+    /// Put the pill where it was last placed on the displays connected now; on displays never
+    /// placed on, where it was last placed anywhere, on the same screen if it is still here.
+    /// `false` when that is where it is already, or nothing was ever placed.
+    pub fn recall(&mut self, monitors: &[(String, String)]) -> bool {
+        let displays = setup(monitors);
+        let Some(place) = self.places.iter().find(|p| p.displays == displays).or(self.places.last()) else {
+            return false;
+        };
+        // Its display by today's device name, which Windows hands out afresh as screens come and go.
+        let monitor = place.monitor.as_ref().and_then(|id| monitors.iter().find(|(i, _)| i == id)).map(|(_, name)| name.clone());
+        let next = (place.edge, place.align, monitor);
+        if (self.edge, self.align, &self.monitor) == (next.0, next.1, &next.2) {
+            return false;
+        }
+        (self.edge, self.align, self.monitor) = next;
+        true
+    }
+}
+
+/// A set of displays' key: their stable ids, sorted.
+fn setup(monitors: &[(String, String)]) -> Vec<String> {
+    let mut ids: Vec<String> = monitors.iter().map(|(id, _)| id.clone()).collect();
+    ids.sort();
+    ids
 }
 
 /// How much the pill shows at rest.
@@ -214,6 +272,7 @@ impl Default for Pill {
             devices: true,
             size: PillSize::Big,
             announce_tracks: false,
+            places: Vec::new(),
         }
     }
 }
@@ -544,6 +603,39 @@ this is not toml").unwrap();
         let back: Config = toml::from_str(&toml::to_string_pretty(&placed).unwrap()).unwrap();
         assert_eq!((back.pill.edge, back.pill.align), (PillEdge::Top, PillAlign::End));
         assert_eq!(back.pill.monitor.as_deref(), Some(r"\\.\DISPLAY2"));
+    }
+
+    /// Each desk's displays get the pill back where it was put on them, whatever device names
+    /// Windows handed out this time.
+    #[test]
+    fn the_pill_goes_back_where_it_was_on_each_set_of_displays() {
+        let screens = |list: &[(&str, &str)]| -> Vec<(String, String)> { list.iter().map(|(id, name)| (id.to_string(), name.to_string())).collect() };
+        let laptop = screens(&[("LAP", r"\\.\DISPLAY1")]);
+        let desk = screens(&[("LAP", r"\\.\DISPLAY1"), ("DELL#UID1", r"\\.\DISPLAY2"), ("DELL#UID2", r"\\.\DISPLAY3")]);
+        let mut pill = Pill::default();
+
+        // Placed on the desk's second Dell, top right.
+        (pill.edge, pill.align, pill.monitor) = (PillEdge::Top, PillAlign::End, Some(r"\\.\DISPLAY3".into()));
+        pill.remember(&desk);
+        // The laptop alone, never placed on: the last place, its Dell gone, on the automatic display.
+        assert!(pill.recall(&laptop));
+        assert_eq!((pill.edge, pill.align, pill.monitor.as_deref()), (PillEdge::Top, PillAlign::End, None));
+        // Placed on the left there.
+        (pill.edge, pill.align, pill.monitor) = (PillEdge::Left, PillAlign::Start, None);
+        pill.remember(&laptop);
+
+        // The desk again, its Dells numbered the other way round this time.
+        let desk_again = screens(&[("DELL#UID2", r"\\.\DISPLAY5"), ("LAP", r"\\.\DISPLAY1"), ("DELL#UID1", r"\\.\DISPLAY4")]);
+        assert!(pill.recall(&desk_again));
+        assert_eq!((pill.edge, pill.align, pill.monitor.as_deref()), (PillEdge::Top, PillAlign::End, Some(r"\\.\DISPLAY5")));
+        assert!(!pill.recall(&desk_again), "already there");
+
+        assert!(pill.recall(&laptop));
+        assert_eq!((pill.edge, pill.align, pill.monitor.as_deref()), (PillEdge::Left, PillAlign::Start, None));
+
+        let config = Config { pill, ..Default::default() };
+        let back: Config = toml::from_str(&toml::to_string_pretty(&config).unwrap()).unwrap();
+        assert_eq!(back.pill.places, config.pill.places, "kept across runs");
     }
 
     /// Configs from when the strip was opt-in carry a `[taskbar]` section; it must be ignored.

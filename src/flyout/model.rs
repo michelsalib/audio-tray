@@ -160,24 +160,12 @@ impl Model {
 /// The Now Playing card's art size, in DIPs.
 pub(super) const ART_DIP: f32 = 52.0;
 
-/// The hub's media, sessions and call as the flyout shows them: a Now Playing card per playing
-/// session, else for the first paused one. A card already shown (`old`) stays while its session
-/// lives, paused or not: a card vanishing on pause would slide the next one under the pointer.
+/// The hub's media, sessions and call as the flyout shows them: a Now Playing card per session,
+/// paused ones too, the same ones the pill lists. A card already shown (`old`) keeps its place.
 /// `art_px` is the cover's size at the panel's scale; decoding is skipped when `old` already
 /// holds a track's sprite.
 pub(super) fn from_hub(state: &crate::hub::State, art_px: u32, icon_px: u32, old: &[NowPlaying]) -> (Vec<NowPlaying>, Vec<AppRow>, Option<Voice>) {
-    let all = state.all_media();
-    let continues = |m: &crate::hub::Media, o: &NowPlaying| o.app_id == m.app_id || crate::hub::names::same_title(&o.title, &m.title);
-    let mut shown: Vec<&crate::hub::Media> = all
-        .iter()
-        .copied()
-        .filter(|m| m.playing || old.iter().any(|o| continues(m, o)))
-        .take(crate::hub::MAX_SHOWN)
-        .collect();
-    if shown.is_empty() {
-        shown.extend(all.first().copied());
-    }
-    let now_playing = shown.into_iter().map(|m| {
+    let now_playing = state.all_media().into_iter().take(crate::hub::MAX_SHOWN).map(|m| {
         let same_track = old.iter().find(|o| o.title == m.title && o.artist == m.artist && o.app == m.app && o.art.is_some());
         let art = match same_track {
             Some(old) => old.art.clone(),

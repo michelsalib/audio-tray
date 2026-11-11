@@ -116,6 +116,16 @@ pub fn is_browser(name: &str) -> bool {
     BROWSERS.contains(&name)
 }
 
+/// Apps whose own media session is followed, by name ([`app_name`]); add a row to follow another.
+/// Others that register one (Teams' ringer, Riot Client's launcher) would sit paused in the pill.
+const PLAYERS: &[&str] = &["YouTube Music", "MPC-HC", "MPC-BE"];
+
+/// Whether the app named `name` is a player whose session is followed: one of [`PLAYERS`], or a
+/// browser, for the sites playing in it (the browser extension narrows those to the followed ones).
+pub fn is_player(name: &str) -> bool {
+    PLAYERS.contains(&name) || is_browser(name)
+}
+
 /// The site a browser session plays from, read from the title of the browser window showing it
 /// (`(3) Nynyhon - Twitch et 1 page supplémentaire - Personnel – Microsoft Edge`). `None` when
 /// no window mentions the session's title or artist (the tab is not the active one).
@@ -180,6 +190,18 @@ mod tests {
         assert_eq!(app_name("Contoso.Notes_abc123"), "Contoso.Notes");
         assert_eq!(app_name("MSEdge"), "Edge");
         assert_eq!(app_name("mpc-hc64.exe"), "MPC-HC");
+    }
+
+    #[test]
+    fn only_players_sessions_are_followed() {
+        let followed = |id: &str| is_player(&app_name(id));
+        assert!(followed("music.youtube.com-5929F88E_vezhnr0wkvrcy!App"));
+        assert!(followed("mpc-hc64.exe"));
+        assert!(followed("MSEdge"));
+        assert!(followed("Chrome"));
+        assert!(!followed("MSTeams_8wekyb3d8bbwe!MSTeams"));
+        assert!(!followed("Riot Client.exe"));
+        assert!(!followed("Spotify.exe"));
     }
 
     #[test]

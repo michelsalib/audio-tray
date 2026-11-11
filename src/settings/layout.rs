@@ -151,6 +151,12 @@ pub(super) enum Choice {
     LowBattery,
     /// The layout of assigned keyboard `i`: the index is into [`super::model::Model::layouts`].
     KeyboardLayout(usize),
+    /// A bar's motion: [`crate::config::MotionStyle::ALL`].
+    RingMotion,
+    BarMotion,
+    VolumeMotion,
+    /// Accent, or the cover's colour.
+    WaveColour,
 }
 
 /// A button (or a whole card that acts like one).
@@ -723,6 +729,15 @@ fn pill(col: &mut Column, model: &Model) {
     col.toggle(None, "Audio devices on the pill", plain("Click one to switch to the next device"), p.devices, off, Toggle::PillDevices);
     col.toggle(None, "Show each new song", plain("Its title, for a moment"), p.announce_tracks, off, Toggle::AnnounceTracks);
     col.toggle(None, "Alert when an app listens", plain("When an app records outside a call"), p.listening_alerts, off, Toggle::ListeningAlerts);
+    col.section("Motion");
+    let m = &model.config.motion;
+    let style = |s: crate::config::MotionStyle| crate::config::MotionStyle::ALL.iter().position(|x| *x == s).unwrap_or(1);
+    let styles = ["None", "Google", "Samsung"];
+    col.segments("Progress ring", plain("Around each cover on the pill"), &styles, style(m.ring), off, Choice::RingMotion);
+    col.segments("Track bar", plain("Under each song on the card"), &styles, style(m.bar), off, Choice::BarMotion);
+    col.segments("Volume sliders", plain("In the flyout and the scroll readout"), &styles, style(m.volume), false, Choice::VolumeMotion);
+    let colour = usize::from(m.colour == crate::config::WaveColour::Cover);
+    col.segments("Wave colour", plain("The Windows accent, or each cover's own colour"), &["Accent", "Cover"], colour, off, Choice::WaveColour);
 }
 
 /// The displays scaled into `area`, keeping their arrangement: one rectangle per display.
@@ -1094,7 +1109,10 @@ mod tests {
         }
         m.config.pill.enabled = false;
         let laid = page(&m, 900.0, &measure);
-        assert!(!laid.hits.iter().any(|(_, t)| matches!(t, Target::Choice(..) | Target::Slot(..) | Target::Monitor(_))));
+        // The volume sliders' style stays: they are the flyout's and the readout's, not the pill's.
+        let pill_only = |t: &Target| matches!(t, Target::Choice(..) | Target::Slot(..) | Target::Monitor(_)) && !matches!(t, Target::Choice(Choice::VolumeMotion, _));
+        assert!(!laid.hits.iter().any(|(_, t)| pill_only(t)));
+        assert!(laid.hits.iter().any(|(_, t)| matches!(t, Target::Choice(Choice::VolumeMotion, _))));
     }
 
     #[test]

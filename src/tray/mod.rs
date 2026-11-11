@@ -243,6 +243,7 @@ fn with_tray<R>(f: impl FnOnce(&mut Tray) -> R) -> Option<R> {
 /// window once it is up.
 pub fn run(backend: WasapiBackend, settings: bool) -> Result<()> {
     let mut config = Config::load();
+    crate::config::set_motion(config.motion);
     // The pill where it was put on the screens plugged in now; a config from before places were
     // remembered keeps its place for them.
     let displays = crate::win::displays();
@@ -679,6 +680,10 @@ impl Tray {
             crate::integrations::reconfigure(&before, c);
         }
         crate::pill::configure(&c.pill);
+        if before.motion != c.motion {
+            crate::config::set_motion(c.motion);
+            crate::pill::motion_changed();
+        }
         // The strip and the tile need a fresh injection.
         let drawn = |c: &Config| {
             let s = &c.strip;

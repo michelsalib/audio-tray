@@ -36,6 +36,67 @@ pub struct Config {
     pub keyboards: Keyboards,
     /// Battery levels of wireless devices — see [`crate::batteries`].
     pub batteries: Batteries,
+    /// How the progress and volume bars move — see [`Motion`].
+    pub motion: Motion,
+}
+
+/// How the bars move, each on its own: the pill's progress ring, the card's track bar, and the
+/// volume sliders (the flyout's and the scroll readout's).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Motion {
+    pub ring: MotionStyle,
+    pub bar: MotionStyle,
+    pub volume: MotionStyle,
+    /// The waves' colour (the Google and Samsung styles of the ring and the bar).
+    pub colour: WaveColour,
+}
+
+/// A bar's style.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MotionStyle {
+    /// Flat bars that jump to their value, as before.
+    None,
+    /// Android's media player: a progress line that ripples while playing and settles flat on
+    /// pause; thick volume tracks with a slim handle that spring to each level.
+    #[default]
+    Google,
+    /// Samsung's media player: translucent waves of several lengths and shades overlapping on the
+    /// played part, ending at a glowing knob; capsule volume sliders that stretch at their ends.
+    Samsung,
+}
+
+impl MotionStyle {
+    pub const ALL: [MotionStyle; 3] = [MotionStyle::None, MotionStyle::Google, MotionStyle::Samsung];
+}
+
+/// What colour the waves are.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WaveColour {
+    /// The Windows accent, as the rest of the app.
+    #[default]
+    Accent,
+    /// The cover's own colour, made vivid; the accent when there is no cover.
+    Cover,
+}
+
+static MOTION: std::sync::Mutex<Motion> = std::sync::Mutex::new(Motion {
+    ring: MotionStyle::Google,
+    bar: MotionStyle::Google,
+    volume: MotionStyle::Google,
+    colour: WaveColour::Accent,
+});
+
+/// The motion settings in use, for the surfaces that draw bars on their own threads.
+pub fn motion() -> Motion {
+    *MOTION.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Use `motion` from now on.
+pub fn set_motion(motion: Motion) {
+    *MOTION.lock().unwrap_or_else(|e| e.into_inner()) = motion;
 }
 
 /// The battery levels of keyboards, mice, headsets and the like, and where they show.

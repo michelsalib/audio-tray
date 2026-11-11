@@ -5,8 +5,10 @@
 //!   --list                         defaults by role, and every active device
 //!   --set <q> / --set-icon <q> <IconId>
 //!                                  switch the default output / store a device's icon
-//!   --flyout [update]              preview the panel (update = fake a staged update)
-//!   --pill-preview <left|right|top> <start|center|end> [secs] [small] [earbuds] [live] [shots] [call]
+//!   --flyout [update] [volume=…]    preview the panel (update = fake a staged update; volume = the
+//!                                  sliders' style: none, google or samsung)
+//!   --pill-preview <left|right|top> <start|center|end> [secs] [small] [earbuds] [live] [shots] [call] [toggle] [card]
+//!                                  [ring=<none|google|samsung>] [bar=…] [colour=cover]
 //!                                  the edge pill alone there, with a song and the devices
 //!   --settings-preview [page]      the settings window alone (taskbar, pill, devices, connectors,
 //!                                  about); changes are not applied, there is no tray to apply them
@@ -43,6 +45,16 @@ use crate::{flyout, music, osd, taskbar, tray, update};
 
 /// Run a dev mode. `Ok(false)`: `args` names none, so `main` carries on.
 pub fn run(args: &[String], backend: &WasapiBackend) -> Result<bool> {
+    // The saved motion; `volume=<none|google|samsung>` shows the flyout's and the readout's sliders
+    // in another style.
+    let mut motion = Config::load().motion;
+    for (key, value) in args.iter().filter_map(|a| a.split_once('=')) {
+        let style = crate::config::MotionStyle::ALL.into_iter().find(|s| format!("{s:?}").eq_ignore_ascii_case(value));
+        if let ("volume", Some(style)) = (key, style) {
+            motion.volume = style;
+        }
+    }
+    crate::config::set_motion(motion);
     match args.first().map(String::as_str) {
         Some("--flyout") => {
             // `update` fakes a staged update.
@@ -319,6 +331,18 @@ fn pill_preview(backend: &WasapiBackend, args: &[String]) -> Result<()> {
     config.size = if args.iter().any(|a| a == "small") { PillSize::Small } else { PillSize::Big };
     config.announce_tracks |= args.iter().any(|a| a == "note");
     let secs: u64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(20);
+    // `ring=<none|google|samsung>`, `bar=…`, `colour=cover`: the motion to show, over the saved one.
+    let mut motion = Config::load().motion;
+    for (key, value) in args.iter().filter_map(|a| a.split_once('=')) {
+        let style = crate::config::MotionStyle::ALL.into_iter().find(|s| format!("{s:?}").eq_ignore_ascii_case(value));
+        match (key, style) {
+            ("ring", Some(style)) => motion.ring = style,
+            ("bar", Some(style)) => motion.bar = style,
+            ("colour", _) if value == "cover" => motion.colour = crate::config::WaveColour::Cover,
+            _ => {}
+        }
+    }
+    crate::config::set_motion(motion);
     crate::pill::create(&config)?;
     let endpoint = |flow: Flow| -> Option<crate::hub::Endpoint> {
         let id = backend.default_of(flow).ok().flatten()?;
@@ -416,10 +440,27 @@ fn pill_preview(backend: &WasapiBackend, args: &[String]) -> Result<()> {
         });
     }
     crate::pill::update(&state);
+    // `card`: the card open, as when the pointer is on the pill.
+    if args.iter().any(|a| a == "card") {
+        crate::pill::preview_hover();
+    }
     println!("pill: {:?} {:?}, {}s", config.edge, config.align, secs);
     let until = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+    // `toggle`: pause and resume the first song every 3 s, to watch its ripple settle and rise.
+    let toggle = args.iter().any(|a| a == "toggle");
+    let mut flip_at = std::time::Instant::now() + std::time::Duration::from_secs(3);
     let mut msg = windows::Win32::UI::WindowsAndMessaging::MSG::default();
     while std::time::Instant::now() < until {
+        if toggle && std::time::Instant::now() >= flip_at {
+            if let Some(song) = state.media.first_mut() {
+                song.playing = !song.playing;
+                if let Some(timeline) = song.timeline.as_mut() {
+                    timeline.last_updated = music::smtc::now_ticks();
+                }
+            }
+            crate::pill::update(&state);
+            flip_at += std::time::Duration::from_secs(3);
+        }
         unsafe {
             while windows::Win32::UI::WindowsAndMessaging::PeekMessageW(&mut msg, None, 0, 0, windows::Win32::UI::WindowsAndMessaging::PM_REMOVE).as_bool() {
                 let _ = windows::Win32::UI::WindowsAndMessaging::TranslateMessage(&msg);

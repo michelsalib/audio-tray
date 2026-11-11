@@ -16,6 +16,7 @@
 pub mod draw;
 pub mod gfx;
 pub mod view;
+mod waves;
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -23,7 +24,10 @@ use std::collections::VecDeque;
 use anyhow::{Context, Result};
 use windows::core::w;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
-use windows::Win32::Graphics::DirectComposition::{IDCompositionAnimation, IDCompositionVisual2};
+use windows::Win32::Graphics::DirectComposition::{
+    IDCompositionAnimation, IDCompositionRectangleClip, IDCompositionVisual2,
+    DCOMPOSITION_BORDER_MODE_SOFT,
+};
 use windows::Win32::Graphics::Gdi::ScreenToClient;
 use windows::Win32::Media::Audio::Endpoints::IAudioMeterInformation;
 use windows::Win32::UI::Input::KeyboardAndMouse::{TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT};
@@ -44,6 +48,7 @@ use crate::hub::{State, VoiceApp};
 use crate::win::Monitor;
 use crate::music::smtc::Command;
 use draw::{Hit, Ring, Scene};
+use crate::config::MotionStyle;
 use gfx::Gfx;
 use view::{Inputs, View};
 
@@ -104,8 +109,26 @@ const COLLAPSE_TIMER: usize = 2;
 /// One-shot: look at the fullscreen state again after an appbar notification.
 const FULLSCREEN_TIMER: usize = 3;
 const FULLSCREEN_RECHECK_MS: u32 = 1000;
+/// Repeating while a Samsung-style ring or bar moves: each tick paints it again (see [`Live`]).
+const LIVE_TIMER: usize = 4;
+const LIVE_MS: u32 = 16;
 /// One beat of the speaking pulse.
 const PULSE_SECONDS: f64 = 1.1;
+/// A playing track's progress ripples, as Android's media player does: the wave travels one
+/// wavelength per this many seconds.
+const WAVE_SECONDS: f64 = 1.0;
+/// The ring's wavelength along its circle, and its amplitude per DIP of radius.
+const RING_WAVELENGTH: f32 = 12.0;
+const RING_AMP: f32 = 0.05;
+/// The card bar's wavelength and amplitude.
+const BAR_WAVELENGTH: f32 = 20.0;
+const BAR_AMP: f32 = 2.5;
+/// The card bar's playhead: a short upright bar, and the gap either side of it.
+const THUMB_W: f32 = 4.0;
+const THUMB_H: f32 = 14.0;
+const THUMB_GAP: f32 = 3.0;
+/// Pausing settles the ripple flat, and playing raises it again, over this long.
+const SETTLE_SECONDS: f64 = 0.4;
 
 /// The shape that lights a hovered target.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -171,6 +194,11 @@ struct Pill {
     spots: Vec<(usize, [f32; 4])>,
     /// Kept alive while shown: the visuals and their animations.
     _visuals: Vec<IDCompositionVisual2>,
+    /// Whether each shown ring and card bar was rippling (playing): a change settles the ripple
+    /// flat or raises it, where a repaint that did not change it shows it as it was.
+    waving: Waving,
+    /// The shown Samsung-style rings and bars, painted again on [`LIVE_TIMER`] while they move.
+    live: Vec<Live>,
     meter: Option<IAudioMeterInformation>,
     loud: u32,
     quiet: u32,
@@ -234,6 +262,8 @@ pub fn create(config: &crate::config::Pill) -> Result<()> {
         hits: Vec::new(),
         spots: Vec::new(),
         _visuals: Vec::new(),
+        waving: Waving::default(),
+        live: Vec::new(),
         meter: None,
         loud: 0,
         quiet: 0,
@@ -293,6 +323,20 @@ pub fn configure(config: &crate::config::Pill) {
             pill.redraw();
         }
         pill.refresh();
+    });
+}
+
+/// Dev preview: open the card as if the pointer were on the pill.
+#[cfg(feature = "dev")]
+pub fn preview_hover() {
+    with_pill(|pill| pill.set_hover(true));
+}
+
+/// The bars' motion settings changed (see [`crate::config::motion`]): draw them again.
+pub fn motion_changed() {
+    with_pill(|pill| {
+        pill.waving = Waving::default();
+        pill.redraw();
     });
 }
 
@@ -480,10 +524,14 @@ impl Pill {
             self.hits.clear();
             self.spots.clear();
             self._visuals.clear();
+            self.live.clear();
+            self.follow_live();
             self.edge_up = false;
             return Ok(());
         };
-        let visuals = self.compose(gfx, &scene, entrance)?;
+        let (visuals, live) = self.compose(gfx, &scene, entrance)?;
+        self.waving = Waving::of(&scene);
+        self.live = live;
         let px = |v: f32| (v * scale).round() as i32;
         let (w, h) = (px(scene.w), px(scene.h));
         let vertical = self.side.vertical();
@@ -532,6 +580,7 @@ impl Pill {
         self.hits = scene.hits;
         self.spots = scene.spots;
         self._visuals = visuals;
+        self.follow_live();
         self.scene_size = (scene.w, scene.h);
         if !matches!(view, View::Music { card: true, .. }) {
             self.quiet_size = (scene.w, scene.h);
@@ -708,24 +757,36 @@ impl Pill {
     /// Hang the scene under the root: its content, the ring's two rotating halves, the speaking
     /// pulses, and the entrance. Returns the visuals to keep alive. Every movement is a
     /// compositor animation set here once.
-    fn compose(&self, gfx: &Gfx, scene: &Scene, entrance: Entrance) -> Result<Vec<IDCompositionVisual2>> {
+    fn compose(&self, gfx: &Gfx, scene: &Scene, entrance: Entrance) -> Result<(Vec<IDCompositionVisual2>, Vec<Live>)> {
+        let motion = crate::config::motion();
         unsafe {
             gfx.root.RemoveAllVisuals()?;
             let holder = gfx.dcomp.CreateVisual()?;
             holder.AddVisual(&scene.content, false, None)?;
             let mut keep = vec![holder.clone(), scene.content.clone()];
-            for &ring in &scene.rings {
-                keep.extend(ring_visuals(gfx, &holder, ring)?);
+            let mut live = Vec::new();
+            for (i, &ring) in scene.rings.iter().enumerate() {
+                let was = self.waving.rings.get(i).copied();
+                match motion.ring {
+                    MotionStyle::None => keep.extend(ring_visuals(gfx, &holder, ring)?),
+                    style => live.push(Live::ring(gfx, &holder, ring, was, style)?),
+                }
             }
-            for &bar in &scene.bars {
-                keep.push(bar_visual(gfx, &holder, bar)?);
+            for (i, &bar) in scene.bars.iter().enumerate() {
+                let was = self.waving.bars.get(i).copied();
+                match motion.bar {
+                    MotionStyle::Samsung => live.push(Live::bar(gfx, &holder, bar, was)?),
+                    MotionStyle::Google => keep.extend(bar_visuals(gfx, &holder, bar, was)?),
+                    MotionStyle::None => keep.extend(plain_bar_visuals(gfx, &holder, bar)?),
+                }
             }
+            keep.extend(live.iter().map(|l| l.visual.clone()));
             for &pulse in &scene.pulses {
                 keep.push(pulse_visual(gfx, &holder, pulse)?);
             }
             gfx.root.AddVisual(&holder, false, None)?;
             let fade_from = match entrance {
-                Entrance::None => return Ok(keep),
+                Entrance::None => return Ok((keep, live)),
                 Entrance::Slide => {
                     // From just off the edge to its place, easing out.
                     let offset = gfx.dcomp.CreateAnimation()?;
@@ -781,8 +842,33 @@ impl Pill {
             let effect = gfx.dcomp.CreateEffectGroup()?;
             effect.SetOpacity(&fade)?;
             holder.SetEffect(&effect)?;
-            Ok(keep)
+            Ok((keep, live))
         }
+    }
+
+    /// Run [`LIVE_TIMER`] while a live ring or bar moves, and stop it once they are all still.
+    fn follow_live(&mut self) {
+        let moving = self.live.iter().any(Live::moving);
+        unsafe {
+            if moving {
+                SetTimer(Some(self.hwnd), LIVE_TIMER, LIVE_MS, None);
+            } else {
+                let _ = KillTimer(Some(self.hwnd), LIVE_TIMER);
+            }
+        }
+    }
+
+    /// Paint each live ring and bar again.
+    fn live_tick(&mut self) {
+        let Some(gfx) = self.gfx.as_ref() else { return };
+        let now = std::time::Instant::now();
+        for live in &mut self.live {
+            if let Err(e) = live.paint(gfx, now) {
+                eprintln!("pill: could not paint a live bar ({e:#})");
+            }
+        }
+        let _ = gfx.commit();
+        self.follow_live();
     }
 
     /// Whether the hover strip is up: on the music pill, on the sliver while some media is paused
@@ -931,76 +1017,332 @@ impl Pill {
     }
 }
 
-/// The ring's moving part: a right-half clip holding the left half-ring, which rotating reveals
-/// 0–180°, and a left-half clip holding the right half-ring for 180–360°. Each angle is a
-/// compositor animation from now to the end of the track.
+/// Whether each ring and card bar of a scene ripples (see [`Pill::waving`]).
+#[derive(Default)]
+struct Waving {
+    rings: Vec<bool>,
+    bars: Vec<bool>,
+}
+
+impl Waving {
+    fn of(scene: &Scene) -> Self {
+        Waving { rings: scene.rings.iter().map(|r| r.rate > 0.0).collect(), bars: scene.bars.iter().map(|b| b.rate > 0.0).collect() }
+    }
+}
+
+/// The None style's ring, in two halves: a right-half clip for 0–180° and a left-half one for
+/// 180–360°. In each, the filled arc is a whole ring behind a half-plane clip that turns with the
+/// progress, so it shows from the top to the playhead; the rest of the track is a whole ring
+/// behind the other half-plane, turned with it. Each angle is a compositor animation from now to
+/// the end of the track, so a playing ring costs nothing between changes.
 fn ring_visuals(gfx: &Gfx, holder: &IDCompositionVisual2, ring: Ring) -> Result<Vec<IDCompositionVisual2>> {
     let reach = ring.r + ring.stroke;
     let size = 2.0 * reach;
-    let (cx, cy) = (reach, reach);
     let scale = gfx.scale;
-    let mut keep = Vec::new();
+    let (_, flat) = gfx.painted(size, size, |p| p.ring(reach, reach, ring.r, ring.stroke, ring.color))?;
+    let (_, track) = gfx.painted(size, size, |p| p.ring(reach, reach, ring.r, ring.stroke, draw::TRACK))?;
     // Degrees now, and degrees per second.
     let now = ring.fraction.clamp(0.0, 1.0) * 360.0;
     let rate = ring.rate * 360.0;
-    for (clip_left, half_left) in [(false, true), (true, false)] {
-        let (half, _) = gfx.painted(size, size, |p| p.half_ring(cx, cy, ring.r, ring.stroke, ring.color, half_left))?;
-        let container = unsafe { gfx.dcomp.CreateVisual()? };
+    // The left or right half of the square, in pixels.
+    let half = |left: bool| -> Result<IDCompositionRectangleClip> {
         unsafe {
-            container.SetOffsetX2((ring.cx - reach) * scale)?;
-            container.SetOffsetY2((ring.cy - reach) * scale)?;
             let clip = gfx.dcomp.CreateRectangleClip()?;
-            let (left, right) = if clip_left { (0.0, reach * scale) } else { (reach * scale, size * scale) };
-            clip.SetLeft2(left)?;
-            clip.SetRight2(right)?;
+            let (l, r) = if left { (0.0, reach * scale) } else { (reach * scale, size * scale) };
+            clip.SetLeft2(l)?;
+            clip.SetRight2(r)?;
             clip.SetTop2(0.0)?;
             clip.SetBottom2(size * scale)?;
-            container.SetClip(&clip)?;
-            let rotate = gfx.dcomp.CreateRotateTransform()?;
-            rotate.SetCenterX2(reach * scale)?;
-            rotate.SetCenterY2(reach * scale)?;
-            // The right clip shows angles 0–180 (the first half), the left 180–360.
+            Ok(clip)
+        }
+    };
+    let mut keep = Vec::new();
+    for clip_left in [false, true] {
+        unsafe {
+            let container = gfx.dcomp.CreateVisual()?;
+            container.SetOffsetX2((ring.cx - reach) * scale)?;
+            container.SetOffsetY2((ring.cy - reach) * scale)?;
+            container.SetClip(&half(clip_left)?)?;
+            // The right clip shows angles 0–180 (the first half), the left 180–360: an angle in
+            // this half that holds until the playhead reaches it, then follows it to 180.
             let base = if clip_left { 180.0 } else { 0.0 };
             let angle = gfx.dcomp.CreateAnimation()?;
             piecewise(&angle, (now - base).clamp(0.0, 180.0), rate, if clip_left { (180.0 - now).max(0.0) } else { 0.0 })?;
+            let rotate = gfx.dcomp.CreateRotateTransform()?;
+            rotate.SetCenterX2(reach * scale)?;
+            rotate.SetCenterY2(reach * scale)?;
             rotate.SetAngle(&angle)?;
-            half.SetTransform(&rotate)?;
-            container.AddVisual(&half, false, None)?;
+            // The rest of the track behind this clip's own half-plane, the filled arc behind the
+            // other, both turned to the playhead.
+            for (content, own_half) in [(&track, true), (&flat, false)] {
+                let part = gfx.dcomp.CreateVisual()?;
+                part.SetContent(content)?;
+                part.SetClip(&half(if own_half { clip_left } else { !clip_left })?)?;
+                part.SetTransform(&rotate)?;
+                part.SetBorderMode(DCOMPOSITION_BORDER_MODE_SOFT)?;
+                container.AddVisual(&part, false, None)?;
+                keep.push(part);
+            }
             // `false` with no reference visual puts it on top of its siblings, over the content.
             holder.AddVisual(&container, false, None)?;
+            keep.push(container);
         }
-        keep.push(container);
-        keep.push(half);
     }
     Ok(keep)
 }
 
-/// A progress bar's filled part: the whole bar, painted once, behind a clip whose right side DWM
-/// moves from now to the end of the track.
-fn bar_visual(gfx: &Gfx, holder: &IDCompositionVisual2, bar: draw::Bar) -> Result<IDCompositionVisual2> {
-    let (visual, _) = gfx.painted(bar.w, bar.h, |p| p.round_rect(0.0, 0.0, bar.w, bar.h, bar.h / 2.0, bar.color))?;
+/// Which fills to show, rippling or not, each with the opacities it fades between: the one, or
+/// both cross-fading when the ripple starts or stops.
+fn fills(waving: bool, was: Option<bool>) -> Vec<(bool, Option<(f32, f32)>)> {
+    match was {
+        Some(was) if was != waving => vec![(was, Some((1.0, 0.0))), (waving, Some((0.0, 1.0)))],
+        _ => vec![(waving, None)],
+    }
+}
+
+/// Fade `visual` between two opacities over [`SETTLE_SECONDS`]; `None` leaves it opaque.
+fn faded(gfx: &Gfx, visual: &IDCompositionVisual2, fade: Option<(f32, f32)>) -> Result<()> {
+    if let Some((from, to)) = fade {
+        unsafe {
+            let opacity = gfx.dcomp.CreateAnimation()?;
+            ease_out(&opacity, from, to, SETTLE_SECONDS)?;
+            let effect = gfx.dcomp.CreateEffectGroup()?;
+            effect.SetOpacity(&opacity)?;
+            visual.SetEffect(&effect)?;
+        }
+    }
+    Ok(())
+}
+
+/// A card bar's moving parts: the filled part up to just before the playhead, the playhead, and
+/// the rest of the track from just after it, each moved by DWM from now to the end of the track.
+/// While playing, the filled part is a wave strip a wavelength longer than the bar, slid by one
+/// wavelength on repeat; paused, it is a flat bar. `was` as for [`ring_visuals`].
+fn bar_visuals(gfx: &Gfx, holder: &IDCompositionVisual2, bar: draw::Bar, was: Option<bool>) -> Result<Vec<IDCompositionVisual2>> {
+    let scale = gfx.scale;
+    let band = THUMB_H.max(2.0 * BAR_AMP + bar.h + 2.0);
+    let (top, mid) = (bar.y + bar.h / 2.0 - band / 2.0, band / 2.0);
+    let w = bar.w;
+    // The playhead, in pixels from the bar's start: now, and how fast it moves.
+    let (now, speed, end) = (bar.fraction.clamp(0.0, 1.0) * w * scale, bar.rate * w * scale, w * scale);
+    // A position that keeps `by` pixels from the playhead.
+    let follow = |by: f32| -> Result<IDCompositionAnimation> {
+        let at = unsafe { gfx.dcomp.CreateAnimation()? };
+        glide(&at, now + by, end + by, speed)?;
+        Ok(at)
+    };
+    let beside = (THUMB_W / 2.0 + THUMB_GAP) * scale;
+    let mut keep = Vec::new();
+    unsafe {
+        // The rest of the track, from just after the playhead.
+        let (rest, _) = gfx.painted(w, band, |p| p.round_rect(0.0, mid - bar.h / 2.0, w, bar.h, bar.h / 2.0, draw::TRACK))?;
+        rest.SetOffsetX2(bar.x * scale)?;
+        rest.SetOffsetY2(top * scale)?;
+        let clip = gfx.dcomp.CreateRectangleClip()?;
+        clip.SetLeft(&follow(beside)?)?;
+        clip.SetRight2(end)?;
+        clip.SetTop2(0.0)?;
+        clip.SetBottom2(band * scale)?;
+        rest.SetClip(&clip)?;
+        holder.AddVisual(&rest, false, None)?;
+        keep.push(rest);
+        // The filled part, up to just before it.
+        let filled = gfx.dcomp.CreateVisual()?;
+        filled.SetOffsetX2(bar.x * scale)?;
+        filled.SetOffsetY2(top * scale)?;
+        let clip = gfx.dcomp.CreateRectangleClip()?;
+        clip.SetLeft2(0.0)?;
+        clip.SetRight(&follow(-beside)?)?;
+        clip.SetTop2(0.0)?;
+        clip.SetBottom2(band * scale)?;
+        filled.SetClip(&clip)?;
+        for (rippling, fade) in fills(bar.rate > 0.0, was) {
+            let fill = if rippling {
+                let length = w + BAR_WAVELENGTH;
+                let (strip, _) = gfx.painted(length, band, |p| p.wave_line((0.0, length), mid, BAR_AMP, BAR_WAVELENGTH, bar.h, bar.color))?;
+                // From a wavelength back to its place, on repeat: the wave travels forwards.
+                let slide = gfx.dcomp.CreateAnimation()?;
+                cycle(&slide, -BAR_WAVELENGTH * scale, BAR_WAVELENGTH * scale, WAVE_SECONDS)?;
+                strip.SetOffsetX(&slide)?;
+                strip
+            } else {
+                gfx.painted(w, band, |p| p.round_rect(0.0, mid - bar.h / 2.0, w, bar.h, bar.h / 2.0, bar.color))?.0
+            };
+            faded(gfx, &fill, fade)?;
+            filled.AddVisual(&fill, false, None)?;
+            keep.push(fill);
+        }
+        holder.AddVisual(&filled, false, None)?;
+        keep.push(filled);
+        // The playhead.
+        let (head, _) = gfx.painted(THUMB_W, THUMB_H, |p| p.round_rect(0.0, 0.0, THUMB_W, THUMB_H, THUMB_W / 2.0, bar.color))?;
+        head.SetOffsetX(&follow((bar.x - THUMB_W / 2.0) * scale)?)?;
+        head.SetOffsetY2((top + mid - THUMB_H / 2.0) * scale)?;
+        holder.AddVisual(&head, false, None)?;
+        keep.push(head);
+    }
+    Ok(keep)
+}
+
+/// A Samsung-style ring or card bar (see [`waves`]): a surface painted again on every
+/// [`LIVE_TIMER`] tick while it moves, then left as it is.
+struct Live {
+    visual: IDCompositionVisual2,
+    surface: windows::Win32::Graphics::DirectComposition::IDCompositionSurface,
+    shape: LiveShape,
+    /// When it was shown: its progress moves on from there.
+    shown: std::time::Instant,
+    last: std::time::Instant,
+    /// The waves' height, springing to 1 while playing and 0 paused, and its speed.
+    amp: f32,
+    speed: f32,
+}
+
+enum LiveShape {
+    /// The ring, in a square `side` DIPs wide centred on it, in the Google or the Samsung style.
+    Ring(Ring, f32, MotionStyle),
+    /// The Samsung bar, in a band from `(x, y)` DIPs.
+    Bar(draw::Bar, (f32, f32)),
+}
+
+/// The Samsung style's dimensions: the room the waves rise into, the line's width, the knob.
+const LIVE_RING_ROOM: f32 = 0.22;
+/// The Samsung ring's line, as a share of the other styles' stroke: thinner, so the waves lead.
+const LIVE_RING_STROKE: f32 = 0.7;
+const LIVE_BAR_ROOM: f32 = 7.0;
+const LIVE_BAR_KNOB: f32 = 5.0;
+/// How far the knob's glow reaches, in knob radii.
+const KNOB_GLOW: f32 = 2.1;
+
+impl Live {
+    fn ring(gfx: &Gfx, holder: &IDCompositionVisual2, ring: Ring, was: Option<bool>, style: MotionStyle) -> Result<Live> {
+        let reach = if style == MotionStyle::Samsung {
+            let stroke = ring.stroke * LIVE_RING_STROKE;
+            ring.r + (ring.r * LIVE_RING_ROOM + stroke).max(stroke * 1.3 * KNOB_GLOW) + 1.0
+        } else {
+            ring.r + ring.stroke + ring.r * RING_AMP + 1.0
+        };
+        let side = 2.0 * reach;
+        Live::new(gfx, holder, (ring.cx - reach, ring.cy - reach), (side, side), LiveShape::Ring(ring, side, style), ring.rate > 0.0, was)
+    }
+
+    fn bar(gfx: &Gfx, holder: &IDCompositionVisual2, bar: draw::Bar, was: Option<bool>) -> Result<Live> {
+        let pad = LIVE_BAR_KNOB * KNOB_GLOW;
+        let cy = bar.y + bar.h / 2.0;
+        let top = cy - bar.h / 2.0 - LIVE_BAR_ROOM - 1.0;
+        let (x, y) = (bar.x - pad, top.min(cy - pad));
+        let size = (bar.w + 2.0 * pad, (cy + pad) - y);
+        Live::new(gfx, holder, (x, y), size, LiveShape::Bar(bar, (x, y)), bar.rate > 0.0, was)
+    }
+
+    fn new(gfx: &Gfx, holder: &IDCompositionVisual2, (x, y): (f32, f32), (w, h): (f32, f32), shape: LiveShape, playing: bool, was: Option<bool>) -> Result<Live> {
+        let (visual, surface) = gfx.painted(w, h, |_| Ok(()))?;
+        unsafe {
+            visual.SetOffsetX2(x * gfx.scale)?;
+            visual.SetOffsetY2(y * gfx.scale)?;
+            holder.AddVisual(&visual, false, None)?;
+        }
+        let now = std::time::Instant::now();
+        let amp = if was.unwrap_or(playing) { 1.0 } else { 0.0 };
+        let mut live = Live { visual, surface, shape, shown: now, last: now, amp, speed: 0.0 };
+        live.paint(gfx, now)?;
+        Ok(live)
+    }
+
+    fn playing(&self) -> bool {
+        match &self.shape {
+            LiveShape::Ring(ring, ..) => ring.rate > 0.0,
+            LiveShape::Bar(bar, _) => bar.rate > 0.0,
+        }
+    }
+
+    /// Whether it still has to be painted again: playing, or its waves still settling.
+    fn moving(&self) -> bool {
+        self.playing() || self.amp > 0.002 || self.speed.abs() > 0.002
+    }
+
+    /// Paint it as it is at `now`.
+    fn paint(&mut self, gfx: &Gfx, now: std::time::Instant) -> Result<()> {
+        // The waves' height springs to where it goes, without overshoot.
+        let target = if self.playing() { 1.0 } else { 0.0 };
+        let dt = now.duration_since(self.last).as_secs_f32().min(0.05);
+        self.last = now;
+        for _ in 0..4 {
+            let pull = 120.0 * (target - self.amp) - 22.0 * self.speed;
+            self.speed += pull * dt / 4.0;
+            self.amp += self.speed * dt / 4.0;
+        }
+        if (target - self.amp).abs() < 0.002 && self.speed.abs() < 0.01 {
+            (self.amp, self.speed) = (target, 0.0);
+        }
+        let elapsed = now.duration_since(self.shown).as_secs_f32();
+        let t = clock() as f32;
+        let amp = self.amp.max(0.0);
+        match &self.shape {
+            LiveShape::Ring(ring, side, style) => {
+                let fraction = ring.fraction + ring.rate * elapsed;
+                let centre = (side / 2.0, side / 2.0);
+                if *style == MotionStyle::Samsung {
+                    let stroke = ring.stroke * LIVE_RING_STROKE;
+                    gfx.repaint(&self.surface, |p| waves::ring(p, centre, ring.r, stroke, ring.r * LIVE_RING_ROOM, fraction, (t, amp), ring.color))
+                } else {
+                    let periods = (std::f32::consts::TAU * ring.r / RING_WAVELENGTH).round().max(5.0);
+                    let wave = (ring.r * RING_AMP, periods, WAVE_SECONDS as f32);
+                    gfx.repaint(&self.surface, |p| waves::ripple_ring(p, centre, ring.r, ring.stroke, wave, fraction, (t, amp), ring.color, draw::TRACK))
+                }
+            }
+            LiveShape::Bar(bar, (x, y)) => {
+                let fraction = bar.fraction + bar.rate * elapsed;
+                let at = (bar.x - x, bar.y + bar.h / 2.0 - y);
+                gfx.repaint(&self.surface, |p| waves::bar(p, at, bar.w, bar.h, LIVE_BAR_ROOM, fraction, (t, amp), bar.color, LIVE_BAR_KNOB))
+            }
+        }
+    }
+}
+
+/// Seconds since the app started, on one clock shared by every repeating animation (see
+/// [`cycle`]).
+fn clock() -> f64 {
+    static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs_f64()
+}
+
+/// A progress bar as it always was: its track, and over it the whole filled bar, painted once,
+/// behind a clip whose right side DWM moves from now to the end of the track.
+fn plain_bar_visuals(gfx: &Gfx, holder: &IDCompositionVisual2, bar: draw::Bar) -> Result<Vec<IDCompositionVisual2>> {
+    let (track, _) = gfx.painted(bar.w, bar.h, |p| p.round_rect(0.0, 0.0, bar.w, bar.h, bar.h / 2.0, draw::TRACK))?;
+    let (filled, _) = gfx.painted(bar.w, bar.h, |p| p.round_rect(0.0, 0.0, bar.w, bar.h, bar.h / 2.0, bar.color))?;
     let scale = gfx.scale;
     let (w, now) = (bar.w * scale, bar.fraction.clamp(0.0, 1.0) * bar.w * scale);
     unsafe {
-        visual.SetOffsetX2(bar.x * scale)?;
-        visual.SetOffsetY2(bar.y * scale)?;
+        for v in [&track, &filled] {
+            v.SetOffsetX2(bar.x * scale)?;
+            v.SetOffsetY2(bar.y * scale)?;
+            holder.AddVisual(v, false, None)?;
+        }
         let clip = gfx.dcomp.CreateRectangleClip()?;
         clip.SetLeft2(0.0)?;
         clip.SetTop2(0.0)?;
         clip.SetBottom2(bar.h * scale)?;
         let right = gfx.dcomp.CreateAnimation()?;
-        if bar.rate > 0.0 && now < w {
-            let speed = bar.rate * w;
-            right.AddCubic(0.0, now, speed, 0.0, 0.0)?;
-            right.End(((w - now) / speed) as f64, w)?;
-        } else {
-            right.AddCubic(0.0, now, 0.0, 0.0, 0.0)?;
-        }
+        glide(&right, now, w, bar.rate * w)?;
         clip.SetRight(&right)?;
-        visual.SetClip(&clip)?;
-        holder.AddVisual(&visual, false, None)?;
+        filled.SetClip(&clip)?;
     }
-    Ok(visual)
+    Ok(vec![track, filled])
+}
+
+/// From `from` to `to` at `speed` per second, then still; `speed` 0 holds at `from`.
+fn glide(animation: &IDCompositionAnimation, from: f32, to: f32, speed: f32) -> Result<()> {
+    unsafe {
+        if speed > 0.0 && from < to {
+            animation.AddCubic(0.0, from, speed, 0.0, 0.0)?;
+            animation.End(((to - from) / speed) as f64, to)?;
+        } else {
+            animation.AddCubic(0.0, from, 0.0, 0.0, 0.0)?;
+        }
+    }
+    Ok(())
 }
 
 /// A green ring around a speaking face that swells and fades, over and over: one animation set
@@ -1033,19 +1375,23 @@ fn pulse_visual(gfx: &Gfx, holder: &IDCompositionVisual2, pulse: draw::Pulse) ->
     Ok(visual)
 }
 
-/// A ramp from `from` by `by` over each [`PULSE_SECONDS`], repeated forever, in step with one
-/// beat shared by every pulse since the app started: a repaint (another face speaking) picks the
-/// pulses up where they were instead of restarting them all from the first frame.
+/// A ramp from `from` by `by` over each [`PULSE_SECONDS`], repeated forever (see [`cycle`]).
 fn beat(animation: &IDCompositionAnimation, from: f32, by: f32) -> Result<()> {
-    static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-    let phase = EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs_f64() % PULSE_SECONDS;
-    let slope = (by as f64 / PULSE_SECONDS) as f32;
-    // What is left of the current beat, then whole beats from the next one on.
-    let next = PULSE_SECONDS - phase;
+    cycle(animation, from, by, PULSE_SECONDS)
+}
+
+/// A ramp from `from` by `by` over each `period`, repeated forever, in step with one clock shared
+/// by every animation since the app started: a repaint (another face speaking, a hover) picks the
+/// pulses and waves up where they were instead of restarting them all from the first frame.
+fn cycle(animation: &IDCompositionAnimation, from: f32, by: f32, period: f64) -> Result<()> {
+    let phase = clock() % period;
+    let slope = (by as f64 / period) as f32;
+    // What is left of the current cycle, then whole cycles from the next one on.
+    let next = period - phase;
     unsafe {
         animation.AddCubic(0.0, from + slope * phase as f32, slope, 0.0, 0.0)?;
         animation.AddCubic(next, from, slope, 0.0, 0.0)?;
-        animation.AddRepeat(next + PULSE_SECONDS, PULSE_SECONDS)?;
+        animation.AddRepeat(next + period, period)?;
     }
     Ok(())
 }
@@ -1220,6 +1566,10 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESUL
         }
         WM_TIMER if wparam.0 == METER_TIMER => {
             with_pill(Pill::meter_tick);
+            Some(LRESULT(0))
+        }
+        WM_TIMER if wparam.0 == LIVE_TIMER => {
+            with_pill(Pill::live_tick);
             Some(LRESULT(0))
         }
         WM_APPBAR => {

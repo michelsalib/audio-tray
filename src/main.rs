@@ -37,6 +37,7 @@ mod instance;
 mod integrations;
 mod keyboards;
 mod layered;
+mod motion;
 mod music;
 mod osd;
 mod pill;

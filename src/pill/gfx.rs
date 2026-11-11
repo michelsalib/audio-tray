@@ -6,7 +6,13 @@ use anyhow::{Context, Result};
 use windows::core::{w, Interface, PCWSTR};
 use windows::Win32::Foundation::{HMODULE, HWND, POINT};
 use windows::Win32::Graphics::Direct2D::Common::{
-    D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_BORDER_MODE_HARD, D2D1_COLOR_F, D2D1_PIXEL_FORMAT, D2D_RECT_F, D2D_SIZE_U,
+    D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_BORDER_MODE_HARD, D2D1_COLOR_F, D2D1_FIGURE_BEGIN_HOLLOW, D2D1_FIGURE_END_CLOSED,
+    D2D1_FIGURE_END_OPEN, D2D1_PIXEL_FORMAT, D2D_RECT_F, D2D_SIZE_U,
+};
+use windows::Win32::Graphics::Direct2D::Common::{D2D1_FIGURE_BEGIN_FILLED, D2D1_GRADIENT_STOP};
+use windows::Win32::Graphics::Direct2D::{
+    ID2D1Brush, D2D1_CAP_STYLE_FLAT, D2D1_CAP_STYLE_ROUND, D2D1_DASH_STYLE_SOLID, D2D1_GAMMA_2_2, D2D1_LINE_JOIN_ROUND,
+    D2D1_RADIAL_GRADIENT_BRUSH_PROPERTIES, D2D1_STROKE_STYLE_PROPERTIES,
 };
 use windows::Win32::Graphics::Direct2D::Common::D2D1_COMPOSITE_MODE_SOURCE_OVER;
 use windows::Win32::Graphics::Direct2D::{
@@ -57,6 +63,17 @@ impl Rgba {
     fn d2d(self) -> D2D1_COLOR_F {
         D2D1_COLOR_F { r: self.0, g: self.1, b: self.2, a: self.3 }
     }
+
+    /// `t` of the way to `other`, alpha and all.
+    pub fn mix(self, other: Rgba, t: f32) -> Rgba {
+        let at = |a: f32, b: f32| a + (b - a) * t;
+        Rgba(at(self.0, other.0), at(self.1, other.1), at(self.2, other.2), at(self.3, other.3))
+    }
+
+    /// The same colour at `alpha`.
+    pub fn alpha(self, alpha: f32) -> Rgba {
+        Rgba(self.0, self.1, self.2, alpha)
+    }
 }
 
 /// Which text style.
@@ -94,6 +111,8 @@ pub struct Gfx {
     blurs: std::cell::RefCell<Vec<((u64, u32), ID2D1Bitmap1)>>,
     /// A context of its own for drawing into those blurred bitmaps, outside any surface's draw.
     offscreen: ID2D1DeviceContext,
+    /// Covers' own colours for the waves, by their hash (see [`Gfx::cover_colour`]).
+    colours: std::cell::RefCell<Vec<(u64, Option<Rgba>)>>,
 }
 
 /// How many decoded images are kept: the covers and faces on screen, with room to spare.
@@ -176,6 +195,7 @@ impl Gfx {
                 decoded: Default::default(),
                 blurs: Default::default(),
                 offscreen,
+                colours: Default::default(),
             };
             gfx.formats = vec![
                 gfx.format(w!("Segoe UI Variable Text"), DWRITE_FONT_WEIGHT_SEMI_BOLD, 13.0, false)?,
@@ -241,6 +261,16 @@ impl Gfx {
                 .dcomp
                 .CreateSurface(px(w), px(h), DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_ALPHA_MODE_PREMULTIPLIED)
                 .context("CreateSurface")?;
+            self.repaint(&surface, draw)?;
+            let visual = self.dcomp.CreateVisual()?;
+            visual.SetContent(&surface)?;
+            Ok((visual, surface))
+        }
+    }
+
+    /// Draw `surface` again from clear, with `draw` working in DIPs. Shown at the next commit.
+    pub fn repaint(&self, surface: &IDCompositionSurface, draw: impl FnOnce(&mut Painter) -> Result<()>) -> Result<()> {
+        unsafe {
             let mut offset = POINT::default();
             let dc: ID2D1DeviceContext = surface.BeginDraw(None, &mut offset).context("BeginDraw")?;
             let dpi = 96.0 * self.scale;
@@ -250,10 +280,7 @@ impl Gfx {
             let mut painter = Painter { gfx: self, dc: dc.clone() };
             let drawn = draw(&mut painter);
             surface.EndDraw().context("EndDraw")?;
-            drawn?;
-            let visual = self.dcomp.CreateVisual()?;
-            visual.SetContent(&surface)?;
-            Ok((visual, surface))
+            drawn
         }
     }
 
@@ -321,6 +348,59 @@ impl Gfx {
         }
     }
 
+    /// A cover's own colour, for waves drawn in it: its pixels' average leaning on the vivid ones,
+    /// brought up to full brightness. `None` for a cover with no colour to speak of (greys) or one
+    /// that will not decode. Worked out once per cover.
+    pub fn cover_colour(&self, bytes: &[u8]) -> Option<Rgba> {
+        let key = hash_of(bytes);
+        if let Some((_, colour)) = self.colours.borrow().iter().find(|(k, _)| *k == key) {
+            return *colour;
+        }
+        let colour = self.vivid(bytes).ok().flatten();
+        keep(&self.colours, key, &colour, DECODED_KEPT);
+        colour
+    }
+
+    fn vivid(&self, bytes: &[u8]) -> Result<Option<Rgba>> {
+        let bitmap = self.decode(bytes)?;
+        let (mut w, mut h) = (0u32, 0u32);
+        let mut pixels;
+        unsafe {
+            bitmap.GetSize(&mut w, &mut h)?;
+            pixels = vec![0u8; (w * h * 4) as usize];
+            bitmap.CopyPixels(std::ptr::null(), w * 4, &mut pixels)?;
+        }
+        let mut sum = [0.0f32; 3];
+        let mut total = 0.0f32;
+        for p in pixels.as_chunks::<4>().0 {
+            let alpha = p[3] as f32 / 255.0;
+            if alpha < 0.5 {
+                continue;
+            }
+            // Premultiplied BGRA.
+            let [b, g, r] = [p[0], p[1], p[2]].map(|v| v as f32 / 255.0 / alpha);
+            let (most, least) = (r.max(g).max(b), r.min(g).min(b));
+            let saturation = if most > 0.0 { (most - least) / most } else { 0.0 };
+            // Vivid, bright pixels count most; a little for every pixel, so a cover of one dull
+            // colour still has that colour.
+            let weight = saturation * saturation * most + 0.002;
+            for (s, v) in sum.iter_mut().zip([r, g, b]) {
+                *s += v * weight;
+            }
+            total += weight;
+        }
+        if total <= 0.0 {
+            return Ok(None);
+        }
+        let [r, g, b] = sum.map(|s| s / total);
+        let (most, least) = (r.max(g).max(b), r.min(g).min(b));
+        if most < 0.05 || (most - least) / most < 0.12 {
+            return Ok(None);
+        }
+        let lift = 0.92 / most;
+        Ok(Some(Rgba(r * lift, g * lift, b * lift, 1.0)))
+    }
+
     pub fn commit(&self) -> Result<()> {
         unsafe { self.dcomp.Commit() }.context("Commit")
     }
@@ -358,32 +438,6 @@ impl Painter<'_> {
 
     pub fn ring(&mut self, cx: f32, cy: f32, r: f32, stroke: f32, color: Rgba) -> Result<()> {
         unsafe { self.dc.DrawEllipse(&ellipse(cx, cy, r), &self.brush(color)?, stroke, None) };
-        Ok(())
-    }
-
-    /// Only the half of a ring left (`left`) or right of its centre.
-    ///
-    /// The ends are cut a little short of the centre, so their anti-aliased edges never spill into
-    /// the other half's side, where they showed as ticks at the top and bottom. The left half's top
-    /// end is the exception and runs a little past instead: turned half a circle it meets the other
-    /// half at the bottom, where a short cut showed as a seam. The visual's own clip makes the exact
-    /// cut at the centre in both cases.
-    pub fn half_ring(&mut self, cx: f32, cy: f32, r: f32, stroke: f32, color: Rgba, left: bool) -> Result<()> {
-        const PAST: f32 = 1.5;
-        const SHORT: f32 = 0.75;
-        let reach = r + stroke;
-        let clip = if left { rect(cx - reach, cy - reach, reach - SHORT, 2.0 * reach) } else { rect(cx + SHORT, cy - reach, reach - SHORT, 2.0 * reach) };
-        unsafe {
-            let brush = self.brush(color)?;
-            self.dc.PushAxisAlignedClip(&clip, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
-            self.dc.DrawEllipse(&ellipse(cx, cy, r), &brush, stroke, None);
-            self.dc.PopAxisAlignedClip();
-            if left {
-                self.dc.PushAxisAlignedClip(&rect(cx - SHORT - 0.5, cy - reach, SHORT + PAST + 0.5, reach), D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
-                self.dc.DrawEllipse(&ellipse(cx, cy, r), &brush, stroke, None);
-                self.dc.PopAxisAlignedClip();
-            }
-        }
         Ok(())
     }
 
@@ -502,6 +556,102 @@ impl Painter<'_> {
             );
         }
         Ok(())
+    }
+
+    /// A line through `points`, `stroke` wide with round caps and joins; `closed` joins the last
+    /// point back to the first.
+    pub fn polyline(&mut self, points: &[Vector2], stroke: f32, color: Rgba, closed: bool) -> Result<()> {
+        let Some((first, rest)) = points.split_first() else {
+            return Ok(());
+        };
+        unsafe {
+            let factory = self.dc.GetFactory()?;
+            let path = factory.CreatePathGeometry()?;
+            let sink = path.Open()?;
+            sink.BeginFigure(*first, D2D1_FIGURE_BEGIN_HOLLOW);
+            sink.AddLines(rest);
+            sink.EndFigure(if closed { D2D1_FIGURE_END_CLOSED } else { D2D1_FIGURE_END_OPEN });
+            sink.Close()?;
+            let round = D2D1_STROKE_STYLE_PROPERTIES {
+                startCap: D2D1_CAP_STYLE_ROUND,
+                endCap: D2D1_CAP_STYLE_ROUND,
+                dashCap: D2D1_CAP_STYLE_FLAT,
+                lineJoin: D2D1_LINE_JOIN_ROUND,
+                miterLimit: 1.0,
+                dashStyle: D2D1_DASH_STYLE_SOLID,
+                dashOffset: 0.0,
+            };
+            let style = factory.CreateStrokeStyle(&round, None)?;
+            self.dc.DrawGeometry(&path, &self.brush(color)?, stroke, &style);
+        }
+        Ok(())
+    }
+
+    /// The shape inside `points`, filled.
+    pub fn fill_polygon(&mut self, points: &[Vector2], color: Rgba) -> Result<()> {
+        let brush = self.brush(color)?;
+        self.fill_with(points, &brush.into())
+    }
+
+    /// The shape inside `points`, filled with `color` fading from `alphas.0` at `radii.0` from
+    /// `centre` to `alphas.1` at `radii.1`.
+    pub fn fill_polygon_radial(&mut self, points: &[Vector2], (cx, cy): (f32, f32), radii: (f32, f32), color: Rgba, alphas: (f32, f32)) -> Result<()> {
+        let inner = (radii.0 / radii.1.max(0.01)).clamp(0.0, 1.0);
+        let stops = [
+            D2D1_GRADIENT_STOP { position: 0.0, color: Rgba(color.0, color.1, color.2, alphas.0).d2d() },
+            D2D1_GRADIENT_STOP { position: inner, color: Rgba(color.0, color.1, color.2, alphas.0).d2d() },
+            D2D1_GRADIENT_STOP { position: 1.0, color: Rgba(color.0, color.1, color.2, alphas.1).d2d() },
+        ];
+        let brush = unsafe {
+            let target: &ID2D1RenderTarget = &self.dc;
+            let collection = target.CreateGradientStopCollection(&stops, D2D1_GAMMA_2_2, D2D1_EXTEND_MODE_CLAMP)?;
+            let shape = D2D1_RADIAL_GRADIENT_BRUSH_PROPERTIES {
+                center: Vector2 { X: cx, Y: cy },
+                gradientOriginOffset: Vector2 { X: 0.0, Y: 0.0 },
+                radiusX: radii.1,
+                radiusY: radii.1,
+            };
+            target.CreateRadialGradientBrush(&shape, None, &collection)?
+        };
+        self.fill_with(points, &brush.into())
+    }
+
+    fn fill_with(&mut self, points: &[Vector2], brush: &ID2D1Brush) -> Result<()> {
+        let Some((first, rest)) = points.split_first() else {
+            return Ok(());
+        };
+        unsafe {
+            let path = self.dc.GetFactory()?.CreatePathGeometry()?;
+            let sink = path.Open()?;
+            sink.BeginFigure(*first, D2D1_FIGURE_BEGIN_FILLED);
+            sink.AddLines(rest);
+            sink.EndFigure(D2D1_FIGURE_END_CLOSED);
+            sink.Close()?;
+            self.dc.FillGeometry(&path, brush, None);
+        }
+        Ok(())
+    }
+
+    /// A round knob with a soft glow around it.
+    pub fn knob(&mut self, cx: f32, cy: f32, r: f32, color: Rgba) -> Result<()> {
+        for (grow, alpha) in [(2.1, 0.10), (1.75, 0.16), (1.4, 0.32)] {
+            self.circle(cx, cy, r * grow, Rgba(color.0, color.1, color.2, alpha))?;
+        }
+        self.circle(cx, cy, r, color)?;
+        self.circle(cx, cy, r * 0.45, color.mix(Rgba(1.0, 1.0, 1.0, 1.0), 0.5))
+    }
+
+    /// A horizontal line from `x0` to `x1` rippling `amp` either side of `cy`, one period every
+    /// `length`, starting on the centre line at `x0`.
+    pub fn wave_line(&mut self, (x0, x1): (f32, f32), cy: f32, amp: f32, length: f32, stroke: f32, color: Rgba) -> Result<()> {
+        let steps = (((x1 - x0) * 2.0).ceil() as usize).max(2);
+        let points: Vec<Vector2> = (0..=steps)
+            .map(|i| {
+                let x = x0 + (x1 - x0) * i as f32 / steps as f32;
+                Vector2 { X: x, Y: cy + amp * (std::f32::consts::TAU * (x - x0) / length).sin() }
+            })
+            .collect();
+        self.polyline(&points, stroke, color, false)
     }
 }
 

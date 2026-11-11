@@ -124,8 +124,12 @@ pub(crate) fn monitor_at(point: windows::Win32::Foundation::POINT) -> (f32, wind
 /// One display, as the desktop arranges it.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Monitor {
-    /// Its device name (`\\.\DISPLAY1`), which is what the config names it by.
+    /// Its device name (`\\.\DISPLAY1`), which is what the config names it by. Windows numbers
+    /// them afresh as screens come and go: the same screen can be another one tomorrow.
     pub name: String,
+    /// The screen's own id, its model and the port it is plugged in (`DEL41A8#5&1a2b&0&UID4357`),
+    /// the same each time it comes back; the device name when Windows tells none.
+    pub id: String,
     /// Its rectangle and work area, in desktop pixels.
     pub rect: windows::Win32::Foundation::RECT,
     pub work: windows::Win32::Foundation::RECT,
@@ -145,8 +149,10 @@ pub(crate) fn monitors() -> Vec<Monitor> {
         info.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
         if unsafe { GetMonitorInfoW(monitor, &mut info.monitorInfo) }.as_bool() {
             let len = info.szDevice.iter().position(|&c| c == 0).unwrap_or(info.szDevice.len());
+            let name = String::from_utf16_lossy(&info.szDevice[..len]);
             found.push(Monitor {
-                name: String::from_utf16_lossy(&info.szDevice[..len]),
+                id: screen_id(&info.szDevice).unwrap_or_else(|| name.clone()),
+                name,
                 rect: info.monitorInfo.rcMonitor,
                 work: info.monitorInfo.rcWork,
                 // MONITORINFOF_PRIMARY
@@ -162,6 +168,43 @@ pub(crate) fn monitors() -> Vec<Monitor> {
     }
     found.sort_by_key(|m| (m.rect.left, m.rect.top));
     found
+}
+
+/// The id of the screen on the display named `device` (NUL-terminated): from its interface path
+/// (`\\?\DISPLAY#DEL41A8#5&1a2b&0&UID4357#{e6f07b5f-…}`), the part between `DISPLAY#` and the
+/// class GUID.
+fn screen_id(device: &[u16]) -> Option<String> {
+    use windows::Win32::Graphics::Gdi::{EnumDisplayDevicesW, DISPLAY_DEVICEW};
+    // EDD_GET_DEVICE_INTERFACE_NAME: the interface path rather than the plain PnP id.
+    const INTERFACE_NAME: u32 = 1;
+    let mut screen = DISPLAY_DEVICEW { cb: std::mem::size_of::<DISPLAY_DEVICEW>() as u32, ..Default::default() };
+    if !unsafe { EnumDisplayDevicesW(PCWSTR(device.as_ptr()), 0, &mut screen, INTERFACE_NAME) }.as_bool() {
+        return None;
+    }
+    let len = screen.DeviceID.iter().position(|&c| c == 0).unwrap_or(screen.DeviceID.len());
+    screen_id_of(&String::from_utf16_lossy(&screen.DeviceID[..len]))
+}
+
+fn screen_id_of(path: &str) -> Option<String> {
+    let mut parts = path.split('#');
+    parts.next()?;
+    let (model, instance) = (parts.next()?, parts.next()?);
+    (!model.is_empty() && !instance.is_empty()).then(|| format!("{model}#{instance}"))
+}
+
+/// Every display as `(stable id, device name)`, for the pill's remembered places.
+pub(crate) fn displays() -> Vec<(String, String)> {
+    monitors().into_iter().map(|m| (m.id, m.name)).collect()
+}
+
+#[cfg(test)]
+mod screen_tests {
+    #[test]
+    fn a_screens_id_is_its_model_and_port() {
+        let path = r"\\?\DISPLAY#DEL41A8#5&1a2b3c&0&UID4357#{e6f07b5f-ee97-4a90-b076-33f57bf4eaa7}";
+        assert_eq!(super::screen_id_of(path).as_deref(), Some("DEL41A8#5&1a2b3c&0&UID4357"));
+        assert_eq!(super::screen_id_of(""), None);
+    }
 }
 
 /// A window's title, empty when it has none.

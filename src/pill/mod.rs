@@ -68,6 +68,8 @@ pub enum Action {
     /// Change this flow's volume by so many wheel notches.
     Volume(crate::audio::Flow, f32),
     Acknowledge(crate::hub::Notice),
+    /// Screens came or went: the pill goes back where it was placed on this set of them.
+    DisplaysChanged,
 }
 
 /// Posted to the tray's message window when [`take_actions`] has something.
@@ -1257,6 +1259,9 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESUL
                 // Both windows get the broadcasts: one repaint.
                 if hwnd != pill.hwnd {
                     return;
+                }
+                if msg == WM_DISPLAYCHANGE {
+                    act(Action::DisplaysChanged);
                 }
                 pill.redraw();
             });

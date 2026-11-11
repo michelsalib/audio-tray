@@ -357,6 +357,16 @@ pub(super) fn render_page(ctx: &Ctx, elems: &[LaidElem], out: &mut [u8]) {
     }
 }
 
+/// A section header's hover pill: [`FOOTER_ITEM_H`] tall, centred on the label that
+/// [`render_page`] sets at `bottom - 0.55 em` (its cap height is about 0.7 em).
+fn header_hover(cv: &mut Canvas, le: &LaidElem, w: i32, scale: f32) {
+    let hdr_px = 14.0 * scale;
+    let cy = (le.top + le.height) as f32 - hdr_px * (0.55 + 0.35);
+    let h = FOOTER_ITEM_H * scale / 2.0;
+    let mx = (ROW_MARGIN * scale).round();
+    cv.fill_round_rect(Rect::new(mx, cy - h, w as f32 - mx, cy + h), (ROW_RADIUS * scale).round(), TEXT, HOVER_A);
+}
+
 /// Copy the static `base` into `buf`, then draw the dynamic overlays.
 pub(super) fn compose(ctx: &Ctx, hit: &Interaction, elems: &[LaidElem], base: &[u8], buf: &mut [u8]) {
     buf.copy_from_slice(base);
@@ -459,16 +469,10 @@ pub(super) fn compose(ctx: &Ctx, hit: &Interaction, elems: &[LaidElem], base: &[
                     cv.fill_round_rect(Rect::new(cx - r, cy - r, cx + r, cy + r), r, TEXT, 0.5);
                 }
             }
-            Elem::AppsHeader if hovered => {
-                let ry0 = le.top as f32 + 4.0 * scale;
-                let ry1 = (le.top + le.height) as f32 - 2.0;
-                cv.fill_round_rect(Rect::new(mx, ry0, w as f32 - mx, ry1), d(ROW_RADIUS) as f32, TEXT, HOVER_A);
-            }
-            Elem::GroupHeader { group } if hovered && groups[group].devices.len() > 1 => {
-                let ry0 = le.top as f32 + 4.0 * scale;
-                let ry1 = (le.top + le.height) as f32 - 2.0;
-                cv.fill_round_rect(Rect::new(mx, ry0, w as f32 - mx, ry1), d(ROW_RADIUS) as f32, TEXT, HOVER_A);
-            }
+            // A header's pill is centred on its label, which sits low in the row (the top is the
+            // gap from the section above): the row's own bounds left the label at the pill's foot.
+            Elem::AppsHeader if hovered => header_hover(&mut cv, le, w, scale),
+            Elem::GroupHeader { group } if hovered && groups[group].devices.len() > 1 => header_hover(&mut cv, le, w, scale),
             Elem::NowPlaying { .. } if hovered => {
                 if let Some(i) = hit.hover_media {
                     let cy = (le.top + le.height / 2) as f32;

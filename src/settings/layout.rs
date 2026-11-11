@@ -1044,7 +1044,7 @@ mod tests {
 
     fn monitor(name: &str, left: i32, top: i32, w: i32, h: i32, primary: bool) -> Monitor {
         let rect = RECT { left, top, right: left + w, bottom: top + h };
-        Monitor { name: name.to_string(), rect, work: rect, primary }
+        Monitor { name: name.to_string(), id: name.to_string(), rect, work: rect, primary }
     }
 
     fn model(page: Page) -> Model {

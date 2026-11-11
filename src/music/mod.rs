@@ -237,11 +237,13 @@ impl Music {
         self.toolbar.update(playing);
     }
 
-    /// Tell the hub about every session with a track, when anything in them changed. Sessions
-    /// with no title yet (a track change in flight) are left out by the feed.
+    /// Tell the hub about every player's session with a track ([`crate::hub::names::is_player`]),
+    /// when anything in them changed. Sessions with no title yet (a track change in flight) are
+    /// left out by the feed.
     fn report(&mut self, all: Vec<smtc::Reading>) {
         let media: Vec<crate::hub::Media> = all
             .into_iter()
+            .filter(|r| crate::hub::names::is_player(&crate::hub::names::app_name(&r.snapshot.app_id)))
             .filter(|r| crate::integrations::mpc::followed(&r.snapshot.app_id))
             .map(|r| {
                 let site = self.site(&r.snapshot);

@@ -367,6 +367,7 @@ mod tests {
             peak: 0.0,
             recording: false,
             devices,
+            motion: Default::default(),
         }
     }
 

@@ -61,6 +61,8 @@ const WM_FLYOUT_CLOSE: u32 = WM_APP + 11;
 // ~30 fps peak-meter sampling.
 const METER_TIMER_ID: usize = 1;
 const METER_INTERVAL_MS: u32 = 33;
+// The same timer while a slider's springs move (see `crate::motion`).
+const FRAME_INTERVAL_MS: u32 = 16;
 // Per-tick fall-off of the displayed peak: instant attack, gentle release (a VU-meter feel).
 const METER_DECAY: f32 = 0.82;
 // Volume change per wheel notch, applied proportionally so sub-notch touchpad deltas are smooth.
@@ -94,6 +96,8 @@ struct Flyout<'a> {
     meters: Vec<Option<Meter>>,        // per-group live peak meters (polled on a timer)
     vol_dirty: Arc<AtomicBool>,        // shared coalescing flag for the volume callbacks
     hub_seen: u64,                     // the hub generation the media/apps/voice rows show
+    last_tick: std::time::Instant,         // the last meter tick, for the sliders' springs
+    fast: bool,                        // the meter timer runs at frame rate while a slider moves
 }
 
 /// Show the flyout near the tray and operate it until the user dismisses it.
@@ -143,7 +147,11 @@ unsafe fn show_inner(
         meters: Vec::new(),
         vol_dirty: Arc::new(AtomicBool::new(false)),
         hub_seen: 0,
+        last_tick: std::time::Instant::now(),
+        fast: false,
     };
+    // The sliders start on their levels.
+    fly.step_sliders();
     fly.load_hub();
 
     fly.surface.wa = work_area;
@@ -188,6 +196,11 @@ unsafe fn show_inner(
                         Elem::Slider { group } => {
                             let level = layout::level_from_x(fly.surface.width, fly.scale, mx);
                             fly.set_group_level(group, level);
+                            // Past either end, the Samsung capsule stretches after the pointer.
+                            let (x0, x1) = (TRACK_X0 * fly.scale, fly.surface.width as f32 - theme::VALUE_W * fly.scale);
+                            let x = mx as f32;
+                            let over = if x < x0 { x - x0 } else if x > x1 { x - x1 } else { 0.0 };
+                            fly.model.groups[group].motion.pull(over / fly.scale);
                         }
                         Elem::AppSlider { app } => {
                             let level = layout::app_level_from_x(fly.surface.width, fly.scale, mx);
@@ -220,6 +233,9 @@ unsafe fn show_inner(
                 if let Some(si) = fly.hit.drag.take() {
                     // Only output volume changes ding.
                     if let Elem::Slider { group } = fly.surface.elems[si].elem {
+                        // Let go: a stretched capsule snaps back.
+                        fly.model.groups[group].motion.pull(0.0);
+                        fly.animate();
                         if fly.model.groups[group].flow == Flow::Output {
                             beep_volume();
                         }
@@ -448,6 +464,7 @@ impl Flyout<'_> {
         if let Some(id) = self.model.groups[group].default_id.clone() {
             let _ = self.backend.set_volume_of(&id, level);
         }
+        self.animate();
     }
 
     /// Adjust volume for a wheel notch at client-y `cy`: the app whose row it is over, else the
@@ -462,7 +479,12 @@ impl Flyout<'_> {
             let Some(group) = self.scroll_target_group(cy) else {
                 return;
             };
-            let level = (self.model.groups[group].level + notches * SCROLL_STEP).clamp(0.0, 1.0);
+            let before = self.model.groups[group].level;
+            let level = (before + notches * SCROLL_STEP).clamp(0.0, 1.0);
+            // Already at that end: the Samsung capsule bounces against it.
+            if level == before && notches != 0.0 && crate::config::motion().volume == crate::config::MotionStyle::Samsung {
+                self.model.groups[group].motion.bump(notches > 0.0);
+            }
             self.set_group_level(group, level);
         }
         self.compose();
@@ -514,10 +536,42 @@ impl Flyout<'_> {
 
     /// Fold each endpoint's live peak into the smoothed `peak` (muted reads as silent) and
     /// repaint if anything moved.
+    /// Move each slider's springs on to now; whether one is still moving.
+    fn step_sliders(&mut self) -> bool {
+        let now = std::time::Instant::now();
+        let dt = now.duration_since(self.last_tick).as_secs_f32();
+        self.last_tick = now;
+        let style = crate::config::motion().volume;
+        let mut moving = false;
+        for g in &mut self.model.groups {
+            moving |= g.motion.step(style, g.level, g.muted, dt);
+        }
+        moving
+    }
+
+    /// A slider was set moving: tick at frame rate until it settles (see [`Self::tick_meters`]).
+    fn animate(&mut self) {
+        if !self.fast && crate::config::motion().volume != crate::config::MotionStyle::None {
+            self.fast = true;
+            self.last_tick = std::time::Instant::now();
+            unsafe {
+                let _ = SetTimer(Some(self.surface.hwnd), METER_TIMER_ID, FRAME_INTERVAL_MS, None);
+            }
+        }
+    }
+
     fn tick_meters(&mut self) {
         // The hub's rows ride the meter tick too: a generation compare, nothing more when idle.
         self.follow_hub();
-        let mut changed = false;
+        let moving = self.step_sliders();
+        if self.fast && !moving {
+            self.fast = false;
+            unsafe {
+                let _ = SetTimer(Some(self.surface.hwnd), METER_TIMER_ID, METER_INTERVAL_MS, None);
+            }
+        }
+        // While a slider moves, the peak's fall-off keeps its pace: one meter tick's worth per tick.
+        let mut changed = moving;
         let mut base_changed = false;
         // The recording dot rides this tick (an atomic load); it is in the base layer, so a flip re-renders it.
         let recording = crate::audio::mic::in_use();
@@ -581,6 +635,7 @@ impl Flyout<'_> {
             self.render_base();
         }
         if mute_changed || vol_changed {
+            self.animate();
             self.compose();
             self.surface.flush();
         }
@@ -597,6 +652,7 @@ impl Flyout<'_> {
                 }
                 self.model.groups[group].muted = muted;
                 self.sync_strip();
+                self.animate();
                 self.render_base();
                 self.compose();
                 self.surface.flush();

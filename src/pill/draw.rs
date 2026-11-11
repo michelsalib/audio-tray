@@ -103,7 +103,7 @@ const NOTICE_BG: Rgba = Rgba::hex(0x6B3FD4, 1.0);
 const SLIVER: Rgba = Rgba::hex(0x9A9A9A, 0.6);
 const SPEAKING: Rgba = Rgba::hex(0x3DD68C, 1.0);
 const LIVE_DOT: Rgba = Rgba::hex(0xFF4D4D, 1.0);
-const TRACK: Rgba = Rgba::hex(0xFFFFFF, 0.22);
+pub const TRACK: Rgba = Rgba::hex(0xFFFFFF, 0.22);
 /// A paused track's ring: the yellow of a paused progress bar on the taskbar.
 const RING_PAUSED: Rgba = Rgba::hex(0xFCE100, 1.0);
 
@@ -122,6 +122,23 @@ fn ring_playing() -> Rgba {
             read
         })
     })
+}
+
+/// A Samsung-style paused track: grey, as its waves sink.
+const SAMSUNG_PAUSED: Rgba = Rgba::hex(0x9A9A9A, 1.0);
+
+/// A track's ring or bar colour in `style`: while playing, the accent, or its cover's colour when
+/// the waves are set to it (not for flat bars, which are no waves); paused, yellow as a paused
+/// taskbar progress bar, or grey in the Samsung style.
+fn track_colour(gfx: &Gfx, media: &crate::hub::Media, style: crate::config::MotionStyle) -> Rgba {
+    use crate::config::{MotionStyle, WaveColour};
+    if !media.playing {
+        return if style == MotionStyle::Samsung { SAMSUNG_PAUSED } else { RING_PAUSED };
+    }
+    let cover = (style != MotionStyle::None && crate::config::motion().colour == WaveColour::Cover)
+        .then(|| media.cover.as_deref().and_then(|c| gfx.cover_colour(c)))
+        .flatten();
+    cover.unwrap_or_else(ring_playing)
 }
 
 /// Windows' accent changed: read it again at the next paint.
@@ -332,7 +349,7 @@ pub fn scene(gfx: &Gfx, view: &View, small: bool, place: Place) -> Result<Option
                     h: 3.0,
                     fraction: m.fraction_now().unwrap_or(0.0) as f32,
                     rate: m.length_seconds().filter(|_| m.playing).map_or(0.0, |len| (1.0 / len) as f32),
-                    color: if m.playing { ring_playing() } else { RING_PAUSED },
+                    color: track_colour(gfx, m, crate::config::motion().bar),
                 })
                 .collect();
             let mut hits: Vec<([f32; 4], Hit)> = rows
@@ -370,10 +387,7 @@ pub fn scene(gfx: &Gfx, view: &View, small: bool, place: Place) -> Result<Option
                     };
                     section_backdrop(p, edge, m, (top, bottom), [0.0, 0.0, w, h], 18.0)?;
                 }
-                // The bars' tracks; their filled parts are visuals of their own (see `Scene::bars`).
-                for bar in &bars {
-                    p.round_rect(bar.x, bar.y, bar.w, bar.h, bar.h / 2.0, TRACK)?;
-                }
+                // The bars, tracks and all, are visuals of their own (see `Scene::bars`).
                 if let Some(call) = call {
                     if !media.is_empty() {
                         p.round_rect(0.0, call_top - 1.0, w, 1.0, 0.0, Rgba::hex(0xFFFFFF, 0.10))?;
@@ -657,9 +671,11 @@ fn stack(gfx: &Gfx, m: Metrics, media: &[crate::hub::Media], call: Option<&CallP
                     // Paused: dimmed, still in its place so the card opens on the same row.
                     p.circle(cx, cy, half, Rgba::hex(0x000000, 0.5))?;
                 }
+                // A track's ring, track and all, is visuals of its own (see `Scene::rings`).
                 if media.length_seconds().is_some() {
-                    p.ring(cx, cy, m.ring_r, m.ring_stroke, TRACK)?;
-                } else if m.words {
+                    continue;
+                }
+                if m.words {
                     // A stream has no end to fill a ring towards: a badge on the art instead.
                     p.round_rect(cx - 12.0, cy + 9.0, 24.0, 11.0, 3.0, LIVE_DOT)?;
                     p.text("LIVE", Font::Badge, (cx - 12.0, cy + 9.0, 24.0, 11.0), WHITE)?;
@@ -704,7 +720,7 @@ fn stack(gfx: &Gfx, m: Metrics, media: &[crate::hub::Media], call: Option<&CallP
                 stroke: m.ring_stroke,
                 fraction: media.fraction_now().unwrap_or(0.0) as f32,
                 rate: media.length_seconds().filter(|_| media.playing).map_or(0.0, |len| (1.0 / len) as f32),
-                color: if media.playing { ring_playing() } else { RING_PAUSED },
+                color: track_colour(gfx, media, crate::config::motion().ring),
             }
         })
         .collect();

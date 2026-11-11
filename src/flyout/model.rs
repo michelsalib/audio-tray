@@ -26,6 +26,8 @@ pub(super) struct Group {
     /// An app has the microphone open (any endpoint; see [`crate::audio::mic`]). Input only.
     pub recording: bool,
     pub devices: Vec<DeviceRow>,
+    /// How the slider moves to its level (see [`crate::motion`]).
+    pub motion: crate::motion::SliderMotion,
 }
 
 /// A Now Playing card: one media session the pill shows.
@@ -307,6 +309,7 @@ pub(super) fn build_groups(backend: &WasapiBackend, config: &Config, batteries: 
             peak: 0.0,
             recording,
             devices: rows,
+            motion: Default::default(),
         });
     }
     groups

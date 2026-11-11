@@ -33,8 +33,9 @@ use crate::icons;
 const HOLD: Duration = Duration::from_secs(3);
 const FADE: Duration = Duration::from_millis(400);
 
-/// Tick cadence while it is up; only the fade repaints.
-const TICK_MS: u32 = 33;
+/// Tick cadence while it is up: the fade, and the level springing to each change (see
+/// [`crate::motion`]).
+const TICK_MS: u32 = 16;
 /// The fade timer's id, on whichever window [`Osd::new`] was told ticks go to.
 pub(crate) const TIMER_ID: usize = 0x05D;
 
@@ -76,6 +77,12 @@ pub(crate) struct Osd {
     shown: bool,
     /// When the level last changed; the hold and fade count from here.
     changed: Instant,
+    /// What it shows, and how its bar moves there.
+    flow: Flow,
+    level: f32,
+    muted: bool,
+    motion: crate::motion::SliderMotion,
+    last_tick: Instant,
 }
 
 impl Osd {
@@ -91,6 +98,11 @@ impl Osd {
             y: 0,
             shown: false,
             changed: Instant::now(),
+            flow: Flow::Output,
+            level: 0.0,
+            muted: false,
+            motion: Default::default(),
+            last_tick: Instant::now(),
         }
     }
 
@@ -119,7 +131,19 @@ impl Osd {
             eprintln!("osd: could not create the readout window ({e})");
             return;
         }
-        self.paint(flow, level, muted);
+        let level = level.clamp(0.0, 1.0);
+        // Another endpoint starts on its own level, without springing from this one's.
+        if flow != self.flow || !self.shown {
+            self.motion = Default::default();
+        } else if level == self.level && (level == 0.0 || level == 1.0) {
+            // A notch that hit an end: the Samsung capsule bounces against it.
+            if crate::config::motion().volume == crate::config::MotionStyle::Samsung {
+                self.motion.bump(level == 1.0);
+            }
+        }
+        (self.flow, self.level, self.muted) = (flow, level, muted);
+        self.step();
+        self.paint();
         (self.x, self.y) = self.place(anchor);
         // Painted before it is shown, so it never appears as an empty frame.
         crate::layered::present(self.hwnd, &self.buf, self.width, self.height, self.x, self.y, 255);
@@ -149,8 +173,16 @@ impl Osd {
         if !self.shown {
             return;
         }
+        let moved = self.step();
+        if moved {
+            self.paint();
+        }
         let Some(fading) = self.changed.elapsed().checked_sub(HOLD) else {
-            return; // still holding at full opacity
+            // Still holding at full opacity.
+            if moved {
+                crate::layered::present(self.hwnd, &self.buf, self.width, self.height, self.x, self.y, 255);
+            }
+            return;
         };
         let t = fading.as_secs_f32() / FADE.as_secs_f32();
         if t >= 1.0 {
@@ -208,11 +240,20 @@ impl Osd {
         Ok(())
     }
 
+    /// Move the bar's springs on to now; whether they are still moving.
+    fn step(&mut self) -> bool {
+        let now = Instant::now();
+        let dt = now.duration_since(self.last_tick).as_secs_f32();
+        self.last_tick = now;
+        self.motion.step(crate::config::motion().volume, self.level, self.muted, dt)
+    }
+
     /// Draw the panel, the endpoint's glyph, the level bar and the number.
-    fn paint(&mut self, flow: Flow, level: f32, muted: bool) {
+    fn paint(&mut self) {
         let (scale, w, h) = (self.scale, self.width, self.height);
+        let (flow, level, muted) = (self.flow, self.level, self.muted);
         let accent = accent_rgb();
-        let level = level.clamp(0.0, 1.0);
+        let style = crate::config::motion().volume;
         let cy = h as f32 / 2.0;
         let mut cv = Canvas::new(&mut self.buf, w, h);
         cv.clear();
@@ -230,21 +271,29 @@ impl Osd {
             }
         }
 
-        // Track, then the fill; no thumb, since nothing here can be dragged.
+        // Track, then the fill; no thumb, since nothing here can be dragged. The other styles draw
+        // their own (see `crate::motion`), with no live peak here.
         let x0 = TRACK_X0 * scale;
         let x1 = w as f32 - TRACK_RIGHT * scale;
-        let th = TRACK_H * scale;
-        cv.fill_round_rect(Rect::new(x0, cy - th / 2.0, x1, cy + th / 2.0), th / 2.0, TEXT, TRACK_A);
-        let fx = x0 + (x1 - x0) * level;
-        if fx > x0 {
-            let (col, alpha) = if muted { (TEXT, MUTED_FILL_A) } else { (accent, 1.0) };
-            cv.fill_round_rect(Rect::new(x0, cy - th / 2.0, fx, cy + th / 2.0), th / 2.0, col, alpha);
+        if style == crate::config::MotionStyle::None {
+            let th = TRACK_H * scale;
+            cv.fill_round_rect(Rect::new(x0, cy - th / 2.0, x1, cy + th / 2.0), th / 2.0, TEXT, TRACK_A);
+            let fx = x0 + (x1 - x0) * level;
+            if fx > x0 {
+                let (col, alpha) = if muted { (TEXT, MUTED_FILL_A) } else { (accent, 1.0) };
+                cv.fill_round_rect(Rect::new(x0, cy - th / 2.0, fx, cy + th / 2.0), th / 2.0, col, alpha);
+            }
+        } else {
+            let track = crate::motion::Track { x0, x1, cy, scale };
+            crate::motion::draw(&mut cv, style, track, &self.motion, muted, 0.0, accent, true);
         }
 
-        // The level as a number, right-aligned, no percent sign (as in the flyout).
+        // The level as a number, right-aligned, no percent sign (as in the flyout); in the moving
+        // styles, where the bar is.
         if let Some(font) = ui_font() {
             let vpx = VALUE_PX * scale;
-            let text = (level * 100.0).round().to_string();
+            let shown = if style == crate::config::MotionStyle::None { level } else { self.motion.shown() };
+            let text = (shown * 100.0).round().to_string();
             let vx = w as f32 - VALUE_RIGHT * scale - measure(font, vpx, &text);
             let alpha = if muted { MUTED_VALUE_A } else { 1.0 };
             cv.draw_text(font, vpx, (vx, cy + vpx * 0.34), TEXT, alpha, &text);

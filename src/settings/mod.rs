@@ -430,6 +430,12 @@ impl Window {
                         c.batteries.low_at = levels[i.min(levels.len() - 1)];
                     }
                     Choice::KeyboardLayout(_) => {}
+                    Choice::RingMotion => c.motion.ring = crate::config::MotionStyle::ALL[i.min(2)],
+                    Choice::BarMotion => c.motion.bar = crate::config::MotionStyle::ALL[i.min(2)],
+                    Choice::VolumeMotion => c.motion.volume = crate::config::MotionStyle::ALL[i.min(2)],
+                    Choice::WaveColour => {
+                        c.motion.colour = if i == 1 { crate::config::WaveColour::Cover } else { crate::config::WaveColour::Accent }
+                    }
                 })
             }
             Target::Slot(i, edge, align) => {

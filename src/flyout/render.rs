@@ -224,11 +224,14 @@ pub(super) fn render_page(ctx: &Ctx, elems: &[LaidElem], out: &mut [u8]) {
                     let label = fit_label(f, px, &row.app, max_w);
                     cv.draw_text(f, px, (d(TEXT_X - 8.0) as f32, cy_i as f32 + px * 0.34), TEXT, 1.0, &label);
                 }
-                let x0 = APP_TRACK_X0 * scale;
-                let x1 = w as f32 - VALUE_W * scale;
-                let th = TRACK_H * scale;
-                let cy = cy_i as f32;
-                cv.fill_round_rect(Rect::new(x0, cy - th / 2.0, x1, cy + th / 2.0), th / 2.0, TEXT, 0.28);
+                // The other styles draw their whole slider in compose (see `crate::motion`).
+                if crate::config::motion().volume == crate::config::MotionStyle::None {
+                    let x0 = APP_TRACK_X0 * scale;
+                    let x1 = w as f32 - VALUE_W * scale;
+                    let th = TRACK_H * scale;
+                    let cy = cy_i as f32;
+                    cv.fill_round_rect(Rect::new(x0, cy - th / 2.0, x1, cy + th / 2.0), th / 2.0, TEXT, 0.28);
+                }
             }
             Elem::Note => {
                 if let (Some(f), Some(text)) = (font, ctx.model.notice) {
@@ -254,11 +257,14 @@ pub(super) fn render_page(ctx: &Ctx, elems: &[LaidElem], out: &mut [u8]) {
                         recording_dot(&mut cv, gx, gy, icon_px);
                     }
                 }
-                // Track background; the accent fill + thumb + value are drawn in compose.
-                let x0 = TRACK_X0 * scale;
-                let x1 = w as f32 - VALUE_W * scale;
-                let th = TRACK_H * scale;
-                cv.fill_round_rect(Rect::new(x0, cy - th / 2.0, x1, cy + th / 2.0), th / 2.0, TEXT, 0.28);
+                // Track background; the accent fill + thumb + value are drawn in compose. The other
+                // styles move their tracks too (see `crate::motion`): compose draws them whole.
+                if crate::config::motion().volume == crate::config::MotionStyle::None {
+                    let x0 = TRACK_X0 * scale;
+                    let x1 = w as f32 - VALUE_W * scale;
+                    let th = TRACK_H * scale;
+                    cv.fill_round_rect(Rect::new(x0, cy - th / 2.0, x1, cy + th / 2.0), th / 2.0, TEXT, 0.28);
+                }
             }
             Elem::Device { group, dev } => {
                 let row = &groups[group].devices[dev];
@@ -388,6 +394,21 @@ pub(super) fn compose(ctx: &Ctx, hit: &Interaction, elems: &[LaidElem], base: &[
             let x0 = APP_TRACK_X0 * scale;
             let x1 = w as f32 - VALUE_W * scale;
             let level = row.level.clamp(0.0, 1.0);
+            // In the moving styles, the same look at the compact size, at its level: the hub
+            // refreshes these rows, so they jump rather than spring.
+            let style = crate::config::motion().volume;
+            if style != crate::config::MotionStyle::None {
+                let track = crate::motion::Track { x0, x1, cy, scale };
+                let still = crate::motion::SliderMotion::still(level, row.muted);
+                crate::motion::draw(&mut cv, style, track, &still, row.muted, 0.0, accent, true);
+                if let Some(f) = font {
+                    let vpx = 13.0 * scale;
+                    let s = (level * 100.0).round().to_string();
+                    let tw = measure(f, vpx, &s);
+                    cv.draw_text(f, vpx, (w as f32 - RIGHT_PAD * scale - tw, cy + vpx * 0.34), TEXT, if row.muted { 0.5 } else { 1.0 }, &s);
+                }
+                continue;
+            }
             let fx = x0 + (x1 - x0) * level;
             let th = TRACK_H * scale;
             let tr = THUMB_R * scale * 0.85;
@@ -408,6 +429,19 @@ pub(super) fn compose(ctx: &Ctx, hit: &Interaction, elems: &[LaidElem], base: &[
             let cy = le.top as f32 + le.height as f32 / 2.0;
             let x0 = TRACK_X0 * scale;
             let x1 = w as f32 - VALUE_W * scale;
+            let style = crate::config::motion().volume;
+            if style != crate::config::MotionStyle::None {
+                let track = crate::motion::Track { x0, x1, cy, scale };
+                crate::motion::draw(&mut cv, style, track, &g.motion, g.muted, g.peak, accent, false);
+                if let Some(f) = font {
+                    let vpx = 13.0 * scale;
+                    let s = (g.motion.shown() * 100.0).round().to_string();
+                    let tw = measure(f, vpx, &s);
+                    let vx = w as f32 - RIGHT_PAD * scale - tw;
+                    cv.draw_text(f, vpx, (vx, cy + vpx * 0.34), TEXT, if g.muted { 0.5 } else { 1.0 }, &s);
+                }
+                continue;
+            }
             let level = g.level.clamp(0.0, 1.0);
             let fx = x0 + (x1 - x0) * level;
             let th = TRACK_H * scale;

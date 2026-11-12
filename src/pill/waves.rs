@@ -41,8 +41,10 @@ const RING_PERIODS: [f32; 4] = [3.0, 5.0, 8.0, 13.0];
 const TRACK: Rgba = Rgba(1.0, 1.0, 1.0, 0.2);
 
 /// Layer `layer`'s height `u` along a played part `span` long, `length` to a period, at most
-/// `room`, `t` seconds in, raised by `amp` (0 paused, 1 playing).
-fn height(layer: &Layer, u: f32, span: f32, length: f32, room: f32, t: f32, amp: f32) -> f32 {
+/// `room`, `t` seconds in, raised by `amp` (0 paused, 1 playing); thinning to nothing at both ends
+/// when `thin`. A full ring has no ends: its layers, a whole number of periods round, meet
+/// seamlessly, and thinning there would only flatten its top.
+fn height(layer: &Layer, u: f32, span: f32, length: f32, room: f32, (t, amp): (f32, f32), thin: bool) -> f32 {
     if span < 4.0 || amp <= 0.002 {
         return 0.0;
     }
@@ -50,7 +52,7 @@ fn height(layer: &Layer, u: f32, span: f32, length: f32, room: f32, t: f32, amp:
     let swell = 1.0 - layer.swell + layer.swell * (0.4 + 0.6 * (0.5 + 0.5 * (t * 1.7 + layer.phase * 2.0).sin()));
     // At the very end, sin(π) is a hair below zero in f32: its power would be NaN, and one NaN
     // point loses the whole shape.
-    let ends = (PI * (u / span).clamp(0.0, 1.0)).sin().max(0.0).powf(0.7);
+    let ends = if thin { (PI * (u / span).clamp(0.0, 1.0)).sin().max(0.0).powf(0.7) } else { 1.0 };
     room * amp * layer.height * swell * hump * ends
 }
 
@@ -86,7 +88,7 @@ pub fn ring(p: &mut Painter, centre: (f32, f32), r: f32, stroke: f32, room: f32,
             let mut points: Vec<Vector2> = (0..=steps)
                 .map(|i| {
                     let u = span * i as f32 / steps as f32;
-                    at(u / r, base + height(layer, u, span, length, room, t, amp))
+                    at(u / r, base + height(layer, u, span, length, room, (t, amp), knob))
                 })
                 .collect();
             // Back along the ring itself.
@@ -161,7 +163,7 @@ pub fn bar(p: &mut Painter, (x, cy): (f32, f32), w: f32, stroke: f32, room: f32,
             let mut points: Vec<Vector2> = (0..=steps)
                 .map(|i| {
                     let u = span * i as f32 / steps as f32;
-                    Vector2 { X: x + u, Y: cy - stroke / 2.0 - height(layer, u, span, layer.length, room, t, amp) }
+                    Vector2 { X: x + u, Y: cy - stroke / 2.0 - height(layer, u, span, layer.length, room, (t, amp), true) }
                 })
                 .collect();
             points.push(Vector2 { X: head, Y: cy });

@@ -1026,7 +1026,7 @@ struct Waving {
 
 impl Waving {
     fn of(scene: &Scene) -> Self {
-        Waving { rings: scene.rings.iter().map(|r| r.rate > 0.0).collect(), bars: scene.bars.iter().map(|b| b.rate > 0.0).collect() }
+        Waving { rings: scene.rings.iter().map(|r| r.playing).collect(), bars: scene.bars.iter().map(|b| b.playing).collect() }
     }
 }
 
@@ -1131,7 +1131,8 @@ fn bar_visuals(gfx: &Gfx, holder: &IDCompositionVisual2, bar: draw::Bar, was: Op
         glide(&at, now + by, end + by, speed)?;
         Ok(at)
     };
-    let beside = (THUMB_W / 2.0 + THUMB_GAP) * scale;
+    // The playhead, and the gaps either side of it: none on a live stream.
+    let beside = if bar.knob { (THUMB_W / 2.0 + THUMB_GAP) * scale } else { 0.0 };
     let mut keep = Vec::new();
     unsafe {
         // The rest of the track, from just after the playhead.
@@ -1156,7 +1157,7 @@ fn bar_visuals(gfx: &Gfx, holder: &IDCompositionVisual2, bar: draw::Bar, was: Op
         clip.SetTop2(0.0)?;
         clip.SetBottom2(band * scale)?;
         filled.SetClip(&clip)?;
-        for (rippling, fade) in fills(bar.rate > 0.0, was) {
+        for (rippling, fade) in fills(bar.playing, was) {
             let fill = if rippling {
                 let length = w + BAR_WAVELENGTH;
                 let (strip, _) = gfx.painted(length, band, |p| p.wave_line((0.0, length), mid, BAR_AMP, BAR_WAVELENGTH, bar.h, bar.color))?;
@@ -1175,11 +1176,13 @@ fn bar_visuals(gfx: &Gfx, holder: &IDCompositionVisual2, bar: draw::Bar, was: Op
         holder.AddVisual(&filled, false, None)?;
         keep.push(filled);
         // The playhead.
-        let (head, _) = gfx.painted(THUMB_W, THUMB_H, |p| p.round_rect(0.0, 0.0, THUMB_W, THUMB_H, THUMB_W / 2.0, bar.color))?;
-        head.SetOffsetX(&follow((bar.x - THUMB_W / 2.0) * scale)?)?;
-        head.SetOffsetY2((top + mid - THUMB_H / 2.0) * scale)?;
-        holder.AddVisual(&head, false, None)?;
-        keep.push(head);
+        if bar.knob {
+            let (head, _) = gfx.painted(THUMB_W, THUMB_H, |p| p.round_rect(0.0, 0.0, THUMB_W, THUMB_H, THUMB_W / 2.0, bar.color))?;
+            head.SetOffsetX(&follow((bar.x - THUMB_W / 2.0) * scale)?)?;
+            head.SetOffsetY2((top + mid - THUMB_H / 2.0) * scale)?;
+            holder.AddVisual(&head, false, None)?;
+            keep.push(head);
+        }
     }
     Ok(keep)
 }
@@ -1223,7 +1226,7 @@ impl Live {
             ring.r + ring.stroke + ring.r * RING_AMP + 1.0
         };
         let side = 2.0 * reach;
-        Live::new(gfx, holder, (ring.cx - reach, ring.cy - reach), (side, side), LiveShape::Ring(ring, side, style), ring.rate > 0.0, was)
+        Live::new(gfx, holder, (ring.cx - reach, ring.cy - reach), (side, side), LiveShape::Ring(ring, side, style), ring.playing, was)
     }
 
     fn bar(gfx: &Gfx, holder: &IDCompositionVisual2, bar: draw::Bar, was: Option<bool>) -> Result<Live> {
@@ -1232,7 +1235,7 @@ impl Live {
         let top = cy - bar.h / 2.0 - LIVE_BAR_ROOM - 1.0;
         let (x, y) = (bar.x - pad, top.min(cy - pad));
         let size = (bar.w + 2.0 * pad, (cy + pad) - y);
-        Live::new(gfx, holder, (x, y), size, LiveShape::Bar(bar, (x, y)), bar.rate > 0.0, was)
+        Live::new(gfx, holder, (x, y), size, LiveShape::Bar(bar, (x, y)), bar.playing, was)
     }
 
     fn new(gfx: &Gfx, holder: &IDCompositionVisual2, (x, y): (f32, f32), (w, h): (f32, f32), shape: LiveShape, playing: bool, was: Option<bool>) -> Result<Live> {
@@ -1251,8 +1254,8 @@ impl Live {
 
     fn playing(&self) -> bool {
         match &self.shape {
-            LiveShape::Ring(ring, ..) => ring.rate > 0.0,
-            LiveShape::Bar(bar, _) => bar.rate > 0.0,
+            LiveShape::Ring(ring, ..) => ring.playing,
+            LiveShape::Bar(bar, _) => bar.playing,
         }
     }
 
@@ -1284,7 +1287,7 @@ impl Live {
                 let centre = (side / 2.0, side / 2.0);
                 if *style == MotionStyle::Samsung {
                     let stroke = ring.stroke * LIVE_RING_STROKE;
-                    gfx.repaint(&self.surface, |p| waves::ring(p, centre, ring.r, stroke, ring.r * LIVE_RING_ROOM, fraction, (t, amp), ring.color))
+                    gfx.repaint(&self.surface, |p| waves::ring(p, centre, ring.r, stroke, ring.r * LIVE_RING_ROOM, fraction, (t, amp), ring.color, ring.knob))
                 } else {
                     let periods = (std::f32::consts::TAU * ring.r / RING_WAVELENGTH).round().max(5.0);
                     let wave = (ring.r * RING_AMP, periods, WAVE_SECONDS as f32);
@@ -1294,7 +1297,7 @@ impl Live {
             LiveShape::Bar(bar, (x, y)) => {
                 let fraction = bar.fraction + bar.rate * elapsed;
                 let at = (bar.x - x, bar.y + bar.h / 2.0 - y);
-                gfx.repaint(&self.surface, |p| waves::bar(p, at, bar.w, bar.h, LIVE_BAR_ROOM, fraction, (t, amp), bar.color, LIVE_BAR_KNOB))
+                gfx.repaint(&self.surface, |p| waves::bar(p, at, bar.w, bar.h, LIVE_BAR_ROOM, fraction, (t, amp), bar.color, if bar.knob { LIVE_BAR_KNOB } else { 0.0 }))
             }
         }
     }

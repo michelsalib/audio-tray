@@ -55,6 +55,11 @@ pub struct Ring {
     pub fraction: f32,
     /// Fraction per second while playing; 0 when paused.
     pub rate: f32,
+    /// Its player plays: the ripple or the waves move. A live stream's is full and still moves,
+    /// though its rate is 0.
+    pub playing: bool,
+    /// A playhead marks where it is: not on a live stream, which is nowhere in particular.
+    pub knob: bool,
     /// The accent while playing, yellow while paused (as the taskbar's progress bars).
     pub color: Rgba,
 }
@@ -69,6 +74,10 @@ pub struct Bar {
     pub h: f32,
     pub fraction: f32,
     pub rate: f32,
+    /// As [`Ring::playing`].
+    pub playing: bool,
+    /// As [`Ring::knob`].
+    pub knob: bool,
     pub color: Rgba,
 }
 
@@ -341,14 +350,16 @@ pub fn scene(gfx: &Gfx, view: &View, small: bool, place: Place) -> Result<Option
             let bars: Vec<Bar> = media
                 .iter()
                 .zip(&tops)
-                .filter(|(m, _)| m.length_seconds().is_some())
+                // A live stream's is full: no end to fill towards, moving while it plays.
                 .map(|(m, top)| Bar {
                     x: text_x,
                     y: top + ART_MARGIN + ART - 3.0,
                     w: text_w,
                     h: 3.0,
-                    fraction: m.fraction_now().unwrap_or(0.0) as f32,
+                    fraction: if m.length_seconds().is_some() { m.fraction_now().unwrap_or(0.0) as f32 } else { 1.0 },
                     rate: m.length_seconds().filter(|_| m.playing).map_or(0.0, |len| (1.0 / len) as f32),
+                    playing: m.playing,
+                    knob: m.length_seconds().is_some(),
                     color: track_colour(gfx, m, crate::config::motion().bar),
                 })
                 .collect();
@@ -671,12 +682,12 @@ fn stack(gfx: &Gfx, m: Metrics, media: &[crate::hub::Media], call: Option<&CallP
                     // Paused: dimmed, still in its place so the card opens on the same row.
                     p.circle(cx, cy, half, Rgba::hex(0x000000, 0.5))?;
                 }
-                // A track's ring, track and all, is visuals of its own (see `Scene::rings`).
+                // The ring, track and all, is visuals of its own (see `Scene::rings`); a live stream's
+                // is full, and says live on the art too.
                 if media.length_seconds().is_some() {
                     continue;
                 }
                 if m.words {
-                    // A stream has no end to fill a ring towards: a badge on the art instead.
                     p.round_rect(cx - 12.0, cy + 9.0, 24.0, 11.0, 3.0, LIVE_DOT)?;
                     p.text("LIVE", Font::Badge, (cx - 12.0, cy + 9.0, 24.0, 11.0), WHITE)?;
                 } else {
@@ -710,7 +721,7 @@ fn stack(gfx: &Gfx, m: Metrics, media: &[crate::hub::Media], call: Option<&CallP
     let rings = media
         .iter()
         .enumerate()
-        .filter(|(_, media)| media.length_seconds().is_some())
+        // A live stream's ring is full: no end to fill towards, moving while it plays.
         .map(|(i, media)| {
             let (cx, cy) = frame.pt(starts[0] + mid + i as f32 * m.disc_step, mid);
             Ring {
@@ -718,8 +729,10 @@ fn stack(gfx: &Gfx, m: Metrics, media: &[crate::hub::Media], call: Option<&CallP
                 cy,
                 r: m.ring_r,
                 stroke: m.ring_stroke,
-                fraction: media.fraction_now().unwrap_or(0.0) as f32,
+                fraction: if media.length_seconds().is_some() { media.fraction_now().unwrap_or(0.0) as f32 } else { 1.0 },
                 rate: media.length_seconds().filter(|_| media.playing).map_or(0.0, |len| (1.0 / len) as f32),
+                playing: media.playing,
+                knob: media.length_seconds().is_some(),
                 color: track_colour(gfx, media, crate::config::motion().ring),
             }
         })

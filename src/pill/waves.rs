@@ -63,9 +63,10 @@ fn shaded(color: Rgba, shade: f32) -> Rgba {
 }
 
 /// A ring `r` round `centre`, `stroke` wide, filled to `fraction` from the top, with the waves
-/// rising outwards into `room` and fading as they go.
+/// rising outwards into `room` and fading as they go, and the glowing playhead when `knob` (none on
+/// a live stream).
 #[allow(clippy::too_many_arguments)]
-pub fn ring(p: &mut Painter, centre: (f32, f32), r: f32, stroke: f32, room: f32, fraction: f32, (t, amp): (f32, f32), color: Rgba) -> Result<()> {
+pub fn ring(p: &mut Painter, centre: (f32, f32), r: f32, stroke: f32, room: f32, fraction: f32, (t, amp): (f32, f32), color: Rgba, knob: bool) -> Result<()> {
     let (cx, cy) = centre;
     let at = |angle: f32, radius: f32| Vector2 { X: cx + radius * angle.sin(), Y: cy - radius * angle.cos() };
     let sweep = fraction.clamp(0.0, 1.0) * TAU;
@@ -98,8 +99,11 @@ pub fn ring(p: &mut Painter, centre: (f32, f32), r: f32, stroke: f32, room: f32,
         let points: Vec<Vector2> = (0..=steps).map(|i| at(sweep * i as f32 / steps as f32, r)).collect();
         p.polyline(&points, stroke, color, false)?;
     }
-    let knob = at(sweep, r);
-    p.knob(knob.X, knob.Y, stroke * 1.3, color)
+    if !knob {
+        return Ok(());
+    }
+    let head = at(sweep, r);
+    p.knob(head.X, head.Y, stroke * 1.3, color)
 }
 
 /// The Google style's ring: filled to `fraction` from the top with a line that ripples `amp`
@@ -143,7 +147,7 @@ pub fn ripple_ring(p: &mut Painter, centre: (f32, f32), r: f32, stroke: f32, (am
 }
 
 /// A bar from `x` along `w` on the line `cy`, `stroke` thick, filled to `fraction`, with the waves
-/// rising above it into `room`.
+/// rising above it into `room`, and a playhead `knob` wide (0 for none: a live stream).
 #[allow(clippy::too_many_arguments)]
 pub fn bar(p: &mut Painter, (x, cy): (f32, f32), w: f32, stroke: f32, room: f32, fraction: f32, (t, amp): (f32, f32), color: Rgba, knob: f32) -> Result<()> {
     let head = x + w * fraction.clamp(0.0, 1.0);
@@ -165,6 +169,9 @@ pub fn bar(p: &mut Painter, (x, cy): (f32, f32), w: f32, stroke: f32, room: f32,
             p.fill_polygon(&points, shaded(color, layer.shade).alpha(layer.alpha))?;
         }
         p.polyline(&[Vector2 { X: x, Y: cy }, Vector2 { X: head, Y: cy }], stroke, color, false)?;
+    }
+    if knob <= 0.0 {
+        return Ok(());
     }
     p.knob(head, cy, knob, color)
 }

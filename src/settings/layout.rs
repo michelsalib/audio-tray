@@ -68,15 +68,17 @@ pub(super) enum Page {
     Pill,
     /// How the bars move: the pill's ring, the card's bar, the volume sliders.
     Motion,
-    /// The audio devices, and the battery levels of the others.
+    /// The audio devices.
     Devices,
+    /// The battery levels of the other devices.
+    Batteries,
     Keyboards,
     Connectors,
     About,
 }
 
 impl Page {
-    pub(super) const ALL: [Page; 8] = [Page::Home, Page::Taskbar, Page::Pill, Page::Motion, Page::Devices, Page::Keyboards, Page::Connectors, Page::About];
+    pub(super) const ALL: [Page; 9] = [Page::Home, Page::Taskbar, Page::Pill, Page::Motion, Page::Devices, Page::Batteries, Page::Keyboards, Page::Connectors, Page::About];
 
     pub(super) fn title(self) -> &'static str {
         match self {
@@ -84,7 +86,8 @@ impl Page {
             Page::Taskbar => "Taskbar",
             Page::Pill => "Edge pill",
             Page::Motion => "Look & motion",
-            Page::Devices => "Devices & batteries",
+            Page::Devices => "Audio devices",
+            Page::Batteries => "Batteries",
             Page::Keyboards => "Keyboards",
             Page::Connectors => "Connectors",
             Page::About => "About",
@@ -98,6 +101,7 @@ impl Page {
             Page::Pill => '\u{E7F4}',
             Page::Motion => '\u{E771}',
             Page::Devices => '\u{E767}',
+            Page::Batteries => '\u{E83F}',
             Page::Keyboards => '\u{E765}',
             Page::Connectors => '\u{E71B}',
             Page::About => '\u{E946}',
@@ -165,8 +169,6 @@ pub(super) enum Choice {
     LowBattery,
     /// The layout of assigned keyboard `i`: the index is into [`super::model::Model::layouts`].
     KeyboardLayout(usize),
-    /// Which half of Devices & batteries shows: the audio devices, or the batteries. Not a setting.
-    DevicesTab,
     /// A bar's motion: [`crate::config::MotionStyle::ALL`].
     RingMotion,
     BarMotion,
@@ -364,7 +366,7 @@ pub(super) fn attention(model: &Model, page: Page) -> usize {
     match page {
         Page::Connectors => usize::from(s.discord_problem.is_some()) + usize::from(s.teams_problem.is_some()),
         Page::Taskbar => usize::from(s.notice.is_some()),
-        Page::Devices => {
+        Page::Batteries => {
             let b = &model.config.batteries;
             if b.enabled { s.batteries.iter().filter(|x| x.level <= b.low_at).count() } else { 0 }
         }
@@ -575,14 +577,6 @@ impl Column<'_> {
         }
     }
 
-    /// A segmented choice on its own, left-aligned at the top of a page: which part of it shows.
-    fn view_switch(&mut self, labels: &[&str], selected: usize, choice: Choice) {
-        let total: f32 = labels.iter().map(|l| ((self.measure)(l) + 28.0).max(48.0)).sum();
-        let anchor = R::new(self.x, self.y, total + CARD_PAD, CONTROL_H);
-        self.segments_in(anchor, labels, selected, false, choice);
-        self.y += CONTROL_H + 12.0;
-    }
-
     /// A row of a group holding a title, then choices as chips that wrap to as many lines as they
     /// need: every one a click away, however many there are.
     fn pick_row(&mut self, group: &mut Group, title: &str, desc: Option<(String, Tone)>, picks: &[(String, bool, Target)], dim: bool) {
@@ -683,15 +677,10 @@ pub(super) fn page(model: &Model, width: f32, measure: &dyn Fn(&str) -> f32) -> 
         Page::Pill => pill(&mut col, model),
         Page::Motion => motion(&mut col, model),
         Page::Devices => {
-            // Two halves, one at a time: the page stays short enough to take in.
-            col.view_switch(&["Audio devices", "Batteries"], model.devices_tab, Choice::DevicesTab);
-            if model.devices_tab == 0 {
-                devices(&mut col, model);
-                windows_sound(&mut col);
-            } else {
-                batteries(&mut col, model);
-            }
+            devices(&mut col, model);
+            windows_sound(&mut col);
         }
+        Page::Batteries => batteries(&mut col, model),
         Page::Keyboards => keyboards(&mut col, model),
         Page::Connectors => connectors(&mut col, model),
         Page::About => about(&mut col, model),
@@ -833,7 +822,7 @@ fn glances(model: &Model) -> Vec<(&'static str, String, String, Tone, Target)> {
             (format!("{} at {}%", low.name, low.level), line, if low.level <= b.low_at { Tone::Warn } else { Tone::Good })
         }
     };
-    tiles.push(("Batteries", head, line, tone, Target::Choice(Choice::DevicesTab, 1)));
+    tiles.push(("Batteries", head, line, tone, Target::Nav(Page::Batteries)));
 
     let k = &c.keyboards;
     let head = match (k.enabled, k.assigned.len()) {
@@ -1184,7 +1173,7 @@ fn devices(col: &mut Column, model: &Model) {
     }
 }
 
-/// Windows' own sound settings, at the end of the devices and batteries.
+/// Windows' own sound settings, at the end of the audio devices.
 fn windows_sound(col: &mut Column) {
     col.section("Windows");
     col.link(Some('\u{E713}'), "Windows sound settings", plain("Volume levels, device properties, spatial sound"), '\u{E8A7}', Button::SoundSettings);

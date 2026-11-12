@@ -436,15 +436,6 @@ impl Window {
                 };
                 *flag = !*flag;
             }),
-            // Which half of Devices & batteries shows, and the page itself from Home's tile.
-            Target::Choice(Choice::DevicesTab, i) => {
-                self.model.page = Page::Devices;
-                self.model.devices_tab = i.min(1);
-                self.model.expanded = None;
-                self.scroll = 0.0;
-                self.relayout();
-                self.invalidate();
-            }
             Target::Choice(Choice::KeyboardLayout(k), i) => {
                 let hkl = self.model.layouts.get(i)?.0;
                 self.set_layout(k, hkl);
@@ -462,7 +453,7 @@ impl Window {
                         let levels = crate::config::Batteries::LOW_LEVELS;
                         c.batteries.low_at = levels[i.min(levels.len() - 1)];
                     }
-                    Choice::KeyboardLayout(_) | Choice::DevicesTab => {}
+                    Choice::KeyboardLayout(_) => {}
                     Choice::RingMotion => c.motion.ring = crate::config::MotionStyle::ALL[i.min(2)],
                     Choice::BarMotion => c.motion.bar = crate::config::MotionStyle::ALL[i.min(2)],
                     Choice::VolumeMotion => c.motion.volume = crate::config::MotionStyle::ALL[i.min(2)],

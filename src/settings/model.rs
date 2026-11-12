@@ -56,6 +56,8 @@ pub(super) struct Model {
     pub devices: Vec<DeviceRow>,
     /// The device whose icons are showing.
     pub expanded: Option<usize>,
+    /// Which half of Devices & batteries shows: 0 the audio devices, 1 the batteries.
+    pub devices_tab: usize,
     pub monitors: Vec<Monitor>,
     pub status: Status,
     /// A staged update's version.
@@ -84,9 +86,10 @@ impl Model {
     pub(super) fn new(config: Config) -> Self {
         Model {
             config,
-            page: Page::Taskbar,
+            page: Page::Home,
             devices: Vec::new(),
             expanded: None,
+            devices_tab: 0,
             monitors: Vec::new(),
             status: Status::default(),
             update: None,

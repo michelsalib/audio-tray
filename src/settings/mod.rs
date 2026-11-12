@@ -27,7 +27,7 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, GetCursorPos, IsIconic, LoadCursorW, LoadIconW, PostMessageW,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, GetCursorPos, IsIconic, KillTimer, SetTimer, WM_TIMER, LoadCursorW, LoadIconW, PostMessageW,
     RegisterClassW, SetForegroundWindow, SetWindowPos, ShowWindow, CS_HREDRAW, CS_VREDRAW, IDC_ARROW, MINMAXINFO,
     SWP_NOACTIVATE, SWP_NOZORDER, SW_RESTORE, SW_SHOWNORMAL, WHEEL_DELTA, WINDOW_EX_STYLE, WM_APP, WM_DESTROY,
     WM_ACTIVATE, WM_CHAR, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
@@ -66,6 +66,9 @@ const OPEN_SIZE: (f32, f32) = (1040.0, 760.0);
 const MIN_SIZE: (f32, f32) = (720.0, 480.0);
 /// How far one wheel notch scrolls the page.
 const SCROLL_STEP: f32 = 64.0;
+/// Repeating while a page shows moving pictures (Home, Look & motion): each tick repaints them.
+const ANIMATION_TIMER: usize = 1;
+const ANIMATION_MS: u32 = 33;
 
 thread_local! {
     static WINDOW: RefCell<Option<Window>> = const { RefCell::new(None) };
@@ -97,6 +100,10 @@ struct Window {
     /// Pixels per DIP, and the client area in pixels.
     scale: f32,
     size: (u32, u32),
+    /// The pictures' clock: they move from when the window opened.
+    clock: std::time::Instant,
+    /// Whether [`ANIMATION_TIMER`] is running.
+    animating: bool,
 }
 
 /// Open the window on `config`, or bring the open one to the front.
@@ -219,6 +226,8 @@ fn create(config: &Config) -> Result<()> {
         scroll: 0.0,
         scale: dpi_scale(hwnd),
         size: client_size(hwnd),
+        clock: std::time::Instant::now(),
+        animating: false,
     };
     window.relayout();
     WINDOW.with(|cell| *cell.borrow_mut() = Some(window));
@@ -265,10 +274,26 @@ impl Window {
 
     fn relayout(&mut self) {
         let (w, h) = self.dips();
-        self.nav = layout::nav();
+        self.nav = layout::nav(h);
         let gfx = &self.gfx;
         self.page = layout::page(&self.model, w - layout::NAV_W, &|text| gfx.measure(Font::Body, text));
         self.scroll = self.scroll.clamp(0.0, (self.page.height - h).max(0.0));
+        self.follow_animation();
+    }
+
+    /// Run [`ANIMATION_TIMER`] while the page shows moving pictures, and only then.
+    fn follow_animation(&mut self) {
+        let wanted = matches!(self.model.page, Page::Home | Page::Motion);
+        if wanted != self.animating {
+            self.animating = wanted;
+            unsafe {
+                if wanted {
+                    SetTimer(Some(self.hwnd), ANIMATION_TIMER, ANIMATION_MS, None);
+                } else {
+                    let _ = KillTimer(Some(self.hwnd), ANIMATION_TIMER);
+                }
+            }
+        }
     }
 
     fn invalidate(&self) {
@@ -283,6 +308,7 @@ impl Window {
             palette: &self.palette,
             size: self.dips(),
             scroll: self.scroll,
+            time: self.clock.elapsed().as_secs_f32(),
         };
         if let Err(e) = self.gfx.frame(self.hwnd, self.size, self.scale, |pen| paint::draw(pen, &scene)) {
             eprintln!("settings: could not paint ({e:#})");
@@ -410,6 +436,15 @@ impl Window {
                 };
                 *flag = !*flag;
             }),
+            // Which half of Devices & batteries shows, and the page itself from Home's tile.
+            Target::Choice(Choice::DevicesTab, i) => {
+                self.model.page = Page::Devices;
+                self.model.devices_tab = i.min(1);
+                self.model.expanded = None;
+                self.scroll = 0.0;
+                self.relayout();
+                self.invalidate();
+            }
             Target::Choice(Choice::KeyboardLayout(k), i) => {
                 let hkl = self.model.layouts.get(i)?.0;
                 self.set_layout(k, hkl);
@@ -420,8 +455,6 @@ impl Window {
                     Choice::Tile => c.music.tile_style = [TileStyle::Off, TileStyle::Cover, TileStyle::Full][i.min(2)],
                     Choice::LeftClick => c.strip.left_click = layout::LEFT_CLICKS[i.min(2)],
                     Choice::PillSize => c.pill.size = [PillSize::Hidden, PillSize::Small, PillSize::Big][i.min(2)],
-                    Choice::Edge => c.pill.edge = layout::EDGES[i.min(2)],
-                    Choice::Align => c.pill.align = layout::ALIGNS[i.min(2)],
                     Choice::BrowserTabs => c.browser.every_site = i == 0,
                     // Automatic, then each display.
                     Choice::Display => c.pill.monitor = i.checked_sub(1).and_then(|m| monitors.get(m).cloned()),
@@ -429,7 +462,7 @@ impl Window {
                         let levels = crate::config::Batteries::LOW_LEVELS;
                         c.batteries.low_at = levels[i.min(levels.len() - 1)];
                     }
-                    Choice::KeyboardLayout(_) => {}
+                    Choice::KeyboardLayout(_) | Choice::DevicesTab => {}
                     Choice::RingMotion => c.motion.ring = crate::config::MotionStyle::ALL[i.min(2)],
                     Choice::BarMotion => c.motion.bar = crate::config::MotionStyle::ALL[i.min(2)],
                     Choice::VolumeMotion => c.motion.volume = crate::config::MotionStyle::ALL[i.min(2)],
@@ -572,13 +605,6 @@ impl Window {
                     keyboard.remove_path(j);
                 }
             }),
-            Button::NextLayout(k) => {
-                let current = self.model.config.keyboards.assigned.get(k)?.hkl();
-                let at = self.model.layouts.iter().position(|(hkl, _)| Some(*hkl) == current);
-                let next = at.map_or(0, |at| (at + 1) % self.model.layouts.len());
-                let hkl = self.model.layouts.get(next)?.0;
-                self.set_layout(k, hkl);
-            }
             Button::ConfigFolder => {
                 let dir = Config::path().ok().and_then(|p| p.parent().map(|d| d.to_path_buf()));
                 return Some(Box::new(move || {
@@ -742,6 +768,10 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESUL
             Some(LRESULT(0))
         }
         WM_ERASEBKGND => Some(LRESULT(1)),
+        WM_TIMER if wparam.0 == ANIMATION_TIMER => {
+            with_window(|w| w.invalidate());
+            Some(LRESULT(0))
+        }
         WM_SIZE => {
             with_window(|w| {
                 w.size = ((lparam.0 & 0xFFFF) as u32, ((lparam.0 >> 16) & 0xFFFF) as u32);

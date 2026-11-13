@@ -152,6 +152,29 @@ pub(super) enum Toggle {
     Site(usize),
     Discord,
     Teams,
+    /// The calendar replaces the taskbar clock's.
+    Calendar,
+}
+
+/// The calendar connector's buttons.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum Cal {
+    /// Google Cloud's console, where the Calendar API is enabled.
+    GoogleApi,
+    /// Its credentials page, where the OAuth client is made.
+    GoogleCredentials,
+    GoogleId,
+    GoogleSecret,
+    /// Entra's app registrations.
+    MicrosoftPortal,
+    /// Copy the redirect the registration needs.
+    MicrosoftRedirect,
+    MicrosoftId,
+    SignIn(crate::calendar::Provider),
+    CancelSignIn(crate::calendar::Provider),
+    SignOut(crate::calendar::Provider),
+    AddLink,
+    RemoveLink(usize),
 }
 
 /// A segmented choice.
@@ -191,6 +214,7 @@ pub(super) enum Button {
     DiscordRedirect,
     DiscordId,
     DiscordSecret,
+    Cal(Cal),
     Restart,
     Releases,
     ConfigFolder,
@@ -364,7 +388,11 @@ pub(super) fn nav(height: f32) -> Laid {
 pub(super) fn attention(model: &Model, page: Page) -> usize {
     let s = &model.status;
     match page {
-        Page::Connectors => usize::from(s.discord_problem.is_some()) + usize::from(s.teams_problem.is_some()),
+        Page::Connectors => {
+            let cal = &model.calendar;
+            let calendar = cal.google.problem.is_some() || cal.microsoft.problem.is_some() || cal.links.iter().any(Option::is_some);
+            usize::from(s.discord_problem.is_some()) + usize::from(s.teams_problem.is_some()) + usize::from(calendar)
+        }
         Page::Taskbar => usize::from(s.notice.is_some()),
         Page::Batteries => {
             let b = &model.config.batteries;
@@ -652,6 +680,7 @@ pub(super) enum Connector {
     Mpc,
     Discord,
     Teams,
+    Calendar,
 }
 
 /// A grouped card being laid out: its item, where it starts, how many rows it has.
@@ -1332,15 +1361,142 @@ fn connectors(col: &mut Column, model: &Model) {
         (true, false, false, false) => not_set_up("its API is off"),
     };
     cards.push(ConnectorCard { glyph: '\u{E716}', title: "Teams meetings", state, on: c.teams.enabled, toggle: Toggle::Teams, connector: Connector::Teams });
+    cards.push(ConnectorCard {
+        glyph: '\u{E787}',
+        title: "Calendar",
+        state: calendar_state(model),
+        on: c.calendar.enabled,
+        toggle: Toggle::Calendar,
+        connector: Connector::Calendar,
+    });
 
     col.connector_grid(&cards, model.open);
     if let Some(card) = model.open.and_then(|open| cards.iter().find(|card| card.connector == open)) {
         col.section(card.title);
+        if card.connector == Connector::Calendar {
+            calendar_steps(col, model);
+            return;
+        }
         connector_steps(col, model, card.connector);
     } else {
         col.laid.push(R::new(col.x, col.y, col.w, 20.0), Kind::Text("Click a connector for its steps and options.".into()));
         col.y += 24.0;
     }
+}
+
+/// The calendar card's second line: what it reads from, or what is wrong.
+fn calendar_state(model: &Model) -> (String, Tone) {
+    use crate::calendar::Provider;
+    let c = &model.config.calendar;
+    let s = &model.calendar;
+    if !c.enabled {
+        return off();
+    }
+    let problem = Provider::ALL.iter().any(|&p| s.account(p).problem.is_some()) || s.links.iter().any(Option::is_some);
+    let mut names: Vec<String> = Provider::ALL
+        .iter()
+        .filter(|&&p| s.account(p).email.is_some())
+        .map(|&p| if p == Provider::Microsoft { "Outlook".to_string() } else { "Google".to_string() })
+        .collect();
+    match c.links.len() {
+        0 => {}
+        1 => names.push("a link".into()),
+        n => names.push(format!("{n} links")),
+    }
+    let names: Vec<&str> = names.iter().map(String::as_str).collect();
+    match (names.is_empty(), problem) {
+        (_, true) => not_set_up("see its steps"),
+        (true, false) => not_set_up("connect an account or a link"),
+        (false, false) => set_up(&format!("Showing {}", join_names(&names))),
+    }
+}
+
+/// The calendar's steps: what the clock does, then a card per account and one for the links.
+fn calendar_steps(col: &mut Column, model: &Model) {
+    use crate::calendar::Provider;
+    let c = &model.config.calendar;
+    let s = &model.calendar;
+    let hint = |button| model.hint.filter(|(b, _, _)| *b == button).map(|(_, h, tone)| (h.to_string(), tone));
+    let mut body = col.group();
+    let what = plain("The clock opens this calendar; Windows' notifications stay on the bell");
+    col.row(&mut body, None, "Opens from the taskbar clock", what, !c.enabled, Control::Toggle(c.enabled, Toggle::Calendar));
+    col.end_group(body);
+
+    for provider in Provider::ALL {
+        let account = s.account(provider);
+        let google = provider == Provider::Google;
+        col.section(if google { "Google account" } else { "Microsoft account (Outlook, work or school)" });
+        let mut body = col.group();
+        let sign_in = Button::Cal(Cal::SignIn(provider));
+        let cancel = Button::Cal(Cal::CancelSignIn(provider));
+        if let Some(email) = &account.email {
+            let (desc, buttons) = match &account.problem {
+                Some(problem) => (
+                    (problem.clone(), Tone::Warn),
+                    vec![("Sign in again".to_string(), true, None, sign_in), ("Sign out".to_string(), false, None, Button::Cal(Cal::SignOut(provider)))],
+                ),
+                None => (("Signed in".to_string(), Tone::Good), vec![("Sign out".to_string(), false, None, Button::Cal(Cal::SignOut(provider)))]),
+            };
+            let control = if account.signing_in { Control::Button("Cancel", false, None, cancel) } else { Control::Buttons(buttons) };
+            let desc = if account.signing_in { ("Finish signing in in your browser".to_string(), Tone::Plain) } else { desc };
+            col.row(&mut body, None, email, Some(desc), false, control);
+            col.end_group(body);
+            continue;
+        }
+        let registered = if google { c.google_client_id.is_some() && c.google_client_secret.is_some() } else { c.microsoft_client_id.is_some() };
+        if google {
+            let api = plain("Enable it, then set up the consent screen: External, and Publish it");
+            col.row(&mut body, Some((1, registered)), "Enable the Calendar API", api, false, Control::Button("Open", false, Some('\u{E8A7}'), Button::Cal(Cal::GoogleApi)));
+            let client = plain("Credentials > Create > OAuth client ID > Desktop app");
+            col.row(&mut body, Some((2, registered)), "Create a desktop client", client, false, Control::Button("Open", false, Some('\u{E8A7}'), Button::Cal(Cal::GoogleCredentials)));
+            let id = hint(Button::Cal(Cal::GoogleId)).or_else(|| c.google_client_id.clone().map(|id| (id, Tone::Plain)));
+            col.row(&mut body, None, "Client ID", id.or(plain("Not set")), false, Control::Button("Paste", false, Some('\u{E77F}'), Button::Cal(Cal::GoogleId)));
+            let secret = hint(Button::Cal(Cal::GoogleSecret)).or_else(|| c.google_client_secret.as_deref().map(|s| (tail(s), Tone::Plain)));
+            col.row(&mut body, None, "Client secret", secret.or(plain("Not set")), false, Control::Button("Paste", false, Some('\u{E77F}'), Button::Cal(Cal::GoogleSecret)));
+        } else {
+            let register = plain("New registration: any organisation + personal; then Calendars.Read");
+            col.row(&mut body, Some((1, registered)), "Register an app", register, false, Control::Button("Open", false, Some('\u{E8A7}'), Button::Cal(Cal::MicrosoftPortal)));
+            let redirect = hint(Button::Cal(Cal::MicrosoftRedirect)).or(plain("Authentication > Mobile and desktop applications: http://localhost"));
+            col.row(&mut body, Some((2, false)), "Add the redirect", redirect, false, Control::Button("Copy", false, Some('\u{E8C8}'), Button::Cal(Cal::MicrosoftRedirect)));
+            let id = hint(Button::Cal(Cal::MicrosoftId)).or_else(|| c.microsoft_client_id.clone().map(|id| (id, Tone::Plain)));
+            col.row(&mut body, None, "Application (client) ID", id.or(plain("Not set")), false, Control::Button("Paste", false, Some('\u{E77F}'), Button::Cal(Cal::MicrosoftId)));
+        }
+        let (desc, control) = if account.signing_in {
+            (plain("Finish signing in in your browser"), Control::Button("Cancel", false, None, cancel))
+        } else {
+            let desc = account.problem.clone().map(|p| (p, Tone::Warn)).or(plain("Opens the sign-in in your browser"));
+            (desc, Control::Button("Sign in", registered, None, sign_in))
+        };
+        col.row(&mut body, Some((3, false)), "Sign in", desc, !registered, control);
+        col.end_group(body);
+    }
+
+    col.section("Calendar links");
+    let mut body = col.group();
+    for (i, link) in c.links.iter().enumerate() {
+        let desc = match s.links.get(i).cloned().flatten() {
+            Some(problem) => (problem, Tone::Warn),
+            None => (link_host(&link.url), Tone::Plain),
+        };
+        col.row(&mut body, None, &link.name, Some(desc), false, Control::Button("Remove", false, Some('\u{E74D}'), Button::Cal(Cal::RemoveLink(i))));
+    }
+    let add = hint(Button::Cal(Cal::AddLink))
+        .or(plain("A secret iCal address: Google's Integrate calendar, Outlook's Publish"));
+    col.row(&mut body, None, "Add a link", add, false, Control::Button("Paste link", c.links.is_empty(), Some('\u{E77F}'), Button::Cal(Cal::AddLink)));
+    col.end_group(body);
+}
+
+/// A secret's last characters: it is never shown whole.
+fn tail(secret: &str) -> String {
+    let tail: String = secret.chars().rev().take(4).collect::<Vec<_>>().into_iter().rev().collect();
+    format!("••••{tail}")
+}
+
+/// Where a link points, without the secret part of its address.
+fn link_host(url: &str) -> String {
+    let url = crate::calendar::feed_url(url);
+    let host = url.split("://").nth(1).and_then(|rest| rest.split('/').next()).unwrap_or_default();
+    format!("{host}/••••")
 }
 
 /// What an opened connector shows under the grid: its setup steps until it is set up, then what can
@@ -1353,6 +1509,8 @@ fn connector_steps(col: &mut Column, model: &Model, connector: Connector) {
     let hint = |button| model.hint.filter(|(b, _, _)| *b == button).map(|(_, h, tone)| (h.to_string(), tone));
     let mut body = col.group();
     match connector {
+        // Laid out by `calendar_steps`, which has a card per account.
+        Connector::Calendar => {}
         Connector::Browser => {
             let dim = !c.browser.enabled;
             if !connected(browser::NAME) {

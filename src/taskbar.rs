@@ -346,6 +346,10 @@ fn init_data(icons: StripIcons, owner_pid: u32, payload: Payload) -> String {
     if config.strip.hide_windows_language {
         pairs.push(("hidelanguage", "1".to_string()));
     }
+    // The clock's clicks open our calendar instead of the shell's. Off is the default.
+    if config.calendar.enabled {
+        pairs.push(("clock", "1".to_string()));
+    }
     // The DLL path only matters to a handover's compatibility check, which comes by WM_COPYDATA
     // (no length cap); the injection's initialization data cannot spare its 70-odd characters.
     if payload == Payload::Handover {
@@ -487,6 +491,8 @@ pub enum Action {
     CycleOutput,
     CycleInput,
     OpenPanel,
+    /// A click on the taskbar clock.
+    OpenCalendar,
     /// Music transport. Codes 10+, deliberately far from the audio ones on the same window.
     MusicPrevious,
     MusicPlayPause,
@@ -500,6 +506,7 @@ impl Action {
             tap_proto::ACTION_CYCLE_OUTPUT => Some(Self::CycleOutput),
             tap_proto::ACTION_CYCLE_INPUT => Some(Self::CycleInput),
             tap_proto::ACTION_OPEN_PANEL => Some(Self::OpenPanel),
+            tap_proto::ACTION_OPEN_CALENDAR => Some(Self::OpenCalendar),
             tap_proto::ACTION_MUSIC_PREVIOUS => Some(Self::MusicPrevious),
             tap_proto::ACTION_MUSIC_PLAY_PAUSE => Some(Self::MusicPlayPause),
             tap_proto::ACTION_MUSIC_NEXT => Some(Self::MusicNext),
@@ -514,6 +521,7 @@ impl Action {
             Self::CycleOutput => tap_proto::ACTION_CYCLE_OUTPUT,
             Self::CycleInput => tap_proto::ACTION_CYCLE_INPUT,
             Self::OpenPanel => tap_proto::ACTION_OPEN_PANEL,
+            Self::OpenCalendar => tap_proto::ACTION_OPEN_CALENDAR,
             Self::MusicPrevious => tap_proto::ACTION_MUSIC_PREVIOUS,
             Self::MusicPlayPause => tap_proto::ACTION_MUSIC_PLAY_PAUSE,
             Self::MusicNext => tap_proto::ACTION_MUSIC_NEXT,

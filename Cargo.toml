@@ -159,6 +159,9 @@ features = [
     # only, never the key), and the language names come from the locale API.
     "Win32_UI_Input",
     "Win32_Globalization",
+    # The calendar (src/calendar): times on the local clock with the time zone's DST rules, and its
+    # name for Microsoft Graph.
+    "Win32_System_Time",
 ]
 
 [build-dependencies]

@@ -38,6 +38,55 @@ pub struct Config {
     pub batteries: Batteries,
     /// How the progress and volume bars move — see [`Motion`].
     pub motion: Motion,
+    /// The calendar that replaces the taskbar clock's — see [`crate::calendar`].
+    pub calendar: Calendar,
+}
+
+/// The calendar: a click on the taskbar clock opens Audio Tray's, with the events of the accounts
+/// signed in here (each through an app registration of the user's own) and of calendar links.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Calendar {
+    /// Replace the taskbar clock's calendar.
+    pub enabled: bool,
+    /// The Google Cloud OAuth client (a desktop app) the Google account signs in through.
+    pub google_client_id: Option<String>,
+    /// Its secret, kept in the Credential Manager like [`Discord::client_secret`].
+    #[serde(skip_serializing)]
+    pub google_client_secret: Option<String>,
+    /// The Microsoft Entra app registration the Microsoft account signs in through.
+    pub microsoft_client_id: Option<String>,
+    /// Which accounts it takes: `common` (any), `organizations`, `consumers` or a tenant id.
+    pub microsoft_tenant: String,
+    /// Calendar links (ICS), kept in the Credential Manager: an address reads the calendar.
+    #[serde(skip_serializing)]
+    pub links: Vec<crate::calendar::Link>,
+}
+
+impl Default for Calendar {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            google_client_id: None,
+            google_client_secret: None,
+            microsoft_client_id: None,
+            microsoft_tenant: "common".into(),
+            links: Vec::new(),
+        }
+    }
+}
+
+impl Calendar {
+    /// What a fetch needs.
+    pub fn setup(&self) -> crate::calendar::Setup {
+        crate::calendar::Setup {
+            google_id: self.google_client_id.clone(),
+            google_secret: self.google_client_secret.clone(),
+            microsoft_id: self.microsoft_client_id.clone(),
+            tenant: self.microsoft_tenant.clone(),
+            links: self.links.clone(),
+        }
+    }
 }
 
 /// How the bars move, each on its own: the pill's progress ring, the card's track bar, and the
@@ -502,7 +551,7 @@ impl Config {
     /// Whether anything is drawn into the taskbar (the audio buttons or the music tile), which is
     /// what injecting into Explorer is for.
     pub fn injects(&self) -> bool {
-        self.strip.enabled || self.tile_shown()
+        self.strip.enabled || self.tile_shown() || self.calendar.enabled
     }
 
     /// Whether the music tile is drawn.
@@ -533,6 +582,10 @@ impl Config {
         if config.teams.token.is_none() {
             config.teams.token = crate::secrets::get(crate::secrets::TEAMS_TOKEN);
         }
+        config.calendar.google_client_secret = crate::secrets::get(crate::secrets::CALENDAR_GOOGLE_SECRET);
+        config.calendar.links = crate::secrets::get(crate::secrets::CALENDAR_LINKS)
+            .and_then(|text| serde_json::from_str(&text).ok())
+            .unwrap_or_default();
         config
     }
 
@@ -579,6 +632,9 @@ impl Config {
     pub fn save(&self) -> Result<()> {
         crate::secrets::set(crate::secrets::DISCORD_SECRET, self.discord.client_secret.as_deref());
         crate::secrets::set(crate::secrets::TEAMS_TOKEN, self.teams.token.as_deref());
+        crate::secrets::set(crate::secrets::CALENDAR_GOOGLE_SECRET, self.calendar.google_client_secret.as_deref());
+        let links = (!self.calendar.links.is_empty()).then(|| serde_json::to_string(&self.calendar.links).ok()).flatten();
+        crate::secrets::set(crate::secrets::CALENDAR_LINKS, links.as_deref());
         let path = Self::path()?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)

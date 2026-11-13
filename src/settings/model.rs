@@ -78,6 +78,8 @@ pub(super) struct Model {
     pub capture: Option<Option<String>>,
     /// The keyboard a capture adds a connection to; `None` adds a new keyboard.
     pub capture_into: Option<usize>,
+    /// The calendar's accounts and links, as last fetched or signed in.
+    pub calendar: crate::calendar::Status,
 }
 
 impl Model {
@@ -99,6 +101,7 @@ impl Model {
             renaming: None,
             capture: None,
             capture_into: None,
+            calendar: crate::calendar::Status::default(),
         }
     }
 
@@ -158,9 +161,60 @@ pub(super) fn paste_key(button: Button, text: &str) -> Result<(), &'static str> 
     }
 }
 
+/// What the clipboard should hold for one of the calendar's Paste buttons.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum CalendarKey {
+    GoogleId,
+    GoogleSecret,
+    MicrosoftId,
+    Link,
+}
+
+/// The clipboard's `text` as the calendar key `key` wants it, else what to say instead.
+pub(super) fn paste_calendar(key: CalendarKey, text: &str) -> Result<String, &'static str> {
+    let text = text.trim();
+    let google_id = text.ends_with(".apps.googleusercontent.com") && !text.contains(char::is_whitespace);
+    let google_secret = text.starts_with("GOCSPX-") && text.len() < 80;
+    let guid = text.len() == 36
+        && text.char_indices().all(|(i, c)| if matches!(i, 8 | 13 | 18 | 23) { c == '-' } else { c.is_ascii_hexdigit() });
+    let link = {
+        let lower = text.to_ascii_lowercase();
+        (lower.starts_with("https://") || lower.starts_with("webcal://") || lower.starts_with("webcals://") || lower.starts_with("http://"))
+            && !text.contains(char::is_whitespace)
+    };
+    match key {
+        CalendarKey::GoogleId if google_id => Ok(text.to_string()),
+        CalendarKey::GoogleId if google_secret => Err("That is the secret: copy the client ID"),
+        CalendarKey::GoogleId => Err("Copy the client ID (…apps.googleusercontent.com) first"),
+        CalendarKey::GoogleSecret if google_secret => Ok(text.to_string()),
+        CalendarKey::GoogleSecret if google_id => Err("That is the ID: copy the client secret"),
+        CalendarKey::GoogleSecret => Err("Copy the client secret (GOCSPX-…) first"),
+        CalendarKey::MicrosoftId if guid => Ok(text.to_ascii_lowercase()),
+        CalendarKey::MicrosoftId => Err("Copy the Application (client) ID from its Overview first"),
+        CalendarKey::Link if link => Ok(text.to_string()),
+        CalendarKey::Link => Err("Copy the calendar's address (https:// or webcal://) first"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn calendar_keys_must_look_like_the_one_asked_for() {
+        let id = "123-abc.apps.googleusercontent.com";
+        assert_eq!(paste_calendar(CalendarKey::GoogleId, &format!(" {id}\n")).as_deref(), Ok(id));
+        assert!(paste_calendar(CalendarKey::GoogleId, "GOCSPX-abc").is_err());
+        assert!(paste_calendar(CalendarKey::GoogleSecret, "GOCSPX-abcDEF123").is_ok());
+        assert!(paste_calendar(CalendarKey::GoogleSecret, id).is_err());
+        assert_eq!(
+            paste_calendar(CalendarKey::MicrosoftId, "0F1E2D3C-4B5A-6978-8796-A5B4C3D2E1F0").as_deref(),
+            Ok("0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0")
+        );
+        assert!(paste_calendar(CalendarKey::MicrosoftId, "not-a-guid").is_err());
+        assert!(paste_calendar(CalendarKey::Link, "webcal://example.com/cal.ics").is_ok());
+        assert!(paste_calendar(CalendarKey::Link, "my calendar").is_err());
+    }
 
     #[test]
     fn a_pasted_key_must_look_like_the_one_asked_for() {

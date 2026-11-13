@@ -1,8 +1,9 @@
 //! What audio-tray and its TAP (inside `explorer.exe`) must agree on. The exe and DLL can be
 //! different builds (RELEASING.md), so values are never renumbered, only added.
 //!
-//! Message ids share the app's receiver window with app-internal ones: `WM_APP + 1..=19` and
-//! `+ 30..=39` are the app's own (audio and tray), `+ 20..=29` and `+ 40..` are this crate's.
+//! Message ids share the app's receiver window with app-internal ones: `WM_APP + 1..=19`,
+//! `+ 30..=39` and `+ 41..=49` are the app's own (audio, tray, calendar); `+ 20..=29`, `+ 40` and
+//! `+ 50..` are this crate's.
 
 /// `WM_APP`, spelled out so this crate needs no Windows bindings.
 const WM_APP: u32 = 0x8000;
@@ -60,6 +61,8 @@ pub const RESTYLE_RECORDING: usize = 1 << 25;
 pub const ACTION_CYCLE_OUTPUT: usize = 1;
 pub const ACTION_CYCLE_INPUT: usize = 2;
 pub const ACTION_OPEN_PANEL: usize = 3;
+/// A click on the taskbar clock, when the calendar replaces the shell's (init data `clock=1`).
+pub const ACTION_OPEN_CALENDAR: usize = 4;
 pub const ACTION_MUSIC_PREVIOUS: usize = 10;
 pub const ACTION_MUSIC_PLAY_PAUSE: usize = 11;
 pub const ACTION_MUSIC_NEXT: usize = 12;
@@ -83,7 +86,7 @@ pub const MUSIC_STATE_FILE: &str = "audio-tray-music.txt";
 /// Version of the app ↔ TAP contract (init-data keys, messages, state file). A loaded TAP adopts a
 /// new app on a handover when this matches and the DLL file is the same, instead of requiring the
 /// identical app version. Bump it on any change an older TAP or app would misread.
-pub const PROTOCOL: u32 = 3;
+pub const PROTOCOL: u32 = 4;
 
 /// Encodes init data: `key=value` pairs joined by `;`. Values escape `%`, `;` and `=` as `%25`,
 /// `%3B` and `%3D`, so a tile name or install path containing them survives; anything else is

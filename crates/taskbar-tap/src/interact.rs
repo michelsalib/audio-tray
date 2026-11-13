@@ -345,3 +345,56 @@ pub unsafe fn attach_music(
     let tap = target.add_Tapped(tapped.as_raw(), &mut tap_token);
     press == S_OK && tap == S_OK
 }
+
+/// A press on the taskbar clock: marked handled while the calendar is ours, so the shell's
+/// `NotificationCenterButton` never starts its click and its flyout stays shut.
+#[implement(IPointerEventHandler)]
+struct ClockPress;
+
+impl IPointerEventHandler_Impl for ClockPress_Impl {
+    unsafe fn Invoke(&self, _sender: *mut c_void, args: *mut c_void) -> HRESULT {
+        guard("clock-press", || {
+            // Not deduped: every delivery must be suppressed.
+            if crate::clock::enabled() {
+                suppress_pointer(args);
+            }
+        })
+    }
+}
+
+/// A completed click on the clock: open audio-tray's calendar.
+#[implement(ITappedEventHandler)]
+struct ClockTap;
+
+impl ITappedEventHandler_Impl for ClockTap_Impl {
+    unsafe fn Invoke(&self, _sender: *mut c_void, args: *mut c_void) -> HRESULT {
+        guard("clock-tap", || {
+            if !crate::clock::enabled() {
+                return;
+            }
+            suppress_tap(args);
+            if already_seen(args) {
+                return;
+            }
+            logf!("clock: tap — opening the calendar");
+            crate::ipc::send_calendar();
+        })
+    }
+}
+
+/// Wire the clock's view (press suppression and tap).
+///
+/// # Safety
+/// XAML UI thread only.
+pub unsafe fn attach_clock(diagnostics: &IXamlDiagnostics, element: InstanceHandle) -> bool {
+    let Some(target) = ui_element(diagnostics, element) else {
+        return false;
+    };
+    let mut press_token = 0i64;
+    let mut tap_token = 0i64;
+    let pressed: IPointerEventHandler = ClockPress.into();
+    let press = target.add_PointerPressed(pressed.as_raw(), &mut press_token);
+    let tapped: ITappedEventHandler = ClockTap.into();
+    let tap = target.add_Tapped(tapped.as_raw(), &mut tap_token);
+    press == S_OK && tap == S_OK
+}

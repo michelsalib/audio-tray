@@ -1,0 +1,133 @@
+//! What a calendar holds, whichever account or link it came from.
+
+use super::time::{self, Zone, DAY};
+
+/// When an event happens.
+#[derive(Clone, Debug, PartialEq)]
+pub enum When {
+    /// A timed event: instants, in seconds since the epoch.
+    At { start: i64, end: i64 },
+    /// Whole days on the local calendar: `first` up to `end`, exclusive.
+    AllDay { first: i32, end: i32 },
+}
+
+/// Where an event came from: a signed-in account, or calendar link `i`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Source {
+    Google,
+    Microsoft,
+    Link(usize),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Event {
+    pub when: When,
+    pub title: String,
+    pub location: String,
+    /// The event in its calendar's web page.
+    pub link: Option<String>,
+    /// The meeting to join (Meet, Teams), when it has one.
+    pub join: Option<String>,
+    pub source: Source,
+    /// Its calendar's colour.
+    pub color: [u8; 3],
+}
+
+impl Event {
+    /// The local days it covers, `[first, last]`.
+    pub fn days(&self, zone: &dyn Zone) -> (i32, i32) {
+        match self.when {
+            When::AllDay { first, end } => (first, (end - 1).max(first)),
+            When::At { start, end } => {
+                let first = time::day_of(zone.to_local(start));
+                // An event ending at midnight does not spill into the next day.
+                let last = time::day_of(zone.to_local(end.max(start + 1) - 1));
+                (first, last.max(first))
+            }
+        }
+    }
+
+    pub fn on_day(&self, day: i32, zone: &dyn Zone) -> bool {
+        let (first, last) = self.days(zone);
+        first <= day && day <= last
+    }
+
+    /// All-day events first, then by start, then by title.
+    pub fn order(&self) -> (u8, i64) {
+        match self.when {
+            When::AllDay { first, .. } => (0, first as i64 * DAY),
+            When::At { start, .. } => (1, start),
+        }
+    }
+}
+
+/// The events on `day`, in the order the agenda lists them.
+pub fn on_day<'a>(events: &'a [Event], day: i32, zone: &dyn Zone) -> Vec<&'a Event> {
+    let mut list: Vec<&Event> = events.iter().filter(|e| e.on_day(day, zone)).collect();
+    list.sort_by(|a, b| a.order().cmp(&b.order()).then_with(|| a.title.cmp(&b.title)));
+    list
+}
+
+/// The colours of up to three events on each of `count` days from `first`, for the month grid's dots.
+pub fn dots(events: &[Event], first: i32, count: usize, zone: &dyn Zone) -> Vec<Vec<[u8; 3]>> {
+    let mut out = vec![Vec::new(); count];
+    let mut sorted: Vec<&Event> = events.iter().collect();
+    sorted.sort_by_key(|e| e.order());
+    for event in sorted {
+        let (a, b) = event.days(zone);
+        for day in a.max(first)..=b.min(first + count as i32 - 1) {
+            let slot = &mut out[(day - first) as usize];
+            if slot.len() < 3 && !slot.contains(&event.color) {
+                slot.push(event.color);
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::calendar::time::{days_from_civil, Fixed};
+
+    fn timed(day: i32, from_h: i64, to_h: i64) -> Event {
+        let base = day as i64 * DAY;
+        Event {
+            when: When::At { start: base + from_h * 3600, end: base + to_h * 3600 },
+            title: format!("{from_h}h"),
+            location: String::new(),
+            link: None,
+            join: None,
+            source: Source::Google,
+            color: [1, 2, 3],
+        }
+    }
+
+    #[test]
+    fn a_timed_event_falls_on_its_local_days_and_midnight_ends_do_not_spill() {
+        let day = days_from_civil(2026, 11, 13);
+        let zone = Fixed(3600);
+        // 23:30 UTC is 00:30 the next day at UTC+1.
+        let late = Event { when: When::At { start: day as i64 * DAY + 23 * 3600 + 1800, end: day as i64 * DAY + 24 * 3600 + 1800 }, ..timed(day, 0, 1) };
+        assert!(!late.on_day(day, &zone));
+        assert!(late.on_day(day + 1, &zone));
+        let to_midnight = timed(day, 22, 23); // 23:00 to 00:00 local
+        assert_eq!(to_midnight.days(&zone), (day, day));
+    }
+
+    #[test]
+    fn all_day_events_come_first_and_span_their_days() {
+        let day = days_from_civil(2026, 11, 13);
+        let zone = Fixed(0);
+        let trip = Event { when: When::AllDay { first: day, end: day + 3 }, title: "Trip".into(), ..timed(day, 0, 1) };
+        let events = vec![timed(day, 9, 10), trip.clone(), timed(day, 8, 9)];
+        let list = on_day(&events, day, &zone);
+        assert_eq!(list[0].title, "Trip");
+        assert_eq!(list[1].title, "8h");
+        assert!(trip.on_day(day + 2, &zone) && !trip.on_day(day + 3, &zone));
+        let dots = dots(&events, day - 1, 5, &zone);
+        assert_eq!(dots[0].len(), 0);
+        assert_eq!(dots[1], vec![[1, 2, 3]]);
+        assert_eq!(dots[3].len(), 1);
+    }
+}

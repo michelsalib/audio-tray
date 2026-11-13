@@ -337,6 +337,7 @@ pub fn run(backend: WasapiBackend, settings: bool) -> Result<()> {
     crate::wait::run();
     crate::integrations::stop();
 
+    crate::calendar::close();
     crate::settings::destroy();
     crate::pill::destroy();
     // The progress bar sits on *another app's* button, so it has to come off here, while this
@@ -389,6 +390,7 @@ fn is_ours(msg: u32, wparam: usize) -> bool {
             | crate::pill::WM_PILL_ACTION
             | crate::settings::WM_SETTINGS
             | crate::settings::WM_OPEN_SETTINGS
+            | crate::calendar::WM_CALENDAR
     ) || (msg == WM_TIMER && (wparam == crate::osd::TIMER_ID || wparam == NOTICE_TIMER))
 }
 
@@ -443,7 +445,13 @@ fn handle(msg: Queued) {
                 with_tray(Tray::adopt_settings);
             }
         },
-        crate::settings::WM_OPEN_SETTINGS => open_settings(),
+        crate::settings::WM_OPEN_SETTINGS => {
+            open_settings();
+            if msg.wparam == crate::settings::OPEN_CALENDAR {
+                crate::settings::show_calendar();
+            }
+        }
+        crate::calendar::WM_CALENDAR => crate::calendar::changed(),
         WM_TIMER if msg.wparam == NOTICE_TIMER => {
             with_tray(Tray::expire_notices);
         }
@@ -512,6 +520,12 @@ fn click_allowed(what: &dyn std::fmt::Debug) -> bool {
 /// A gesture on the injected strip, relayed by the TAP.
 fn on_action(action: Action) {
     if !click_allowed(&action) {
+        return;
+    }
+    if action == Action::OpenCalendar {
+        if let Some(config) = with_tray(|tray| tray.config.clone()) {
+            crate::calendar::open(&config);
+        }
         return;
     }
     // A segment's left click does what `[strip] left_click` says.
@@ -687,10 +701,13 @@ impl Tray {
         // The strip and the tile need a fresh injection.
         let drawn = |c: &Config| {
             let s = &c.strip;
-            (s.enabled, s.next_to_wifi, s.hide_windows_volume, s.hide_windows_mic, s.hide_windows_language, c.music.enabled, c.music.tile_style)
+            (s.enabled, s.next_to_wifi, s.hide_windows_volume, s.hide_windows_mic, s.hide_windows_language, c.music.enabled, c.music.tile_style, c.calendar.enabled)
         };
         if drawn(&before) != drawn(c) {
             self.apply_taskbar();
+        }
+        if before.calendar.links != self.config.calendar.links {
+            crate::calendar::links_changed();
         }
         if before.icons != self.config.icons {
             self.refresh();
@@ -1176,7 +1193,7 @@ impl Tray {
         let flow = match action {
             Action::CycleOutput => Flow::Output,
             Action::CycleInput => Flow::Input,
-            Action::OpenPanel => return Ok(()), // handled by `on_action`
+            Action::OpenPanel | Action::OpenCalendar => return Ok(()), // handled by `on_action`
             // Handed to the feed thread and not awaited: a slow media session must not stall this
             // thread. The strip catches up on the next poll.
             Action::MusicPrevious | Action::MusicPlayPause | Action::MusicNext => {
@@ -1484,6 +1501,8 @@ mod tests {
             crate::pill::WM_PILL_ACTION,
             crate::settings::WM_SETTINGS,
             crate::settings::WM_OPEN_SETTINGS,
+            WM_ICON_RECT_CHECK,
+            crate::calendar::WM_CALENDAR,
             tap_proto::WM_TASKBAR_ACTION,
             tap_proto::WM_TASKBAR_RESTARTED,
             tap_proto::WM_TASKBAR_SCROLL,

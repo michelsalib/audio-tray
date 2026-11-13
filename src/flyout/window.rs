@@ -73,16 +73,17 @@ impl Surface {
 
     /// Slide up + fade in, like the native tray flyouts. Runs before the modal loop.
     pub(super) fn animate_in(&self, scale: f32) {
-        let slide = (14.0 * scale) as i32;
-        let frames = 9;
-        for i in 1..=frames {
-            let t = i as f32 / frames as f32;
-            let ease = 1.0 - (1.0 - t) * (1.0 - t); // ease-out quad
-            let yy = self.y + (slide as f32 * (1.0 - ease)) as i32;
-            self.present(&self.buf, self.x, yy, (255.0 * ease) as u8);
-            std::thread::sleep(std::time::Duration::from_millis(9));
-        }
+        self.animate(crate::win::Flyout::Open, scale);
         self.flush();
+    }
+
+    /// Slide down + fade out, before the window is destroyed.
+    pub(super) fn animate_out(&self, scale: f32) {
+        self.animate(crate::win::Flyout::Close, scale);
+    }
+
+    fn animate(&self, motion: crate::win::Flyout, scale: f32) {
+        motion.run(crate::win::FLYOUT_SLIDE * scale, |offset, alpha| self.present(&self.buf, self.x, self.y + offset, alpha));
     }
 
     /// Present the current `buf` at the resting position, fully opaque.

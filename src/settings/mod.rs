@@ -50,7 +50,7 @@ pub const APPLY: usize = 0;
 pub const QUIT: usize = 1;
 /// Relaunch into a staged update.
 pub const RESTART: usize = 2;
-/// [`WM_OPEN_SETTINGS`]'s `wParam` to open on the calendar's connector.
+/// [`WM_OPEN_SETTINGS`]'s `wParam` to open on the Calendar page.
 pub const OPEN_CALENDAR: usize = 1;
 
 /// Posted to this window: something in [`INBOX`] to read.
@@ -164,11 +164,10 @@ pub fn calendar_changed() {
     wake();
 }
 
-/// Show the calendar's connector (the calendar's gear opens it).
+/// Show the Calendar page (the calendar's gear opens it).
 pub fn show_calendar() {
     with_window(|w| {
-        w.model.page = Page::Connectors;
-        w.model.open = Some(layout::Connector::Calendar);
+        w.model.page = Page::Calendar;
         w.model.calendar = crate::calendar::status(&w.model.config.calendar.setup());
         w.scroll = 0.0;
         w.relayout();
@@ -405,6 +404,9 @@ impl Window {
                     self.stop_capture();
                     if page == Page::Keyboards {
                         self.model.read_keyboards();
+                    }
+                    if page == Page::Calendar {
+                        self.model.calendar = crate::calendar::status(&self.model.config.calendar.setup());
                     }
                     self.scroll = 0.0;
                     self.relayout();

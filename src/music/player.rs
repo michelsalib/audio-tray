@@ -400,7 +400,7 @@ pub enum Raise {
 /// Bring a window to the front, restoring it if minimised, escalating `SetForegroundWindow` →
 /// `AttachThreadInput` + retry → `SwitchToThisWindow` and verifying each rung. We usually lack
 /// foreground rights (the click reached us as a message from Explorer).
-fn raise(hwnd: HWND) -> Raise {
+pub(crate) fn raise(hwnd: HWND) -> Raise {
     use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
     use windows::Win32::UI::WindowsAndMessaging::{
         BringWindowToTop, GetForegroundWindow, GetWindowThreadProcessId, IsIconic,

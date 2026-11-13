@@ -81,11 +81,60 @@ pub unsafe fn wire(diagnostics: &xamlom::IXamlDiagnostics) {
         }
         // Recorded either way: a failure is logged once, not retried every sweep.
         crate::lock(&WIRED).push(target);
+        make_hit_testable(diagnostics, content);
         let wired = crate::interact::attach_clock(diagnostics, target);
         logf!(
             "clock: {} 0x{target:x} ({})",
             if wired { "wired" } else { "could not wire" },
             tree::type_of(target).unwrap_or_default()
+        );
+    }
+}
+
+/// The button around the clock.
+const BUTTON: &str = "SystemTray.OmniButton";
+
+/// The shell's template leaves the clock's elements out of hit-testing, so a press lands on the
+/// button itself and never reaches handlers on the clock. Every element from the clock's text up
+/// to the button is made hit-testable, so the press reaches [`crate::interact::attach_clock`]'s
+/// handler first. Left on after a revert: with no handler acting, the press bubbles on to the
+/// button as before. Each element's original value is logged.
+///
+/// # Safety
+/// XAML UI thread only.
+unsafe fn make_hit_testable(diagnostics: &xamlom::IXamlDiagnostics, content: xamlom::InstanceHandle) {
+    use crate::winrt::IUIElement;
+    let mut chain = Vec::new();
+    // Up from the content to the button (exclusive).
+    let mut handle = content;
+    for _ in 0..16 {
+        if tree::type_of(handle).as_deref() == Some(BUTTON) {
+            break;
+        }
+        chain.push(handle);
+        let Some(parent) = tree::parent_of(handle) else { break };
+        handle = parent;
+    }
+    // And everything inside the content (the time and date text).
+    let mut queue = tree::children_of(content);
+    while let Some(child) = queue.pop() {
+        if chain.len() > 64 {
+            break;
+        }
+        chain.push(child);
+        queue.extend(tree::children_of(child));
+    }
+    for handle in chain {
+        let Some(element) = crate::decorate::element::<IUIElement>(diagnostics, handle) else { continue };
+        let mut was = 0u8;
+        let _ = element.get_IsHitTestVisible(&mut was);
+        let set = if was == 0 { element.put_IsHitTestVisible(1).0 } else { 0 };
+        let name = tree::name_of(handle).filter(|n| !n.is_empty()).map(|n| format!("#{n}")).unwrap_or_default();
+        logf!(
+            "clock:   {}{name} hit-test {}{}",
+            tree::type_of(handle).unwrap_or_default(),
+            was != 0,
+            if was == 0 { format!(" -> on (0x{set:08x})") } else { String::new() }
         );
     }
 }
@@ -109,4 +158,14 @@ fn report_missing() {
         logf!("clock:   {}{}{name}", "  ".repeat(depth), tree::type_of(handle).unwrap_or_default());
         queue.extend(tree::children_of(handle).into_iter().map(|c| (c, depth + 1)));
     }
+}
+
+/// What [`enabled`] read, for the log.
+pub fn why() -> String {
+    format!(
+        "asked {}, live {}, app there {}",
+        ENABLED.load(Ordering::SeqCst),
+        crate::live(),
+        crate::ipc::receiver_present()
+    )
 }

@@ -24,8 +24,15 @@ pub use model::{Event, Source};
 pub use sources::{feed_url, link_name, Link, Provider, Setup};
 use time::{Local, Zone, DAY};
 
-/// Posted to the tray's window: a fetch or a sign-in finished.
+/// Posted to the tray's window: a fetch or a sign-in finished (`wParam` 0), or a click landed
+/// outside the open calendar ([`CLOSE`]).
 pub const WM_CALENDAR: u32 = WM_APP + 42;
+/// [`WM_CALENDAR`]'s `wParam` to close the calendar.
+pub const CLOSE: usize = 1;
+
+/// The open calendar's screen rectangle, for the mouse hook: a click outside it closes it even
+/// when Windows kept the foreground from it.
+pub static OPEN_RECT: Mutex<Option<windows::Win32::Foundation::RECT>> = Mutex::new(None);
 
 /// A cache this old is fetched again when the calendar opens.
 const STALE_AFTER: i64 = 5 * 60;
@@ -249,11 +256,20 @@ fn fetch_all(setup: &Setup, days: (i32, i32)) -> (Vec<Event>, Vec<(Source, Strin
             }
             Err(e) => {
                 eprintln!("calendar: link {i} ({e:#})");
-                problems.push((Source::Link(i), describe(&e)));
+                problems.push((Source::Link(i), describe_link(&e)));
             }
         }
     }
     (events, problems, done)
+}
+
+/// A link's problem: there is no account to sign in again with, only the address to fix.
+fn describe_link(error: &anyhow::Error) -> String {
+    match error.downcast_ref::<oauth::Refused>().map(|r| r.0) {
+        Some(401 | 403) => "Refused: use the calendar's secret iCal address".into(),
+        _ if format!("{error:#}").contains("not a calendar") => "Not a calendar: use its iCal (.ics) address".into(),
+        _ => describe(error),
+    }
 }
 
 /// A problem in a few words, for Settings and the calendar's footer.

@@ -360,6 +360,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         taskbar::set_status(wparam.0);
         return LRESULT(0);
     }
+    // A plain store too, read by the mouse hook on its own thread.
+    if msg == tap_proto::WM_TASKBAR_CLOCK_HOVER {
+        hook::set_clock_hover(wparam.0 != 0);
+        return LRESULT(0);
+    }
     if !is_ours(msg, wparam.0) {
         return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
     }
@@ -451,6 +456,7 @@ fn handle(msg: Queued) {
                 crate::settings::show_calendar();
             }
         }
+        crate::calendar::WM_CALENDAR if msg.wparam == crate::calendar::CLOSE => crate::calendar::close(),
         crate::calendar::WM_CALENDAR => crate::calendar::changed(),
         WM_TIMER if msg.wparam == NOTICE_TIMER => {
             with_tray(Tray::expire_notices);
@@ -497,6 +503,8 @@ fn handle(msg: Queued) {
         }
         WM_TRAY_CLICK => on_tray_click(msg.wparam, msg.lparam),
         WM_TASKBAR_RESTARTED => {
+            // The clock the TAP said the pointer was over is gone with the old shell.
+            hook::set_clock_hover(false);
             with_tray(Tray::taskbar_restarted);
         }
         _ => {}
@@ -1508,6 +1516,7 @@ mod tests {
             tap_proto::WM_TASKBAR_SCROLL,
             tap_proto::WM_MUSIC_PROGRESS,
             tap_proto::WM_TASKBAR_STATUS,
+            tap_proto::WM_TASKBAR_CLOCK_HOVER,
         ];
         for (i, a) in ids.iter().enumerate() {
             assert!(ids[i + 1..].iter().all(|b| a != b), "0x{a:x} is used twice");

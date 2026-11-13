@@ -283,6 +283,7 @@ unsafe fn show_inner(
     fly.watches.clear(); // unregister the volume callbacks before the window goes away
     fly.meters.clear(); // release the peak-meter interfaces too
     let _ = ReleaseCapture();
+    fly.surface.animate_out(fly.scale);
     let _ = DestroyWindow(fly.surface.hwnd);
     // The outer loop must still see the quit this pump took.
     if quit {

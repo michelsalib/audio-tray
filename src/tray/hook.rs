@@ -1,4 +1,7 @@
-//! Wheel over the taskbar → [`WM_TASKBAR_SCROLL`] to the tray's message window.
+//! Wheel over the taskbar → [`WM_TASKBAR_SCROLL`] to the tray's message window; a left click on the
+//! taskbar clock → the calendar, while it replaces the shell's (the TAP says when the pointer is
+//! over the clock, [`set_clock_hover`]). The click is swallowed whole, down and up: Explorer's
+//! clock button opens its own flyout whatever its XAML handlers do with the press.
 //!
 //! A `WH_MOUSE_LL` hook on a thread of its own, with a bare message loop: Windows silently
 //! unhooks a low-level hook whose thread misses `LowLevelHooksTimeout`, and the tray thread does
@@ -10,8 +13,8 @@ use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, GetAncestor, GetMessageW, PostThreadMessageW, SetWindowsHookExW,
-    UnhookWindowsHookEx, WindowFromPoint, GA_ROOT, MSG, MSLLHOOKSTRUCT, WH_MOUSE_LL, WM_MOUSEWHEEL,
-    WM_QUIT,
+    UnhookWindowsHookEx, WindowFromPoint, GA_ROOT, MSG, MSLLHOOKSTRUCT, WH_MOUSE_LL, WM_LBUTTONDOWN,
+    WM_LBUTTONUP, WM_MOUSEWHEEL, WM_QUIT, WM_RBUTTONDOWN,
 };
 
 use crate::audio::Flow;
@@ -76,6 +79,17 @@ fn icon_rect() -> Option<RECT> {
 }
 
 unsafe extern "system" fn mouse_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if code >= 0 && matches!(wparam.0 as u32, WM_LBUTTONDOWN | WM_LBUTTONUP | WM_RBUTTONDOWN) {
+        let info = unsafe { &*(lparam.0 as *const MSLLHOOKSTRUCT) };
+        let message = wparam.0 as u32;
+        if message != WM_RBUTTONDOWN && clock_click(message == WM_LBUTTONDOWN, info.pt) {
+            return LRESULT(1);
+        }
+        if message != WM_LBUTTONUP && outside_calendar(info.pt) {
+            // Passed on: the click still does what it does there.
+            super::post(crate::calendar::WM_CALENDAR, crate::calendar::CLOSE, 0);
+        }
+    }
     if code >= 0 && wparam.0 as u32 == WM_MOUSEWHEEL {
         let info = unsafe { &*(lparam.0 as *const MSLLHOOKSTRUCT) };
         let delta = (info.mouseData >> 16) as i16;
@@ -115,6 +129,46 @@ fn flow_at(pt: POINT) -> Flow {
         Some(slot) if pt.x >= (slot.left + slot.right) / 2 => Flow::Input,
         _ => Flow::Output,
     }
+}
+
+/// The pointer is over the taskbar clock, as the TAP last said.
+static CLOCK_HOVER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// A press on the clock was swallowed: its release goes too.
+static CLOCK_PRESSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The TAP's word on whether the pointer is over the clock (it only says "over" while the calendar
+/// replaces the shell's).
+pub(super) fn set_clock_hover(over: bool) {
+    CLOCK_HOVER.store(over, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether a left button event is a click on the clock to take: a press while over it (and over a
+/// taskbar, so a stale word from the TAP cannot take clicks elsewhere), or the release of one.
+fn clock_click(down: bool, pt: POINT) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    if !down {
+        return CLOCK_PRESSED.swap(false, Relaxed);
+    }
+    if !CLOCK_HOVER.load(Relaxed) {
+        return false;
+    }
+    let hwnd = unsafe { WindowFromPoint(pt) };
+    let root: HWND = unsafe { GetAncestor(hwnd, GA_ROOT) };
+    if !matches!(crate::win::class_name(root).as_str(), "Shell_TrayWnd" | "Shell_SecondaryTrayWnd") {
+        return false;
+    }
+    if !super::post(crate::taskbar::WM_TASKBAR_ACTION, tap_proto::ACTION_OPEN_CALENDAR, 0) {
+        return false;
+    }
+    CLOCK_PRESSED.store(true, Relaxed);
+    true
+}
+
+/// Whether the calendar is open and `pt` is outside it: the click that closes it, as a menu's would.
+/// The calendar closes on losing the foreground too, but Windows may never have given it that.
+fn outside_calendar(pt: POINT) -> bool {
+    let open = *crate::calendar::OPEN_RECT.lock().unwrap_or_else(|e| e.into_inner());
+    open.is_some_and(|r| pt.x < r.left || pt.x >= r.right || pt.y < r.top || pt.y >= r.bottom)
 }
 
 /// A [`super::WM_ICON_RECT_CHECK`] is on its way: one is enough however fast the wheel turns.

@@ -158,3 +158,8 @@ pub fn send_calendar() {
     }
     let _ = post(WM_TASKBAR_ACTION, tap_proto::ACTION_OPEN_CALENDAR, 0);
 }
+
+/// The pointer entered (`true`) or left the clock.
+pub fn send_clock_hover(over: bool) {
+    let _ = post(tap_proto::WM_TASKBAR_CLOCK_HOVER, usize::from(over), 0);
+}

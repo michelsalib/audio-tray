@@ -65,6 +65,8 @@ pub(super) enum Page {
     /// What Audio Tray is doing, at a glance, with the switches most changed.
     Home,
     Taskbar,
+    /// The calendar that replaces the taskbar clock's: its switch, accounts and links.
+    Calendar,
     Pill,
     /// How the bars move: the pill's ring, the card's bar, the volume sliders.
     Motion,
@@ -78,12 +80,13 @@ pub(super) enum Page {
 }
 
 impl Page {
-    pub(super) const ALL: [Page; 9] = [Page::Home, Page::Taskbar, Page::Pill, Page::Motion, Page::Devices, Page::Batteries, Page::Keyboards, Page::Connectors, Page::About];
+    pub(super) const ALL: [Page; 10] = [Page::Home, Page::Taskbar, Page::Calendar, Page::Pill, Page::Motion, Page::Devices, Page::Batteries, Page::Keyboards, Page::Connectors, Page::About];
 
     pub(super) fn title(self) -> &'static str {
         match self {
             Page::Home => "Home",
             Page::Taskbar => "Taskbar",
+            Page::Calendar => "Calendar",
             Page::Pill => "Edge pill",
             Page::Motion => "Look & motion",
             Page::Devices => "Audio devices",
@@ -98,6 +101,7 @@ impl Page {
         match self {
             Page::Home => '\u{E80F}',
             Page::Taskbar => '\u{E75B}',
+            Page::Calendar => '\u{E787}',
             Page::Pill => '\u{E7F4}',
             Page::Motion => '\u{E771}',
             Page::Devices => '\u{E767}',
@@ -388,10 +392,11 @@ pub(super) fn nav(height: f32) -> Laid {
 pub(super) fn attention(model: &Model, page: Page) -> usize {
     let s = &model.status;
     match page {
-        Page::Connectors => {
+        Page::Connectors => usize::from(s.discord_problem.is_some()) + usize::from(s.teams_problem.is_some()),
+        Page::Calendar => {
             let cal = &model.calendar;
-            let calendar = cal.google.problem.is_some() || cal.microsoft.problem.is_some() || cal.links.iter().any(Option::is_some);
-            usize::from(s.discord_problem.is_some()) + usize::from(s.teams_problem.is_some()) + usize::from(calendar)
+            let accounts = [&cal.google, &cal.microsoft].into_iter().filter(|a| a.problem.is_some()).count();
+            if model.config.calendar.enabled { accounts + cal.links.iter().filter(|l| l.is_some()).count() } else { 0 }
         }
         Page::Taskbar => usize::from(s.notice.is_some()),
         Page::Batteries => {
@@ -680,7 +685,6 @@ pub(super) enum Connector {
     Mpc,
     Discord,
     Teams,
-    Calendar,
 }
 
 /// A grouped card being laid out: its item, where it starts, how many rows it has.
@@ -712,6 +716,7 @@ pub(super) fn page(model: &Model, width: f32, measure: &dyn Fn(&str) -> f32) -> 
         Page::Batteries => batteries(&mut col, model),
         Page::Keyboards => keyboards(&mut col, model),
         Page::Connectors => connectors(&mut col, model),
+        Page::Calendar => calendar_steps(&mut col, model),
         Page::About => about(&mut col, model),
     }
     col.laid.height = col.y + PAGE_PAD;
@@ -1361,22 +1366,10 @@ fn connectors(col: &mut Column, model: &Model) {
         (true, false, false, false) => not_set_up("its API is off"),
     };
     cards.push(ConnectorCard { glyph: '\u{E716}', title: "Teams meetings", state, on: c.teams.enabled, toggle: Toggle::Teams, connector: Connector::Teams });
-    cards.push(ConnectorCard {
-        glyph: '\u{E787}',
-        title: "Calendar",
-        state: calendar_state(model),
-        on: c.calendar.enabled,
-        toggle: Toggle::Calendar,
-        connector: Connector::Calendar,
-    });
 
     col.connector_grid(&cards, model.open);
     if let Some(card) = model.open.and_then(|open| cards.iter().find(|card| card.connector == open)) {
         col.section(card.title);
-        if card.connector == Connector::Calendar {
-            calendar_steps(col, model);
-            return;
-        }
         connector_steps(col, model, card.connector);
     } else {
         col.laid.push(R::new(col.x, col.y, col.w, 20.0), Kind::Text("Click a connector for its steps and options.".into()));
@@ -1384,34 +1377,7 @@ fn connectors(col: &mut Column, model: &Model) {
     }
 }
 
-/// The calendar card's second line: what it reads from, or what is wrong.
-fn calendar_state(model: &Model) -> (String, Tone) {
-    use crate::calendar::Provider;
-    let c = &model.config.calendar;
-    let s = &model.calendar;
-    if !c.enabled {
-        return off();
-    }
-    let problem = Provider::ALL.iter().any(|&p| s.account(p).problem.is_some()) || s.links.iter().any(Option::is_some);
-    let mut names: Vec<String> = Provider::ALL
-        .iter()
-        .filter(|&&p| s.account(p).email.is_some())
-        .map(|&p| if p == Provider::Microsoft { "Outlook".to_string() } else { "Google".to_string() })
-        .collect();
-    match c.links.len() {
-        0 => {}
-        1 => names.push("a link".into()),
-        n => names.push(format!("{n} links")),
-    }
-    let names: Vec<&str> = names.iter().map(String::as_str).collect();
-    match (names.is_empty(), problem) {
-        (_, true) => not_set_up("see its steps"),
-        (true, false) => not_set_up("connect an account or a link"),
-        (false, false) => set_up(&format!("Showing {}", join_names(&names))),
-    }
-}
-
-/// The calendar's steps: what the clock does, then a card per account and one for the links.
+/// The Calendar page: what the clock does, then a card per account and one for the links.
 fn calendar_steps(col: &mut Column, model: &Model) {
     use crate::calendar::Provider;
     let c = &model.config.calendar;
@@ -1509,8 +1475,6 @@ fn connector_steps(col: &mut Column, model: &Model, connector: Connector) {
     let hint = |button| model.hint.filter(|(b, _, _)| *b == button).map(|(_, h, tone)| (h.to_string(), tone));
     let mut body = col.group();
     match connector {
-        // Laid out by `calendar_steps`, which has a card per account.
-        Connector::Calendar => {}
         Connector::Browser => {
             let dim = !c.browser.enabled;
             if !connected(browser::NAME) {

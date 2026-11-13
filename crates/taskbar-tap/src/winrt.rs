@@ -96,7 +96,7 @@ pub unsafe trait IVisualTreeHelperStatics: IUnknown {
 pub const VISIBILITY_COLLAPSED: i32 = 1;
 
 /// `Windows.UI.Xaml.IUIElement`. Slot numbers follow the header: `get_Opacity` 9,
-/// `get_Visibility` 21, the pointer and tap events 57..80.
+/// `get_IsHitTestVisible` 19, `get_Visibility` 21, the pointer and tap events 57..80.
 #[interface("676d0be9-b65c-41c6-ba40-58cf87f201c1")]
 pub unsafe trait IUIElement: IUnknown {
     pub fn GetIids(&self, count: *mut u32, iids: *mut *mut windows_core::GUID) -> HRESULT;
@@ -115,8 +115,8 @@ pub unsafe trait IUIElement: IUnknown {
     pub fn _reserved16(&self) -> HRESULT;
     pub fn _reserved17(&self) -> HRESULT;
     pub fn _reserved18(&self) -> HRESULT;
-    pub fn _reserved19(&self) -> HRESULT;
-    pub fn _reserved20(&self) -> HRESULT;
+    pub fn get_IsHitTestVisible(&self, value: *mut u8) -> HRESULT;
+    pub fn put_IsHitTestVisible(&self, value: u8) -> HRESULT;
     pub fn get_Visibility(&self, value: *mut i32) -> HRESULT;
     pub fn put_Visibility(&self, value: i32) -> HRESULT;
     // Slots 23..56 — RenderSize, transitions, drag/drop and friends.

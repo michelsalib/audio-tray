@@ -44,6 +44,9 @@ pub const WM_TAP_MUSIC_CHANGED: u32 = WM_APP + 29;
 /// TAP → app: which parts of the taskbar integration are not working (`wParam`, `STATUS_*` bits;
 /// 0 = all well). Posted when it changes, after a start-up grace period.
 pub const WM_TASKBAR_STATUS: u32 = WM_APP + 40;
+/// TAP → app: the pointer is over the taskbar clock (`wParam` 1) or has left it (0), while the
+/// calendar replaces the shell's. The app's mouse hook then takes the clock's left clicks.
+pub const WM_TASKBAR_CLOCK_HOVER: u32 = WM_APP + 50;
 
 /// Our buttons are not on the taskbar (the notification icon was not found or not decorated).
 pub const STATUS_NO_STRIP: usize = 1 << 0;
@@ -183,7 +186,7 @@ mod tests {
         let ids = [
             WM_TASKBAR_ACTION, WM_TAP_REVERT, WM_TASKBAR_RESTARTED, WM_TAP_RESTYLE, WM_TASKBAR_SCROLL,
             WM_MUSIC_PROGRESS, WM_TAP_WIRE_TRANSPORT, WM_TAP_REPIN, WM_TAP_PROGRESS_WINDOW,
-            WM_TAP_MUSIC_CHANGED, WM_TASKBAR_STATUS,
+            WM_TAP_MUSIC_CHANGED, WM_TASKBAR_STATUS, WM_TASKBAR_CLOCK_HOVER,
         ];
         for (i, a) in ids.iter().enumerate() {
             assert!(ids[i + 1..].iter().all(|b| a != b));

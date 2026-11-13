@@ -191,14 +191,39 @@ pub(super) fn paste_calendar(key: CalendarKey, text: &str) -> Result<String, &'s
         CalendarKey::GoogleSecret => Err("Copy the client secret (GOCSPX-…) first"),
         CalendarKey::MicrosoftId if guid => Ok(text.to_ascii_lowercase()),
         CalendarKey::MicrosoftId => Err("Copy the Application (client) ID from its Overview first"),
+        // Google's and Outlook's calendar pages (embed, HTML) are not feeds.
+        CalendarKey::Link if link && !looks_like_feed(text) => Err("That is a web page: copy the calendar's secret iCal (.ics) address"),
         CalendarKey::Link if link => Ok(text.to_string()),
         CalendarKey::Link => Err("Copy the calendar's address (https:// or webcal://) first"),
     }
 }
 
+/// Whether a calendar address is a feed rather than a page about one. Only Google's and Outlook's
+/// own pages are recognised; any other address is taken at its word.
+fn looks_like_feed(url: &str) -> bool {
+    let lower = url.to_ascii_lowercase();
+    let host = lower.split("://").nth(1).and_then(|rest| rest.split('/').next()).unwrap_or_default();
+    if host.ends_with("calendar.google.com") {
+        return lower.contains("/ical/");
+    }
+    if host.contains("outlook.") || host.contains("office365.com") || host.contains("office.com") {
+        return lower.split('?').next().is_some_and(|path| path.ends_with(".ics"));
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn calendar_pages_are_told_from_feeds() {
+        assert!(paste_calendar(CalendarKey::Link, "https://calendar.google.com/calendar/embed?src=me%40gmail.com&ctz=Europe%2FParis").is_err());
+        assert!(paste_calendar(CalendarKey::Link, "https://calendar.google.com/calendar/ical/me%40gmail.com/private-abc/basic.ics").is_ok());
+        assert!(paste_calendar(CalendarKey::Link, "https://outlook.office365.com/owa/calendar/a@b.com/c/calendar.html").is_err());
+        assert!(paste_calendar(CalendarKey::Link, "https://outlook.office365.com/owa/calendar/a@b.com/c/calendar.ics").is_ok());
+        assert!(paste_calendar(CalendarKey::Link, "https://example.com/feed").is_ok());
+    }
 
     #[test]
     fn calendar_keys_must_look_like_the_one_asked_for() {

@@ -14,19 +14,20 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use windows::core::{w, BOOL, PCWSTR};
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
+use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
     DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
 };
-use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, InvalidateRect, ScreenToClient, PAINTSTRUCT};
+use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, InvalidateRect, ScreenToClient, UpdateWindow, PAINTSTRUCT};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetCapture, ReleaseCapture, SendInput, SetCapture, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, VIRTUAL_KEY,
     VK_DOWN, VK_ESCAPE, VK_HOME, VK_LEFT, VK_LWIN, VK_NEXT, VK_PRIOR, VK_RIGHT, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    DefWindowProcW, DestroyWindow, GetCursorPos, SetForegroundWindow, ShowWindow, SW_SHOW, WA_INACTIVE, WHEEL_DELTA,
+    DefWindowProcW, DestroyWindow, GetCursorPos, ShowWindow, SW_SHOW, WA_INACTIVE, WHEEL_DELTA,
     WINDOW_EX_STYLE, WM_ACTIVATE, WM_CAPTURECHANGED, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONDOWN, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONDOWN, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    SetLayeredWindowAttributes, LWA_ALPHA,
 };
 
 use super::model::{self, Event, When};
@@ -47,6 +48,10 @@ thread_local! {
     static VIEW: RefCell<Option<View>> = const { RefCell::new(None) };
     static OPEN: Cell<isize> = const { Cell::new(0) };
     static CLOSED_AT: Cell<Option<Instant>> = const { Cell::new(None) };
+    /// The close animation is running.
+    static CLOSING: Cell<bool> = const { Cell::new(false) };
+    /// How far it slides, in pixels.
+    static SLIDE_PX: Cell<f32> = const { Cell::new(0.0) };
 }
 
 struct View {
@@ -92,9 +97,16 @@ pub fn toggle(config: &crate::config::Config) {
 
 pub fn close() {
     let open = OPEN.with(Cell::get);
-    if open != 0 {
-        let _ = unsafe { DestroyWindow(HWND(open as *mut _)) };
+    if open == 0 || CLOSING.with(|c| c.replace(true)) {
+        return;
     }
+    let hwnd = HWND(open as *mut _);
+    let rest = *super::OPEN_RECT.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(r) = rest {
+        crate::win::animate_window(hwnd, crate::win::Flyout::Close, (r.left, r.top), SLIDE_PX.with(Cell::get));
+    }
+    let _ = unsafe { DestroyWindow(hwnd) };
+    CLOSING.with(|c| c.set(false));
 }
 
 /// The events changed: show them.
@@ -119,7 +131,7 @@ fn create(config: &crate::config::Config) -> Result<()> {
     let margin = (MARGIN * scale).round() as i32;
     // Over the clock's corner: the work area's bottom right, wherever the taskbar is.
     let (x, y) = (work.right - w - margin, work.bottom - h - margin);
-    let hwnd = crate::win::create_popup(CLASS, w!("Calendar"), Some(wndproc), WINDOW_EX_STYLE(WS_EX_TOOLWINDOW.0 | WS_EX_TOPMOST.0), (x, y, w, h))
+    let hwnd = crate::win::create_popup(CLASS, w!("Calendar"), Some(wndproc), WINDOW_EX_STYLE(WS_EX_TOOLWINDOW.0 | WS_EX_TOPMOST.0 | WS_EX_LAYERED.0), (x, y, w, h))
         .context("CreateWindowExW")?;
     let palette = Palette::current();
     unsafe {
@@ -155,11 +167,25 @@ fn create(config: &crate::config::Config) -> Result<()> {
     view.fetch();
     VIEW.with(|cell| *cell.borrow_mut() = Some(view));
     OPEN.with(|o| o.set(hwnd.0 as isize));
+    *super::OPEN_RECT.lock().unwrap_or_else(|e| e.into_inner()) = Some(windows::Win32::Foundation::RECT { left: x, top: y, right: x + w, bottom: y + h });
     unsafe {
+        // Shown transparent, painted, then brought in.
+        let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 0, LWA_ALPHA);
         let _ = ShowWindow(hwnd, SW_SHOW);
-        let _ = SetForegroundWindow(hwnd);
+        let _ = UpdateWindow(hwnd);
+        // The click that opened it was swallowed by our hook, so Windows has not lent us the
+        // foreground: without it there are no keys (Escape) and no deactivation to close on.
+        let raised = crate::music::player::raise(hwnd);
+        if raised == crate::music::player::Raise::Refused {
+            eprintln!("calendar: could not take the foreground");
+        }
+        let slide = crate::win::FLYOUT_SLIDE * scale;
+        SLIDE_PX.with(|s| s.set(slide));
+        crate::win::animate_window(hwnd, crate::win::Flyout::Open, (x, y), slide);
         // Like a menu: a click anywhere else comes here first, and closes it.
         SetCapture(hwnd);
+        // No WM_SETCURSOR arrives under capture: the arrow is set here, and on every move.
+        arrow();
     }
     Ok(())
 }
@@ -169,10 +195,10 @@ impl View {
         let _ = unsafe { InvalidateRect(Some(self.hwnd), None, false) };
     }
 
-    /// Take the cache's events, and the selected day's.
+    /// Take the cache's events, and the selected day's. The month shown stays where it is.
     fn reload(&mut self) {
         self.events = super::events().0;
-        self.select(self.selected);
+        self.agenda = model::on_day(&self.events, self.selected, &Local).into_iter().cloned().collect();
     }
 
     fn fetch(&self) {
@@ -470,6 +496,12 @@ fn open_notifications() {
     unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
 }
 
+/// The arrow cursor, whatever was showing when the capture began.
+fn arrow() {
+    use windows::Win32::UI::WindowsAndMessaging::{LoadCursorW, SetCursor, IDC_ARROW};
+    unsafe { SetCursor(LoadCursorW(None, IDC_ARROW).ok()) };
+}
+
 fn client_xy(lparam: LPARAM) -> (i32, i32) {
     ((lparam.0 & 0xFFFF) as u16 as i16 as i32, ((lparam.0 >> 16) & 0xFFFF) as u16 as i16 as i32)
 }
@@ -494,6 +526,7 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESUL
         }
         WM_ERASEBKGND => return Some(LRESULT(1)),
         WM_MOUSEMOVE => {
+            arrow();
             let (x, y) = client_xy(lparam);
             with_view(|v| {
                 let hit = v.hit(x, y);
@@ -545,6 +578,7 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESUL
         }
         WM_DESTROY => {
             OPEN.with(|o| o.set(0));
+            *super::OPEN_RECT.lock().unwrap_or_else(|e| e.into_inner()) = None;
             CLOSED_AT.with(|c| c.set(Some(Instant::now())));
             drop(VIEW.with(|cell| cell.borrow_mut().take()));
             let _ = unsafe { ReleaseCapture() };

@@ -27,6 +27,8 @@ pub struct Toast {
     pub body: String,
     /// When it arrived, in seconds since the epoch.
     pub at: i64,
+    /// The app's logo (an image file's bytes), when it has one.
+    pub logo: Option<std::sync::Arc<Vec<u8>>>,
 }
 
 /// What the reader thread is asked to do.
@@ -208,6 +210,7 @@ fn read(listener: &UserNotificationListener) -> anyhow::Result<Vec<Toast>> {
             .map(|list| list.into_iter().filter_map(|t| t.Text().ok().map(|s| s.to_string())).collect())
             .unwrap_or_default();
         let at = n.CreationTime().map_or(0, |t| t.UniversalTime / 10_000_000 - 11_644_473_600);
+        let logo = logo_of(&aumid, info.as_ref());
         toasts.push(Toast {
             id: n.Id().unwrap_or_default(),
             app,
@@ -215,10 +218,41 @@ fn read(listener: &UserNotificationListener) -> anyhow::Result<Vec<Toast>> {
             title: texts.first().cloned().unwrap_or_default(),
             body: texts.get(1..).map(|rest| rest.join(" ")).unwrap_or_default(),
             at,
+            logo,
         });
     }
     toasts.sort_by_key(|t| std::cmp::Reverse(t.at));
     Ok(toasts)
+}
+
+/// Logos read so far, by app: each is read once.
+static LOGOS: Mutex<Vec<(String, Option<Logo>)>> = Mutex::new(Vec::new());
+
+/// An image file's bytes, shared.
+type Logo = std::sync::Arc<Vec<u8>>;
+
+/// An app's logo, as its notifications show it in Windows' centre.
+fn logo_of(aumid: &str, info: Option<&windows::ApplicationModel::AppInfo>) -> Option<std::sync::Arc<Vec<u8>>> {
+    if let Some((_, logo)) = LOGOS.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|(a, _)| a == aumid) {
+        return logo.clone();
+    }
+    let read = || -> Option<Vec<u8>> {
+        use windows::Storage::Streams::DataReader;
+        let reference = info?.DisplayInfo().ok()?.GetLogo(windows::Foundation::Size { Width: 32.0, Height: 32.0 }).ok()?;
+        let stream = reference.OpenReadAsync().ok()?.get().ok()?;
+        let size = stream.Size().ok()?;
+        if size == 0 || size > 1024 * 1024 {
+            return None;
+        }
+        let reader = DataReader::CreateDataReader(&stream).ok()?;
+        reader.LoadAsync(size as u32).ok()?.get().ok()?;
+        let mut bytes = vec![0u8; size as usize];
+        reader.ReadBytes(&mut bytes).ok()?;
+        Some(bytes)
+    };
+    let logo = read().map(std::sync::Arc::new);
+    LOGOS.lock().unwrap_or_else(|e| e.into_inner()).push((aumid.to_string(), logo.clone()));
+    logo
 }
 
 /// A change notification on the folder of Windows' notification store.
@@ -270,7 +304,7 @@ mod tests {
     use super::*;
 
     fn toast(id: u32, app: &str, at: i64) -> Toast {
-        Toast { id, app: app.into(), aumid: format!("{app}.id"), title: String::new(), body: String::new(), at }
+        Toast { id, app: app.into(), aumid: format!("{app}.id"), title: String::new(), body: String::new(), at, logo: None }
     }
 
     #[test]

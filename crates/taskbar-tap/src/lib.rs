@@ -741,6 +741,9 @@ pub(crate) unsafe fn stand_down() {
             restore::revert(&diagnostics);
             // The music tile keeps its own record (widths and margins on the shell's elements).
             music::revert(&diagnostics);
+            // The clock's width let go; the shell writes its own text at the next minute.
+            clock::release_text();
+            clock::restore(&diagnostics);
         }
         None => logf!("stand down: no IXamlDiagnostics — cannot revert"),
     }
@@ -753,8 +756,6 @@ pub(crate) unsafe fn stand_down() {
     lock(&WATCHED).clear();
     lock(&WIRED).clear();
     reorder::forget();
-    // A styled clock goes back to the locale's format, still kept ticking.
-    clock::release_text();
     PROBED.store(false, Ordering::SeqCst);
     SLOT_METRICS_REPORTED.store(false, Ordering::SeqCst);
     lock(&UNKNOWN_GLYPHS).clear();
@@ -879,7 +880,10 @@ unsafe fn sweep_claimed() {
     if REAPPLY_PENDING.swap(false, Ordering::SeqCst) {
         let _phase = watch::enter("sweep: re-apply after a handover");
         logf!("handover changed the shell edits — reverting and applying them again");
+        // The same app stays: its clock text too (it is not sent again).
+        let text = clock::keep_text();
         stand_down();
+        clock::put_back_text(text);
         // Back up for the same owner: `stand_down` cleared the active flags and the status clock.
         ACTIVE.store(true, Ordering::SeqCst);
         CURRENT.store(GENERATION.load(Ordering::SeqCst), Ordering::SeqCst);

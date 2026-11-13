@@ -287,20 +287,20 @@ impl View {
         let room = (self.work.bottom - self.work.top) as f32 / self.scale - 2.0 * MARGIN;
         let most = shape.rows;
         let fit = |shape: Shape| layout::rows_for(Shape { rows: most, ..shape }, room);
-        // The notification centre takes what it needs (scrolling past CENTER_MAX); to make room
-        // the calendar gives up, in turn, agenda rows down to two, the world clocks, and the month
-        // (as Windows' own centre collapses its calendar).
+        // The notification centre takes the height the calendar leaves, and scrolls. To leave it
+        // at least a notification and a half, the calendar gives up agenda rows down to two, then
+        // the world clocks; never the month.
         if calendar.notifications {
             let wanted = center_height(&self.toasts).min(layout::CENTER_MAX);
+            let enough = wanted.min(layout::GROUP_H + 1.5 * layout::TOAST_H);
             let header = 41.0;
             let steps = [
                 Shape { rows: most.min(3), ..shape },
                 Shape { rows: layout::ROWS_MIN, ..shape },
                 Shape { rows: layout::ROWS_MIN, clocks: 0, ..shape },
-                Shape { rows: layout::ROWS_MIN, clocks: 0, agenda_only: true, ..shape },
             ];
             let spare = |s: Shape| room - layout::layout(s).h - header;
-            let chosen = steps.iter().copied().find(|s| spare(*s) >= wanted).unwrap_or(steps[3]);
+            let chosen = steps.iter().copied().find(|s| spare(*s) >= enough).unwrap_or(steps[2]);
             shape = chosen;
             shape.center = wanted.min(spare(chosen));
             if shape.center < layout::EMPTY_H {
@@ -609,8 +609,15 @@ fn draw_center(pen: &Pen, v: &View, area: R) {
         match row {
             Row::Group(g) => {
                 let Some((_, list)) = groups.get(g) else { continue };
-                let name = list.first().map_or("", |t| t.app.as_str());
-                pen.text(name, Font::CaptionStrong, R::new(r.x + 4.0, r.y + 4.0, r.w - 40.0, r.h - 4.0), p.text2, Align::Left);
+                let first = list.first();
+                let name = first.map_or("", |t| t.app.as_str());
+                let mut x = r.x + 4.0;
+                if let Some(toast) = first.filter(|t| t.logo.is_some()) {
+                    let logo = toast.logo.as_deref().map_or(&[][..], |l| l.as_slice());
+                    pen.image(&toast.aumid, logo, R::new(x, r.y + 9.0, 16.0, 16.0));
+                    x += 24.0;
+                }
+                pen.text(name, Font::CaptionStrong, R::new(x, r.y + 4.0, r.right() - 40.0 - x, r.h - 4.0), p.text2, Align::Left);
                 let x = R::new(r.right() - 28.0, r.y + 4.0, 24.0, 24.0);
                 if hovered(Hit::ClearApp(g)) {
                     pen.fill(x, 4.0, p.hover);

@@ -203,18 +203,17 @@ pub fn tick(config: &Config) -> Duration {
         // The clock.
         let top = if config.calendar.enabled && config.clock.next_meeting || s.focus.is_some() { countdown(&events, now, s.focus.map(|(end, minutes, _)| (end, minutes))) } else { String::new() };
         let unread = if config.calendar.enabled && config.clock.unread { super::notifications::count() } else { 0 };
-        let bottom = if unread > 0 { format!("🔔 {unread}") } else { String::new() };
         if !top.is_empty() {
             // The countdown moves with the minute.
             next = next.min(now - now % 60 + 60);
         }
         let (time_pattern, date_pattern) = patterns(&config.clock);
-        let text = ClockText { time: time_pattern, date: date_pattern, one_line: config.clock.one_line, top, bottom };
+        let text = ClockText { time: time_pattern, date: date_pattern, one_line: config.clock.one_line, top, badge: unread as u32 };
         // Nothing to say and nothing said: the shell's clock stays the shell's.
-        let wanted = config.clock.styled() || !text.top.is_empty() || !text.bottom.is_empty() || s.sent.is_some();
+        let wanted = config.clock.styled() || !text.top.is_empty() || text.badge > 0 || s.sent.is_some();
         if wanted && s.sent.as_ref() != Some(&text) {
             if crate::taskbar::send_clock(&text) {
-                println!("calendar: the clock now reads {:?} / {:?}", text.top, text.bottom);
+                println!("calendar: the clock now reads {:?}, {} unread", text.top, text.badge);
                 s.sent = Some(text);
             } else {
                 // The TAP is busy or reloading: soon again, not at the next quarter hour.

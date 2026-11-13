@@ -4,9 +4,9 @@
 
 use anyhow::{Context, Result};
 use windows::core::{w, PCWSTR};
-use windows::Win32::Graphics::Direct2D::Common::{D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT, D2D_RECT_F};
+use windows::Win32::Graphics::Direct2D::Common::{D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT, D2D_RECT_F, D2D_SIZE_U};
 use windows::Win32::Graphics::Direct2D::{
-    D2D1CreateFactory, ID2D1Factory, ID2D1RenderTarget, ID2D1SolidColorBrush, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+    D2D1CreateFactory, ID2D1Bitmap, ID2D1Factory, ID2D1RenderTarget, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, D2D1_BITMAP_PROPERTIES, ID2D1SolidColorBrush, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
     D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_ELLIPSE, D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_RENDER_TARGET_PROPERTIES,
     D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1_ROUNDED_RECT, D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE,
 };
@@ -130,6 +130,8 @@ pub struct Gfx {
     surface: Option<((u32, u32), IWICBitmap, ID2D1RenderTarget)>,
     /// The last frame, premultiplied BGRA.
     pub pixels: Vec<u8>,
+    /// Images drawn for this surface, by key and pixel size.
+    images: std::cell::RefCell<Vec<(String, u32, Option<ID2D1Bitmap>)>>,
 }
 
 impl Gfx {
@@ -138,7 +140,7 @@ impl Gfx {
             let factory: ID2D1Factory = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None).context("D2D1CreateFactory")?;
             let dwrite: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED).context("DWriteCreateFactory")?;
             let wic: IWICImagingFactory = CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER).context("WIC")?;
-            let mut gfx = Gfx { factory, dwrite, wic, formats: Vec::new(), surface: None, pixels: Vec::new() };
+            let mut gfx = Gfx { factory, dwrite, wic, formats: Vec::new(), surface: None, pixels: Vec::new(), images: Default::default() };
             let text = w!("Segoe UI Variable Text");
             let icons = w!("Segoe Fluent Icons");
             gfx.formats = vec![
@@ -185,11 +187,12 @@ impl Gfx {
                 let target = self.factory.CreateWicBitmapRenderTarget(&bitmap, &props).context("CreateWicBitmapRenderTarget")?;
                 target.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
                 self.surface = Some((size, bitmap, target));
+                self.images.borrow_mut().clear();
             }
             let (_, bitmap, target) = self.surface.as_ref().expect("just built");
             target.SetDpi(96.0 * scale, 96.0 * scale);
             target.BeginDraw();
-            draw(&Pen { gfx: self, target: target.clone() });
+            draw(&Pen { gfx: self, target: target.clone(), scale });
             target.EndDraw(None, None).context("EndDraw")?;
 
             let rect = WICRect { X: 0, Y: 0, Width: size.0 as i32, Height: size.1 as i32 };
@@ -212,6 +215,8 @@ impl Gfx {
 pub struct Pen<'a> {
     gfx: &'a Gfx,
     target: ID2D1RenderTarget,
+    /// Pixels per DIP.
+    scale: f32,
 }
 
 fn rect(r: R) -> D2D_RECT_F {
@@ -280,6 +285,42 @@ impl Pen<'_> {
 
     pub fn glyph(&self, glyph: char, font: Font, r: R, c: Color) {
         self.text(&glyph.to_string(), font, r, c, Align::Center);
+    }
+
+    /// An image file (`bytes`, kept by `key`) drawn square into `r`.
+    pub fn image(&self, key: &str, bytes: &[u8], r: R) {
+        let px = (r.w * self.scale).round().max(1.0) as u32;
+        let cached = self.gfx.images.borrow().iter().find(|(k, p, _)| k == key && *p == px).map(|(_, _, b)| b.clone());
+        let bitmap = match cached {
+            Some(b) => b,
+            None => {
+                let made = crate::image::sprite(bytes, px, 0.0).ok().and_then(|rgba| self.bitmap(&rgba, px));
+                self.gfx.images.borrow_mut().push((key.to_string(), px, made.clone()));
+                made
+            }
+        };
+        if let Some(bitmap) = bitmap {
+            unsafe { self.target.DrawBitmap(&bitmap, Some(&rect(r)), 1.0, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, None) };
+        }
+    }
+
+    fn bitmap(&self, rgba: &[u8], px: u32) -> Option<ID2D1Bitmap> {
+        let bgra: Vec<u8> = rgba
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .flat_map(|p| {
+                let a = p[3] as u32;
+                let m = |c: u8| ((c as u32 * a + 127) / 255) as u8;
+                [m(p[2]), m(p[1]), m(p[0]), p[3]]
+            })
+            .collect();
+        let props = D2D1_BITMAP_PROPERTIES {
+            pixelFormat: D2D1_PIXEL_FORMAT { format: DXGI_FORMAT_B8G8R8A8_UNORM, alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED },
+            dpiX: 96.0 * self.scale,
+            dpiY: 96.0 * self.scale,
+        };
+        unsafe { self.target.CreateBitmap(D2D_SIZE_U { width: px, height: px }, Some(bgra.as_ptr() as *const _), px * 4, &props) }.ok()
     }
 
     pub fn clip(&self, r: R) {

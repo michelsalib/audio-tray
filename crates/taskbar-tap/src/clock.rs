@@ -1,15 +1,20 @@
-//! The taskbar clock, when audio-tray's calendar replaces the shell's (`clock=1` in the init data):
-//! a press on the clock is marked handled so `NotificationCenterButton` never opens its flyout,
-//! and the completed tap is reported as [`tap_proto::ACTION_OPEN_CALENDAR`]. The bell beside it
-//! is left alone, so Windows' notifications stay one click away.
+//! The taskbar clock: where audio-tray's calendar opens from, and what it reads.
 //!
-//! The clock is `SystemTray.DateTimeIconContent` inside a `SystemTray.IconView`; the handlers go on
-//! the view (the clock's whole hit area). Attaching handlers writes nothing to the tree, so this
-//! runs behind the short wiring gate, like the music tile's transport buttons. Handlers are never
-//! detached: they check [`enabled`] on every event, so turning the calendar off, a revert, or the
-//! app quitting gives the clock back to the shell at once.
+//! **Clicks** (`clock=1` in the init data): the shell's `NotificationCenterButton` opens its own
+//! flyout whatever its XAML handlers do with a press, so the TAP only says when the pointer is over
+//! the button (`WM_TASKBAR_CLOCK_HOVER`) and the app's mouse hook takes the click. The handlers go on
+//! the whole button (the clock's view alone leaves its edges to the shell), behind the short wiring
+//! gate (attaching writes nothing), and are never detached: they check [`enabled`] on every event.
+//!
+//! **Text** (`tap_proto::CLOCK_MAGIC`): once the app styles the clock, the TAP writes the shell's
+//! two text blocks. Nothing can be added beside them (`Panel.Children` refuses writes, and the
+//! shell resets the clock's slot when its content is replaced), and the shell rewrites them every
+//! minute through compiled bindings: the TAP looks again a few times just after each minute and
+//! puts its text back, and holds the clock's width at the widest it has drawn so the taskbar does
+//! not shift meanwhile. The unread count goes before the time, behind a colour emoji dot picked to
+//! match the accent (a text block has one colour; emoji keep their own).
 
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Mutex;
 
 use crate::log::logf;
@@ -17,11 +22,14 @@ use crate::{tree, xamlom};
 
 /// The clock's content, the same on the main and the secondary taskbars.
 const CONTENT: &str = "SystemTray.DateTimeIconContent";
-/// The section it lives in, for the diagnostic dump when it is not found.
+/// The button around it (the bell's too, when shown), by `x:Name`.
 const SECTION: &str = "NotificationCenterButton";
+const TIME: &str = "TimeInnerTextBlock";
+const DATE: &str = "DateInnerTextBlock";
+const STACK: &str = "DateTimeStackPanel";
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
-/// Views that already have the handlers.
+/// Elements that already have the handlers.
 static WIRED: Mutex<Vec<u64>> = Mutex::new(Vec::new());
 /// The clock's section was found without the clock in it (and reported).
 static MISSING: AtomicBool = AtomicBool::new(false);
@@ -37,26 +45,31 @@ pub fn enabled() -> bool {
     ENABLED.load(Ordering::SeqCst) && crate::live() && crate::ipc::receiver_present()
 }
 
-/// Nothing left to wire: off, or every clock found so far has its handlers.
+/// What [`enabled`] read, for the log.
+pub fn why() -> String {
+    format!("asked {}, live {}, app there {}", ENABLED.load(Ordering::SeqCst), crate::live(), crate::ipc::receiver_present())
+}
+
+/// What the handlers go on: the button around each clock.
+fn targets() -> Vec<u64> {
+    tree::find_by_name(SECTION)
+}
+
+/// Nothing left to wire: off, or every clock's button has its handlers.
 pub fn settled() -> bool {
     if !ENABLED.load(Ordering::SeqCst) {
         return true;
     }
-    let clocks = tree::find_by_type(CONTENT);
-    if clocks.is_empty() {
+    let targets = targets();
+    if targets.is_empty() || tree::find_by_type(CONTENT).is_empty() {
         // Not on this build (reported once): nothing to wait for.
         return MISSING.load(Ordering::SeqCst);
     }
     let wired = crate::lock(&WIRED);
-    clocks.iter().all(|c| wired.contains(&target_of(*c)))
+    targets.iter().all(|t| wired.contains(t))
 }
 
-/// The element the handlers go on: the clock's `IconView`, else the content itself.
-fn target_of(content: xamlom::InstanceHandle) -> xamlom::InstanceHandle {
-    crate::ancestor_of_type(content, crate::ICON_VIEW, 8).unwrap_or(content)
-}
-
-/// Attach the handlers to every clock not yet wired.
+/// Attach the handlers to every clock's button not yet wired.
 ///
 /// # Safety
 /// XAML UI thread only, behind the wiring gate.
@@ -64,78 +77,20 @@ pub unsafe fn wire(diagnostics: &xamlom::IXamlDiagnostics) {
     if !ENABLED.load(Ordering::SeqCst) {
         return;
     }
-    let clocks = tree::find_by_type(CONTENT);
-    {
-        // Views gone from the tree (a taskbar rebuilt) are forgotten: their handles can come back.
-        let mut wired = crate::lock(&WIRED);
-        wired.retain(|h| tree::type_of(*h).is_some());
-    }
-    if clocks.is_empty() {
+    // Elements gone from the tree (a taskbar rebuilt) are forgotten: their handles can come back.
+    crate::lock(&WIRED).retain(|h| tree::type_of(*h).is_some());
+    if tree::find_by_type(CONTENT).is_empty() {
         report_missing();
         return;
     }
-    for content in clocks {
-        let target = target_of(content);
+    for target in targets() {
         if crate::lock(&WIRED).contains(&target) {
             continue;
         }
         // Recorded either way: a failure is logged once, not retried every sweep.
         crate::lock(&WIRED).push(target);
-        make_hit_testable(diagnostics, content);
         let wired = crate::interact::attach_clock(diagnostics, target);
-        logf!(
-            "clock: {} 0x{target:x} ({})",
-            if wired { "wired" } else { "could not wire" },
-            tree::type_of(target).unwrap_or_default()
-        );
-    }
-}
-
-/// The button around the clock.
-const BUTTON: &str = "SystemTray.OmniButton";
-
-/// The shell's template leaves the clock's elements out of hit-testing, so a press lands on the
-/// button itself and never reaches handlers on the clock. Every element from the clock's text up
-/// to the button is made hit-testable, so the press reaches [`crate::interact::attach_clock`]'s
-/// handler first. Left on after a revert: with no handler acting, the press bubbles on to the
-/// button as before. Each element's original value is logged.
-///
-/// # Safety
-/// XAML UI thread only.
-unsafe fn make_hit_testable(diagnostics: &xamlom::IXamlDiagnostics, content: xamlom::InstanceHandle) {
-    use crate::winrt::IUIElement;
-    let mut chain = Vec::new();
-    // Up from the content to the button (exclusive).
-    let mut handle = content;
-    for _ in 0..16 {
-        if tree::type_of(handle).as_deref() == Some(BUTTON) {
-            break;
-        }
-        chain.push(handle);
-        let Some(parent) = tree::parent_of(handle) else { break };
-        handle = parent;
-    }
-    // And everything inside the content (the time and date text).
-    let mut queue = tree::children_of(content);
-    while let Some(child) = queue.pop() {
-        if chain.len() > 64 {
-            break;
-        }
-        chain.push(child);
-        queue.extend(tree::children_of(child));
-    }
-    for handle in chain {
-        let Some(element) = crate::decorate::element::<IUIElement>(diagnostics, handle) else { continue };
-        let mut was = 0u8;
-        let _ = element.get_IsHitTestVisible(&mut was);
-        let set = if was == 0 { element.put_IsHitTestVisible(1).0 } else { 0 };
-        let name = tree::name_of(handle).filter(|n| !n.is_empty()).map(|n| format!("#{n}")).unwrap_or_default();
-        logf!(
-            "clock:   {}{name} hit-test {}{}",
-            tree::type_of(handle).unwrap_or_default(),
-            was != 0,
-            if was == 0 { format!(" -> on (0x{set:08x})") } else { String::new() }
-        );
+        logf!("clock: {} 0x{target:x} ({})", if wired { "wired" } else { "could not wire" }, tree::type_of(target).unwrap_or_default());
     }
 }
 
@@ -160,37 +115,32 @@ fn report_missing() {
     }
 }
 
-/// What [`enabled`] read, for the log.
-pub fn why() -> String {
-    format!(
-        "asked {}, live {}, app there {}",
-        ENABLED.load(Ordering::SeqCst),
-        crate::live(),
-        crate::ipc::receiver_present()
-    )
-}
-
 // ---- The clock's text, when the app styles it ----
 
-/// What the clock's two lines say, from the app (`tap_proto::CLOCK_MAGIC`). Patterns are
-/// `GetTimeFormatEx` / `GetDateFormatEx` ones; empty means the locale's short time or date.
+/// What the clock says, from the app. Patterns are `GetTimeFormatEx` / `GetDateFormatEx` ones;
+/// empty means the locale's short time or date.
 #[derive(Clone, Debug, Default, PartialEq)]
-struct Text {
+pub struct Text {
     time: String,
     /// `-` hides the date.
     date: String,
     /// The date after the time, on one line.
     one_line: bool,
-    /// Appended to the time line (the next meeting, the focus time left).
+    /// After the time (the next meeting, the focus time left).
     top: String,
-    /// Appended to the date line (the unread count).
-    bottom: String,
+    /// Windows' unread notifications (0: none).
+    badge: u32,
 }
 
-/// `None` until the app first styles the clock: the shell's text is then never touched. Once set,
-/// the TAP keeps the clock ticking itself for the life of the shell (going back to the locale's
-/// format when the app leaves), since the shell may stop updating text it no longer owns.
+/// The app's latest word; `None` when it never styled the clock or has gone.
 static TEXT: Mutex<Option<Text>> = Mutex::new(None);
+/// The clock's width held (DIPs): the widest drawn since its text last changed shape; negative
+/// when it is to be measured afresh.
+static HELD_WIDTH: Mutex<f64> = Mutex::new(0.0);
+/// Looks still due just after the last minute (the shell rewrites its text then).
+static FOLLOW: AtomicU32 = AtomicU32::new(0);
+/// Delays of those looks, last first.
+const FOLLOW_UPS: [u32; 5] = [2000, 600, 150, 50, 15];
 
 /// Control-window timer that updates the text, at each minute (each second with seconds shown).
 pub const TEXT_TIMER: usize = 3;
@@ -199,23 +149,53 @@ pub const TEXT_TIMER: usize = 3;
 pub fn set_text(data: &str) {
     let flag = |key: &str| tap_proto::init_value(data, key).as_deref() == Some("1");
     let value = |key: &str| tap_proto::init_value(data, key).unwrap_or_default();
-    let text = Text { time: value("time"), date: value("date"), one_line: flag("oneline"), top: value("top"), bottom: value("bottom") };
+    let text = Text {
+        time: value("time"),
+        date: value("date"),
+        one_line: flag("oneline"),
+        top: value("top"),
+        badge: value("badge").parse().unwrap_or(0),
+    };
     let mut held = crate::lock(&TEXT);
     if held.as_ref() != Some(&text) {
         logf!("clock: text now {text:?}");
+        // A new shape: the width is measured afresh.
+        *crate::lock(&HELD_WIDTH) = -1.0;
         *held = Some(text);
     }
     drop(held);
     crate::lifecycle::arm_clock_timer(1);
 }
 
-/// The app is gone: back to the locale's own format, still kept ticking.
+pub fn keep_text() -> Option<Text> {
+    crate::lock(&TEXT).clone()
+}
+
+/// The app's text, kept across a revert that re-applies everything for the same app.
+pub fn put_back_text(text: Option<Text>) {
+    *crate::lock(&TEXT) = text;
+    crate::lifecycle::arm_clock_timer(1);
+}
+
+/// The app is gone: the shell writes its own text again at the next minute.
 pub fn release_text() {
-    let mut held = crate::lock(&TEXT);
-    if held.is_some() {
-        *held = Some(Text::default());
-        drop(held);
-        crate::lifecycle::arm_clock_timer(1);
+    *crate::lock(&TEXT) = None;
+}
+
+/// Let go of the clock's width (a revert).
+///
+/// # Safety
+/// XAML UI thread only.
+pub unsafe fn restore(diagnostics: &xamlom::IXamlDiagnostics) {
+    *crate::lock(&HELD_WIDTH) = 0.0;
+    for stack in tree::find_by_name(STACK) {
+        set_min_width(diagnostics, stack, 0.0);
+    }
+}
+
+unsafe fn set_min_width(diagnostics: &xamlom::IXamlDiagnostics, handle: u64, width: f64) {
+    if let Some(element) = crate::decorate::element::<crate::winrt::IFrameworkElement>(diagnostics, handle) {
+        let _ = element.put_MinWidth(width);
     }
 }
 
@@ -243,12 +223,42 @@ fn format_date(st: &windows::Win32::Foundation::SYSTEMTIME, pattern: &str) -> St
     String::from_utf16_lossy(&buf[..(n.max(1) - 1) as usize])
 }
 
+/// The colour emoji circle nearest the accent: 🔴 🟠 🟡 🟢 🔵 🟣, or ⚪ for a grey accent.
+pub fn accent_dot(accent: Option<[u8; 3]>) -> &'static str {
+    let Some([r, g, b]) = accent else { return "🔵" };
+    let (r, g, b) = (r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0);
+    let (max, min) = (r.max(g).max(b), r.min(g).min(b));
+    if max - min < 0.12 {
+        return "⚪";
+    }
+    let d = max - min;
+    let hue = if max == r {
+        60.0 * ((g - b) / d).rem_euclid(6.0)
+    } else if max == g {
+        60.0 * ((b - r) / d + 2.0)
+    } else {
+        60.0 * ((r - g) / d + 4.0)
+    };
+    match hue {
+        h if !(15.0..345.0).contains(&h) => "🔴",
+        h if h < 45.0 => "🟠",
+        h if h < 70.0 => "🟡",
+        h if h < 170.0 => "🟢",
+        h if h < 260.0 => "🔵",
+        _ => "🟣",
+    }
+}
+
 /// The two lines for `text` at `st`: the time line, and the date line (`None`: hidden).
-fn lines(text: &Text, st: &windows::Win32::Foundation::SYSTEMTIME) -> (String, Option<String>) {
-    let join = |a: String, b: &str| if b.is_empty() { a } else if a.is_empty() { b.to_string() } else { format!("{a} · {b}") };
-    let time = join(format_time(st, &text.time), &text.top);
+fn lines(text: &Text, st: &windows::Win32::Foundation::SYSTEMTIME, dot: &str) -> (String, Option<String>) {
+    let mut time = format_time(st, &text.time);
+    if !text.top.is_empty() {
+        time = format!("{time} · {}", text.top);
+    }
+    if text.badge > 0 {
+        time = format!("{dot} {}   {time}", text.badge);
+    }
     let date = if text.date == "-" { String::new() } else { format_date(st, &text.date) };
-    let date = join(date, &text.bottom);
     if text.one_line {
         let line = if date.is_empty() { time } else { format!("{time}   {date}") };
         return (line, None);
@@ -256,7 +266,8 @@ fn lines(text: &Text, st: &windows::Win32::Foundation::SYSTEMTIME) -> (String, O
     (time, (!date.is_empty()).then_some(date))
 }
 
-/// Update every clock's text, and say when to next (ms).
+/// Write our text where the shell's differs, hold the width, and say when to look next (ms);
+/// `None` stops the timer.
 ///
 /// # Safety
 /// Tray thread only (the control window's timer).
@@ -267,13 +278,14 @@ pub unsafe fn tick() -> Option<u32> {
     }
     let Some(diagnostics) = crate::diagnostics() else { return Some(1000) };
     let st = now();
-    let (time, date) = lines(&text, &st);
-    for block in tree::find_by_name("TimeInnerTextBlock") {
+    let dot = accent_dot(crate::strip_state().and_then(|s| s.accent));
+    let (time, date) = lines(&text, &st, dot);
+    for block in tree::find_by_name(TIME) {
         if crate::decorate::text_of(&diagnostics, block).as_deref() != Some(time.as_str()) {
             crate::decorate::set_text(&diagnostics, block, &time);
         }
     }
-    for block in tree::find_by_name("DateInnerTextBlock") {
+    for block in tree::find_by_name(DATE) {
         match &date {
             Some(date) => {
                 crate::decorate::set_visible(&diagnostics, block, true);
@@ -286,22 +298,45 @@ pub unsafe fn tick() -> Option<u32> {
             }
         }
     }
-    // Just past the next second or minute, so the text changes with the clock. The shell writes
-    // its own text at the minute too, sometimes after us: a few looks after each minute put ours
-    // back within moments.
+    // Hold the width at the widest drawn, so the shell's own (shorter) text, shown for a moment
+    // after each minute, does not move the taskbar.
+    for stack in tree::find_by_name(STACK) {
+        let width = crate::decorate::actual_width(&diagnostics, stack).unwrap_or(0.0);
+        let mut held = crate::lock(&HELD_WIDTH);
+        if *held < 0.0 {
+            // A new shape: start from what it measures now.
+            *held = 0.0;
+            set_min_width(&diagnostics, stack, 0.0);
+        } else if width > *held + 0.5 {
+            *held = width;
+            set_min_width(&diagnostics, stack, width);
+        }
+    }
+    // Just past the next second or minute, then a few quick looks after a minute: the shell
+    // writes its text at the minute too, sometimes after us.
     let ms = st.wMilliseconds as u32;
     if text.time.contains('s') {
         return Some(1000 - ms + 15);
     }
-    const FOLLOW_UPS: [u32; 3] = [3000, 1000, 250];
     let left = FOLLOW.load(Ordering::SeqCst);
     if left > 0 {
         FOLLOW.store(left - 1, Ordering::SeqCst);
         return Some(FOLLOW_UPS[(left - 1) as usize]);
     }
     FOLLOW.store(FOLLOW_UPS.len() as u32, Ordering::SeqCst);
-    Some((60 - st.wSecond as u32) * 1000 - ms + 30)
+    Some((60 - st.wSecond as u32) * 1000 - ms + 5)
 }
 
-/// Looks still due after the last minute's change.
-static FOLLOW: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+#[cfg(test)]
+mod tests {
+    use super::accent_dot;
+
+    #[test]
+    fn the_dot_follows_the_accent_hue() {
+        assert_eq!(accent_dot(Some([0xD8, 0x8D, 0xE1])), "🟣");
+        assert_eq!(accent_dot(Some([0x00, 0x78, 0xD4])), "🔵");
+        assert_eq!(accent_dot(Some([0xE8, 0x11, 0x23])), "🔴");
+        assert_eq!(accent_dot(Some([0x10, 0x7C, 0x10])), "🟢");
+        assert_eq!(accent_dot(Some([0x80, 0x80, 0x84])), "⚪");
+    }
+}

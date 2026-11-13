@@ -80,7 +80,7 @@ pub const HANDOVER_ACCEPTED: isize = 1;
 pub const HANDOVER_DECLINED: isize = 2;
 /// App → TAP `WM_COPYDATA` tag ("ATC1"): how the clock reads, as init-data pairs: `time` and
 /// `date` (`GetTimeFormatEx`/`GetDateFormatEx` patterns, empty for the locale's, `date=-` to hide
-/// it), `oneline`, and `top`/`bottom` (text after each line).
+/// it), `oneline`, `top` (text after the time) and `badge` (the unread count, an accent dot).
 pub const CLOCK_MAGIC: usize = 0x4154_4331;
 
 /// Plane-15 PUA markers (Segoe Fluent owns the BMP PUA) for earbuds the TAP draws as vectors.

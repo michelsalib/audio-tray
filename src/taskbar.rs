@@ -982,8 +982,8 @@ pub struct ClockText {
     pub one_line: bool,
     /// After the time (the next meeting, the focus time left).
     pub top: String,
-    /// After the date (the unread count).
-    pub bottom: String,
+    /// Windows' unread notifications, an accent dot and its count on the time line (0: none).
+    pub badge: u32,
 }
 
 /// Tell the loaded TAP how the clock reads. `false` when no TAP took it.
@@ -998,7 +998,7 @@ pub fn send_clock(text: &ClockText) -> bool {
         ("date", text.date.clone()),
         ("oneline", flag(text.one_line)),
         ("top", text.top.clone()),
-        ("bottom", text.bottom.clone()),
+        ("badge", text.badge.to_string()),
     ]);
     let payload = crate::win::wide(&data);
     let copy = COPYDATASTRUCT {

@@ -618,6 +618,8 @@ fn unpack_point(packed: isize) -> (i32, i32) {
 /// microphone dot, scrolls and the progress bar stay live; refreshes wait for it (see
 /// [`waits_for_flyout`]) and clicks are dropped ([`click_allowed`]).
 fn open_flyout(anchor: Option<flyout::Anchor>) {
+    // One flyout at a time: the calendar goes before the panel takes the mouse.
+    crate::calendar::close();
     let opened = with_tray(|tray| {
         if tray.flyout_open {
             return None;

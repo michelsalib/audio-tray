@@ -1056,7 +1056,12 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESUL
             *super::OPEN_RECT.lock().unwrap_or_else(|e| e.into_inner()) = None;
             CLOSED_AT.with(|c| c.set(Some(Instant::now())));
             drop(VIEW.with(|cell| cell.borrow_mut().take()));
-            let _ = unsafe { ReleaseCapture() };
+            // Only a capture of our own: capture is per thread, and the audio flyout (on this same
+            // thread) may hold it by now; ReleaseCapture would take it from the flyout, which
+            // then closes at once.
+            if unsafe { GetCapture() } == hwnd {
+                let _ = unsafe { ReleaseCapture() };
+            }
         }
         _ => return None,
     }

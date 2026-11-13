@@ -1451,9 +1451,9 @@ fn calendar_steps(col: &mut Column, model: &Model) {
     let clocks = hint(Button::Cal(Cal::EditClocks)).or(plain("Windows' additional clocks, under the date"));
     col.row(&mut body, None, "World clocks", clocks, dim, Control::Toggle(c.world_clocks, Toggle::WorldClocks));
     col.row(&mut body, None, "Choose the world clocks", plain("In Windows' Date and time settings"), dim, Control::Button("Open", false, Some('\u{E8A7}'), Button::Cal(Cal::EditClocks)));
-    let notes = plain("Above the month, to read, dismiss or clear");
-    col.row(&mut body, None, "Windows' notifications", notes, dim, Control::Toggle(c.notifications, Toggle::CalendarNotifications));
-    col.row(&mut body, None, "Win+Alt+D opens it", plain("Windows' own shortcut for the clock's calendar"), dim, Control::Toggle(c.shortcut, Toggle::CalendarShortcut));
+    let notes = plain("Its notification centre, above the month: grouped by app, to open, dismiss or clear");
+    col.row(&mut body, None, "Notification centre", notes, dim, Control::Toggle(c.notifications, Toggle::CalendarNotifications));
+    col.row(&mut body, None, "Win+N and Win+Alt+D open it", plain("Windows' shortcuts for its notification centre and calendar"), dim, Control::Toggle(c.shortcut, Toggle::CalendarShortcut));
     col.end_group(body);
 
     col.section("Meetings and focus");

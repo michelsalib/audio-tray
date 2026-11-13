@@ -225,21 +225,24 @@ fn in_slot(pt: POINT) -> bool {
     icon_rect().is_some_and(|slot| pt.x >= slot.left && pt.x < slot.right && pt.y >= slot.top && pt.y < slot.bottom)
 }
 
-/// The D of a Win+Alt+D taken for the calendar: its release goes too.
+/// The D or N of a shortcut taken for the calendar: its release goes too.
 static SHORTCUT_HELD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Win+Alt+D (Windows' shortcut for the clock's calendar) opens ours, while it replaces Windows'.
+/// Win+Alt+D and Win+N (Windows' shortcuts for the clock's calendar and the notification centre)
+/// open ours, while it replaces Windows'.
 unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     use std::sync::atomic::Ordering::Relaxed;
     use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LWIN, VK_MENU, VK_RWIN};
     use windows::Win32::UI::WindowsAndMessaging::{KBDLLHOOKSTRUCT, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP};
     if code >= 0 && crate::calendar::SHORTCUT.load(Relaxed) {
         let key = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
-        if key.vkCode == b'D' as u32 {
+        // Win+Alt+D (the clock's calendar) and Win+N (the notification centre).
+        if key.vkCode == b'D' as u32 || key.vkCode == b'N' as u32 {
             let down = matches!(wparam.0 as u32, WM_KEYDOWN | WM_SYSKEYDOWN);
             let up = matches!(wparam.0 as u32, WM_KEYUP | WM_SYSKEYUP);
             let held = |vk: windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY| unsafe { GetAsyncKeyState(vk.0 as i32) } as u16 & 0x8000 != 0;
-            if down && (held(VK_LWIN) || held(VK_RWIN)) && held(VK_MENU) {
+            let wanted = if key.vkCode == b'D' as u32 { held(VK_MENU) } else { !held(VK_MENU) };
+            if down && (held(VK_LWIN) || held(VK_RWIN)) && wanted {
                 if !SHORTCUT_HELD.swap(true, Relaxed) {
                     super::post(crate::taskbar::WM_TASKBAR_ACTION, tap_proto::ACTION_OPEN_CALENDAR, 0);
                     // A key between the Windows key's press and release, so letting go of it does

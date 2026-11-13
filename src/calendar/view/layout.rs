@@ -51,9 +51,12 @@ const AGENDA_HEAD_H: f32 = 40.0;
 pub const ROW_H: f32 = 52.0;
 const FOOTER_H: f32 = 48.0;
 const TOAST_HEAD_H: f32 = 40.0;
-pub const TOAST_H: f32 = 52.0;
-/// Notifications listed at most; the rest are counted.
-pub const TOASTS_MAX: usize = 3;
+/// In the notification centre: an app's heading, a notification, and the line saying there are none.
+pub const GROUP_H: f32 = 30.0;
+pub const TOAST_H: f32 = 58.0;
+pub const EMPTY_H: f32 = 36.0;
+/// The centre's list takes at most this much height; it scrolls past it.
+pub const CENTER_MAX: f32 = 380.0;
 pub const ROWS_MIN: usize = 2;
 pub const BUTTON: f32 = 32.0;
 const JOIN_W: f32 = 52.0;
@@ -68,7 +71,8 @@ pub struct Shape {
     pub compact: bool,
     pub agenda_only: bool,
     /// Notifications listed (0: no section).
-    pub toasts: usize,
+    /// The notification centre's list, its height (0: no centre).
+    pub center: f32,
     /// World clocks under the date.
     pub clocks: usize,
 }
@@ -80,7 +84,8 @@ pub struct Layout {
     /// The notifications' section: its title, Clear all, and its rows.
     pub toast_title: Option<R>,
     pub clear: Option<R>,
-    pub toasts: Vec<R>,
+    /// The list's viewport: its rows scroll inside it.
+    pub center: Option<R>,
     /// The day's date, which also goes back to today.
     pub date: R,
     pub bell: R,
@@ -112,7 +117,7 @@ pub struct Layout {
 
 /// The height of everything but the agenda's rows.
 fn fixed_height(shape: Shape) -> f32 {
-    let toasts = if shape.toasts > 0 { TOAST_HEAD_H + shape.toasts as f32 * TOAST_H + 1.0 } else { 0.0 };
+    let toasts = if shape.center > 0.0 { TOAST_HEAD_H + shape.center + 1.0 } else { 0.0 };
     let clocks = if shape.clocks > 0 { shape.clocks as f32 * CLOCK_H + 8.0 } else { 0.0 };
     let month = if shape.agenda_only { 0.0 } else { MONTH_H + WEEKDAYS_H + 6.0 * cell_h(shape) + 8.0 + 1.0 };
     toasts + HEADER_H + clocks + 1.0 + month + AGENDA_HEAD_H + FOOTER_H
@@ -132,15 +137,13 @@ pub fn layout(shape: Shape) -> Layout {
     let inner = W - 2.0 * PAD;
     let mut y = 0.0;
 
-    let (mut toast_title, mut clear, mut toasts) = (None, None, Vec::new());
-    if shape.toasts > 0 {
+    let (mut toast_title, mut clear, mut center) = (None, None, None);
+    if shape.center > 0.0 {
         toast_title = Some(R::new(PAD, y, inner - 96.0, TOAST_HEAD_H));
         clear = Some(R::new(W - PAD - 88.0, y + 6.0, 88.0, 28.0));
         y += TOAST_HEAD_H;
-        for _ in 0..shape.toasts {
-            toasts.push(R::new(8.0, y, W - 16.0, TOAST_H));
-            y += TOAST_H;
-        }
+        center = Some(R::new(0.0, y, W, shape.center));
+        y += shape.center;
         y += 1.0;
     }
 
@@ -203,7 +206,7 @@ pub fn layout(shape: Shape) -> Layout {
         h: y,
         toast_title,
         clear,
-        toasts,
+        center,
         date,
         bell,
         gear,
@@ -238,7 +241,7 @@ impl Layout {
         R::new(r.right() - 8.0 - JOIN_W, r.y + (r.h - JOIN_H) / 2.0, JOIN_W, JOIN_H)
     }
 
-    /// The dismiss cross on notification row `r`.
+    /// The dismiss cross on a notification centre row `r`.
     pub fn dismiss(&self, r: R) -> R {
         R::new(r.right() - 32.0, r.y + (r.h - 28.0) / 2.0, 28.0, 28.0)
     }
@@ -265,8 +268,8 @@ impl Layout {
 pub enum Hit {
     /// Back to today.
     Today,
-    /// Windows' notifications.
-    Bell,
+    /// Do not disturb on or off.
+    Quiet,
     /// Settings, on the Calendar page.
     Settings,
     Prev,
@@ -287,9 +290,11 @@ pub enum Hit {
     /// The world clocks: Windows' settings for them.
     Clocks,
     ClearAll,
-    /// A notification: Windows' notification centre.
+    /// A notification (by its place in the centre's list): opens its app.
     Toast(usize),
     Dismiss(usize),
+    /// An app's heading's cross: dismiss all of its notifications.
+    ClearApp(usize),
     FocusLess,
     FocusMore,
     /// Start or stop the focus timer.
@@ -307,7 +312,7 @@ pub struct Showing<'a> {
 
 /// The target at `(x, y)`.
 pub fn hit(l: &Layout, x: f32, y: f32, s: &Showing) -> Option<Hit> {
-    let mut simple = vec![(l.date, Hit::Today), (l.bell, Hit::Bell), (l.gear, Hit::Settings), (l.focus_less, Hit::FocusLess), (l.focus_more, Hit::FocusMore), (l.focus_button, Hit::Focus)];
+    let mut simple = vec![(l.date, Hit::Today), (l.bell, Hit::Quiet), (l.gear, Hit::Settings), (l.focus_less, Hit::FocusLess), (l.focus_more, Hit::FocusMore), (l.focus_button, Hit::Focus)];
     if l.month.is_some() {
         simple.extend([(l.prev, Hit::Prev), (l.next, Hit::Next)]);
     }
@@ -330,11 +335,6 @@ pub fn hit(l: &Layout, x: f32, y: f32, s: &Showing) -> Option<Hit> {
     }
     if let Some((_, hit)) = simple.iter().find(|(r, _)| r.contains(x, y)) {
         return Some(*hit);
-    }
-    for (i, r) in l.toasts.iter().enumerate() {
-        if r.contains(x, y) {
-            return Some(if l.dismiss(*r).contains(x, y) { Hit::Dismiss(i) } else { Hit::Toast(i) });
-        }
     }
     if let Some(i) = l.cells.iter().position(|c| c.contains(x, y)) {
         return Some(Hit::Day(i));
@@ -371,7 +371,7 @@ mod tests {
     use crate::calendar::time::days_from_civil;
 
     fn shape() -> Shape {
-        Shape { rows: 4, weeks: false, compact: false, agenda_only: false, toasts: 0, clocks: 0 }
+        Shape { rows: 4, weeks: false, compact: false, agenda_only: false, center: 0.0, clocks: 0 }
     }
 
     fn showing<'a>(rows: usize, joinable: &'a dyn Fn(usize) -> bool) -> Showing<'a> {
@@ -415,13 +415,11 @@ mod tests {
     #[test]
     fn sections_come_and_go_with_what_there_is() {
         let base = layout(shape());
-        let full = layout(Shape { toasts: 2, clocks: 2, weeks: true, ..shape() });
-        assert_eq!(full.h - base.h, TOAST_HEAD_H + 2.0 * TOAST_H + 1.0 + 2.0 * CLOCK_H + 8.0);
+        let full = layout(Shape { center: 120.0, clocks: 2, weeks: true, ..shape() });
+        assert_eq!(full.h - base.h, TOAST_HEAD_H + 120.0 + 1.0 + 2.0 * CLOCK_H + 8.0);
+        assert_eq!(full.center.map(|c| c.h), Some(120.0));
         assert_eq!(full.weeks.len(), 6);
         assert!(full.cells[0].x >= PAD + WEEK_W);
-        let none = |_: usize| false;
-        let (dx, dy) = full.dismiss(full.toasts[1]).center();
-        assert_eq!(hit(&full, dx, dy, &showing(0, &none)), Some(Hit::Dismiss(1)));
         let alone = layout(Shape { agenda_only: true, ..shape() });
         assert!(alone.cells.is_empty() && alone.month.is_none() && alone.day_next.is_some());
         assert!(alone.h < base.h);

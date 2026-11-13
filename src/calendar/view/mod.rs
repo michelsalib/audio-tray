@@ -21,8 +21,7 @@ use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromPoint, ScreenToClient, MONITORINFO, MONITOR_DEFAULTTONEAREST};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetCapture, ReleaseCapture, SendInput, SetCapture, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, VIRTUAL_KEY,
-    VK_DOWN, VK_ESCAPE, VK_HOME, VK_LEFT, VK_LWIN, VK_NEXT, VK_PRIOR, VK_RIGHT, VK_UP,
+    GetCapture, ReleaseCapture, SetCapture, VIRTUAL_KEY, VK_DOWN, VK_ESCAPE, VK_HOME, VK_LEFT, VK_NEXT, VK_PRIOR, VK_RIGHT, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     DefWindowProcW, DestroyWindow, GetCursorPos, ShowWindow, SW_SHOWNA, WA_INACTIVE, WHEEL_DELTA, WINDOW_EX_STYLE, WM_ACTIVATE,
@@ -100,6 +99,8 @@ struct View {
     hover: Option<Hit>,
     pressed: Option<Hit>,
     toasts: Vec<Toast>,
+    /// How far the notification centre's list is scrolled.
+    center_scroll: f32,
     clocks: Vec<WorldClock>,
     focus_minutes: u32,
 }
@@ -167,7 +168,7 @@ fn edge_of(rect: &RECT, work: &RECT) -> Edge {
 }
 
 fn empty_shape() -> Shape {
-    Shape { rows: 0, weeks: false, compact: false, agenda_only: false, toasts: 0, clocks: 0 }
+    Shape { rows: 0, weeks: false, compact: false, agenda_only: false, center: 0.0, clocks: 0 }
 }
 
 fn create(config: &Config) -> Result<()> {
@@ -207,9 +208,11 @@ fn create(config: &Config) -> Result<()> {
         hover: None,
         pressed: None,
         toasts: Vec::new(),
+        center_scroll: 0.0,
         clocks: Vec::new(),
         focus_minutes: config.calendar.focus_minutes.clamp(FOCUS_MIN, FOCUS_MAX),
     };
+    super::notifications::refresh();
     view.reload();
     view.fetch();
     view.place();
@@ -278,22 +281,35 @@ impl View {
             weeks: calendar.week_numbers,
             compact: calendar.layout == CalendarLayout::Compact,
             agenda_only: calendar.layout == CalendarLayout::AgendaOnly,
-            toasts: self.toasts.len().min(layout::TOASTS_MAX),
+            center: 0.0,
             clocks: self.clocks.len(),
         };
         let room = (self.work.bottom - self.work.top) as f32 / self.scale - 2.0 * MARGIN;
         let most = shape.rows;
         let fit = |shape: Shape| layout::rows_for(Shape { rows: most, ..shape }, room);
-        shape.rows = fit(shape);
-        // Too tall, or the agenda squeezed under three rows: fewer notifications, then no world
-        // clocks.
-        let wanted = most.min(3);
-        while (layout::layout(shape).h > room || shape.rows < wanted) && (shape.toasts > 0 || shape.clocks > 0) {
-            if shape.toasts > 0 {
-                shape.toasts -= 1;
-            } else {
-                shape.clocks = 0;
+        // The notification centre takes what it needs (scrolling past CENTER_MAX); to make room
+        // the calendar gives up, in turn, agenda rows down to two, the world clocks, and the month
+        // (as Windows' own centre collapses its calendar).
+        if calendar.notifications {
+            let wanted = center_height(&self.toasts).min(layout::CENTER_MAX);
+            let header = 41.0;
+            let steps = [
+                Shape { rows: most.min(3), ..shape },
+                Shape { rows: layout::ROWS_MIN, ..shape },
+                Shape { rows: layout::ROWS_MIN, clocks: 0, ..shape },
+                Shape { rows: layout::ROWS_MIN, clocks: 0, agenda_only: true, ..shape },
+            ];
+            let spare = |s: Shape| room - layout::layout(s).h - header;
+            let chosen = steps.iter().copied().find(|s| spare(*s) >= wanted).unwrap_or(steps[3]);
+            shape = chosen;
+            shape.center = wanted.min(spare(chosen));
+            if shape.center < layout::EMPTY_H {
+                shape.center = 0.0;
             }
+        }
+        shape.rows = fit(shape);
+        if layout::layout(shape).h > room {
+            shape.clocks = 0;
             shape.rows = fit(shape);
         }
         self.shape = shape;
@@ -371,6 +387,13 @@ impl View {
 
     fn hit(&self, x: i32, y: i32) -> Option<Hit> {
         let (x, y) = (x as f32 / self.scale, y as f32 / self.scale);
+        if let Some(area) = self.layout.center.filter(|a| a.contains(x, y)) {
+            return center_rows(&self.toasts, area, self.center_scroll).into_iter().find(|(r, _)| r.contains(x, y)).map(|(r, row)| match row {
+                Row::Group(g) => Hit::ClearApp(g),
+                Row::Toast(i) if self.layout.dismiss(r).contains(x, y) => Hit::Dismiss(i),
+                Row::Toast(i) => Hit::Toast(i),
+            });
+        }
         let joinable = |i: usize| self.agenda.get(i).is_some_and(|e| e.join.is_some());
         let detail = self.detail.and_then(|i| self.agenda.get(i)).map(|e| (e.join.is_some(), e.link.is_some()));
         layout::hit(&self.layout, x, y, &Showing { scroll: self.scroll, rows: self.agenda.len(), joinable: &joinable, detail })
@@ -401,11 +424,22 @@ impl View {
             Hit::Day(i) => self.select(self.grid_start() + i as i32),
             Hit::DayPrev => self.select(self.selected - 1),
             Hit::DayNext => self.select(self.selected + 1),
-            Hit::Bell | Hit::Toast(_) => {
-                return Some(Box::new(|| {
+            Hit::Quiet => {
+                super::focus::toggle();
+                crate::tray::wake_calendar();
+            }
+            Hit::Toast(i) => {
+                let toast = self.toasts.get(i)?.clone();
+                super::notifications::remove(vec![toast.id]);
+                return Some(Box::new(move || {
                     close();
-                    open_notifications();
-                }))
+                    super::notifications::open_app(&toast.aumid);
+                }));
+            }
+            Hit::ClearApp(g) => {
+                let groups = super::notifications::grouped(&self.toasts);
+                let ids: Vec<u32> = groups.get(g)?.1.iter().map(|t| t.id).collect();
+                return self.drop_toasts(ids);
             }
             Hit::Settings => {
                 return Some(Box::new(|| {
@@ -436,12 +470,8 @@ impl View {
                 return Some(Box::new(keep_rect));
             }
             Hit::Dismiss(i) => {
-                let toast = self.toasts.get(i)?;
-                super::notifications::remove(toast.id);
-                self.toasts.remove(i);
-                self.hover = None;
-                self.relayout();
-                return Some(Box::new(keep_rect));
+                let id = self.toasts.get(i)?.id;
+                return self.drop_toasts(vec![id]);
             }
             Hit::FocusLess => self.focus_minutes = self.focus_minutes.saturating_sub(FOCUS_STEP).max(FOCUS_MIN),
             Hit::FocusMore => self.focus_minutes = (self.focus_minutes + FOCUS_STEP).min(FOCUS_MAX),
@@ -457,6 +487,18 @@ impl View {
         }
         self.render();
         None
+    }
+
+    /// Dismiss these notifications, and lay out without them.
+    fn drop_toasts(&mut self, ids: Vec<u32>) -> Option<After> {
+        self.toasts.retain(|t| !ids.contains(&t.id));
+        super::notifications::remove(ids);
+        self.hover = None;
+        self.relayout();
+        let max = (center_height(&self.toasts) - self.layout.center.map_or(0.0, |c| c.h)).max(0.0);
+        self.center_scroll = self.center_scroll.min(max);
+        self.render();
+        Some(Box::new(keep_rect))
     }
 
     fn key(&mut self, key: VIRTUAL_KEY) -> Option<After> {
@@ -488,7 +530,10 @@ impl View {
     fn wheel(&mut self, delta: i32, x: i32, y: i32) {
         let notches = delta as f32 / WHEEL_DELTA as f32;
         let (x, y) = (x as f32 / self.scale, y as f32 / self.scale);
-        if self.layout.agenda.contains(x, y) {
+        if let Some(area) = self.layout.center.filter(|a| a.contains(x, y)) {
+            let max = (center_height(&self.toasts) - area.h).max(0.0);
+            self.center_scroll = (self.center_scroll - notches * SCROLL_STEP).clamp(0.0, max);
+        } else if self.layout.agenda.contains(x, y) {
             if self.detail.is_none() {
                 let max = self.layout.max_scroll(self.agenda.len());
                 self.scroll = (self.scroll - notches * SCROLL_STEP).clamp(0.0, max);
@@ -499,6 +544,99 @@ impl View {
         }
         self.render();
     }
+}
+
+/// A row of the notification centre: an app's heading (by group), or a notification (by its
+/// place in the list).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Row {
+    Group(usize),
+    Toast(usize),
+}
+
+/// The centre's rows in `area`, scrolled, each with its rectangle.
+fn center_rows(toasts: &[Toast], area: R, scroll: f32) -> Vec<(R, Row)> {
+    let mut rows = Vec::new();
+    let mut y = area.y - scroll;
+    for (g, (_, list)) in super::notifications::grouped(toasts).iter().enumerate() {
+        rows.push((R::new(area.x + 8.0, y, area.w - 16.0, layout::GROUP_H), Row::Group(g)));
+        y += layout::GROUP_H;
+        for toast in list {
+            let i = toasts.iter().position(|t| t.id == toast.id).unwrap_or(0);
+            rows.push((R::new(area.x + 8.0, y, area.w - 16.0, layout::TOAST_H), Row::Toast(i)));
+            y += layout::TOAST_H;
+        }
+    }
+    rows
+}
+
+/// The height the centre's list wants: every heading and notification, or the line saying there
+/// are none.
+fn center_height(toasts: &[Toast]) -> f32 {
+    if toasts.is_empty() {
+        return layout::EMPTY_H;
+    }
+    let groups = super::notifications::grouped(toasts).len() as f32;
+    groups * layout::GROUP_H + toasts.len() as f32 * layout::TOAST_H + 4.0
+}
+
+/// When a notification arrived, in a few words.
+fn arrived(at: i64) -> String {
+    let now = time::now();
+    let minutes = (now - at).max(0) / 60;
+    let wall = Local.to_local(at);
+    match minutes {
+        0 => "now".into(),
+        1..=59 => format!("{minutes} min"),
+        _ if time::day_of(wall) == time::day_of(Local.to_local(now)) => locale::clock(time::second_of_day(wall)),
+        _ => capitalised(&locale::day_title(time::day_of(wall))),
+    }
+}
+
+fn draw_center(pen: &Pen, v: &View, area: R) {
+    let p = &v.palette;
+    let hovered = |hit: Hit| v.hover == Some(hit);
+    if v.toasts.is_empty() {
+        pen.text("No new notifications", Font::Body, R::new(area.x + layout::PAD, area.y, area.w - 2.0 * layout::PAD, layout::EMPTY_H), p.text2, Align::Left);
+        return;
+    }
+    let groups = super::notifications::grouped(&v.toasts);
+    pen.clip(area);
+    for (r, row) in center_rows(&v.toasts, area, v.center_scroll) {
+        if r.bottom() < area.y || r.y > area.bottom() {
+            continue;
+        }
+        match row {
+            Row::Group(g) => {
+                let Some((_, list)) = groups.get(g) else { continue };
+                let name = list.first().map_or("", |t| t.app.as_str());
+                pen.text(name, Font::CaptionStrong, R::new(r.x + 4.0, r.y + 4.0, r.w - 40.0, r.h - 4.0), p.text2, Align::Left);
+                let x = R::new(r.right() - 28.0, r.y + 4.0, 24.0, 24.0);
+                if hovered(Hit::ClearApp(g)) {
+                    pen.fill(x, 4.0, p.hover);
+                }
+                pen.glyph('\u{E711}', Font::IconSmall, x, p.text3);
+            }
+            Row::Toast(i) => {
+                let Some(toast) = v.toasts.get(i) else { continue };
+                let lit = hovered(Hit::Toast(i)) || hovered(Hit::Dismiss(i));
+                pen.fill(R::new(r.x, r.y + 2.0, r.w, r.h - 4.0), 6.0, if lit { p.hover } else { p.raised });
+                let text_w = r.w - 24.0 - if lit { 32.0 } else { 0.0 };
+                let title = if toast.title.is_empty() { toast.app.as_str() } else { toast.title.as_str() };
+                pen.text(title, Font::Body, R::new(r.x + 12.0, r.y + 7.0, text_w - 56.0, 22.0), p.text, Align::Left);
+                pen.text(&arrived(toast.at), Font::Caption, R::new(r.x + 12.0, r.y + 7.0, text_w, 22.0), p.text3, Align::Right);
+                pen.text(&toast.body, Font::Caption, R::new(r.x + 12.0, r.y + 30.0, text_w, 20.0), p.text2, Align::Left);
+                if lit {
+                    let x = v.layout.dismiss(r);
+                    if hovered(Hit::Dismiss(i)) {
+                        pen.fill(x, 4.0, p.hover);
+                    }
+                    pen.glyph('\u{E711}', Font::IconSmall, x, p.text2);
+                }
+            }
+        }
+    }
+    pen.unclip();
 }
 
 fn draw(pen: &Pen, v: &View) {
@@ -513,37 +651,29 @@ fn draw(pen: &Pen, v: &View) {
     };
 
     // Windows' notifications.
-    if let Some(title) = l.toast_title {
-        pen.text(&format!("Notifications · {}", v.toasts.len()), Font::Strong, title, p.text, Align::Left);
-        if let Some(clear) = l.clear {
+    if let (Some(title), Some(area)) = (l.toast_title, l.center) {
+        let count = v.toasts.len();
+        let heading = if count == 0 { "Notifications".to_string() } else { format!("Notifications · {count}") };
+        pen.text(&heading, Font::Strong, title, p.text, Align::Left);
+        if let Some(clear) = l.clear.filter(|_| count > 0) {
             button_bg(Hit::ClearAll, clear);
             pen.text("Clear all", Font::Caption, clear, p.text2, Align::Center);
         }
-        for (i, r) in l.toasts.iter().enumerate() {
-            let Some(toast) = v.toasts.get(i) else { continue };
-            let lit = hovered(Hit::Toast(i)) || hovered(Hit::Dismiss(i));
-            pen.fill(R::new(r.x, r.y + 2.0, r.w, r.h - 4.0), 6.0, if lit { p.hover } else { p.raised });
-            let text_w = r.w - 56.0;
-            let when = locale::clock(time::second_of_day(Local.to_local(toast.at)));
-            pen.text(&toast.app, Font::CaptionStrong, R::new(r.x + 12.0, r.y + 6.0, text_w - 50.0, 18.0), p.text2, Align::Left);
-            pen.text(&when, Font::Caption, R::new(r.x + 12.0, r.y + 6.0, text_w, 18.0), p.text3, Align::Right);
-            let line = if toast.body.is_empty() { toast.title.clone() } else { format!("{} · {}", toast.title, toast.body) };
-            pen.text(&line, Font::Body, R::new(r.x + 12.0, r.y + 24.0, text_w, 22.0), p.text, Align::Left);
-            if lit {
-                let x = l.dismiss(*r);
-                button_bg(Hit::Dismiss(i), x);
-                pen.glyph('\u{E711}', Font::IconSmall, x, p.text2);
-            }
-        }
+        draw_center(pen, v, area);
         pen.fill(R::new(0.0, l.date.y - 1.0, l.w, 1.0), 0.0, p.rule);
     }
 
-    // The day's date, the notifications and Settings, and the world clocks.
+    // The day's date, Do not disturb and Settings, and the world clocks.
     let date_r = R::new(l.date.x - 8.0, l.date.y + 10.0, l.date.w + 8.0, l.date.h - 20.0);
     button_bg(Hit::Today, date_r);
     pen.text(&locale::day_title(v.today), Font::Header, l.date, p.text, Align::Left);
-    button_bg(Hit::Bell, l.bell);
-    pen.glyph('\u{EA8F}', Font::Icon, l.bell, p.text);
+    if super::focus::active() {
+        pen.fill(l.bell, 4.0, if hovered(Hit::Quiet) { p.accent.alpha(0.85) } else { p.accent });
+        pen.glyph('\u{E708}', Font::Icon, l.bell, p.on_accent);
+    } else {
+        button_bg(Hit::Quiet, l.bell);
+        pen.glyph('\u{E708}', Font::Icon, l.bell, p.text);
+    }
     button_bg(Hit::Settings, l.gear);
     pen.glyph('\u{E713}', Font::Icon, l.gear, p.text);
     let here = time::day_of(Local.to_local(time::now()));
@@ -843,16 +973,6 @@ fn capitalised(text: &str) -> String {
     chars.next().map_or_else(String::new, |c| c.to_uppercase().chain(chars).collect())
 }
 
-/// Windows' notification centre (Win+N).
-fn open_notifications() {
-    let key = |vk: VIRTUAL_KEY, up: bool| INPUT {
-        r#type: INPUT_KEYBOARD,
-        Anonymous: INPUT_0 { ki: KEYBDINPUT { wVk: vk, dwFlags: if up { KEYEVENTF_KEYUP } else { Default::default() }, ..Default::default() } },
-    };
-    let n = VIRTUAL_KEY(b'N' as u16);
-    let inputs = [key(VK_LWIN, false), key(n, false), key(n, true), key(VK_LWIN, true)];
-    unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
-}
 
 /// The arrow cursor, whatever was showing when the capture began.
 fn arrow() {
@@ -968,9 +1088,14 @@ pub fn preview(config: &Config) {
 
 #[cfg(feature = "dev")]
 fn refresh_if_done() {
-    thread_local! { static WAS_FETCHING: Cell<bool> = const { Cell::new(false) }; }
+    thread_local! {
+        static WAS_FETCHING: Cell<bool> = const { Cell::new(false) };
+        static TOASTS: Cell<usize> = const { Cell::new(usize::MAX) };
+    }
     let now = super::fetching();
-    if WAS_FETCHING.with(|w| w.replace(now)) && !now {
+    let toasts = super::notifications::count();
+    let fetched = WAS_FETCHING.with(|w| w.replace(now)) && !now;
+    if fetched || TOASTS.with(|t| t.replace(toasts)) != toasts {
         refresh();
     }
 }

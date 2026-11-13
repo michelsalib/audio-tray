@@ -1,17 +1,18 @@
 //! Windows' notifications, read through the documented notification listener (allowed for
-//! unpackaged apps on Windows 11): how many there are for the clock, and the newest few for the
-//! calendar, with dismissing one and Clear all.
+//! unpackaged apps on Windows 11): all of them for the calendar's notification centre, and how many
+//! for the clock, with opening one's app, dismissing one, an app's, or all.
 //!
-//! A thread of its own (the listener's calls block on async operations, which an STA must not do)
-//! that sleeps until the notification store changes on disk: Windows writes
-//! `%LOCALAPPDATA%\Microsoft\Windows\Notifications\wpndatabase.db*` on every arrival and dismissal,
-//! so nothing polls.
+//! A thread of its own (the listener's calls block on async operations, which an STA must not do).
+//! It reads again when the listener says something changed, when the notification store changes
+//! on disk, when the calendar opens, and once a minute while any are waiting (a dismissal in
+//! Windows' own centre is not always written promptly, and the count must not go stale).
 
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use windows::core::HSTRING;
+use windows::Foundation::TypedEventHandler;
 use windows::UI::Notifications::Management::{UserNotificationListener, UserNotificationListenerAccessStatus};
 use windows::UI::Notifications::{KnownNotificationBindings, NotificationKinds};
 
@@ -20,6 +21,8 @@ use windows::UI::Notifications::{KnownNotificationBindings, NotificationKinds};
 pub struct Toast {
     pub id: u32,
     pub app: String,
+    /// The app's id, to open it.
+    pub aumid: String,
     pub title: String,
     pub body: String,
     /// When it arrived, in seconds since the epoch.
@@ -28,9 +31,13 @@ pub struct Toast {
 
 /// What the reader thread is asked to do.
 enum Ask {
-    Remove(u32),
+    Read,
+    Remove(Vec<u32>),
     Clear,
 }
+
+/// How often the list is read again while it is not empty.
+const RECHECK: Duration = Duration::from_secs(60);
 
 /// Every notification, newest first, as last read; `None` before the first read or when the
 /// listener is not allowed.
@@ -44,10 +51,10 @@ pub fn start() {
         return;
     }
     let (send, asks) = channel();
-    if ASK.set(send).is_err() {
+    if ASK.set(send.clone()).is_err() {
         return;
     }
-    let _ = std::thread::Builder::new().name("notifications".into()).spawn(move || run(asks));
+    let _ = std::thread::Builder::new().name("notifications".into()).spawn(move || run(asks, send));
 }
 
 /// The notifications, newest first; empty when there are none or they cannot be read.
@@ -60,19 +67,35 @@ pub fn count() -> usize {
     TOASTS.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map_or(0, Vec::len)
 }
 
-pub fn remove(id: u32) {
+fn ask(what: Ask) {
     if let Some(ask) = ASK.get() {
-        let _ = ask.send(Ask::Remove(id));
+        let _ = ask.send(what);
     }
+}
+
+/// Read the list again now (the calendar is opening).
+pub fn refresh() {
+    ask(Ask::Read);
+}
+
+pub fn remove(ids: Vec<u32>) {
+    TOASTS.lock().unwrap_or_else(|e| e.into_inner()).iter_mut().for_each(|list| list.retain(|t| !ids.contains(&t.id)));
+    ask(Ask::Remove(ids));
 }
 
 pub fn clear() {
-    if let Some(ask) = ASK.get() {
-        let _ = ask.send(Ask::Clear);
+    if let Some(list) = TOASTS.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        list.clear();
     }
+    ask(Ask::Clear);
 }
 
-fn run(asks: Receiver<Ask>) {
+/// Open the app a notification came from (its own buttons belong to Windows' centre).
+pub fn open_app(aumid: &str) -> bool {
+    !aumid.is_empty() && crate::win::shell_open(&format!(r"shell:AppsFolder\{aumid}"), None)
+}
+
+fn run(asks: Receiver<Ask>, again: Sender<Ask>) {
     unsafe {
         let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_MULTITHREADED);
     }
@@ -83,8 +106,17 @@ fn run(asks: Receiver<Ask>) {
             return;
         }
     };
+    // The listener's own word on changes, where Windows sends it to an unpackaged app.
+    let handler = TypedEventHandler::new(move |_, _| {
+        let _ = again.send(Ask::Read);
+        Ok(())
+    });
+    if listener.NotificationChanged(&handler).is_err() {
+        println!("notifications: no change events here; following the store on disk");
+    }
     let changes = watch_store();
     loop {
+        let mut last_read = Instant::now();
         match read(&listener) {
             Ok(toasts) => {
                 let changed = {
@@ -99,11 +131,14 @@ fn run(asks: Receiver<Ask>) {
             }
             Err(e) => eprintln!("notifications: could not read them ({e:#})"),
         }
-        // Until the store changes, or the calendar asks for something.
+        // Until something changes, or the calendar asks for something.
         loop {
             match asks.recv_timeout(Duration::from_millis(500)) {
-                Ok(Ask::Remove(id)) => {
-                    let _ = listener.RemoveNotification(id);
+                Ok(Ask::Read) => break,
+                Ok(Ask::Remove(ids)) => {
+                    for id in ids {
+                        let _ = listener.RemoveNotification(id);
+                    }
                     break;
                 }
                 Ok(Ask::Clear) => {
@@ -121,6 +156,10 @@ fn run(asks: Receiver<Ask>) {
                 }
                 break;
             }
+            if count() > 0 && last_read.elapsed() >= RECHECK {
+                last_read = Instant::now();
+                break;
+            }
         }
     }
 }
@@ -129,20 +168,33 @@ fn run(asks: Receiver<Ask>) {
 fn read(listener: &UserNotificationListener) -> anyhow::Result<Vec<Toast>> {
     let all = listener.GetNotificationsAsync(NotificationKinds::Toast)?.get()?;
     let generic: HSTRING = KnownNotificationBindings::ToastGeneric()?;
+    let now = super::time::now();
     let mut toasts = Vec::new();
     for n in all {
-        let app = n.AppInfo().and_then(|a| a.DisplayInfo()).and_then(|d| d.DisplayName()).map(|s| s.to_string()).unwrap_or_default();
-        let texts: Vec<String> = n
-            .Notification()
-            .and_then(|x| x.Visual())
-            .and_then(|v| v.GetBinding(&generic))
-            .and_then(|b| b.GetTextElements())
+        let notification = n.Notification().ok();
+        // One past its expiry has left Windows' centre, whatever the listener still holds.
+        let expired = notification
+            .as_ref()
+            .and_then(|x| x.ExpirationTime().ok())
+            .and_then(|t| t.Value().ok())
+            .is_some_and(|t| t.UniversalTime / 10_000_000 - 11_644_473_600 <= now);
+        if expired {
+            continue;
+        }
+        let info = n.AppInfo().ok();
+        let app = info.as_ref().and_then(|a| a.DisplayInfo().ok()).and_then(|d| d.DisplayName().ok()).map(|s| s.to_string()).unwrap_or_default();
+        let aumid = info.as_ref().and_then(|a| a.AppUserModelId().ok()).map(|s| s.to_string()).unwrap_or_default();
+        let texts: Vec<String> = notification
+            .and_then(|x| x.Visual().ok())
+            .and_then(|v| v.GetBinding(&generic).ok())
+            .and_then(|b| b.GetTextElements().ok())
             .map(|list| list.into_iter().filter_map(|t| t.Text().ok().map(|s| s.to_string())).collect())
             .unwrap_or_default();
         let at = n.CreationTime().map_or(0, |t| t.UniversalTime / 10_000_000 - 11_644_473_600);
         toasts.push(Toast {
             id: n.Id().unwrap_or_default(),
             app,
+            aumid,
             title: texts.first().cloned().unwrap_or_default(),
             body: texts.get(1..).map(|rest| rest.join(" ")).unwrap_or_default(),
             at,
@@ -180,4 +232,37 @@ fn watch_store() -> Option<StoreWatch> {
     let wide = crate::win::wide(&folder);
     let handle = unsafe { FindFirstChangeNotificationW(windows::core::PCWSTR(wide.as_ptr()), false, FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_SIZE) }.ok()?;
     Some(StoreWatch(handle))
+}
+
+/// The notifications as the centre lists them: by app (the app with the newest first), newest
+/// first within each.
+pub fn grouped(toasts: &[Toast]) -> Vec<(String, Vec<&Toast>)> {
+    let mut groups: Vec<(String, Vec<&Toast>)> = Vec::new();
+    for toast in toasts {
+        let key = if toast.aumid.is_empty() { &toast.app } else { &toast.aumid };
+        match groups.iter_mut().find(|(k, _)| k == key) {
+            Some((_, list)) => list.push(toast),
+            None => groups.push((key.clone(), vec![toast])),
+        }
+    }
+    groups
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn toast(id: u32, app: &str, at: i64) -> Toast {
+        Toast { id, app: app.into(), aumid: format!("{app}.id"), title: String::new(), body: String::new(), at }
+    }
+
+    #[test]
+    fn notifications_group_by_app_newest_app_first() {
+        let list = vec![toast(1, "Outlook", 30), toast(2, "Teams", 20), toast(3, "Outlook", 10)];
+        let groups = grouped(&list);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].0, "Outlook.id");
+        assert_eq!(groups[0].1.iter().map(|t| t.id).collect::<Vec<_>>(), vec![1, 3]);
+        assert_eq!(groups[1].1[0].id, 2);
+    }
 }

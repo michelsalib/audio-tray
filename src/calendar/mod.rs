@@ -8,7 +8,7 @@
 //! are fetched when the calendar opens (from the cache at once, refreshed when stale) and when its
 //! month moves out of what was fetched.
 
-mod focus;
+pub mod focus;
 mod ics;
 mod model;
 pub mod notifications;

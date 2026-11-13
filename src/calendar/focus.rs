@@ -16,6 +16,8 @@ pub enum Why {
     Timer,
     /// A calendar event, or a call.
     Quiet,
+    /// Switched on by hand, until switched off.
+    Manual,
 }
 
 thread_local! {
@@ -74,5 +76,26 @@ pub fn stop(why: Why) {
             let _ = manager.DeactivateFocus();
         }
         OURS.with(|o| o.set(None));
+    }
+}
+
+/// Do not disturb, switched by hand from the notification centre: off if Windows is in any focus
+/// session (whoever started it), else on until switched off.
+pub fn toggle() -> bool {
+    let Some(manager) = manager() else { return false };
+    if manager.IsFocusActive().unwrap_or(false) {
+        let _ = manager.DeactivateFocus();
+        OURS.with(|o| o.set(None));
+        return false;
+    }
+    match manager.TryStartFocusSession() {
+        Ok(_) => {
+            OURS.with(|o| o.set(Some((Why::Manual, i64::MAX))));
+            true
+        }
+        Err(e) => {
+            eprintln!("calendar: Windows would not start a focus session ({e})");
+            false
+        }
     }
 }

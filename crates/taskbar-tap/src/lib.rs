@@ -753,6 +753,8 @@ pub(crate) unsafe fn stand_down() {
     lock(&WATCHED).clear();
     lock(&WIRED).clear();
     reorder::forget();
+    // A styled clock goes back to the locale's format, still kept ticking.
+    clock::release_text();
     PROBED.store(false, Ordering::SeqCst);
     SLOT_METRICS_REPORTED.store(false, Ordering::SeqCst);
     lock(&UNKNOWN_GLYPHS).clear();

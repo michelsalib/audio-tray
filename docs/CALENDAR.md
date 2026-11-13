@@ -1,9 +1,55 @@
-# Calendar
+# Clock & calendar
 
-With **Settings > Connectors > Calendar** on, a click on the taskbar clock opens Audio Tray's
-calendar instead of Windows': the month, a dot on each day that has events, and the selected day's
-agenda with a **Join** button for Teams and Meet meetings. Windows' notification centre stays on
-the bell beside the clock, on the calendar's own bell, and on Win+N.
+With **Settings > Clock & calendar > Opens from the taskbar clock** on, a click on the clock (or
+Win+Alt+D) opens Audio Tray's calendar instead of Windows'. Audio Tray's low-level mouse hook
+swallows the click, because the shell's clock button opens its own flyout whatever its XAML
+handlers do with the press. The calendar shows, top to bottom:
+
+- **Windows' notifications** (up to three, with a count), to dismiss one by one or Clear all.
+  Clicking one opens Windows' notification centre.
+- **The date**, with Windows' additional clocks under it (Date and time settings > Additional
+  clocks; Settings has a button to them).
+- **The month**, with a dot per calendar on each day that has events, and optional ISO week
+  numbers. The layout can be compact, or the agenda alone, a day at a time.
+- **The day's agenda**, with **Join** for Teams, Meet, Zoom and Webex meetings. Clicking an event
+  opens its details: time, place, organiser and your reply, who's invited, notes, and buttons to
+  join or open it in its calendar.
+- **The focus timer.** It starts a Windows focus session, so Windows' Do not disturb runs with
+  it, and the clock counts down.
+
+It opens from whichever screen edge the taskbar is on, over Windows' acrylic, sliding in and out
+like the shell's own flyouts.
+
+## The taskbar clock
+
+The TAP (in Explorer) writes the clock's two lines itself once anything differs from Windows' own
+format, formatting the time with the locale's patterns:
+
+- seconds, the day of the week, one line, or no date (`time_pattern` and `date_pattern` under
+  `[clock]` in config.toml take your own `GetTimeFormatEx`/`GetDateFormatEx` patterns);
+- the next meeting after the time, from 30 minutes before (`Stand-up in 12 min`, then `now`), or
+  the focus time left;
+- the unread notifications after the date (`🔔 3`).
+
+Once it has written the clock, the TAP keeps it ticking for the rest of Explorer's life, going back
+to the locale's own format when Audio Tray quits: the shell might not take its clock back on its
+own.
+
+## Meetings and focus
+
+- **Reminders** on the edge pill, 1, 5 or 10 minutes before an event: a banner you click to join.
+- **Do not disturb** (a Windows focus session) during calendar events, during calls (Teams,
+  Discord, or a meeting app holding the microphone), or both. Audio Tray only ends the sessions it
+  started.
+- Events are fetched in the background every 15 minutes while there are sources, for the
+  reminders and the clock. A tray timer wakes only for the next thing due.
+
+## Calendars
+
+Once fetched, every calendar is listed in Settings with a switch to hide it and colours to pick
+from (its own first). Hidden calendars send no reminders and no countdown.
+
+## Sources
 
 Events come from up to three kinds of source, in any mix:
 
@@ -17,9 +63,9 @@ Sign-ins happen in your browser. Audio Tray keeps only each account's refresh to
 Windows Credential Manager (`AudioTray/calendar-google`, `AudioTray/calendar-microsoft`), along
 with the Google client secret and the calendar links. None of these go in `config.toml`.
 
-Nothing polls. Events are fetched when the calendar opens: cached ones show at once, and they are
-refreshed if they are more than 5 minutes old. They are fetched again when you move to a month
-outside the three already fetched.
+Events are fetched when the calendar opens (cached ones show at once, refreshed when more than 5
+minutes old), when you move to a month outside the three already fetched, and every 15 minutes in
+the background for reminders and the clock.
 
 ## Google account
 

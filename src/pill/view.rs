@@ -138,6 +138,8 @@ pub enum Action {
     MuteAndAcknowledge(Notice),
     /// Acknowledge only.
     Dismiss(Notice),
+    /// Open this address (a meeting to join) and acknowledge.
+    Open(String, Notice),
 }
 
 impl View {
@@ -188,6 +190,9 @@ pub const GLYPH_SONG: char = '\u{E8D6}';
 pub const GLYPH_KEYBOARD: char = '\u{E765}';
 /// Battery1: a sliver left.
 pub const GLYPH_BATTERY_LOW: char = '\u{E851}';
+pub const GLYPH_CALENDAR: char = '\u{E787}';
+/// Timer: the focus timer.
+pub const GLYPH_FOCUS: char = '\u{E916}';
 
 /// Everything besides the hub state that the view depends on.
 #[derive(Clone, Copy, Default)]
@@ -272,6 +277,30 @@ fn loudest(state: &State, inputs: Inputs) -> View {
                 action: Action::Dismiss(notice.clone()),
             };
         }
+    }
+    // A meeting about to start: click to join it (or open the event).
+    if let Some(notice @ Notice::Meeting { title, line, url, .. }) = newest(state, |n| matches!(n, Notice::Meeting { .. })) {
+        let hint = match url {
+            Some(_) => " · click to join",
+            None => "",
+        };
+        return View::Banner {
+            level: Level::Normal,
+            glyph: GLYPH_CALENDAR,
+            text: format!("{title} {line}{hint}"),
+            action: match url {
+                Some(url) => Action::Open(url.clone(), notice.clone()),
+                None => Action::Dismiss(notice.clone()),
+            },
+        };
+    }
+    if let Some(notice @ Notice::FocusDone { minutes }) = newest(state, |n| matches!(n, Notice::FocusDone { .. })) {
+        return View::Banner {
+            level: Level::Normal,
+            glyph: GLYPH_FOCUS,
+            text: format!("Focus done · {minutes} min"),
+            action: Action::Dismiss(notice.clone()),
+        };
     }
     // A layout switch, for a moment: quieter than the above, so a compact pill or a fullscreen
     // app keeps it to itself.

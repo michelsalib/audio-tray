@@ -10,7 +10,7 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::model::{Event, Source, When};
+use super::model::{Calendar, Details, Event, Source, When};
 use super::oauth::{self, Client};
 use super::time::{self, Zone};
 
@@ -221,8 +221,8 @@ fn access(provider: Provider, setup: &Setup) -> Result<String> {
     Ok(tokens.access)
 }
 
-/// `provider`'s events between two instants.
-pub fn fetch(provider: Provider, setup: &Setup, range: (i64, i64), zone: &dyn Zone) -> Result<Vec<Event>> {
+/// `provider`'s events between two instants, and its calendars.
+pub fn fetch(provider: Provider, setup: &Setup, range: (i64, i64), zone: &dyn Zone) -> Result<(Vec<Event>, Vec<Calendar>)> {
     let run = |token: &str| match provider {
         Provider::Google => google_events(token, range),
         Provider::Microsoft => microsoft_events(token, range, zone),
@@ -257,9 +257,14 @@ const OUTLOOK_BLUE: [u8; 3] = [0x47, 0x9E, 0xF5];
 /// The links' colours, in turn.
 pub const LINK_COLORS: [[u8; 3]; 4] = [[0xE8, 0x83, 0x6A], [0x6C, 0xCB, 0x5F], [0xC3, 0x9B, 0xF5], [0xF7, 0xB3, 0x2B]];
 
-fn google_events(token: &str, (from, to): (i64, i64)) -> Result<Vec<Event>> {
-    let list = oauth::get_json("https://www.googleapis.com/calendar/v3/users/me/calendarList?minAccessRole=reader&fields=items(id,backgroundColor,selected,primary,hidden)", token, &[])?;
+fn google_events(token: &str, (from, to): (i64, i64)) -> Result<(Vec<Event>, Vec<Calendar>)> {
+    let list = oauth::get_json(
+        "https://www.googleapis.com/calendar/v3/users/me/calendarList?minAccessRole=reader&fields=items(id,summary,summaryOverride,backgroundColor,selected,primary,hidden)",
+        token,
+        &[],
+    )?;
     let mut events = Vec::new();
+    let mut calendars = Vec::new();
     for calendar in list["items"].as_array().into_iter().flatten() {
         // The calendars shown in Google Calendar itself.
         let shown = calendar["selected"].as_bool().unwrap_or(false) || calendar["primary"].as_bool().unwrap_or(false);
@@ -268,11 +273,14 @@ fn google_events(token: &str, (from, to): (i64, i64)) -> Result<Vec<Event>> {
         }
         let Some(id) = calendar["id"].as_str() else { continue };
         let color = calendar["backgroundColor"].as_str().and_then(hex_color).unwrap_or(GOOGLE_BLUE);
+        let key = format!("google:{id}");
+        let name = calendar["summaryOverride"].as_str().or(calendar["summary"].as_str()).unwrap_or(id).to_string();
+        calendars.push(Calendar { key: key.clone(), name, color, source: Source::Google });
         let mut page: Option<String> = None;
         loop {
             let mut url = format!(
                 "https://www.googleapis.com/calendar/v3/calendars/{}/events?singleEvents=true&orderBy=startTime&maxResults=2500&timeMin={}&timeMax={}\
-                 &fields=nextPageToken,items(summary,start,end,location,htmlLink,hangoutLink,status,attendees(self,responseStatus),conferenceData/entryPoints)",
+                 &fields=nextPageToken,items(summary,description,start,end,location,htmlLink,hangoutLink,status,organizer(displayName,email),attendees(email,displayName,self,responseStatus),conferenceData/entryPoints)",
                 oauth::encode(id),
                 oauth::encode(&rfc3339(from)),
                 oauth::encode(&rfc3339(to))
@@ -286,17 +294,17 @@ fn google_events(token: &str, (from, to): (i64, i64)) -> Result<Vec<Event>> {
                 Err(e) if e.downcast_ref::<oauth::Refused>().is_some_and(|r| r.0 == 404 || r.0 == 403) => break,
                 Err(e) => return Err(e),
             };
-            events.extend(answer["items"].as_array().into_iter().flatten().filter_map(|item| google_event(item, color)));
+            events.extend(answer["items"].as_array().into_iter().flatten().filter_map(|item| google_event(item, color, &key)));
             match answer["nextPageToken"].as_str() {
                 Some(next) => page = Some(next.to_string()),
                 None => break,
             }
         }
     }
-    Ok(events)
+    Ok((events, calendars))
 }
 
-fn google_event(item: &Value, color: [u8; 3]) -> Option<Event> {
+fn google_event(item: &Value, color: [u8; 3], key: &str) -> Option<Event> {
     if item["status"] == "cancelled" || declined(item["attendees"].as_array(), |a| a["self"].as_bool() == Some(true), |a| a["responseStatus"].as_str()) {
         return None;
     }
@@ -325,6 +333,13 @@ fn google_event(item: &Value, color: [u8; 3]) -> Option<Event> {
         join: item["hangoutLink"].as_str().or(video).map(str::to_string),
         source: Source::Google,
         color,
+        calendar: key.to_string(),
+        details: Details {
+            people: item["attendees"].as_array().into_iter().flatten().filter(|a| a["self"].as_bool() != Some(true)).filter_map(|a| a["displayName"].as_str().or(a["email"].as_str()).map(str::to_string)).collect(),
+            organizer: item["organizer"]["displayName"].as_str().or(item["organizer"]["email"].as_str()).unwrap_or_default().to_string(),
+            response: item["attendees"].as_array().into_iter().flatten().find(|a| a["self"].as_bool() == Some(true)).and_then(|a| a["responseStatus"].as_str()).map(response_word).unwrap_or_default(),
+            notes: plain_text(item["description"].as_str().unwrap_or_default()),
+        },
     })
 }
 
@@ -342,12 +357,12 @@ fn windows_zone_name() -> String {
     if name.is_empty() { "UTC".into() } else { name }
 }
 
-fn microsoft_events(token: &str, (from, to): (i64, i64), zone: &dyn Zone) -> Result<Vec<Event>> {
+fn microsoft_events(token: &str, (from, to): (i64, i64), zone: &dyn Zone) -> Result<(Vec<Event>, Vec<Calendar>)> {
     // In local time: an all-day event's dates are then the ones it shows on.
     let prefer = format!("outlook.timezone=\"{}\"", windows_zone_name());
     let mut url = format!(
         "https://graph.microsoft.com/v1.0/me/calendarView?startDateTime={}&endDateTime={}&$top=250\
-         &$select=subject,start,end,isAllDay,location,webLink,onlineMeeting,isCancelled,responseStatus&$orderby=start/dateTime",
+         &$select=subject,start,end,isAllDay,location,webLink,onlineMeeting,isCancelled,responseStatus,organizer,attendees,bodyPreview&$orderby=start/dateTime",
         oauth::encode(&rfc3339(from)),
         oauth::encode(&rfc3339(to))
     );
@@ -360,7 +375,8 @@ fn microsoft_events(token: &str, (from, to): (i64, i64), zone: &dyn Zone) -> Res
             None => break,
         }
     }
-    Ok(events)
+    let calendars = vec![Calendar { key: OUTLOOK_KEY.into(), name: "Outlook".into(), color: OUTLOOK_BLUE, source: Source::Microsoft }];
+    Ok((events, calendars))
 }
 
 fn microsoft_event(item: &Value, zone: &dyn Zone) -> Option<Event> {
@@ -386,6 +402,13 @@ fn microsoft_event(item: &Value, zone: &dyn Zone) -> Option<Event> {
         join: item["onlineMeeting"]["joinUrl"].as_str().map(str::to_string),
         source: Source::Microsoft,
         color: OUTLOOK_BLUE,
+        calendar: OUTLOOK_KEY.into(),
+        details: Details {
+            people: item["attendees"].as_array().into_iter().flatten().filter_map(|a| a["emailAddress"]["name"].as_str().or(a["emailAddress"]["address"].as_str()).map(str::to_string)).collect(),
+            organizer: item["organizer"]["emailAddress"]["name"].as_str().unwrap_or_default().to_string(),
+            response: item["responseStatus"]["response"].as_str().map(response_word).unwrap_or_default(),
+            notes: item["bodyPreview"].as_str().unwrap_or_default().trim().to_string(),
+        },
     })
 }
 
@@ -398,25 +421,69 @@ pub fn feed_url(url: &str) -> String {
     }
 }
 
-/// Calendar link `index`'s events on the local days `[from, to)`.
-pub fn fetch_link(index: usize, link: &Link, days: (i32, i32), zone: &dyn Zone) -> Result<Vec<Event>> {
+/// Calendar link `index`'s events on the local days `[from, to)`, and the calendar itself.
+pub fn fetch_link(index: usize, link: &Link, days: (i32, i32), zone: &dyn Zone) -> Result<(Vec<Event>, Calendar)> {
     let text = oauth::get_text(&feed_url(&link.url))?;
     if !text.contains("BEGIN:VCALENDAR") {
         bail!("not a calendar");
     }
     let color = LINK_COLORS[index % LINK_COLORS.len()];
-    Ok(super::ics::parse(&text, days, zone)
+    let key = link_key(&link.url);
+    let events = super::ics::parse(&text, days, zone)
         .into_iter()
         .map(|item| Event {
             when: item.when,
             title: if item.title.is_empty() { "(No title)".into() } else { item.title },
             location: item.location,
             link: item.link,
-            join: None,
+            join: item.join,
             source: Source::Link(index),
             color,
+            calendar: key.clone(),
+            details: item.details,
         })
-        .collect())
+        .collect();
+    Ok((events, Calendar { key, name: link.name.clone(), color, source: Source::Link(index) }))
+}
+
+/// The Microsoft account's calendar's key.
+pub const OUTLOOK_KEY: &str = "outlook";
+
+/// A link's key: a hash of its address, which is a secret and stays out of config.toml.
+pub fn link_key(url: &str) -> String {
+    use sha2::Digest;
+    let digest = sha2::Sha256::digest(feed_url(url).as_bytes());
+    format!("link:{}", digest[..6].iter().map(|b| format!("{b:02x}")).collect::<String>())
+}
+
+/// An attendee's reply, as the card says it.
+fn response_word(code: &str) -> String {
+    match code {
+        "accepted" => "Accepted",
+        "tentative" | "tentativelyAccepted" => "Maybe",
+        "declined" => "Declined",
+        "needsAction" | "notResponded" | "none" => "Not answered",
+        "organizer" => "Organiser",
+        _ => "",
+    }
+    .to_string()
+}
+
+/// A description as plain text: Google sends HTML.
+pub fn plain_text(html: &str) -> String {
+    let text = html.replace("<br>", "\n").replace("<br/>", "\n").replace("</p>", "\n").replace("</li>", "\n");
+    let mut out = String::with_capacity(text.len());
+    let mut in_tag = false;
+    for c in text.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            c if !in_tag => out.push(c),
+            _ => {}
+        }
+    }
+    let out = out.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"").replace("&#39;", "'").replace("&nbsp;", " ");
+    out.lines().map(str::trim).filter(|l| !l.is_empty()).collect::<Vec<_>>().join("\n")
 }
 
 /// A pasted link's name: its host, or the calendar's when the feed says (filled in on fetch).
@@ -440,14 +507,28 @@ mod tests {
     fn google_events_read_both_shapes_and_skip_declined_ones() {
         let timed = json!({"summary":"Call","start":{"dateTime":"2026-11-13T10:00:00+01:00"},"end":{"dateTime":"2026-11-13T11:00:00+01:00"},
             "hangoutLink":"https://meet.google.com/abc","htmlLink":"https://calendar.google.com/x"});
-        let event = google_event(&timed, [1, 2, 3]).unwrap();
+        let event = google_event(&timed, [1, 2, 3], "google:me").unwrap();
         let base = days_from_civil(2026, 11, 13) as i64 * DAY;
         assert_eq!(event.when, When::At { start: base + 9 * 3600, end: base + 10 * 3600 });
         assert_eq!(event.join.as_deref(), Some("https://meet.google.com/abc"));
         let day = json!({"summary":"Off","start":{"date":"2026-11-13"},"end":{"date":"2026-11-15"}});
-        assert_eq!(google_event(&day, [0; 3]).unwrap().when, When::AllDay { first: days_from_civil(2026, 11, 13), end: days_from_civil(2026, 11, 15) });
+        assert_eq!(google_event(&day, [0; 3], "google:me").unwrap().when, When::AllDay { first: days_from_civil(2026, 11, 13), end: days_from_civil(2026, 11, 15) });
         let declined = json!({"summary":"No","start":{"date":"2026-11-13"},"attendees":[{"self":true,"responseStatus":"declined"}]});
-        assert!(google_event(&declined, [0; 3]).is_none());
+        assert!(google_event(&declined, [0; 3], "google:me").is_none());
+    }
+
+    #[test]
+    fn event_details_are_read_and_descriptions_become_plain_text() {
+        let item = json!({"summary":"Review","start":{"dateTime":"2026-11-13T10:00:00Z"},"end":{"dateTime":"2026-11-13T11:00:00Z"},
+            "description":"Agenda:<br>1. Calendar &amp; clock<br><b>Notes</b>","organizer":{"displayName":"Ana"},
+            "attendees":[{"email":"me@x.com","self":true,"responseStatus":"tentative"},{"displayName":"Jo","responseStatus":"accepted"}]});
+        let event = google_event(&item, [0; 3], "google:me").unwrap();
+        assert_eq!(event.details.people, vec!["Jo".to_string()]);
+        assert_eq!(event.details.organizer, "Ana");
+        assert_eq!(event.details.response, "Maybe");
+        assert_eq!(event.details.notes, "Agenda:\n1. Calendar & clock\nNotes");
+        assert_eq!(event.calendar, "google:me");
+        assert!(link_key("webcal://a/b.ics") == link_key("https://a/b.ics") && link_key("https://a/b.ics").starts_with("link:"));
     }
 
     #[test]

@@ -1,21 +1,28 @@
-//! Drawing the calendar with Direct2D and DirectWrite, in Windows 11's flyout colours.
+//! Drawing the calendar with Direct2D and DirectWrite into an off-screen bitmap, whose
+//! premultiplied pixels go to the layered window as they are ([`crate::layered`]): a translucent
+//! panel over Windows' acrylic, like the audio flyout.
 
 use anyhow::{Context, Result};
 use windows::core::{w, PCWSTR};
-use windows::Win32::Foundation::HWND;
-use windows::Win32::Graphics::Direct2D::Common::{D2D1_ALPHA_MODE_IGNORE, D2D1_COLOR_F, D2D1_PIXEL_FORMAT, D2D_RECT_F, D2D_SIZE_U};
+use windows::Win32::Graphics::Direct2D::Common::{D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT, D2D_RECT_F};
 use windows::Win32::Graphics::Direct2D::{
-    D2D1CreateFactory, ID2D1Factory, ID2D1HwndRenderTarget, ID2D1SolidColorBrush, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
-    D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_ELLIPSE, D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_HWND_RENDER_TARGET_PROPERTIES,
-    D2D1_PRESENT_OPTIONS_NONE, D2D1_RENDER_TARGET_PROPERTIES, D2D1_ROUNDED_RECT,
+    D2D1CreateFactory, ID2D1Factory, ID2D1RenderTarget, ID2D1SolidColorBrush, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+    D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_ELLIPSE, D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_RENDER_TARGET_PROPERTIES,
+    D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1_ROUNDED_RECT, D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE,
 };
 use windows::Win32::Graphics::DirectWrite::{
     DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat, DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL,
     DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_WEIGHT_SEMI_BOLD,
-    DWRITE_PARAGRAPH_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT, DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_LEADING,
-    DWRITE_TRIMMING, DWRITE_TRIMMING_GRANULARITY_CHARACTER, DWRITE_WORD_WRAPPING_NO_WRAP,
+    DWRITE_PARAGRAPH_ALIGNMENT_CENTER, DWRITE_PARAGRAPH_ALIGNMENT_NEAR, DWRITE_TEXT_ALIGNMENT, DWRITE_TEXT_ALIGNMENT_CENTER,
+    DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_TEXT_ALIGNMENT_TRAILING, DWRITE_TRIMMING, DWRITE_TRIMMING_GRANULARITY_CHARACTER,
+    DWRITE_WORD_WRAPPING_NO_WRAP, DWRITE_WORD_WRAPPING_WRAP,
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
+use windows::Win32::Graphics::Imaging::{
+    CLSID_WICImagingFactory, GUID_WICPixelFormat32bppPBGRA, IWICBitmap, IWICImagingFactory, WICBitmapCacheOnLoad, WICBitmapLockRead,
+    WICRect,
+};
+use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
 use windows_numerics::Vector2;
 
 use super::layout::R;
@@ -40,7 +47,10 @@ impl Color {
 
 /// The flyout's colours in the system's light or dark theme.
 pub struct Palette {
+    /// The panel, translucent over the acrylic.
     pub bg: Color,
+    /// A raised surface (a notification, the event's card).
+    pub raised: Color,
     pub rule: Color,
     pub text: Color,
     pub text2: Color,
@@ -59,7 +69,8 @@ impl Palette {
         let light = std::env::var("AUDIO_TRAY_THEME").map_or(light, |t| t == "light");
         if light {
             Palette {
-                bg: Color::hex(0xEEEEEE, 1.0),
+                bg: Color::hex(0xEEEEEE, 0.86),
+                raised: Color::hex(0xFFFFFF, 0.7),
                 rule: Color::hex(0x000000, 0.08),
                 text: Color::hex(0x000000, 0.896),
                 text2: Color::hex(0x000000, 0.606),
@@ -71,9 +82,11 @@ impl Palette {
                 warn: Color::hex(0x9D5D00, 1.0),
             }
         } else {
+            let [r, g, b] = crate::flyout::theme::TINT;
             Palette {
-                bg: Color::hex(0x2B2B2B, 1.0),
-                rule: Color::hex(0x000000, 0.25),
+                bg: Color::rgb([r, g, b]).alpha(crate::flyout::theme::TINT_A),
+                raised: Color::hex(0xFFFFFF, 0.05),
+                rule: Color::hex(0x000000, 0.3),
                 text: Color::hex(0xFFFFFF, 1.0),
                 text2: Color::hex(0xFFFFFF, 0.786),
                 text3: Color::hex(0xFFFFFF, 0.362),
@@ -84,10 +97,6 @@ impl Palette {
                 warn: Color::hex(0xF7B32B, 1.0),
             }
         }
-    }
-
-    pub fn dark(&self) -> bool {
-        self.bg.0 < 0.5
     }
 }
 
@@ -101,19 +110,26 @@ pub enum Font {
     CaptionStrong,
     Icon,
     IconSmall,
+    /// Wrapping body text, from the top (an event's notes).
+    Paragraph,
 }
 
 #[derive(Clone, Copy)]
 pub enum Align {
     Left,
     Center,
+    Right,
 }
 
 pub struct Gfx {
     factory: ID2D1Factory,
     dwrite: IDWriteFactory,
+    wic: IWICImagingFactory,
     formats: Vec<IDWriteTextFormat>,
-    target: Option<ID2D1HwndRenderTarget>,
+    /// The bitmap drawn into, its size in pixels, and the target on it.
+    surface: Option<((u32, u32), IWICBitmap, ID2D1RenderTarget)>,
+    /// The last frame, premultiplied BGRA.
+    pub pixels: Vec<u8>,
 }
 
 impl Gfx {
@@ -121,27 +137,34 @@ impl Gfx {
         unsafe {
             let factory: ID2D1Factory = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None).context("D2D1CreateFactory")?;
             let dwrite: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED).context("DWriteCreateFactory")?;
-            let mut gfx = Gfx { factory, dwrite, formats: Vec::new(), target: None };
+            let wic: IWICImagingFactory = CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER).context("WIC")?;
+            let mut gfx = Gfx { factory, dwrite, wic, formats: Vec::new(), surface: None, pixels: Vec::new() };
             let text = w!("Segoe UI Variable Text");
             let icons = w!("Segoe Fluent Icons");
             gfx.formats = vec![
-                gfx.format(text, DWRITE_FONT_WEIGHT_NORMAL, 15.0)?,
-                gfx.format(text, DWRITE_FONT_WEIGHT_NORMAL, 14.0)?,
-                gfx.format(text, DWRITE_FONT_WEIGHT_SEMI_BOLD, 14.0)?,
-                gfx.format(text, DWRITE_FONT_WEIGHT_NORMAL, 12.0)?,
-                gfx.format(text, DWRITE_FONT_WEIGHT_SEMI_BOLD, 12.0)?,
-                gfx.format(icons, DWRITE_FONT_WEIGHT_NORMAL, 16.0)?,
-                gfx.format(icons, DWRITE_FONT_WEIGHT_NORMAL, 10.0)?,
+                gfx.format(text, DWRITE_FONT_WEIGHT_NORMAL, 15.0, false)?,
+                gfx.format(text, DWRITE_FONT_WEIGHT_NORMAL, 14.0, false)?,
+                gfx.format(text, DWRITE_FONT_WEIGHT_SEMI_BOLD, 14.0, false)?,
+                gfx.format(text, DWRITE_FONT_WEIGHT_NORMAL, 12.0, false)?,
+                gfx.format(text, DWRITE_FONT_WEIGHT_SEMI_BOLD, 12.0, false)?,
+                gfx.format(icons, DWRITE_FONT_WEIGHT_NORMAL, 16.0, false)?,
+                gfx.format(icons, DWRITE_FONT_WEIGHT_NORMAL, 10.0, false)?,
+                gfx.format(text, DWRITE_FONT_WEIGHT_NORMAL, 12.5, true)?,
             ];
             Ok(gfx)
         }
     }
 
-    fn format(&self, family: PCWSTR, weight: DWRITE_FONT_WEIGHT, size: f32) -> Result<IDWriteTextFormat> {
+    fn format(&self, family: PCWSTR, weight: DWRITE_FONT_WEIGHT, size: f32, wrap: bool) -> Result<IDWriteTextFormat> {
         unsafe {
             let format = self.dwrite.CreateTextFormat(family, None, weight, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, size, w!(""))?;
-            format.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
-            format.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
+            if wrap {
+                format.SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP)?;
+                format.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR)?;
+            } else {
+                format.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
+                format.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
+            }
             let sign = self.dwrite.CreateEllipsisTrimmingSign(&format)?;
             let trimming = DWRITE_TRIMMING { granularity: DWRITE_TRIMMING_GRANULARITY_CHARACTER, delimiter: 0, delimiterCount: 0 };
             format.SetTrimming(&trimming, &sign)?;
@@ -149,31 +172,37 @@ impl Gfx {
         }
     }
 
-    /// Draw a frame into `hwnd` (`size` in pixels) at `scale` pixels per DIP.
-    pub fn frame(&mut self, hwnd: HWND, size: (u32, u32), scale: f32, draw: impl FnOnce(&Pen)) -> Result<()> {
+    /// Draw a frame of `size` pixels at `scale` pixels per DIP into [`Gfx::pixels`].
+    pub fn frame(&mut self, size: (u32, u32), scale: f32, draw: impl FnOnce(&Pen)) -> Result<()> {
         unsafe {
-            if self.target.is_none() {
+            if self.surface.as_ref().map(|(s, ..)| *s) != Some(size) {
+                let bitmap = self.wic.CreateBitmap(size.0.max(1), size.1.max(1), &GUID_WICPixelFormat32bppPBGRA, WICBitmapCacheOnLoad).context("CreateBitmap")?;
                 let props = D2D1_RENDER_TARGET_PROPERTIES {
-                    pixelFormat: D2D1_PIXEL_FORMAT { format: DXGI_FORMAT_B8G8R8A8_UNORM, alphaMode: D2D1_ALPHA_MODE_IGNORE },
+                    r#type: D2D1_RENDER_TARGET_TYPE_DEFAULT,
+                    pixelFormat: D2D1_PIXEL_FORMAT { format: DXGI_FORMAT_B8G8R8A8_UNORM, alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED },
                     ..Default::default()
                 };
-                let hwnd_props = D2D1_HWND_RENDER_TARGET_PROPERTIES {
-                    hwnd,
-                    pixelSize: D2D_SIZE_U { width: size.0.max(1), height: size.1.max(1) },
-                    presentOptions: D2D1_PRESENT_OPTIONS_NONE,
-                };
-                self.target = Some(self.factory.CreateHwndRenderTarget(&props, &hwnd_props).context("CreateHwndRenderTarget")?);
+                let target = self.factory.CreateWicBitmapRenderTarget(&bitmap, &props).context("CreateWicBitmapRenderTarget")?;
+                target.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+                self.surface = Some((size, bitmap, target));
             }
-            let target = self.target.clone().expect("just built");
+            let (_, bitmap, target) = self.surface.as_ref().expect("just built");
             target.SetDpi(96.0 * scale, 96.0 * scale);
             target.BeginDraw();
             draw(&Pen { gfx: self, target: target.clone() });
-            if let Err(e) = target.EndDraw(None, None) {
-                self.target = None;
-                // D2DERR_RECREATE_TARGET: the next frame builds a new one.
-                if e.code().0 as u32 != 0x8899_000C {
-                    return Err(e).context("EndDraw");
-                }
+            target.EndDraw(None, None).context("EndDraw")?;
+
+            let rect = WICRect { X: 0, Y: 0, Width: size.0 as i32, Height: size.1 as i32 };
+            let lock = bitmap.Lock(&rect, WICBitmapLockRead.0 as u32).context("Lock")?;
+            let stride = lock.GetStride()? as usize;
+            let mut len = 0u32;
+            let mut data = std::ptr::null_mut();
+            lock.GetDataPointer(&mut len, &mut data)?;
+            let src = std::slice::from_raw_parts(data, len as usize);
+            let row = size.0 as usize * 4;
+            self.pixels.resize(row * size.1 as usize, 0);
+            for (y, out) in self.pixels.chunks_exact_mut(row).enumerate() {
+                out.copy_from_slice(&src[y * stride..y * stride + row]);
             }
         }
         Ok(())
@@ -182,7 +211,7 @@ impl Gfx {
 
 pub struct Pen<'a> {
     gfx: &'a Gfx,
-    target: ID2D1HwndRenderTarget,
+    target: ID2D1RenderTarget,
 }
 
 fn rect(r: R) -> D2D_RECT_F {
@@ -194,14 +223,24 @@ impl Pen<'_> {
         unsafe { self.target.CreateSolidColorBrush(&D2D1_COLOR_F { r: c.0, g: c.1, b: c.2, a: c.3 }, None) }.ok()
     }
 
+    /// Fill everything with `c`, alpha included (the panel is translucent).
     pub fn clear(&self, c: Color) {
-        unsafe { self.target.Clear(Some(&D2D1_COLOR_F { r: c.0, g: c.1, b: c.2, a: 1.0 })) };
+        unsafe { self.target.Clear(Some(&D2D1_COLOR_F { r: c.0 * c.3, g: c.1 * c.3, b: c.2 * c.3, a: c.3 })) };
     }
 
     pub fn fill(&self, r: R, radius: f32, c: Color) {
         if let Some(brush) = self.brush(c) {
             let rounded = D2D1_ROUNDED_RECT { rect: rect(r), radiusX: radius, radiusY: radius };
             unsafe { self.target.FillRoundedRectangle(&rounded, &brush) };
+        }
+    }
+
+    pub fn stroke(&self, r: R, radius: f32, width: f32, c: Color) {
+        if let Some(brush) = self.brush(c) {
+            let half = width / 2.0;
+            let inner = R::new(r.x + half, r.y + half, r.w - width, r.h - width);
+            let rounded = D2D1_ROUNDED_RECT { rect: rect(inner), radiusX: radius, radiusY: radius };
+            unsafe { self.target.DrawRoundedRectangle(&rounded, &brush, width, None) };
         }
     }
 
@@ -232,6 +271,7 @@ impl Pen<'_> {
             let a: DWRITE_TEXT_ALIGNMENT = match align {
                 Align::Left => DWRITE_TEXT_ALIGNMENT_LEADING,
                 Align::Center => DWRITE_TEXT_ALIGNMENT_CENTER,
+                Align::Right => DWRITE_TEXT_ALIGNMENT_TRAILING,
             };
             let _ = layout.SetTextAlignment(a);
             self.target.DrawTextLayout(Vector2 { X: r.x, Y: r.y }, &layout, &brush, D2D1_DRAW_TEXT_OPTIONS_CLIP);

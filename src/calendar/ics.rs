@@ -6,7 +6,7 @@
 
 use std::collections::HashSet;
 
-use super::model::When;
+use super::model::{Details, When};
 use super::time::{self, days_from_civil, Zone, DAY};
 
 /// One event (or occurrence) in a feed.
@@ -16,6 +16,9 @@ pub struct Item {
     pub title: String,
     pub location: String,
     pub link: Option<String>,
+    /// A Teams, Meet or Zoom address found in its description or location.
+    pub join: Option<String>,
+    pub details: Details,
 }
 
 /// A date-time as the feed writes it.
@@ -52,6 +55,9 @@ struct Raw {
     exdates: Vec<Stamp>,
     recurrence_id: Option<Stamp>,
     cancelled: bool,
+    description: String,
+    organizer: String,
+    attendees: Vec<String>,
 }
 
 /// The events of `text` that touch the local days `[from, to)`.
@@ -108,7 +114,9 @@ pub fn parse(text: &str, (from, to): (i32, i32), zone: &dyn Zone) -> Vec<Item> {
                 When::At { start, end } => (time::day_of(zone.to_local(start)), time::day_of(zone.to_local(end.max(start + 1) - 1))),
             };
             if first < to && last >= from {
-                out.push(Item { when, title: raw.title.clone(), location: raw.location.clone(), link: raw.url.clone() });
+                let details = Details { people: raw.attendees.clone(), organizer: raw.organizer.clone(), response: String::new(), notes: raw.description.clone() };
+                let join = find_join(&raw.description).or_else(|| find_join(&raw.location));
+                out.push(Item { when, title: raw.title.clone(), location: raw.location.clone(), link: raw.url.clone(), join, details });
             }
         }
     }
@@ -156,6 +164,9 @@ fn read_events(text: &str) -> Vec<Raw> {
                     "EXDATE" => raw.exdates.extend(value.split(',').filter_map(|v| stamp(v, &params))),
                     "RECURRENCE-ID" => raw.recurrence_id = stamp(value, &params),
                     "STATUS" => raw.cancelled = value.eq_ignore_ascii_case("CANCELLED"),
+                    "DESCRIPTION" => raw.description = unescape_lines(value),
+                    "ORGANIZER" => raw.organizer = person(value, &params),
+                    "ATTENDEE" => raw.attendees.push(person(value, &params)),
                     _ => {}
                 }
             }
@@ -214,6 +225,30 @@ fn unescape(text: &str) -> String {
         }
     }
     out.trim().to_string()
+}
+
+/// A text value with its line breaks kept.
+fn unescape_lines(text: &str) -> String {
+    unescape(&text.replace("\\n", "\n").replace("\\N", "\n"))
+}
+
+/// An organiser or attendee: its `CN`, else its address.
+fn person(value: &str, params: &[(String, String)]) -> String {
+    params
+        .iter()
+        .find(|(k, _)| k == "CN")
+        .map(|(_, v)| v.clone())
+        .unwrap_or_else(|| value.trim_start_matches("mailto:").trim_start_matches("MAILTO:").to_string())
+}
+
+/// The first meeting address (Teams, Meet, Zoom, Webex) in `text`.
+pub fn find_join(text: &str) -> Option<String> {
+    const HOSTS: [&str; 5] = ["https://teams.microsoft.com/l/meetup-join", "https://teams.live.com/meet", "https://meet.google.com/", ".zoom.us/j/", ".webex.com/"];
+    HOSTS.iter().filter_map(|host| text.find(host)).min().map(|at| {
+        let start = text[..at].rfind("https://").filter(|_| !text[at..].starts_with("https://")).unwrap_or(at);
+        let end = text[start..].find(|c: char| c.is_whitespace() || matches!(c, '>' | '"' | '<' | ')')).map_or(text.len(), |n| start + n);
+        text[start..end].to_string()
+    })
 }
 
 /// `20261113`, `20261113T090000` or `20261113T090000Z`.
@@ -592,6 +627,22 @@ mod tests {
         let text = feed("BEGIN:VEVENT\r\nUID:s\r\nSUMMARY:Gym\r\nDTSTART:20261021T070000Z\r\nRRULE:FREQ=WEEKLY\r\nEND:VEVENT\r\n");
         let items = parse(&text, (day(2026, 10, 19), day(2026, 11, 2)), &zone);
         assert_eq!(starts(&items, &zone), vec![(day(2026, 10, 21), 540), (day(2026, 10, 28), 540)]);
+    }
+
+    #[test]
+    fn descriptions_people_and_meeting_links_are_read() {
+        let text = feed(concat!(
+            "BEGIN:VEVENT\r\nUID:j\r\nSUMMARY:Sync\r\nDTSTART:20261113T090000Z\r\n",
+            "ORGANIZER;CN=Ana:mailto:ana@x.com\r\nATTENDEE;CN=Jo;PARTSTAT=ACCEPTED:mailto:jo@x.com\r\nATTENDEE:mailto:bo@x.com\r\n",
+            "DESCRIPTION:Join here\\nhttps://teams.microsoft.com/l/meetup-join/abc%40thread> \r\n more\r\nEND:VEVENT\r\n",
+        ));
+        let items = parse(&text, (day(2026, 11, 1), day(2026, 12, 1)), &Fixed(0));
+        let item = &items[0];
+        assert_eq!(item.details.organizer, "Ana");
+        assert_eq!(item.details.people, vec!["Jo".to_string(), "bo@x.com".to_string()]);
+        assert_eq!(item.join.as_deref(), Some("https://teams.microsoft.com/l/meetup-join/abc%40thread"));
+        assert!(item.details.notes.starts_with("Join here\n"));
+        assert_eq!(find_join("call on https://us02web.zoom.us/j/123?pwd=x now").as_deref(), Some("https://us02web.zoom.us/j/123?pwd=x"));
     }
 
     #[test]

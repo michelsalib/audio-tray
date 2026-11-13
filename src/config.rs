@@ -40,6 +40,8 @@ pub struct Config {
     pub motion: Motion,
     /// The calendar that replaces the taskbar clock's — see [`crate::calendar`].
     pub calendar: Calendar,
+    /// How the taskbar clock reads.
+    pub clock: Clock,
 }
 
 /// The calendar: a click on the taskbar clock opens Audio Tray's, with the events of the accounts
@@ -61,6 +63,42 @@ pub struct Calendar {
     /// Calendar links (ICS), kept in the Credential Manager: an address reads the calendar.
     #[serde(skip_serializing)]
     pub links: Vec<crate::calendar::Link>,
+    /// Minutes before an event the pill reminds of it; 0: no reminders.
+    pub remind_minutes: u32,
+    /// The focus timer's length, in minutes.
+    pub focus_minutes: u32,
+    /// Do not disturb (a Windows focus session) during calendar events…
+    pub quiet_in_meetings: bool,
+    /// …and during calls (Teams, Discord, or an app holding the microphone in a meeting).
+    pub quiet_in_calls: bool,
+    pub week_numbers: bool,
+    pub layout: CalendarLayout,
+    /// The agenda's rows, at most.
+    pub rows: u8,
+    /// The week's first day, Monday 0 to Sunday 6; `None`: the locale's.
+    pub first_weekday: Option<u8>,
+    /// Calendars left out, by key ([`crate::calendar::Calendar::key`]).
+    pub hidden: Vec<String>,
+    /// Colours chosen for calendars, by key: `#RRGGBB`.
+    pub colors: std::collections::BTreeMap<String, String>,
+    /// Win+Alt+D opens this calendar.
+    pub shortcut: bool,
+    /// Windows' notifications listed above the month, with Clear all.
+    pub notifications: bool,
+    /// Windows' additional clocks under the date.
+    pub world_clocks: bool,
+}
+
+/// How the calendar is laid out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CalendarLayout {
+    #[default]
+    Comfortable,
+    /// Shorter days in the month.
+    Compact,
+    /// No month: the agenda alone, a day at a time.
+    AgendaOnly,
 }
 
 impl Default for Calendar {
@@ -72,7 +110,62 @@ impl Default for Calendar {
             microsoft_client_id: None,
             microsoft_tenant: "common".into(),
             links: Vec::new(),
+            remind_minutes: 5,
+            focus_minutes: 25,
+            quiet_in_meetings: false,
+            quiet_in_calls: false,
+            week_numbers: false,
+            layout: CalendarLayout::Comfortable,
+            rows: 5,
+            first_weekday: None,
+            hidden: Vec::new(),
+            colors: Default::default(),
+            shortcut: true,
+            notifications: true,
+            world_clocks: true,
         }
+    }
+}
+
+/// How the taskbar clock reads (drawn by the TAP once anything differs from Windows' own).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Clock {
+    pub seconds: bool,
+    /// The day's short name before the date.
+    pub weekday: bool,
+    /// Time and date on one line.
+    pub one_line: bool,
+    pub hide_date: bool,
+    /// Your own `GetTimeFormatEx` pattern (`HH:mm`), over the above; empty: none.
+    pub time_pattern: String,
+    /// Your own `GetDateFormatEx` pattern (`ddd d MMM`); empty: none.
+    pub date_pattern: String,
+    /// The next event's countdown after the time, from 30 minutes before.
+    pub next_meeting: bool,
+    /// Windows' unread notifications, counted after the date.
+    pub unread: bool,
+}
+
+impl Default for Clock {
+    fn default() -> Self {
+        Self {
+            seconds: false,
+            weekday: false,
+            one_line: false,
+            hide_date: false,
+            time_pattern: String::new(),
+            date_pattern: String::new(),
+            next_meeting: true,
+            unread: true,
+        }
+    }
+}
+
+impl Clock {
+    /// Whether the format itself differs from Windows'.
+    pub fn styled(&self) -> bool {
+        self.seconds || self.weekday || self.one_line || self.hide_date || !self.time_pattern.is_empty() || !self.date_pattern.is_empty()
     }
 }
 
@@ -551,7 +644,7 @@ impl Config {
     /// Whether anything is drawn into the taskbar (the audio buttons or the music tile), which is
     /// what injecting into Explorer is for.
     pub fn injects(&self) -> bool {
-        self.strip.enabled || self.tile_shown() || self.calendar.enabled
+        self.strip.enabled || self.tile_shown() || self.calendar.enabled || self.clock.styled()
     }
 
     /// Whether the music tile is drawn.

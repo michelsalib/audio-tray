@@ -29,8 +29,33 @@ pub struct Event {
     /// The meeting to join (Meet, Teams), when it has one.
     pub join: Option<String>,
     pub source: Source,
-    /// Its calendar's colour.
+    /// Its calendar's colour, as the calendar names it (Settings can override it by key).
     pub color: [u8; 3],
+    /// Its calendar ([`Calendar::key`]).
+    pub calendar: String,
+    pub details: Details,
+}
+
+/// What the event's card shows beyond the agenda row.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Details {
+    /// Who is invited, by name (or address).
+    pub people: Vec<String>,
+    pub organizer: String,
+    /// Your reply: accepted, tentative, needs action…
+    pub response: String,
+    /// The description, as plain text.
+    pub notes: String,
+}
+
+/// A calendar events come from: one of a Google account's, the Microsoft account's, or a link.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Calendar {
+    /// Stable across fetches: `google:<id>`, `outlook`, `link:<hash of its address>`.
+    pub key: String,
+    pub name: String,
+    pub color: [u8; 3],
+    pub source: Source,
 }
 
 impl Event {
@@ -100,6 +125,8 @@ mod tests {
             join: None,
             source: Source::Google,
             color: [1, 2, 3],
+            calendar: "google:me".into(),
+            details: Details::default(),
         }
     }
 

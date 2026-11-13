@@ -971,3 +971,48 @@ mod tests {
         assert_eq!(status_notice(all), status_notice(tap_proto::STATUS_SHAPE_CHANGED));
     }
 }
+
+/// How the taskbar clock reads, for the TAP (see `tap_proto::CLOCK_MAGIC`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ClockText {
+    /// A `GetTimeFormatEx` pattern; empty: the locale's short time.
+    pub time: String,
+    /// A `GetDateFormatEx` pattern; empty: the locale's short date; `-`: hidden.
+    pub date: String,
+    pub one_line: bool,
+    /// After the time (the next meeting, the focus time left).
+    pub top: String,
+    /// After the date (the unread count).
+    pub bottom: String,
+}
+
+/// Tell the loaded TAP how the clock reads. `false` when no TAP took it.
+pub fn send_clock(text: &ClockText) -> bool {
+    use windows::Win32::Foundation::{LPARAM, WPARAM};
+    use windows::Win32::System::DataExchange::COPYDATASTRUCT;
+    use windows::Win32::UI::WindowsAndMessaging::{SendMessageTimeoutW, SMTO_ABORTIFHUNG, WM_COPYDATA};
+
+    let flag = |on: bool| u8::from(on).to_string();
+    let data = tap_proto::encode_init([
+        ("time", text.time.clone()),
+        ("date", text.date.clone()),
+        ("oneline", flag(text.one_line)),
+        ("top", text.top.clone()),
+        ("bottom", text.bottom.clone()),
+    ]);
+    let payload = crate::win::wide(&data);
+    let copy = COPYDATASTRUCT {
+        dwData: tap_proto::CLOCK_MAGIC,
+        cbData: (payload.len() * 2) as u32,
+        lpData: payload.as_ptr() as *mut core::ffi::c_void,
+    };
+    let mut taken = false;
+    for control in crate::win::windows_by_class(TAP_CONTROL_CLASS) {
+        let mut result = 0usize;
+        let sent = unsafe {
+            SendMessageTimeoutW(control, WM_COPYDATA, WPARAM(0), LPARAM(&copy as *const COPYDATASTRUCT as isize), SMTO_ABORTIFHUNG, 1_000, Some(&mut result))
+        };
+        taken |= sent.0 != 0 && result == 1;
+    }
+    taken
+}

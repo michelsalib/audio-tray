@@ -14,7 +14,7 @@ use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, GetAncestor, GetMessageW, PostThreadMessageW, SetWindowsHookExW,
     UnhookWindowsHookEx, WindowFromPoint, GA_ROOT, MSG, MSLLHOOKSTRUCT, WH_MOUSE_LL, WM_LBUTTONDOWN,
-    WM_LBUTTONUP, WM_MOUSEWHEEL, WM_QUIT, WM_RBUTTONDOWN,
+    WM_LBUTTONUP, WM_MOUSEWHEEL, WM_QUIT, WM_RBUTTONDOWN, WH_KEYBOARD_LL,
 };
 
 use crate::audio::Flow;
@@ -38,8 +38,13 @@ impl WheelHook {
                 let hook = unsafe { SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook), None, 0) };
                 let _ = ready.send(hook.is_ok().then(|| unsafe { GetCurrentThreadId() }));
                 let Ok(hook) = hook else { return };
+                // Win+Alt+D, for the calendar; it passes everything else straight on.
+                let keys = unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook), None, 0) }.ok();
                 let mut msg = MSG::default();
                 while unsafe { GetMessageW(&mut msg, None, 0, 0) }.0 > 0 {}
+                if let Some(keys) = keys {
+                    let _ = unsafe { UnhookWindowsHookEx(keys) };
+                }
                 let _ = unsafe { UnhookWindowsHookEx(hook) };
             })
             .ok()?;
@@ -218,6 +223,47 @@ fn wheel_belongs_to_tray(class: &str, strip_up: bool) -> bool {
 
 fn in_slot(pt: POINT) -> bool {
     icon_rect().is_some_and(|slot| pt.x >= slot.left && pt.x < slot.right && pt.y >= slot.top && pt.y < slot.bottom)
+}
+
+/// The D of a Win+Alt+D taken for the calendar: its release goes too.
+static SHORTCUT_HELD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Win+Alt+D (Windows' shortcut for the clock's calendar) opens ours, while it replaces Windows'.
+unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    use std::sync::atomic::Ordering::Relaxed;
+    use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LWIN, VK_MENU, VK_RWIN};
+    use windows::Win32::UI::WindowsAndMessaging::{KBDLLHOOKSTRUCT, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP};
+    if code >= 0 && crate::calendar::SHORTCUT.load(Relaxed) {
+        let key = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
+        if key.vkCode == b'D' as u32 {
+            let down = matches!(wparam.0 as u32, WM_KEYDOWN | WM_SYSKEYDOWN);
+            let up = matches!(wparam.0 as u32, WM_KEYUP | WM_SYSKEYUP);
+            let held = |vk: windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY| unsafe { GetAsyncKeyState(vk.0 as i32) } as u16 & 0x8000 != 0;
+            if down && (held(VK_LWIN) || held(VK_RWIN)) && held(VK_MENU) {
+                if !SHORTCUT_HELD.swap(true, Relaxed) {
+                    super::post(crate::taskbar::WM_TASKBAR_ACTION, tap_proto::ACTION_OPEN_CALENDAR, 0);
+                    // A key between the Windows key's press and release, so letting go of it does
+                    // not open Start.
+                    mask_windows_key();
+                }
+                return LRESULT(1);
+            }
+            if up && SHORTCUT_HELD.swap(false, Relaxed) {
+                return LRESULT(1);
+            }
+        }
+    }
+    unsafe { CallNextHookEx(None, code, wparam, lparam) }
+}
+
+/// Press and release an unassigned key (0xE8), which the shell counts as "another key".
+fn mask_windows_key() {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, VIRTUAL_KEY};
+    let key = |up: bool| INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 { ki: KEYBDINPUT { wVk: VIRTUAL_KEY(0xE8), dwFlags: if up { KEYEVENTF_KEYUP } else { Default::default() }, ..Default::default() } },
+    };
+    unsafe { SendInput(&[key(false), key(true)], std::mem::size_of::<INPUT>() as i32) };
 }
 
 #[cfg(test)]

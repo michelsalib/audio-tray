@@ -14,6 +14,24 @@ use windows::Win32::UI::WindowsAndMessaging::{UpdateLayeredWindow, ULW_ALPHA};
 /// Push a straight-alpha RGBA buffer (`w`×`h`) to a layered window at `(x, y)`, scaled by a
 /// global `alpha`. This also moves and resizes the window.
 pub(crate) fn present(hwnd: HWND, src_buf: &[u8], w: i32, h: i32, x: i32, y: i32, alpha: u8) {
+    present_with(hwnd, w, h, x, y, alpha, |dst| {
+        // straight-alpha RGBA -> premultiplied BGRA
+        for (d, s) in dst.as_chunks_mut::<4>().0.iter_mut().zip(src_buf.as_chunks::<4>().0) {
+            let a = s[3] as u32;
+            d[0] = ((s[2] as u32 * a) / 255) as u8;
+            d[1] = ((s[1] as u32 * a) / 255) as u8;
+            d[2] = ((s[0] as u32 * a) / 255) as u8;
+            d[3] = a as u8;
+        }
+    });
+}
+
+/// [`present`] for pixels already premultiplied BGRA (Direct2D's), copied as they are.
+pub(crate) fn present_premultiplied(hwnd: HWND, bgra: &[u8], w: i32, h: i32, x: i32, y: i32, alpha: u8) {
+    present_with(hwnd, w, h, x, y, alpha, |dst| dst.copy_from_slice(&bgra[..dst.len()]));
+}
+
+fn present_with(hwnd: HWND, w: i32, h: i32, x: i32, y: i32, alpha: u8, fill: impl FnOnce(&mut [u8])) {
     unsafe {
         let screen = GetDC(None);
         let mem = CreateCompatibleDC(Some(screen));
@@ -38,19 +56,8 @@ pub(crate) fn present(hwnd: HWND, src_buf: &[u8], w: i32, h: i32, x: i32, y: i32
             return;
         };
 
-        // straight-alpha RGBA -> premultiplied BGRA
         let px = (w * h) as usize;
-        let dst = std::slice::from_raw_parts_mut(bits as *mut u8, px * 4);
-        for i in 0..px {
-            let r = src_buf[i * 4] as u32;
-            let g = src_buf[i * 4 + 1] as u32;
-            let b = src_buf[i * 4 + 2] as u32;
-            let a = src_buf[i * 4 + 3] as u32;
-            dst[i * 4] = ((b * a) / 255) as u8;
-            dst[i * 4 + 1] = ((g * a) / 255) as u8;
-            dst[i * 4 + 2] = ((r * a) / 255) as u8;
-            dst[i * 4 + 3] = a as u8;
-        }
+        fill(std::slice::from_raw_parts_mut(bits as *mut u8, px * 4));
 
         let old = SelectObject(mem, HGDIOBJ(hbm.0));
         let src = POINT { x: 0, y: 0 };
@@ -113,7 +120,7 @@ pub(crate) unsafe fn style_panel(hwnd: HWND, corner: i32) {
 ///
 /// # Safety
 /// `hwnd` must be a live window this process owns.
-unsafe fn enable_acrylic(hwnd: HWND) {
+pub(crate) unsafe fn enable_acrylic(hwnd: HWND) {
     #[repr(C)]
     struct AccentPolicy {
         accent_state: u32,

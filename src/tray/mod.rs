@@ -97,6 +97,8 @@ const WM_ICON_RECT_CHECK: u32 = WM_APP + 41;
 
 /// The receiver window's timer for the next timed notice (`osd::TIMER_ID` is the other one).
 const NOTICE_TIMER: usize = 0x4E54;
+/// The receiver window's timer for the calendar's next moment ([`crate::calendar::schedule`]).
+const CALENDAR_TIMER: usize = 0x4341;
 
 /// Re-registration checks after a restart, and the first gap (doubling): ~1 min in all.
 const ICON_CHECKS: usize = 6;
@@ -328,6 +330,11 @@ pub fn run(backend: WasapiBackend, settings: bool) -> Result<()> {
         })
     });
     with_tray(Tray::refresh);
+    if with_tray(|tray| tray.config.calendar.enabled).unwrap_or(false) {
+        crate::calendar::notifications::start();
+    }
+    crate::calendar::set_shortcut(with_tray(|tray| tray.config.calendar.enabled && tray.config.calendar.shortcut).unwrap_or(false));
+    reschedule();
     if settings {
         post(crate::settings::WM_OPEN_SETTINGS, 0, 0);
     }
@@ -396,7 +403,7 @@ fn is_ours(msg: u32, wparam: usize) -> bool {
             | crate::settings::WM_SETTINGS
             | crate::settings::WM_OPEN_SETTINGS
             | crate::calendar::WM_CALENDAR
-    ) || (msg == WM_TIMER && (wparam == crate::osd::TIMER_ID || wparam == NOTICE_TIMER))
+    ) || (msg == WM_TIMER && (wparam == crate::osd::TIMER_ID || wparam == NOTICE_TIMER || wparam == CALENDAR_TIMER))
 }
 
 /// Handle queued messages, oldest first, unless a handler further up the stack already is.
@@ -457,7 +464,11 @@ fn handle(msg: Queued) {
             }
         }
         crate::calendar::WM_CALENDAR if msg.wparam == crate::calendar::CLOSE => crate::calendar::close(),
-        crate::calendar::WM_CALENDAR => crate::calendar::changed(),
+        crate::calendar::WM_CALENDAR => {
+            crate::calendar::changed();
+            reschedule();
+        }
+        WM_TIMER if msg.wparam == CALENDAR_TIMER => reschedule(),
         WM_TIMER if msg.wparam == NOTICE_TIMER => {
             with_tray(Tray::expire_notices);
         }
@@ -642,6 +653,19 @@ fn open_flyout(anchor: Option<flyout::Anchor>) {
     }
 }
 
+/// Have the calendar look again now (the focus timer started, a setting changed).
+pub(crate) fn wake_calendar() {
+    post(WM_TIMER, CALENDAR_TIMER, 0);
+}
+
+/// Let the calendar do what is due, and set its timer for the next moment.
+fn reschedule() {
+    let Some(delay) = with_tray(|tray| crate::calendar::schedule::tick(&tray.config)) else { return };
+    if let Some(window) = taskbar::receiver() {
+        unsafe { SetTimer(Some(window), CALENDAR_TIMER, delay.as_millis().min(u32::MAX as u128) as u32, None) };
+    }
+}
+
 /// Put the taskbar back and end the message loop. The TAP's owner watch would revert it too, but
 /// asking means a normal quit tidies up promptly instead of racing our own teardown.
 fn quit() {
@@ -717,6 +741,13 @@ impl Tray {
         if before.calendar.links != self.config.calendar.links {
             crate::calendar::links_changed();
         }
+        if self.config.calendar.enabled {
+            crate::calendar::notifications::start();
+        }
+        crate::calendar::set_shortcut(self.config.calendar.enabled && self.config.calendar.shortcut);
+        if before.calendar != self.config.calendar || before.clock != self.config.clock {
+            post(WM_TIMER, CALENDAR_TIMER, 0);
+        }
         if before.icons != self.config.icons {
             self.refresh();
         }
@@ -754,6 +785,7 @@ impl Tray {
     fn apply_taskbar(&mut self) {
         taskbar::revert(0);
         self.strip = None;
+        crate::calendar::schedule::forget_clock();
         if self.config.injects() {
             taskbar::apply_at_startup(Current::read(&self.backend, &self.config).strip_icons());
         }
@@ -875,6 +907,11 @@ impl Tray {
     /// The hub state changed: bring the surfaces in line, and arm the next notice's expiry.
     fn hub_changed(&mut self) {
         HUB_GENERATION.fetch_add(1, Ordering::SeqCst);
+        // A call starting or ending can turn Do not disturb on or off.
+        let in_call = self.hub.call().is_some() || self.hub.mic_users.iter().any(|u| crate::hub::names::is_meeting_app(&crate::hub::names::app_name(u)));
+        if crate::calendar::schedule::set_in_call(in_call) {
+            post(WM_TIMER, CALENDAR_TIMER, 0);
+        }
         let (_, next) = self.hub.expire(Instant::now());
         crate::pill::update(&self.hub);
         crate::settings::follow(&self.hub);
@@ -962,6 +999,9 @@ impl Tray {
             Action::Acknowledge(notice) => {
                 self.hub.acknowledge(&notice);
                 self.hub_changed();
+            }
+            Action::Open(url) => {
+                crate::win::shell_open(&url, None);
             }
             Action::DisplaysChanged => {
                 if self.config.pill.recall(&crate::win::displays()) {
@@ -1123,6 +1163,8 @@ impl Tray {
     /// Explorer restarted: the strip, the progress bar and the thumbnail toolbar died with it.
     fn taskbar_restarted(&mut self) {
         self.strip = None;
+        crate::calendar::schedule::forget_clock();
+        post(WM_TIMER, CALENDAR_TIMER, 0);
         if self.config.injects() {
             taskbar::apply_at_restart(Current::read(&self.backend, &self.config).strip_icons());
         }

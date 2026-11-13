@@ -424,6 +424,16 @@ impl Window {
                     }));
                 }
             }
+            Target::Toggle(Toggle::CalendarShown(i)) => {
+                let key = self.model.calendar.calendars.get(i)?.key.clone();
+                self.change(|c| {
+                    if c.calendar.hidden.contains(&key) {
+                        c.calendar.hidden.retain(|k| *k != key);
+                    } else {
+                        c.calendar.hidden.push(key);
+                    }
+                });
+            }
             Target::Toggle(Toggle::Site(i)) => {
                 let (key, _, _) = crate::integrations::browser::SITES.get(i)?;
                 self.change(|c| {
@@ -455,6 +465,19 @@ impl Window {
                     Toggle::Discord => &mut c.discord.enabled,
                     Toggle::Teams => &mut c.teams.enabled,
                     Toggle::Calendar => &mut c.calendar.enabled,
+                    Toggle::ClockSeconds => &mut c.clock.seconds,
+                    Toggle::ClockWeekday => &mut c.clock.weekday,
+                    Toggle::ClockOneLine => &mut c.clock.one_line,
+                    Toggle::ClockHideDate => &mut c.clock.hide_date,
+                    Toggle::ClockNextMeeting => &mut c.clock.next_meeting,
+                    Toggle::ClockUnread => &mut c.clock.unread,
+                    Toggle::WeekNumbers => &mut c.calendar.week_numbers,
+                    Toggle::WorldClocks => &mut c.calendar.world_clocks,
+                    Toggle::CalendarNotifications => &mut c.calendar.notifications,
+                    Toggle::CalendarShortcut => &mut c.calendar.shortcut,
+                    Toggle::QuietMeetings => &mut c.calendar.quiet_in_meetings,
+                    Toggle::QuietCalls => &mut c.calendar.quiet_in_calls,
+                    Toggle::CalendarShown(_) => return,
                     Toggle::Batteries => &mut c.batteries.enabled,
                     Toggle::BatteryFlyout => &mut c.batteries.flyout,
                     Toggle::BatteryTooltip => &mut c.batteries.tooltip,
@@ -488,6 +511,11 @@ impl Window {
                     Choice::WaveColour => {
                         c.motion.colour = if i == 1 { crate::config::WaveColour::Cover } else { crate::config::WaveColour::Accent }
                     }
+                    Choice::CalendarLayout => c.calendar.layout = layout::CALENDAR_LAYOUTS[i.min(2)],
+                    Choice::AgendaRows => c.calendar.rows = layout::AGENDA_ROWS[i.min(2)],
+                    Choice::WeekStart => c.calendar.first_weekday = [None, Some(0), Some(6)][i.min(2)],
+                    Choice::Reminder => c.calendar.remind_minutes = layout::REMINDERS[i.min(3)],
+                    Choice::FocusLength => c.calendar.focus_minutes = layout::FOCUS_LENGTHS[i.min(3)],
                 })
             }
             Target::Slot(i, edge, align) => {
@@ -501,6 +529,17 @@ impl Window {
             Target::Monitor(i) => {
                 let name = self.pin(i, self.model.config.pill.edge);
                 self.change(|c| c.pill.monitor = name);
+            }
+            Target::Swatch(i, j) => {
+                let key = self.model.calendar.calendars.get(i)?.key.clone();
+                self.change(|c| match j.checked_sub(1).and_then(|j| layout::SWATCHES.get(j)) {
+                    Some([r, g, b]) => {
+                        c.calendar.colors.insert(key, format!("#{r:02X}{g:02X}{b:02X}"));
+                    }
+                    None => {
+                        c.calendar.colors.remove(&key);
+                    }
+                });
             }
             Target::Connector(connector) => {
                 self.model.open = if self.model.open == Some(connector) { None } else { Some(connector) };
@@ -697,6 +736,7 @@ impl Window {
             }
             Cal::CancelSignIn(provider) => crate::calendar::cancel_sign_in(provider),
             Cal::SignOut(provider) => crate::calendar::sign_out(provider),
+            Cal::EditClocks => return Some(Box::new(crate::calendar::zones::edit)),
         }
         None
     }

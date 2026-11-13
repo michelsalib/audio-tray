@@ -169,3 +169,139 @@ pub fn why() -> String {
         crate::ipc::receiver_present()
     )
 }
+
+// ---- The clock's text, when the app styles it ----
+
+/// What the clock's two lines say, from the app (`tap_proto::CLOCK_MAGIC`). Patterns are
+/// `GetTimeFormatEx` / `GetDateFormatEx` ones; empty means the locale's short time or date.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Text {
+    time: String,
+    /// `-` hides the date.
+    date: String,
+    /// The date after the time, on one line.
+    one_line: bool,
+    /// Appended to the time line (the next meeting, the focus time left).
+    top: String,
+    /// Appended to the date line (the unread count).
+    bottom: String,
+}
+
+/// `None` until the app first styles the clock: the shell's text is then never touched. Once set,
+/// the TAP keeps the clock ticking itself for the life of the shell (going back to the locale's
+/// format when the app leaves), since the shell may stop updating text it no longer owns.
+static TEXT: Mutex<Option<Text>> = Mutex::new(None);
+
+/// Control-window timer that updates the text, at each minute (each second with seconds shown).
+pub const TEXT_TIMER: usize = 3;
+
+/// The app's new text settings (init-data encoded).
+pub fn set_text(data: &str) {
+    let flag = |key: &str| tap_proto::init_value(data, key).as_deref() == Some("1");
+    let value = |key: &str| tap_proto::init_value(data, key).unwrap_or_default();
+    let text = Text { time: value("time"), date: value("date"), one_line: flag("oneline"), top: value("top"), bottom: value("bottom") };
+    let mut held = crate::lock(&TEXT);
+    if held.as_ref() != Some(&text) {
+        logf!("clock: text now {text:?}");
+        *held = Some(text);
+    }
+    drop(held);
+    crate::lifecycle::arm_clock_timer(1);
+}
+
+/// The app is gone: back to the locale's own format, still kept ticking.
+pub fn release_text() {
+    let mut held = crate::lock(&TEXT);
+    if held.is_some() {
+        *held = Some(Text::default());
+        drop(held);
+        crate::lifecycle::arm_clock_timer(1);
+    }
+}
+
+fn now() -> windows::Win32::Foundation::SYSTEMTIME {
+    unsafe { windows::Win32::System::SystemInformation::GetLocalTime() }
+}
+
+fn format_time(st: &windows::Win32::Foundation::SYSTEMTIME, pattern: &str) -> String {
+    use windows::core::PCWSTR;
+    use windows::Win32::Globalization::{GetTimeFormatEx, TIME_FORMAT_FLAGS, TIME_NOSECONDS};
+    let wide = crate::wide(pattern);
+    let (flags, format) = if pattern.is_empty() { (TIME_NOSECONDS, PCWSTR::null()) } else { (TIME_FORMAT_FLAGS(0), PCWSTR(wide.as_ptr())) };
+    let mut buf = [0u16; 64];
+    let n = unsafe { GetTimeFormatEx(PCWSTR::null(), flags, Some(st), format, Some(&mut buf)) };
+    String::from_utf16_lossy(&buf[..(n.max(1) - 1) as usize])
+}
+
+fn format_date(st: &windows::Win32::Foundation::SYSTEMTIME, pattern: &str) -> String {
+    use windows::core::PCWSTR;
+    use windows::Win32::Globalization::{GetDateFormatEx, DATE_SHORTDATE, ENUM_DATE_FORMATS_FLAGS};
+    let wide = crate::wide(pattern);
+    let (flags, format) = if pattern.is_empty() { (DATE_SHORTDATE, PCWSTR::null()) } else { (ENUM_DATE_FORMATS_FLAGS(0), PCWSTR(wide.as_ptr())) };
+    let mut buf = [0u16; 96];
+    let n = unsafe { GetDateFormatEx(PCWSTR::null(), flags, Some(st), format, Some(&mut buf), PCWSTR::null()) };
+    String::from_utf16_lossy(&buf[..(n.max(1) - 1) as usize])
+}
+
+/// The two lines for `text` at `st`: the time line, and the date line (`None`: hidden).
+fn lines(text: &Text, st: &windows::Win32::Foundation::SYSTEMTIME) -> (String, Option<String>) {
+    let join = |a: String, b: &str| if b.is_empty() { a } else if a.is_empty() { b.to_string() } else { format!("{a} · {b}") };
+    let time = join(format_time(st, &text.time), &text.top);
+    let date = if text.date == "-" { String::new() } else { format_date(st, &text.date) };
+    let date = join(date, &text.bottom);
+    if text.one_line {
+        let line = if date.is_empty() { time } else { format!("{time}   {date}") };
+        return (line, None);
+    }
+    (time, (!date.is_empty()).then_some(date))
+}
+
+/// Update every clock's text, and say when to next (ms).
+///
+/// # Safety
+/// Tray thread only (the control window's timer).
+pub unsafe fn tick() -> Option<u32> {
+    let text = crate::lock(&TEXT).clone()?;
+    if !crate::tree::quiet_for(std::time::Duration::from_millis(32)) {
+        return Some(50);
+    }
+    let Some(diagnostics) = crate::diagnostics() else { return Some(1000) };
+    let st = now();
+    let (time, date) = lines(&text, &st);
+    for block in tree::find_by_name("TimeInnerTextBlock") {
+        if crate::decorate::text_of(&diagnostics, block).as_deref() != Some(time.as_str()) {
+            crate::decorate::set_text(&diagnostics, block, &time);
+        }
+    }
+    for block in tree::find_by_name("DateInnerTextBlock") {
+        match &date {
+            Some(date) => {
+                crate::decorate::set_visible(&diagnostics, block, true);
+                if crate::decorate::text_of(&diagnostics, block).as_deref() != Some(date.as_str()) {
+                    crate::decorate::set_text(&diagnostics, block, date);
+                }
+            }
+            None => {
+                crate::decorate::set_visible(&diagnostics, block, false);
+            }
+        }
+    }
+    // Just past the next second or minute, so the text changes with the clock. The shell writes
+    // its own text at the minute too, sometimes after us: a few looks after each minute put ours
+    // back within moments.
+    let ms = st.wMilliseconds as u32;
+    if text.time.contains('s') {
+        return Some(1000 - ms + 15);
+    }
+    const FOLLOW_UPS: [u32; 3] = [3000, 1000, 250];
+    let left = FOLLOW.load(Ordering::SeqCst);
+    if left > 0 {
+        FOLLOW.store(left - 1, Ordering::SeqCst);
+        return Some(FOLLOW_UPS[(left - 1) as usize]);
+    }
+    FOLLOW.store(FOLLOW_UPS.len() as u32, Ordering::SeqCst);
+    Some((60 - st.wSecond as u32) * 1000 - ms + 30)
+}
+
+/// Looks still due after the last minute's change.
+static FOLLOW: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);

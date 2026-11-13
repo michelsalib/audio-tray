@@ -136,19 +136,6 @@ impl Flyout {
     }
 }
 
-/// [`Flyout::run`] on an ordinary window made `WS_EX_LAYERED`: moved, and faded with
-/// `SetLayeredWindowAttributes`, its resting place at `(x, y)`.
-pub(crate) fn animate_window(hwnd: windows::Win32::Foundation::HWND, motion: Flyout, (x, y): (i32, i32), slide_px: f32) {
-    use windows::Win32::Foundation::COLORREF;
-    use windows::Win32::UI::WindowsAndMessaging::{
-        SetLayeredWindowAttributes, SetWindowPos, LWA_ALPHA, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER,
-    };
-    motion.run(slide_px, |offset, alpha| unsafe {
-        let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), alpha, LWA_ALPHA);
-        let _ = SetWindowPos(hwnd, None, x, y + offset, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
-    });
-}
-
 /// Register `class` (re-registering is a no-op) and create a `WS_POPUP` window of it. The class
 /// carries the arrow cursor because a captured window gets no `WM_SETCURSOR`.
 pub(crate) fn create_popup(

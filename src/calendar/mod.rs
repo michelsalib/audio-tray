@@ -8,19 +8,23 @@
 //! are fetched when the calendar opens (from the cache at once, refreshed when stale) and when its
 //! month moves out of what was fetched.
 
+mod focus;
 mod ics;
 mod model;
+pub mod notifications;
 mod oauth;
+pub mod schedule;
 mod sources;
 pub mod time;
 mod view;
+pub mod zones;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use windows::Win32::UI::WindowsAndMessaging::WM_APP;
 
-pub use model::{Event, Source};
+pub use model::{Calendar, Event, Source};
 pub use sources::{feed_url, link_name, Link, Provider, Setup};
 use time::{Local, Zone, DAY};
 
@@ -29,6 +33,8 @@ use time::{Local, Zone, DAY};
 pub const WM_CALENDAR: u32 = WM_APP + 42;
 /// [`WM_CALENDAR`]'s `wParam` to close the calendar.
 pub const CLOSE: usize = 1;
+/// [`WM_CALENDAR`]'s `wParam`: Windows' notifications changed.
+pub const NOTIFICATIONS: usize = 2;
 
 /// The open calendar's screen rectangle, for the mouse hook: a click outside it closes it even
 /// when Windows kept the foreground from it.
@@ -57,6 +63,8 @@ pub struct Status {
     pub links: Vec<Option<String>>,
     /// When events were last fetched.
     pub fetched: Option<i64>,
+    /// The calendars found, to show or hide and colour.
+    pub calendars: Vec<Calendar>,
 }
 
 impl Status {
@@ -90,6 +98,8 @@ struct State {
     /// Sign-ins in progress, each with its way to give up.
     signing_in: Vec<(Provider, Arc<AtomicBool>)>,
     sign_in_problems: Vec<(Provider, String)>,
+    /// The calendars the last fetch found.
+    calendars: Vec<Calendar>,
 }
 
 static STATE: Mutex<State> = Mutex::new(State {
@@ -102,6 +112,7 @@ static STATE: Mutex<State> = Mutex::new(State {
     problems: Vec::new(),
     signing_in: Vec::new(),
     sign_in_problems: Vec::new(),
+    calendars: Vec::new(),
 });
 
 fn state() -> std::sync::MutexGuard<'static, State> {
@@ -142,7 +153,7 @@ pub fn fetching() -> bool {
 /// What Settings shows.
 pub fn status(setup: &Setup) -> Status {
     let state = state();
-    let mut status = Status { fetched: state.fetched, ..Default::default() };
+    let mut status = Status { fetched: state.fetched, calendars: state.calendars.clone(), ..Default::default() };
     for provider in Provider::ALL {
         let account = status.account_mut(provider);
         account.email = sources::signed_in(provider);
@@ -195,7 +206,7 @@ fn spawn_fetch(setup: Setup, days: (i32, i32)) {
     std::thread::spawn(move || {
         let (mut setup, mut days) = (setup, days);
         loop {
-            let (events, problems, done) = fetch_all(&setup, days);
+            let Fetched { events, problems, done, calendars } = fetch_all(&setup, days);
             {
                 let mut state = state();
                 // A source that failed keeps what it had, when it was for the same days.
@@ -208,6 +219,9 @@ fn spawn_fetch(setup: Setup, days: (i32, i32)) {
                 state.setup = Some(setup.clone());
                 state.fetched = Some(time::now());
                 state.problems = problems;
+                // Calendars of a source that failed stay listed.
+                state.calendars.retain(|c| failed.contains(&c.source));
+                state.calendars.extend(calendars);
                 match state.again.take() {
                     Some((next_setup, next_days)) => {
                         setup = next_setup;
@@ -227,19 +241,30 @@ fn spawn_fetch(setup: Setup, days: (i32, i32)) {
 }
 
 /// Every source's events on `days`, the problems met, and which sources answered.
-fn fetch_all(setup: &Setup, days: (i32, i32)) -> (Vec<Event>, Vec<(Source, String)>, Vec<Source>) {
+/// What a fetch brings back: the events, the problems met, which sources answered, and their
+/// calendars.
+struct Fetched {
+    events: Vec<Event>,
+    problems: Vec<(Source, String)>,
+    done: Vec<Source>,
+    calendars: Vec<Calendar>,
+}
+
+fn fetch_all(setup: &Setup, days: (i32, i32)) -> Fetched {
     let zone = Local;
     let range = (zone.to_utc(days.0 as i64 * DAY), zone.to_utc(days.1 as i64 * DAY));
     let mut events = Vec::new();
     let mut problems = Vec::new();
     let mut done = Vec::new();
+    let mut calendars = Vec::new();
     for provider in Provider::ALL {
         if !setup.registered(provider) || sources::signed_in(provider).is_none() {
             continue;
         }
         match sources::fetch(provider, setup, range, &zone) {
-            Ok(list) => {
+            Ok((list, found)) => {
                 events.extend(list);
+                calendars.extend(found);
                 done.push(provider.source());
             }
             Err(e) => {
@@ -250,8 +275,9 @@ fn fetch_all(setup: &Setup, days: (i32, i32)) -> (Vec<Event>, Vec<(Source, Strin
     }
     for (i, link) in setup.links.iter().enumerate() {
         match sources::fetch_link(i, link, days, &zone) {
-            Ok(list) => {
+            Ok((list, calendar)) => {
                 events.extend(list);
+                calendars.push(calendar);
                 done.push(Source::Link(i));
             }
             Err(e) => {
@@ -260,7 +286,7 @@ fn fetch_all(setup: &Setup, days: (i32, i32)) -> (Vec<Event>, Vec<(Source, Strin
             }
         }
     }
-    (events, problems, done)
+    Fetched { events, problems, done, calendars }
 }
 
 /// A link's problem: there is no account to sign in again with, only the address to fix.
@@ -381,4 +407,18 @@ pub fn links_changed() {
 #[cfg(feature = "dev")]
 pub fn preview(config: &crate::config::Config) {
     view::preview(config);
+}
+
+/// Win+Alt+D opens this calendar (taken by the tray's keyboard hook) while this is on.
+pub static SHORTCUT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_shortcut(on: bool) {
+    SHORTCUT.store(on, Ordering::SeqCst);
+}
+
+/// `#RRGGBB` as a colour.
+pub fn parse_hex(text: &str) -> Option<[u8; 3]> {
+    let hex = text.trim().trim_start_matches('#');
+    let n = u32::from_str_radix(hex.get(..6)?, 16).ok()?;
+    Some([(n >> 16) as u8, (n >> 8) as u8, n as u8])
 }

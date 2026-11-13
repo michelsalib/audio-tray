@@ -162,6 +162,11 @@ features = [
     # The calendar (src/calendar): times on the local clock with the time zone's DST rules, and its
     # name for Microsoft Graph.
     "Win32_System_Time",
+    # Windows' focus sessions (Do not disturb) for the focus timer and quiet meetings, and the
+    # notification listener for the clock's unread count and the calendar's list.
+    "UI_Shell",
+    "UI_Notifications_Management",
+    "ApplicationModel",
 ]
 
 [build-dependencies]

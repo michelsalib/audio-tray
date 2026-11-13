@@ -212,7 +212,7 @@ fn create(config: &Config) -> Result<()> {
         clocks: Vec::new(),
         focus_minutes: config.calendar.focus_minutes.clamp(FOCUS_MIN, FOCUS_MAX),
     };
-    super::notifications::refresh();
+    super::notifications::set_watching(true);
     view.reload();
     view.fetch();
     view.place();
@@ -1052,6 +1052,7 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESUL
         }
         WM_DESTROY => {
             OPEN.with(|o| o.set(0));
+            super::notifications::set_watching(false);
             *super::OPEN_RECT.lock().unwrap_or_else(|e| e.into_inner()) = None;
             CLOSED_AT.with(|c| c.set(Some(Instant::now())));
             drop(VIEW.with(|cell| cell.borrow_mut().take()));

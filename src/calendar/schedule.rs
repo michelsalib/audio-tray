@@ -212,8 +212,15 @@ pub fn tick(config: &Config) -> Duration {
         let text = ClockText { time: time_pattern, date: date_pattern, one_line: config.clock.one_line, top, bottom };
         // Nothing to say and nothing said: the shell's clock stays the shell's.
         let wanted = config.clock.styled() || !text.top.is_empty() || !text.bottom.is_empty() || s.sent.is_some();
-        if wanted && s.sent.as_ref() != Some(&text) && crate::taskbar::send_clock(&text) {
-            s.sent = Some(text);
+        if wanted && s.sent.as_ref() != Some(&text) {
+            if crate::taskbar::send_clock(&text) {
+                println!("calendar: the clock now reads {:?} / {:?}", text.top, text.bottom);
+                s.sent = Some(text);
+            } else {
+                // The TAP is busy or reloading: soon again, not at the next quarter hour.
+                eprintln!("calendar: the TAP did not take the clock's text");
+                next = next.min(now + 5);
+            }
         }
     });
     Duration::from_secs((next - now).clamp(1, REFRESH_EVERY) as u64)

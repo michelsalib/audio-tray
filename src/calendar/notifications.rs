@@ -36,8 +36,21 @@ enum Ask {
     Clear,
 }
 
-/// How often the list is read again while it is not empty.
+/// How often the list is read again: the store on disk does not always say when it changes.
 const RECHECK: Duration = Duration::from_secs(60);
+/// …and while the calendar is open, so what it lists follows what arrives.
+const RECHECK_OPEN: Duration = Duration::from_secs(3);
+
+/// The calendar is open.
+static WATCHING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The calendar opened (read often) or closed.
+pub fn set_watching(on: bool) {
+    WATCHING.store(on, std::sync::atomic::Ordering::SeqCst);
+    if on {
+        refresh();
+    }
+}
 
 /// Every notification, newest first, as last read; `None` before the first read or when the
 /// listener is not allowed.
@@ -122,6 +135,9 @@ fn run(asks: Receiver<Ask>, again: Sender<Ask>) {
                 let changed = {
                     let mut held = TOASTS.lock().unwrap_or_else(|e| e.into_inner());
                     let changed = held.as_ref() != Some(&toasts);
+                    if changed {
+                        println!("notifications: {} waiting", toasts.len());
+                    }
                     *held = Some(toasts);
                     changed
                 };
@@ -156,7 +172,8 @@ fn run(asks: Receiver<Ask>, again: Sender<Ask>) {
                 }
                 break;
             }
-            if count() > 0 && last_read.elapsed() >= RECHECK {
+            let every = if WATCHING.load(std::sync::atomic::Ordering::SeqCst) { RECHECK_OPEN } else { RECHECK };
+            if last_read.elapsed() >= every {
                 last_read = Instant::now();
                 break;
             }

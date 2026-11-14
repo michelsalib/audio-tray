@@ -9,12 +9,12 @@
 //! **Text** (`tap_proto::CLOCK_MAGIC`): once the app styles the clock, the TAP writes the shell's
 //! two text blocks. Nothing can be added beside them (`Panel.Children` refuses writes, and the
 //! shell resets the clock's slot when its content is replaced), and the shell rewrites them every
-//! minute through compiled bindings: the TAP looks again a few times just after each minute and
-//! puts its text back, and holds the clock's width at the widest it has drawn so the taskbar does
+//! minute through compiled bindings: the TAP watches every frame through the 1.5 s after each minute and
+//! puts its text back within one, and holds the clock's width at the widest it has drawn so the taskbar does
 //! not shift meanwhile. The unread count goes before the time, behind a colour emoji dot picked to
 //! match the accent (a text block has one colour; emoji keep their own).
 
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use crate::log::logf;
@@ -137,10 +137,6 @@ static TEXT: Mutex<Option<Text>> = Mutex::new(None);
 /// The clock's width held (DIPs): the widest drawn since its text last changed shape; negative
 /// when it is to be measured afresh.
 static HELD_WIDTH: Mutex<f64> = Mutex::new(0.0);
-/// Looks still due just after the last minute (the shell rewrites its text then).
-static FOLLOW: AtomicU32 = AtomicU32::new(0);
-/// Delays of those looks, last first.
-const FOLLOW_UPS: [u32; 5] = [2000, 600, 150, 50, 15];
 
 /// Control-window timer that updates the text, at each minute (each second with seconds shown).
 pub const TEXT_TIMER: usize = 3;
@@ -312,24 +308,44 @@ pub unsafe fn tick() -> Option<u32> {
             set_min_width(&diagnostics, stack, width);
         }
     }
-    // Just past the next second or minute, then a few quick looks after a minute: the shell
-    // writes its text at the minute too, sometimes after us.
-    let ms = st.wMilliseconds as u32;
-    if text.time.contains('s') {
-        return Some(1000 - ms + 15);
+    Some(next_look(st.wSecond as u32 * 1000 + st.wMilliseconds as u32, text.time.contains('s')))
+}
+
+/// When to look next (ms), `into` ms into the minute. The shell rewrites its text about half a
+/// second after each minute (measured: 0.5 to 0.7 s): through the first 1.5 s the TAP looks every
+/// frame, so its text is back within one; then once more at 3 s, then at the next minute (or
+/// second, with seconds shown).
+fn next_look(into: u32, seconds: bool) -> u32 {
+    const WATCH: u32 = 1500;
+    const FRAME: u32 = 16;
+    const LAST_LOOK: u32 = 3000;
+    if into < WATCH {
+        return FRAME;
     }
-    let left = FOLLOW.load(Ordering::SeqCst);
-    if left > 0 {
-        FOLLOW.store(left - 1, Ordering::SeqCst);
-        return Some(FOLLOW_UPS[(left - 1) as usize]);
+    if seconds {
+        return 1000 - into % 1000 + 15;
     }
-    FOLLOW.store(FOLLOW_UPS.len() as u32, Ordering::SeqCst);
-    Some((60 - st.wSecond as u32) * 1000 - ms + 5)
+    if into < LAST_LOOK {
+        return LAST_LOOK - into + 5;
+    }
+    60_000 - into.min(59_999) + 5
 }
 
 #[cfg(test)]
 mod tests {
     use super::accent_dot;
+
+    #[test]
+    fn the_clock_is_watched_every_frame_just_after_each_minute() {
+        use super::next_look;
+        assert_eq!(next_look(0, false), 16);
+        assert_eq!(next_look(1499, false), 16);
+        assert_eq!(next_look(1500, false), 1505);
+        assert_eq!(next_look(3000, false), 57_005);
+        assert_eq!(next_look(59_990, false), 15);
+        assert_eq!(next_look(700, true), 16);
+        assert_eq!(next_look(5_200, true), 815);
+    }
 
     #[test]
     fn the_dot_follows_the_accent_hue() {

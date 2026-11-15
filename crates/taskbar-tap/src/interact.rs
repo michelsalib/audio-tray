@@ -420,6 +420,7 @@ impl IPointerEventHandler_Impl for ClockHover_Impl {
                 return;
             }
             crate::ipc::send_clock_hover(self.0);
+            crate::clock::watch_closely();
         })
     }
 }

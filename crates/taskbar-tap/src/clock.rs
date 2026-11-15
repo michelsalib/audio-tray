@@ -268,10 +268,10 @@ fn lines(text: &Text, st: &windows::Win32::Foundation::SYSTEMTIME, dot: &str) ->
 /// # Safety
 /// Tray thread only (the control window's timer).
 pub unsafe fn tick() -> Option<u32> {
+    // No quiet gate: setting text on elements that exist is no structural change (like the hover
+    // plates' opacity), and while music plays the tree is seldom quiet: waiting for it left the
+    // shell's text up for long stretches.
     let text = crate::lock(&TEXT).clone()?;
-    if !crate::tree::quiet_for(std::time::Duration::from_millis(32)) {
-        return Some(50);
-    }
     let Some(diagnostics) = crate::diagnostics() else { return Some(1000) };
     let st = now();
     let dot = accent_dot(crate::strip_state().and_then(|s| s.accent));
@@ -308,27 +308,42 @@ pub unsafe fn tick() -> Option<u32> {
             set_min_width(&diagnostics, stack, width);
         }
     }
+    // A burst of looks asked for (the pointer over the clock): one frame at a time until spent.
+    if BURST.load(Ordering::SeqCst) > 0 {
+        BURST.fetch_sub(1, Ordering::SeqCst);
+        return Some(16);
+    }
     Some(next_look(st.wSecond as u32 * 1000 + st.wMilliseconds as u32, text.time.contains('s')))
+}
+
+/// Frame-by-frame looks still due, after the pointer entered or left the clock.
+static BURST: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// The pointer entered or left the clock: the shell may redraw its text then, so look every frame
+/// for about a second.
+pub fn watch_closely() {
+    if crate::lock(&TEXT).is_some() {
+        BURST.store(60, Ordering::SeqCst);
+        crate::lifecycle::arm_clock_timer(16);
+    }
 }
 
 /// When to look next (ms), `into` ms into the minute. The shell rewrites its text about half a
 /// second after each minute (measured: 0.5 to 0.7 s): through the first 1.5 s the TAP looks every
-/// frame, so its text is back within one; then once more at 3 s, then at the next minute (or
-/// second, with seconds shown).
+/// frame, so its text is back within one. The shell also rewrites it at other moments, so outside
+/// that window it looks every 2 s (every second with seconds shown).
 fn next_look(into: u32, seconds: bool) -> u32 {
     const WATCH: u32 = 1500;
     const FRAME: u32 = 16;
-    const LAST_LOOK: u32 = 3000;
+    const LOOK: u32 = 2000;
     if into < WATCH {
         return FRAME;
     }
     if seconds {
         return 1000 - into % 1000 + 15;
     }
-    if into < LAST_LOOK {
-        return LAST_LOOK - into + 5;
-    }
-    60_000 - into.min(59_999) + 5
+    // Never past the next minute's watch.
+    LOOK.min(60_000 - into.min(59_999) + 5)
 }
 
 #[cfg(test)]
@@ -340,8 +355,9 @@ mod tests {
         use super::next_look;
         assert_eq!(next_look(0, false), 16);
         assert_eq!(next_look(1499, false), 16);
-        assert_eq!(next_look(1500, false), 1505);
-        assert_eq!(next_look(3000, false), 57_005);
+        assert_eq!(next_look(1500, false), 2000);
+        assert_eq!(next_look(30_000, false), 2000);
+        assert_eq!(next_look(59_000, false), 1005);
         assert_eq!(next_look(59_990, false), 15);
         assert_eq!(next_look(700, true), 16);
         assert_eq!(next_look(5_200, true), 815);

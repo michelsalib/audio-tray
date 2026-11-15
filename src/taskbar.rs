@@ -982,8 +982,11 @@ pub struct ClockText {
     pub one_line: bool,
     /// After the time (the next meeting, the focus time left).
     pub top: String,
-    /// Windows' unread notifications, an accent dot and its count on the time line (0: none).
+    /// Windows' unread notifications (0: none).
     pub badge: u32,
+    /// The badge drawn for it (`calendar::view::badge`): the PNG, its width in DIPs and the DPI it
+    /// was drawn for. Without one, the TAP puts an emoji dot and the count before the time.
+    pub badge_image: Option<(String, u32, u32)>,
 }
 
 /// Tell the loaded TAP how the clock reads. `false` when no TAP took it.
@@ -999,6 +1002,9 @@ pub fn send_clock(text: &ClockText) -> bool {
         ("oneline", flag(text.one_line)),
         ("top", text.top.clone()),
         ("badge", text.badge.to_string()),
+        ("badge_image", text.badge_image.as_ref().map(|b| b.0.clone()).unwrap_or_default()),
+        ("badge_width", text.badge_image.as_ref().map(|b| b.1.to_string()).unwrap_or_default()),
+        ("badge_scale", text.badge_image.as_ref().map(|b| (b.2 as f32 / 96.0).to_string()).unwrap_or_default()),
     ]);
     let payload = crate::win::wide(&data);
     let copy = COPYDATASTRUCT {

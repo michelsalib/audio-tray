@@ -140,6 +140,46 @@ pub fn close() {
     CLOSING.with(|c| c.set(false));
 }
 
+/// The clock's unread badge: an accent pill with `count`, drawn at the taskbar's scale into a PNG
+/// the TAP paints beside the clock. Gives the file, its width in DIPs and the taskbar's DPI.
+/// Each look (count, colour, scale) is its own file, drawn once: XAML caches images by address.
+pub fn badge(count: u32) -> Option<(String, u32, u32)> {
+    use windows::Win32::UI::HiDpi::GetDpiForWindow;
+    use windows::Win32::UI::WindowsAndMessaging::FindWindowW;
+    const H: f32 = 18.0;
+    let tray = unsafe { FindWindowW(w!("Shell_TrayWnd"), None) }.ok();
+    let dpi = tray.map_or(96, |t| unsafe { GetDpiForWindow(t) }).max(96);
+    let scale = dpi as f32 / 96.0;
+    let p = Palette::current();
+    let label = if count > 99 { "99+".to_string() } else { count.to_string() };
+    let w = (H + 7.0 * (label.chars().count().max(1) - 1) as f32).round();
+    let ink = {
+        let Color(r, g, b, _) = p.accent;
+        // Dark figures on a light accent, as the shell's own badges.
+        if 0.2126 * r + 0.7152 * g + 0.0722 * b > 0.55 { Color::hex(0x000000, 0.9) } else { Color::hex(0xFFFFFF, 1.0) }
+    };
+    let hex = |c: Color| format!("{:02x}{:02x}{:02x}", (c.0 * 255.0) as u8, (c.1 * 255.0) as u8, (c.2 * 255.0) as u8);
+    let dir = std::path::PathBuf::from(std::env::var_os("LOCALAPPDATA")?).join("audio-tray").join("badges");
+    let path = dir.join(format!("{label}-{}-{}-{dpi}.png", hex(p.accent), hex(ink)).replace('+', "p"));
+    if !path.exists() {
+        let _ = std::fs::create_dir_all(&dir);
+        let size = ((w * scale).round() as u32, (H * scale).round() as u32);
+        let drawn = Gfx::new().and_then(|mut gfx| {
+            gfx.frame(size, scale, |pen| {
+                pen.clear(Color(0.0, 0.0, 0.0, 0.0));
+                pen.fill(R::new(0.0, 0.0, w, H), H / 2.0, p.accent);
+                pen.text(&label, paint::Font::CaptionStrong, R::new(0.0, -0.5, w, H), ink, paint::Align::Center);
+            })?;
+            gfx.save_png(&path)
+        });
+        if let Err(e) = drawn {
+            eprintln!("calendar: could not draw the clock's badge ({e:#})");
+            return None;
+        }
+    }
+    Some((path.to_string_lossy().into_owned(), w as u32, dpi))
+}
+
 /// The events or the notifications changed: show them.
 pub fn refresh() {
     with_view(|v| {

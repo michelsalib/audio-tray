@@ -489,3 +489,30 @@ pub unsafe trait ITappedRoutedEventArgs: IUnknown {
     pub fn put_Handled(&self, value: u8) -> HRESULT;
     pub fn GetPosition(&self, relative_to: *mut c_void, value: *mut c_void) -> HRESULT;
 }
+/// `Windows.UI.Xaml.Controls.IPanel`. `Background` is how the clock's badge is drawn: a brush is
+/// a property value, which the shell accepts where it refuses new children.
+#[interface("a50a4bbd-8361-469c-90da-e9a40c7474df")]
+pub unsafe trait IPanel: IUnknown {
+    pub fn GetIids(&self, count: *mut u32, iids: *mut *mut windows_core::GUID) -> HRESULT;
+    pub fn GetRuntimeClassName(&self, name: *mut *mut c_void) -> HRESULT;
+    pub fn GetTrustLevel(&self, level: *mut i32) -> HRESULT;
+    pub fn get_Children(&self, value: *mut *mut c_void) -> HRESULT;
+    pub fn get_Background(&self, value: *mut *mut c_void) -> HRESULT;
+    pub fn put_Background(&self, value: *mut c_void) -> HRESULT;
+}
+
+/// `Windows.UI.Xaml.Controls.IStackPanel2`: its `Padding` makes room for the badge.
+#[interface("36f23359-040e-48f7-9a98-f2664591959c")]
+pub unsafe trait IStackPanel2: IUnknown {
+    pub fn GetIids(&self, count: *mut u32, iids: *mut *mut windows_core::GUID) -> HRESULT;
+    pub fn GetRuntimeClassName(&self, name: *mut *mut c_void) -> HRESULT;
+    pub fn GetTrustLevel(&self, level: *mut i32) -> HRESULT;
+    pub fn get_BorderBrush(&self, value: *mut *mut c_void) -> HRESULT;
+    pub fn put_BorderBrush(&self, value: *mut c_void) -> HRESULT;
+    pub fn get_BorderThickness(&self, value: *mut Thickness) -> HRESULT;
+    pub fn put_BorderThickness(&self, value: Thickness) -> HRESULT;
+    pub fn _reserved10(&self) -> HRESULT;
+    pub fn _reserved11(&self) -> HRESULT;
+    pub fn get_Padding(&self, value: *mut Thickness) -> HRESULT;
+    pub fn put_Padding(&self, value: Thickness) -> HRESULT;
+}

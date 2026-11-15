@@ -1,5 +1,5 @@
 //! What the calendar does on its own, between clicks: the pill's meeting reminders, the clock's
-//! countdown to the next meeting, the focus timer, and Do not disturb during meetings and calls.
+//! text and badge, the focus timer, and Do not disturb during meetings and calls.
 //!
 //! One tray timer drives it, set by [`tick`] for the next moment anything changes (a countdown's
 //! next minute, a reminder, an event starting or ending, the focus timer's end), never more often
@@ -176,7 +176,8 @@ pub fn tick(config: &Config) -> Duration {
             next = next.min(now - now % 60 + 60);
         }
         let (time_pattern, date_pattern) = patterns(&config.clock);
-        let text = ClockText { time: time_pattern, date: date_pattern, one_line: config.clock.one_line, top, badge: unread as u32 };
+        let badge_image = if unread > 0 { super::view::badge(unread as u32) } else { None };
+        let text = ClockText { time: time_pattern, date: date_pattern, one_line: config.clock.one_line, top, badge: unread as u32, badge_image };
         // Nothing to say and nothing said: the shell's clock stays the shell's.
         let wanted = config.clock.styled() || !text.top.is_empty() || text.badge > 0 || s.sent.is_some();
         if wanted && s.sent.as_ref() != Some(&text) {

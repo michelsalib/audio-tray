@@ -11,8 +11,9 @@
 //! shell resets the clock's slot when its content is replaced), and the shell rewrites them every
 //! minute through compiled bindings: the TAP watches every frame through the 1.5 s after each minute and
 //! puts its text back within one, and holds the clock's width at the widest it has drawn so the taskbar does
-//! not shift meanwhile. The unread count goes before the time, behind a colour emoji dot picked to
-//! match the accent (a text block has one colour; emoji keep their own).
+//! not shift meanwhile. The unread count is a badge the app draws (an accent pill with the count, a
+//! PNG at the taskbar's scale), painted as the clock stack's background left of the two lines
+//! ([`show_badge`]); without one, an emoji dot near the accent and the count go before the time.
 
 use core::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
@@ -130,6 +131,11 @@ pub struct Text {
     top: String,
     /// Windows' unread notifications (0: none).
     badge: u32,
+    /// The badge drawn by the app (a PNG), its width in DIPs and its pixels per DIP; empty: the
+    /// emoji dot and the count in the text instead.
+    badge_image: String,
+    badge_width: f64,
+    badge_scale: f64,
 }
 
 /// The app's latest word; `None` when it never styled the clock or has gone.
@@ -151,6 +157,9 @@ pub fn set_text(data: &str) {
         one_line: flag("oneline"),
         top: value("top"),
         badge: value("badge").parse().unwrap_or(0),
+        badge_image: value("badge_image"),
+        badge_width: value("badge_width").parse().unwrap_or(0.0),
+        badge_scale: value("badge_scale").parse().unwrap_or(1.0),
     };
     let mut held = crate::lock(&TEXT);
     if held.as_ref() != Some(&text) {
@@ -186,7 +195,80 @@ pub unsafe fn restore(diagnostics: &xamlom::IXamlDiagnostics) {
     *crate::lock(&HELD_WIDTH) = 0.0;
     for stack in tree::find_by_name(STACK) {
         set_min_width(diagnostics, stack, 0.0);
+        show_badge(diagnostics, stack, None);
     }
+    crate::lock(&BADGED).clear();
+}
+
+/// The room between the badge and the text, in DIPs.
+const BADGE_GAP: f64 = 6.0;
+/// Clocks wearing a badge, and which image.
+static BADGED: Mutex<Vec<(u64, String)>> = Mutex::new(Vec::new());
+
+/// Draw the app's badge (`image`, `width` DIPs wide, at `scale` pixels per DIP) left of the clock's
+/// two lines, or take it off. It is the stack's background (a brush is a property value, which the
+/// shell takes where it refuses new children), with padding making room for it. The image is shown
+/// at its pixel size and scaled back by `1 / scale` about the stack's middle, so it lands pixel for
+/// pixel and centred on both lines.
+///
+/// # Safety
+/// XAML UI thread only.
+unsafe fn show_badge(diagnostics: &xamlom::IXamlDiagnostics, stack: u64, image: Option<(&str, f64, f64)>) {
+    use crate::winrt::{IPanel, IStackPanel2, Thickness};
+    let Some(panel) = crate::decorate::element::<IPanel>(diagnostics, stack) else { return };
+    let Some(padded) = crate::decorate::element::<IStackPanel2>(diagnostics, stack) else { return };
+    let mut padding = Thickness::default();
+    let _ = padded.get_Padding(&mut padding);
+    let left = image.map_or(0.0, |(_, width, _)| width + BADGE_GAP);
+    let key = image.map(|(path, ..)| path.to_string()).unwrap_or_default();
+    let mut badged = crate::lock(&BADGED);
+    let current = badged.iter().find(|(h, _)| *h == stack).map(|(_, k)| k.clone()).unwrap_or_default();
+    if current == key && (padding.left - left).abs() < 0.01 {
+        return;
+    }
+    match image {
+        Some((path, _, scale)) => {
+            let shrink = 1.0 / scale.max(0.5);
+            let markup = format!(
+                r#"<ImageBrush xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" ImageSource="{}" Stretch="None" AlignmentX="Left" AlignmentY="Center"><ImageBrush.RelativeTransform><ScaleTransform CenterY="0.5" ScaleX="{shrink}" ScaleY="{shrink}"/></ImageBrush.RelativeTransform></ImageBrush>"#,
+                file_uri(path)
+            );
+            let Some(brush) = crate::decorate::load_xaml(&markup) else { return };
+            let hr = panel.put_Background(windows_core::Interface::as_raw(&brush));
+            if hr.is_err() {
+                logf!("clock: badge background refused: 0x{:08x}", hr.0);
+                return;
+            }
+        }
+        None => {
+            let _ = panel.put_Background(core::ptr::null_mut());
+        }
+    }
+    let _ = padded.put_Padding(Thickness { left, ..padding });
+    badged.retain(|(h, _)| *h != stack);
+    if !key.is_empty() {
+        badged.push((stack, key));
+    }
+    // The width changes with the badge: measured afresh.
+    *crate::lock(&HELD_WIDTH) = -1.0;
+}
+
+/// `C:\a b\c.png` as `file:///C:/a%20b/c.png`, quoted for an XAML attribute.
+fn file_uri(path: &str) -> String {
+    let mut uri = String::from("file:///");
+    for c in path.chars() {
+        match c {
+            '\\' => uri.push('/'),
+            ' ' => uri.push_str("%20"),
+            '%' => uri.push_str("%25"),
+            '#' => uri.push_str("%23"),
+            '&' => uri.push_str("&amp;"),
+            '"' => uri.push_str("&quot;"),
+            '<' => uri.push_str("&lt;"),
+            c => uri.push(c),
+        }
+    }
+    uri
 }
 
 unsafe fn set_min_width(diagnostics: &xamlom::IXamlDiagnostics, handle: u64, width: f64) {
@@ -251,7 +333,7 @@ fn lines(text: &Text, st: &windows::Win32::Foundation::SYSTEMTIME, dot: &str) ->
     if !text.top.is_empty() {
         time = format!("{time} · {}", text.top);
     }
-    if text.badge > 0 {
+    if text.badge > 0 && text.badge_image.is_empty() {
         time = format!("{dot} {}   {time}", text.badge);
     }
     let date = if text.date == "-" { String::new() } else { format_date(st, &text.date) };
@@ -296,7 +378,9 @@ pub unsafe fn tick() -> Option<u32> {
     }
     // Hold the width at the widest drawn, so the shell's own (shorter) text, shown for a moment
     // after each minute, does not move the taskbar.
+    let badge = (text.badge > 0 && !text.badge_image.is_empty()).then_some((text.badge_image.as_str(), text.badge_width, text.badge_scale));
     for stack in tree::find_by_name(STACK) {
+        show_badge(&diagnostics, stack, badge);
         let width = crate::decorate::actual_width(&diagnostics, stack).unwrap_or(0.0);
         let mut held = crate::lock(&HELD_WIDTH);
         if *held < 0.0 {
@@ -361,6 +445,11 @@ mod tests {
         assert_eq!(next_look(59_990, false), 15);
         assert_eq!(next_look(700, true), 16);
         assert_eq!(next_look(5_200, true), 815);
+    }
+
+    #[test]
+    fn badge_paths_become_file_uris_fit_for_an_attribute() {
+        assert_eq!(super::file_uri(r"C:\Users\a b\x&y.png"), "file:///C:/Users/a%20b/x&amp;y.png");
     }
 
     #[test]

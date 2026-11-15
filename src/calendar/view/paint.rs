@@ -188,7 +188,7 @@ impl Gfx {
                 self.surface = Some((size, bitmap, target));
                 self.images.borrow_mut().clear();
             }
-            let (_, bitmap, target) = self.surface.as_ref().expect("just built");
+            let (_, bitmap, target) = self.surface.as_ref().context("no surface")?;
             target.SetDpi(96.0 * scale, 96.0 * scale);
             target.BeginDraw();
             draw(&Pen { gfx: self, target: target.clone(), scale });
@@ -206,6 +206,28 @@ impl Gfx {
             for (y, out) in self.pixels.chunks_exact_mut(row).enumerate() {
                 out.copy_from_slice(&src[y * stride..y * stride + row]);
             }
+        }
+        Ok(())
+    }
+
+    /// The last frame, as a PNG file.
+    pub fn save_png(&self, path: &std::path::Path) -> Result<()> {
+        use windows::Win32::Foundation::GENERIC_WRITE;
+        use windows::Win32::Graphics::Imaging::{GUID_ContainerFormatPng, WICBitmapEncoderNoCache};
+        let (_, bitmap, _) = self.surface.as_ref().context("nothing drawn")?;
+        let wide = crate::win::wide(&path.to_string_lossy());
+        unsafe {
+            let stream = self.wic.CreateStream()?;
+            stream.InitializeFromFilename(PCWSTR(wide.as_ptr()), GENERIC_WRITE.0)?;
+            let encoder = self.wic.CreateEncoder(&GUID_ContainerFormatPng, std::ptr::null())?;
+            encoder.Initialize(&stream, WICBitmapEncoderNoCache)?;
+            let mut frame = None;
+            encoder.CreateNewFrame(&mut frame, std::ptr::null_mut())?;
+            let frame = frame.context("no frame")?;
+            frame.Initialize(None)?;
+            frame.WriteSource(bitmap, std::ptr::null())?;
+            frame.Commit()?;
+            encoder.Commit()?;
         }
         Ok(())
     }

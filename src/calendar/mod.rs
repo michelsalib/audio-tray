@@ -13,6 +13,7 @@ mod ics;
 mod model;
 pub mod notifications;
 mod oauth;
+pub mod rich;
 pub mod schedule;
 mod sources;
 pub mod time;

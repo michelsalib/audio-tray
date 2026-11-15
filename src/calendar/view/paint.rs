@@ -297,21 +297,49 @@ impl Pen<'_> {
     /// An image file (`bytes`, kept by `key`) drawn square into `r`.
     pub fn image(&self, key: &str, bytes: &[u8], r: R) {
         let px = (r.w * self.scale).round().max(1.0) as u32;
-        let cached = self.gfx.images.borrow().iter().find(|(k, p, _)| k == key && *p == px).map(|(_, _, b)| b.clone());
-        let bitmap = match cached {
-            Some(b) => b,
-            None => {
-                let made = crate::image::sprite(bytes, px, 0.0).ok().and_then(|rgba| self.bitmap(&rgba, px));
-                self.gfx.images.borrow_mut().push((key.to_string(), px, made.clone()));
-                made
-            }
-        };
+        let made = self.cached(key, px, || crate::image::sprite(bytes, px, 0.0).ok().map(|rgba| (rgba, px, px)));
+        self.place(made, r);
+    }
+
+    /// A photo cut to a circle in `r` (square).
+    pub fn avatar(&self, key: &str, bytes: &[u8], r: R) {
+        let px = (r.w * self.scale).round().max(1.0) as u32;
+        let made = self.cached(&format!("round:{key}"), px, || crate::image::sprite(bytes, px, px as f32 / 2.0).ok().map(|rgba| (rgba, px, px)));
+        self.place(made, r);
+    }
+
+    /// A picture whole, fitted and centred in `r`, its corners slightly rounded.
+    pub fn picture(&self, key: &str, bytes: &[u8], r: R) {
+        let (max_w, max_h) = ((r.w * self.scale).round().max(1.0) as u32, (r.h * self.scale).round().max(1.0) as u32);
+        let made = self.cached(&format!("whole:{key}"), max_w * 10_000 + max_h, || {
+            let (mut rgba, w, h) = crate::image::fitted(bytes, max_w, max_h).ok()?;
+            crate::image::round_corners(&mut rgba, w, h, 6.0 * self.scale);
+            Some((rgba, w, h))
+        });
+        if let Some(bitmap) = &made {
+            let size = unsafe { bitmap.GetSize() };
+            let at = R::new(r.x + (r.w - size.width) / 2.0, r.y + (r.h - size.height) / 2.0, size.width, size.height);
+            self.place(made, at);
+        }
+    }
+
+    /// The bitmap for `key` at `px`, made once.
+    fn cached(&self, key: &str, px: u32, make: impl FnOnce() -> Option<(Vec<u8>, u32, u32)>) -> Option<ID2D1Bitmap> {
+        if let Some(b) = self.gfx.images.borrow().iter().find(|(k, p, _)| k == key && *p == px).map(|(_, _, b)| b.clone()) {
+            return b;
+        }
+        let made = make().and_then(|(rgba, w, h)| self.bitmap(&rgba, w, h));
+        self.gfx.images.borrow_mut().push((key.to_string(), px, made.clone()));
+        made
+    }
+
+    fn place(&self, bitmap: Option<ID2D1Bitmap>, r: R) {
         if let Some(bitmap) = bitmap {
             unsafe { self.target.DrawBitmap(&bitmap, Some(&rect(r)), 1.0, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, None) };
         }
     }
 
-    fn bitmap(&self, rgba: &[u8], px: u32) -> Option<ID2D1Bitmap> {
+    fn bitmap(&self, rgba: &[u8], w: u32, h: u32) -> Option<ID2D1Bitmap> {
         let bgra: Vec<u8> = rgba
             .as_chunks::<4>()
             .0
@@ -327,7 +355,7 @@ impl Pen<'_> {
             dpiX: 96.0 * self.scale,
             dpiY: 96.0 * self.scale,
         };
-        unsafe { self.target.CreateBitmap(D2D_SIZE_U { width: px, height: px }, Some(bgra.as_ptr() as *const _), px * 4, &props) }.ok()
+        unsafe { self.target.CreateBitmap(D2D_SIZE_U { width: w, height: h }, Some(bgra.as_ptr() as *const _), w * 4, &props) }.ok()
     }
 
     pub fn clip(&self, r: R) {

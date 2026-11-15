@@ -42,6 +42,11 @@ pub const W: f32 = 360.0;
 pub const GAP: f32 = 12.0;
 const PAD: f32 = 16.0;
 const TOAST_H: f32 = 76.0;
+/// A notification's large picture.
+const PICTURE_H: f32 = 150.0;
+/// The row of a notification's buttons (or its reply box), and a line of its menu.
+const ACTIONS_H: f32 = 32.0;
+const MENU_ROW_H: f32 = 30.0;
 const GROUP_H: f32 = 28.0;
 const FOLDED_H: f32 = 36.0;
 const SUMMARY_H: f32 = 48.0;
@@ -82,6 +87,10 @@ pub enum Draw {
     Text { text: String, font: Font, ink: Ink, align: Align },
     Glyph { glyph: char, font: Font, ink: Ink },
     Logo { key: String, bytes: Arc<Vec<u8>> },
+    /// A photo cut to a circle (a sender's).
+    Avatar { key: String, bytes: Arc<Vec<u8>> },
+    /// A picture whole, fitted and centred in the rectangle.
+    Picture { key: String, bytes: Arc<Vec<u8>> },
     Clip,
     Unclip,
 }
@@ -98,6 +107,15 @@ pub enum Hit {
     /// A notification (by its place in the list): opens its app.
     Toast(usize),
     Dismiss(usize),
+    /// A notification's button, by its place.
+    Action(usize, usize),
+    /// Open the reply box; its field; send what is typed.
+    Reply(usize),
+    Draft(usize),
+    Send(usize),
+    /// Open or close a notification's menu; an entry of it.
+    Menu(usize),
+    MenuItem(usize, usize),
     ClearAll,
     Quiet,
     Today,
@@ -127,6 +145,43 @@ pub struct Toast {
     pub index: usize,
     pub title: String,
     pub body: String,
+    pub avatar: Option<(String, Arc<Vec<u8>>)>,
+    pub picture: Option<(String, Arc<Vec<u8>>)>,
+    pub buttons: Vec<String>,
+    /// The reply box's placeholder, when it takes a reply.
+    pub reply: Option<String>,
+    pub menu: Vec<String>,
+    /// What is typed in its reply box, while that is open.
+    pub draft: Option<String>,
+    pub menu_open: bool,
+}
+
+impl Toast {
+    fn has_actions(&self) -> bool {
+        !self.buttons.is_empty() || self.reply.is_some() || !self.menu.is_empty()
+    }
+
+    fn height(&self) -> f32 {
+        let mut h = TOAST_H;
+        if self.picture.is_some() {
+            h += PICTURE_H + 8.0;
+        }
+        if self.has_actions() {
+            h += ACTIONS_H + 8.0;
+        }
+        if self.menu_open {
+            h += self.menu.len() as f32 * MENU_ROW_H + 6.0;
+        }
+        h
+    }
+}
+
+/// The notification a target belongs to.
+fn toast_of(hit: Hit) -> Option<usize> {
+    match hit {
+        Hit::Toast(i) | Hit::Dismiss(i) | Hit::Action(i, _) | Hit::Reply(i) | Hit::Draft(i) | Hit::Send(i) | Hit::Menu(i) | Hit::MenuItem(i, _) => Some(i),
+        _ => None,
+    }
 }
 
 pub struct Group {
@@ -311,7 +366,7 @@ fn center_height(groups: &[Group]) -> f32 {
     for g in groups {
         if g.open {
             let shown = if g.all { g.toasts.len() } else { 1 };
-            h += GROUP_H + shown as f32 * (TOAST_H + 4.0);
+            h += GROUP_H + g.toasts.iter().take(shown).map(|t| t.height() + 4.0).sum::<f32>();
             if !g.all && g.toasts.len() > 1 {
                 h += 6.0 + 22.0;
             }
@@ -404,6 +459,89 @@ fn center_summary(ink: &mut Ink2, card: R, input: &Input, groups: &[Group]) {
     ink.glyph(R::new(card.right() - PAD - 16.0, y, 16.0, 20.0), '\u{E70E}', Font::IconSmall, Ink::Text2);
 }
 
+/// One notification in `r`: the sender's photo, its text, its picture, then its buttons (or its
+/// reply box, while open) and its menu.
+fn notification(ink: &mut Ink2, r: R, toast: &Toast) {
+    let i = toast.index;
+    let lit = ink.hover.and_then(toast_of) == Some(i) || toast.draft.is_some();
+    ink.draw(r, Draw::Rect { fill: if lit { Fill::Hover } else { Fill::Raised }, radius: 6.0 });
+    ink.hit(r, Hit::Toast(i));
+    let mut tx = r.x + 12.0;
+    if let Some((key, bytes)) = &toast.avatar {
+        ink.draw(R::new(tx, r.y + 12.0, 36.0, 36.0), Draw::Avatar { key: key.clone(), bytes: bytes.clone() });
+        tx += 48.0;
+    }
+    ink.text(R::new(tx, r.y + 8.0, r.right() - tx - 40.0, 20.0), toast.title.clone(), Font::Strong, Ink::Text, Align::Left);
+    ink.text(R::new(tx, r.y + 30.0, r.right() - tx - 12.0, 38.0), toast.body.clone(), Font::Wrap, Ink::Text2, Align::Left);
+    if lit {
+        let x_r = R::new(r.right() - 32.0, r.y + 6.0, 26.0, 26.0);
+        ink.plate(x_r, Hit::Dismiss(i), 4.0);
+        ink.glyph(x_r, '\u{E711}', Font::IconSmall, Ink::Text2);
+    }
+    let mut y = r.y + TOAST_H - 4.0;
+    if let Some((key, bytes)) = &toast.picture {
+        ink.draw(R::new(r.x + 12.0, y, r.w - 24.0, PICTURE_H), Draw::Picture { key: key.clone(), bytes: bytes.clone() });
+        y += PICTURE_H + 8.0;
+    }
+    if toast.has_actions() {
+        let row = R::new(r.x + 12.0, y, r.w - 24.0, ACTIONS_H);
+        match &toast.draft {
+            Some(draft) => {
+                let field = R::new(row.x, row.y, row.w - ACTIONS_H - 6.0, row.h);
+                ink.draw(field, Draw::Rect { fill: Fill::Raised, radius: 4.0 });
+                ink.draw(field, Draw::Outline { ink: Ink::Accent, radius: 4.0 });
+                ink.hit(field, Hit::Draft(i));
+                let inner = R::new(field.x + 10.0, field.y, field.w - 20.0, field.h);
+                if draft.is_empty() {
+                    ink.draw(R::new(inner.x, inner.y + 8.0, 1.5, 16.0), Draw::Rect { fill: Fill::Accent, radius: 0.0 });
+                    let hint = toast.reply.clone().unwrap_or_default();
+                    ink.text(R::new(inner.x + 4.0, inner.y, inner.w - 4.0, inner.h), hint, Font::Body, Ink::Text3, Align::Left);
+                } else {
+                    // The end of what is typed stays in view, the caret after it.
+                    let long = draft.chars().count() > 36;
+                    ink.draw(inner, Draw::Clip);
+                    ink.text(inner, format!("{draft}\u{2009}|"), Font::Body, Ink::Text, if long { Align::Right } else { Align::Left });
+                    ink.draw(inner, Draw::Unclip);
+                }
+                let send = R::new(row.right() - ACTIONS_H, row.y, ACTIONS_H, ACTIONS_H);
+                ink.draw(send, Draw::Rect { fill: Fill::Accent, radius: 4.0 });
+                ink.glyph(send, '\u{E724}', Font::IconSmall, Ink::OnAccent);
+                ink.hit(send, Hit::Send(i));
+            }
+            None => {
+                let mut bx = row.x;
+                let end = if toast.menu.is_empty() { row.right() } else { row.right() - ACTIONS_H - 6.0 };
+                let mut pills: Vec<(String, Hit)> = toast.buttons.iter().enumerate().map(|(n, label)| (label.clone(), Hit::Action(i, n))).collect();
+                if toast.reply.is_some() {
+                    pills.insert(0, ("Reply".to_string(), Hit::Reply(i)));
+                }
+                for (label, hit) in pills {
+                    let pw = (label.chars().count() as f32 * 7.0 + 28.0).clamp(64.0, end - bx);
+                    if pw < 40.0 {
+                        break;
+                    }
+                    ink.pill(R::new(bx, row.y + 2.0, pw, row.h - 4.0), &label, hit, false);
+                    bx += pw + 6.0;
+                }
+                if !toast.menu.is_empty() {
+                    let more = R::new(row.right() - ACTIONS_H, row.y, ACTIONS_H, ACTIONS_H);
+                    ink.plate(more, Hit::Menu(i), 4.0);
+                    ink.glyph(more, '\u{E712}', Font::IconSmall, Ink::Text2);
+                }
+            }
+        }
+        y += ACTIONS_H + 8.0;
+    }
+    if toast.menu_open {
+        for (n, label) in toast.menu.iter().enumerate() {
+            let line = R::new(r.x + 8.0, y, r.w - 16.0, MENU_ROW_H);
+            ink.plate(line, Hit::MenuItem(i, n), 4.0);
+            ink.text(R::new(line.x + 12.0, line.y, line.w - 24.0, line.h), label.clone(), Font::Body, Ink::Text, Align::Left);
+            y += MENU_ROW_H;
+        }
+    }
+}
+
 /// The notification centre open: its header, then each app's group. Returns its scrolling area.
 fn center(ink: &mut Ink2, card: R, input: &Input, groups: &[Group]) -> (R, f32) {
     let x = card.x + 8.0;
@@ -446,19 +584,9 @@ fn center(ink: &mut Ink2, card: R, input: &Input, groups: &[Group]) -> (R, f32) 
         }
         let shown = if group.all { group.toasts.len() } else { 1 };
         for toast in group.toasts.iter().take(shown) {
-            let r = R::new(x, y, w, TOAST_H);
-            let lit = ink.lit(Hit::Toast(toast.index)) || ink.lit(Hit::Dismiss(toast.index));
-            ink.draw(r, Draw::Rect { fill: if lit { Fill::Hover } else { Fill::Raised }, radius: 6.0 });
-            ink.hit(r, Hit::Toast(toast.index));
-            let tw = r.w - 24.0 - 28.0;
-            ink.text(R::new(r.x + 12.0, r.y + 8.0, tw, 20.0), toast.title.clone(), Font::Strong, Ink::Text, Align::Left);
-            ink.text(R::new(r.x + 12.0, r.y + 30.0, r.w - 24.0, 38.0), toast.body.clone(), Font::Wrap, Ink::Text2, Align::Left);
-            if lit {
-                let x_r = R::new(r.right() - 32.0, r.y + 6.0, 26.0, 26.0);
-                ink.plate(x_r, Hit::Dismiss(toast.index), 4.0);
-                ink.glyph(x_r, '\u{E711}', Font::IconSmall, Ink::Text2);
-            }
-            y += TOAST_H + 4.0;
+            let r = R::new(x, y, w, toast.height());
+            notification(ink, r, toast);
+            y += r.h + 4.0;
         }
         if !group.all && group.toasts.len() > 1 {
             ink.draw(R::new(x + 8.0, y - 4.0, w - 16.0, 6.0), Draw::Rect { fill: Fill::Raised, radius: 3.0 });
@@ -688,11 +816,15 @@ mod tests {
         }
     }
 
+    fn toast(i: usize) -> Toast {
+        Toast { index: i, title: format!("t{i}"), body: String::new(), avatar: None, picture: None, buttons: Vec::new(), reply: None, menu: Vec::new(), draft: None, menu_open: false }
+    }
+
     fn group(name: &str, n: usize, open: bool) -> Group {
         Group {
             name: name.into(),
             logo: None,
-            toasts: (0..n).map(|i| Toast { index: i, title: format!("t{i}"), body: String::new() }).collect(),
+            toasts: (0..n).map(toast).collect(),
             when: "2 min".into(),
             open,
             all: false,

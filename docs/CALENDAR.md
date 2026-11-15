@@ -3,19 +3,24 @@
 With **Settings > Clock & calendar > Opens from the taskbar clock** on, a click on the clock (or
 Win+Alt+D) opens Audio Tray's calendar instead of Windows'. Audio Tray's low-level mouse hook
 swallows the click, because the shell's clock button opens its own flyout whatever its XAML
-handlers do with the press. The calendar shows, top to bottom:
+handlers do with the press. It shows two cards:
 
-- **Windows' notifications** (up to three, with a count), to dismiss one by one or Clear all.
-  Clicking one opens Windows' notification centre.
-- **The date**, with Windows' additional clocks under it (Date and time settings > Additional
-  clocks; Settings has a button to them).
-- **The month**, with a dot per calendar on each day that has events, and optional ISO week
-  numbers. The layout can be compact, or the agenda alone, a day at a time.
-- **The day's agenda**, with **Join** for Teams, Meet, Zoom and Webex meetings. Clicking an event
-  opens its details: time, place, organiser and your reply, who's invited, notes, and buttons to
-  join or open it in its calendar.
-- **The focus timer.** It starts a Windows focus session, so Windows' Do not disturb runs with
-  it, and the clock counts down.
+- **Windows' notifications**, grouped by app, above. Each shows the sender's photo, its text and
+  any large picture, with the app's own buttons: **Reply** opens a box under it (Enter sends,
+  Escape cancels), and ⋯ holds the rest (mute, turn off). Clicking a notification does what a
+  click does in Windows' centre. The pictures and buttons come from Windows' own notification
+  store (`wpndatabase.db`, read-only), since the notification listener gives only the text; the
+  buttons and replies reach the app through the COM class it registers for them
+  (`ToastActivatorCLSID`). An app without one is only opened. The card folds to one line when the
+  calendar needs the room.
+- **The calendar**, below: today's date and Windows' additional clocks (Date and time settings >
+  Additional clocks), a week strip that opens into the month (with optional ISO week numbers),
+  the next event, the rest of the week, and Focus / Do not disturb / Settings at the foot.
+  **Join** works for Teams, Meet, Zoom and Webex meetings. An event opens into its details: time,
+  place, organiser and your reply, who's invited, notes, and buttons to join or open it in its
+  calendar.
+- **The focus timer** starts a Windows focus session, so Windows' Do not disturb runs with it, and
+  the clock shows the time left.
 
 It opens from whichever screen edge the taskbar is on, over Windows' acrylic, sliding in and out
 like the shell's own flyouts.

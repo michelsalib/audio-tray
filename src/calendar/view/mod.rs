@@ -22,16 +22,17 @@ use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromPoint, ScreenToClient, MONITORINFO, MONITOR_DEFAULTTONEAREST};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetCapture, ReleaseCapture, SetCapture, VIRTUAL_KEY, VK_DOWN, VK_ESCAPE, VK_HOME, VK_LEFT, VK_NEXT, VK_PRIOR, VK_RIGHT, VK_UP,
+    GetCapture, ReleaseCapture, SetCapture, VIRTUAL_KEY, VK_BACK, VK_DOWN, VK_ESCAPE, VK_RETURN, VK_HOME, VK_LEFT, VK_NEXT, VK_PRIOR, VK_RIGHT, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     DefWindowProcW, DestroyWindow, GetCursorPos, ShowWindow, SW_HIDE, SW_SHOWNA, WA_INACTIVE, WHEEL_DELTA, WINDOW_EX_STYLE, WM_ACTIVATE,
-    WM_CAPTURECHANGED, WM_DESTROY, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN,
+    WM_CAPTURECHANGED, WM_CHAR, WM_DESTROY, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN,
     WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
 };
 
 use super::model::{self, Event, Source, When};
 use super::notifications::Toast;
+use super::rich::{self, Kind};
 use super::time::{self, Local, Zone, DAY};
 use super::zones::WorldClock;
 use super::Setup;
@@ -100,6 +101,10 @@ struct View {
     /// Apps whose notifications are open (`None`: the newest app's), and shown in full.
     open_groups: Option<Vec<String>>,
     full_groups: Vec<String>,
+    /// The notification whose reply box is open, and what is typed in it.
+    draft: Option<(u32, String)>,
+    /// The notification whose menu is open.
+    menu_for: Option<u32>,
     clocks: Vec<WorldClock>,
     center_scroll: f32,
     list_scroll: f32,
@@ -257,6 +262,8 @@ fn create(config: &Config) -> Result<()> {
         toasts: Vec::new(),
         open_groups: None,
         full_groups: Vec::new(),
+        draft: None,
+        menu_for: None,
         clocks: Vec::new(),
         center_scroll: 0.0,
         list_scroll: 0.0,
@@ -389,6 +396,13 @@ impl View {
                                 index: self.toasts.iter().position(|x| x.id == t.id).unwrap_or(0),
                                 title: if t.title.is_empty() { t.app.clone() } else { t.title.clone() },
                                 body: t.body.clone(),
+                                avatar: t.rich.avatar.as_ref().map(|p| (p.key.clone(), p.bytes.clone())),
+                                picture: t.rich.picture.as_ref().map(|p| (p.key.clone(), p.bytes.clone())),
+                                buttons: t.rich.buttons.iter().map(|a| a.label.clone()).collect(),
+                                reply: t.rich.reply.as_ref().map(|r| if r.placeholder.is_empty() { "Reply".to_string() } else { r.placeholder.clone() }),
+                                menu: t.rich.menu.iter().map(|a| a.label.clone()).collect(),
+                                draft: self.draft.as_ref().filter(|(id, _)| *id == t.id).map(|(_, text)| text.clone()),
+                                menu_open: self.menu_for == Some(t.id),
                             })
                             .collect(),
                         when: list.first().map_or_else(String::new, |t| arrived(t.at)),
@@ -662,9 +676,36 @@ impl View {
                 super::notifications::remove(vec![toast.id]);
                 return Some(Box::new(move || {
                     close();
-                    super::notifications::open_app(&toast.aumid);
+                    let rich = &toast.rich;
+                    if rich.launch.is_empty() && rich.launch_kind != Kind::Protocol {
+                        super::notifications::open_app(&toast.aumid);
+                    } else {
+                        rich::invoke(&toast.aumid, rich.activator, &rich.launch, rich.launch_kind, Vec::new());
+                    }
                 }));
             }
+            Hit::Action(i, n) => {
+                let toast = self.toasts.get(i)?.clone();
+                let action = toast.rich.buttons.get(n)?.clone();
+                return Some(self.carry_out(toast, action, Vec::new()));
+            }
+            Hit::MenuItem(i, n) => {
+                let toast = self.toasts.get(i)?.clone();
+                let action = toast.rich.menu.get(n)?.clone();
+                self.menu_for = None;
+                return Some(self.carry_out(toast, action, Vec::new()));
+            }
+            Hit::Menu(i) => {
+                let id = self.toasts.get(i)?.id;
+                self.menu_for = if self.menu_for == Some(id) { None } else { Some(id) };
+            }
+            Hit::Reply(i) => {
+                let id = self.toasts.get(i)?.id;
+                self.draft = Some((id, String::new()));
+                self.menu_for = None;
+            }
+            Hit::Draft(_) => return None,
+            Hit::Send(i) => return self.send_reply(i),
             Hit::Dismiss(i) => {
                 let id = self.toasts.get(i)?.id;
                 self.toasts.retain(|t| t.id != id);
@@ -729,7 +770,80 @@ impl View {
         Some(Box::new(keep_rect))
     }
 
+    /// Carry out a notification's button: it leaves the list, as in Windows' centre, and the panel
+    /// closes when the app comes up.
+    fn carry_out(&mut self, toast: Toast, action: rich::Action, inputs: Vec<(String, String)>) -> After {
+        self.toasts.retain(|t| t.id != toast.id);
+        super::notifications::remove(vec![toast.id]);
+        self.hover = None;
+        let quiet = action.kind == Kind::Background;
+        Box::new(move || {
+            if !quiet {
+                close();
+            }
+            rich::invoke(&toast.aumid, toast.rich.activator, &action.arguments, action.kind, inputs);
+            if quiet {
+                refresh();
+                keep_rect();
+            }
+        })
+    }
+
+    /// Send what is typed in notification `i`'s reply box.
+    fn send_reply(&mut self, i: usize) -> Option<After> {
+        let toast = self.toasts.get(i)?.clone();
+        let reply = toast.rich.reply.clone()?;
+        let text = self.draft.take().filter(|(id, _)| *id == toast.id).map(|(_, text)| text)?;
+        if text.trim().is_empty() {
+            self.draft = Some((toast.id, text));
+            return None;
+        }
+        Some(self.carry_out(toast, reply.send, vec![(reply.input, text)]))
+    }
+
+    /// A character typed while a reply box is open. `true`: it was the reply box's.
+    fn type_char(&mut self, c: char) -> bool {
+        let Some((_, draft)) = self.draft.as_mut() else { return false };
+        match c {
+            // Backspace, Enter and Escape come as keys.
+            '\u{8}' | '\r' | '\n' | '\u{1b}' => return true,
+            // Ctrl+Backspace: the last word.
+            '\u{7f}' => {
+                let kept = draft.trim_end().rfind(' ').map_or(0, |i| i + 1);
+                draft.truncate(kept);
+            }
+            // Ctrl+V.
+            '\u{16}' => draft.push_str(&crate::win::clipboard_text().ok().flatten().unwrap_or_default().replace(['\r', '\n'], " ")),
+            c if !c.is_control() => draft.push(c),
+            _ => return true,
+        }
+        self.relayout();
+        true
+    }
+
     fn key(&mut self, key: VIRTUAL_KEY) -> Option<After> {
+        if let Some((id, draft)) = self.draft.as_mut() {
+            match key {
+                VK_ESCAPE => self.draft = None,
+                VK_BACK => {
+                    draft.pop();
+                }
+                VK_RETURN => {
+                    let id = *id;
+                    let i = self.toasts.iter().position(|t| t.id == id)?;
+                    let after = self.send_reply(i);
+                    self.relayout();
+                    return after;
+                }
+                _ => return None,
+            }
+            self.relayout();
+            return None;
+        }
+        if key == VK_ESCAPE && self.menu_for.take().is_some() {
+            self.relayout();
+            return None;
+        }
         if key == VK_ESCAPE {
             if self.detail.take().is_some() {
                 self.relayout();
@@ -937,6 +1051,8 @@ fn draw(pen: &Pen, scene: &Scene, p: &Palette) {
             Draw::Text { text, font, ink: i, align } => pen.text(text, *font, *r, ink(*i), *align),
             Draw::Glyph { glyph, font, ink: i } => pen.glyph(*glyph, *font, *r, ink(*i)),
             Draw::Logo { key, bytes } => pen.image(key, bytes, *r),
+            Draw::Avatar { key, bytes } => pen.avatar(key, bytes, *r),
+            Draw::Picture { key, bytes } => pen.picture(key, bytes, *r),
             Draw::Clip => pen.clip(*r),
             Draw::Unclip => pen.unclip(),
         }
@@ -1008,6 +1124,11 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESUL
         }
         WM_KEYDOWN => {
             after = with_view(|v| v.key(VIRTUAL_KEY(wparam.0 as u16))).flatten();
+        }
+        WM_CHAR => {
+            if let Some(c) = char::from_u32(wparam.0 as u32) {
+                with_view(|v| v.type_char(c));
+            }
         }
         WM_ACTIVATE if (wparam.0 & 0xFFFF) as u32 == WA_INACTIVE => {
             after = Some(Box::new(close));

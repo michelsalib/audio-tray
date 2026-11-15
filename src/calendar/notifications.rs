@@ -1,6 +1,7 @@
 //! Windows' notifications, read through the documented notification listener (allowed for
-//! unpackaged apps on Windows 11): all of them for the calendar's notification centre, and how many
-//! for the clock, with opening one's app, dismissing one, an app's, or all.
+//! unpackaged apps on Windows 11), with their pictures and buttons from Windows' store
+//! ([`super::rich`]): all of them for the calendar's notification centre, and how many for the
+//! clock, with opening one's app, dismissing one, an app's, or all.
 //!
 //! A thread of its own (the listener's calls block on async operations, which an STA must not do).
 //! It reads again when the listener says something changed, when the notification store changes
@@ -29,6 +30,8 @@ pub struct Toast {
     pub at: i64,
     /// The app's logo (an image file's bytes), when it has one.
     pub logo: Option<std::sync::Arc<Vec<u8>>>,
+    /// Its pictures, reply box and buttons, from Windows' store.
+    pub rich: super::rich::Rich,
 }
 
 /// What the reader thread is asked to do.
@@ -105,7 +108,7 @@ pub fn clear() {
     ask(Ask::Clear);
 }
 
-/// Open the app a notification came from (its own buttons belong to Windows' centre).
+/// Open the app a notification came from (for an app that takes no buttons from outside).
 pub fn open_app(aumid: &str) -> bool {
     !aumid.is_empty() && crate::win::shell_open(&format!(r"shell:AppsFolder\{aumid}"), None)
 }
@@ -189,6 +192,7 @@ fn read(listener: &UserNotificationListener) -> anyhow::Result<Vec<Toast>> {
     let generic: HSTRING = KnownNotificationBindings::ToastGeneric()?;
     let now = super::time::now();
     let mut toasts = Vec::new();
+    let mut infos = Vec::new();
     for n in all {
         let notification = n.Notification().ok();
         // One past its expiry has left Windows' centre, whatever the listener still holds.
@@ -211,15 +215,21 @@ fn read(listener: &UserNotificationListener) -> anyhow::Result<Vec<Toast>> {
             .unwrap_or_default();
         let at = n.CreationTime().map_or(0, |t| t.UniversalTime / 10_000_000 - 11_644_473_600);
         let logo = logo_of(&aumid, info.as_ref());
+        let id = n.Id().unwrap_or_default();
+        infos.push((id, aumid.clone(), info));
         toasts.push(Toast {
-            id: n.Id().unwrap_or_default(),
+            id,
             app,
             aumid,
             title: texts.first().cloned().unwrap_or_default(),
             body: texts.get(1..).map(|rest| rest.join(" ")).unwrap_or_default(),
             at,
             logo,
+            rich: Default::default(),
         });
+    }
+    for (toast, rich) in toasts.iter_mut().zip(super::rich::for_toasts(&infos)) {
+        toast.rich = rich;
     }
     toasts.sort_by_key(|t| std::cmp::Reverse(t.at));
     Ok(toasts)
@@ -304,7 +314,7 @@ mod tests {
     use super::*;
 
     fn toast(id: u32, app: &str, at: i64) -> Toast {
-        Toast { id, app: app.into(), aumid: format!("{app}.id"), title: String::new(), body: String::new(), at, logo: None }
+        Toast { id, app: app.into(), aumid: format!("{app}.id"), title: String::new(), body: String::new(), at, logo: None, rich: Default::default() }
     }
 
     #[test]

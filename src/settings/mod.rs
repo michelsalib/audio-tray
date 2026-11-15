@@ -469,7 +469,6 @@ impl Window {
                     Toggle::ClockWeekday => &mut c.clock.weekday,
                     Toggle::ClockOneLine => &mut c.clock.one_line,
                     Toggle::ClockHideDate => &mut c.clock.hide_date,
-                    Toggle::ClockNextMeeting => &mut c.clock.next_meeting,
                     Toggle::ClockUnread => &mut c.clock.unread,
                     Toggle::WeekNumbers => &mut c.calendar.week_numbers,
                     Toggle::WorldClocks => &mut c.calendar.world_clocks,

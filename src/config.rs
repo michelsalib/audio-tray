@@ -141,8 +141,6 @@ pub struct Clock {
     pub time_pattern: String,
     /// Your own `GetDateFormatEx` pattern (`ddd d MMM`); empty: none.
     pub date_pattern: String,
-    /// The next event's countdown after the time, from 30 minutes before.
-    pub next_meeting: bool,
     /// Windows' unread notifications, counted after the date.
     pub unread: bool,
 }
@@ -156,7 +154,6 @@ impl Default for Clock {
             hide_date: false,
             time_pattern: String::new(),
             date_pattern: String::new(),
-            next_meeting: true,
             unread: true,
         }
     }

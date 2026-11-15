@@ -7,7 +7,7 @@ use windows::core::{w, PCWSTR};
 use windows::Win32::Graphics::Direct2D::Common::{D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT, D2D_RECT_F, D2D_SIZE_U};
 use windows::Win32::Graphics::Direct2D::{
     D2D1CreateFactory, ID2D1Bitmap, ID2D1Factory, ID2D1RenderTarget, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, D2D1_BITMAP_PROPERTIES, ID2D1SolidColorBrush, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
-    D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_ELLIPSE, D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_RENDER_TARGET_PROPERTIES,
+    D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_RENDER_TARGET_PROPERTIES,
     D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1_ROUNDED_RECT, D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE,
 };
 use windows::Win32::Graphics::DirectWrite::{
@@ -25,7 +25,7 @@ use windows::Win32::Graphics::Imaging::{
 use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
 use windows_numerics::Vector2;
 
-use super::layout::R;
+use super::scene::R;
 
 /// An sRGB colour with straight alpha.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -51,15 +51,12 @@ pub struct Palette {
     pub bg: Color,
     /// A raised surface (a notification, the event's card).
     pub raised: Color,
-    pub rule: Color,
     pub text: Color,
     pub text2: Color,
     pub text3: Color,
     pub hover: Color,
-    pub pressed: Color,
     pub accent: Color,
     pub on_accent: Color,
-    pub warn: Color,
 }
 
 impl Palette {
@@ -71,50 +68,49 @@ impl Palette {
             Palette {
                 bg: Color::hex(0xEEEEEE, 0.86),
                 raised: Color::hex(0xFFFFFF, 0.7),
-                rule: Color::hex(0x000000, 0.08),
                 text: Color::hex(0x000000, 0.896),
                 text2: Color::hex(0x000000, 0.606),
                 text3: Color::hex(0x000000, 0.361),
                 hover: Color::hex(0x000000, 0.045),
-                pressed: Color::hex(0x000000, 0.03),
                 accent: Color::rgb(crate::flyout::theme::accent_shade(4).unwrap_or([0x00, 0x5F, 0xB8])),
                 on_accent: Color::hex(0xFFFFFF, 1.0),
-                warn: Color::hex(0x9D5D00, 1.0),
             }
         } else {
             let [r, g, b] = crate::flyout::theme::TINT;
             Palette {
                 bg: Color::rgb([r, g, b]).alpha(crate::flyout::theme::TINT_A),
                 raised: Color::hex(0xFFFFFF, 0.05),
-                rule: Color::hex(0x000000, 0.3),
                 text: Color::hex(0xFFFFFF, 1.0),
                 text2: Color::hex(0xFFFFFF, 0.786),
                 text3: Color::hex(0xFFFFFF, 0.362),
                 hover: Color::hex(0xFFFFFF, 0.061),
-                pressed: Color::hex(0xFFFFFF, 0.042),
                 accent: Color::rgb(crate::flyout::theme::accent_rgb()),
                 on_accent: Color::hex(0x000000, 1.0),
-                warn: Color::hex(0xF7B32B, 1.0),
             }
         }
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Font {
-    /// The day's date at the top.
-    Header,
     Body,
     Strong,
     Caption,
     CaptionStrong,
     Icon,
     IconSmall,
-    /// Wrapping body text, from the top (an event's notes).
-    Paragraph,
+    /// The day's date (22, semibold).
+    Big,
+    /// An event's title in its details (18, semibold).
+    Title,
+    /// Small labels (11), and their emphasis.
+    Tiny,
+    TinyStrong,
+    /// Wrapping text from the top (a notification's body, an event's notes).
+    Wrap,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Align {
     Left,
     Center,
@@ -144,14 +140,17 @@ impl Gfx {
             let text = w!("Segoe UI Variable Text");
             let icons = w!("Segoe Fluent Icons");
             gfx.formats = vec![
-                gfx.format(text, DWRITE_FONT_WEIGHT_NORMAL, 15.0, false)?,
                 gfx.format(text, DWRITE_FONT_WEIGHT_NORMAL, 14.0, false)?,
                 gfx.format(text, DWRITE_FONT_WEIGHT_SEMI_BOLD, 14.0, false)?,
                 gfx.format(text, DWRITE_FONT_WEIGHT_NORMAL, 12.0, false)?,
                 gfx.format(text, DWRITE_FONT_WEIGHT_SEMI_BOLD, 12.0, false)?,
                 gfx.format(icons, DWRITE_FONT_WEIGHT_NORMAL, 16.0, false)?,
                 gfx.format(icons, DWRITE_FONT_WEIGHT_NORMAL, 10.0, false)?,
-                gfx.format(text, DWRITE_FONT_WEIGHT_NORMAL, 12.5, true)?,
+                gfx.format(text, DWRITE_FONT_WEIGHT_SEMI_BOLD, 22.0, false)?,
+                gfx.format(text, DWRITE_FONT_WEIGHT_SEMI_BOLD, 18.0, false)?,
+                gfx.format(text, DWRITE_FONT_WEIGHT_NORMAL, 11.0, false)?,
+                gfx.format(text, DWRITE_FONT_WEIGHT_SEMI_BOLD, 11.0, false)?,
+                gfx.format(text, DWRITE_FONT_WEIGHT_NORMAL, 13.0, true)?,
             ];
             Ok(gfx)
         }
@@ -246,20 +245,6 @@ impl Pen<'_> {
             let inner = R::new(r.x + half, r.y + half, r.w - width, r.h - width);
             let rounded = D2D1_ROUNDED_RECT { rect: rect(inner), radiusX: radius, radiusY: radius };
             unsafe { self.target.DrawRoundedRectangle(&rounded, &brush, width, None) };
-        }
-    }
-
-    pub fn circle(&self, (cx, cy): (f32, f32), radius: f32, c: Color) {
-        if let Some(brush) = self.brush(c) {
-            let e = D2D1_ELLIPSE { point: Vector2 { X: cx, Y: cy }, radiusX: radius, radiusY: radius };
-            unsafe { self.target.FillEllipse(&e, &brush) };
-        }
-    }
-
-    pub fn ring(&self, (cx, cy): (f32, f32), radius: f32, width: f32, c: Color) {
-        if let Some(brush) = self.brush(c) {
-            let e = D2D1_ELLIPSE { point: Vector2 { X: cx, Y: cy }, radiusX: radius - width / 2.0, radiusY: radius - width / 2.0 };
-            unsafe { self.target.DrawEllipse(&e, &brush, width, None) };
         }
     }
 

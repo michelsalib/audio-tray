@@ -27,9 +27,8 @@ format, formatting the time with the locale's patterns:
 
 - seconds, the day of the week, one line, or no date (`time_pattern` and `date_pattern` under
   `[clock]` in config.toml take your own `GetTimeFormatEx`/`GetDateFormatEx` patterns);
-- the next meeting after the time, from 30 minutes before (`Stand-up in 12 min`, then `now`), or
-  the focus time left;
-- the unread notifications after the date (`🔔 3`).
+- the focus time left after the time, while a focus timer runs (meetings stay off the clock);
+- an accent-coloured dot and the unread count before the time.
 
 Once it has written the clock, the TAP keeps it ticking for the rest of Explorer's life, going back
 to the locale's own format when Audio Tray quits: the shell might not take its clock back on its
@@ -47,7 +46,7 @@ own.
 ## Calendars
 
 Once fetched, every calendar is listed in Settings with a switch to hide it and colours to pick
-from (its own first). Hidden calendars send no reminders and no countdown.
+from (its own first). Hidden calendars send no reminders.
 
 ## Sources
 

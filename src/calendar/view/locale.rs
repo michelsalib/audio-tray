@@ -73,6 +73,16 @@ pub fn weekday_names() -> [String; 7] {
     })
 }
 
+/// The day in a pattern of `GetDateFormatEx`'s ("dddd", "d MMMM").
+pub fn format(day: i32, pattern: &str) -> String {
+    let st = system_time(day, 0);
+    let wide: Vec<u16> = pattern.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut buf = [0u16; 128];
+    let flags = windows::Win32::Globalization::ENUM_DATE_FORMATS_FLAGS(0);
+    let n = unsafe { GetDateFormatEx(PCWSTR::null(), flags, Some(&st), PCWSTR(wide.as_ptr()), Some(&mut buf), PCWSTR::null()) };
+    String::from_utf16_lossy(&buf[..(n.max(1) - 1) as usize])
+}
+
 #[cfg(test)]
 mod tests {
     use super::without_year;

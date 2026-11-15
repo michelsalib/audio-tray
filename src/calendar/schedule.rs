@@ -15,16 +15,10 @@ use super::time;
 use crate::config::Config;
 use crate::taskbar::ClockText;
 
-/// How long before an event the clock starts counting down to it.
-const COUNTDOWN_FROM: i64 = 30 * 60;
-/// How long the clock says "now" once it has started.
-const NOW_FOR: i64 = 5 * 60;
 /// How often events are fetched in the background, for reminders and the clock.
 const REFRESH_EVERY: i64 = 15 * 60;
 /// Events longer than this are not meetings (an all-morning block, a trip).
 const MEETING_MAX: i64 = 4 * 3600;
-/// The clock's countdown keeps a title this short.
-const TITLE_MAX: usize = 22;
 
 #[derive(Default)]
 struct State {
@@ -56,36 +50,10 @@ fn span(event: &Event) -> Option<(i64, i64)> {
     }
 }
 
-/// The text after the time: the focus time left, else the next meeting's countdown.
-fn countdown(events: &[Event], now: i64, focus: Option<(i64, u32)>) -> String {
-    if let Some((end, _)) = focus {
-        let left = ((end - now) + 59) / 60;
-        return format!("Focus {left} min");
-    }
-    let next = events
-        .iter()
-        .filter_map(|e| span(e).map(|(start, _)| (start, e)))
-        .filter(|(start, _)| *start + NOW_FOR > now && *start - COUNTDOWN_FROM <= now)
-        .min_by_key(|(start, _)| *start);
-    match next {
-        Some((start, event)) => {
-            let title = short(&event.title);
-            if start <= now {
-                format!("{title} now")
-            } else {
-                format!("{title} in {} min", (start - now + 59) / 60)
-            }
-        }
-        None => String::new(),
-    }
-}
-
-fn short(title: &str) -> String {
-    if title.chars().count() <= TITLE_MAX {
-        return title.to_string();
-    }
-    let cut: String = title.chars().take(TITLE_MAX - 1).collect();
-    format!("{}…", cut.trim_end())
+/// The text after the time: the focus time left, if a focus timer runs. Meetings stay off the
+/// clock: the time is the time.
+fn focus_left(now: i64, end: i64) -> String {
+    format!("Focus {} min", ((end - now) + 59) / 60)
 }
 
 /// The clock's time and date patterns, from the `[clock]` settings and the locale's own formats.
@@ -193,7 +161,7 @@ pub fn tick(config: &Config) -> Duration {
             None => focus::stop(Why::Quiet),
         }
         for (start, end) in events.iter().filter_map(span) {
-            for at in [start, end, start - COUNTDOWN_FROM] {
+            for at in [start, end] {
                 if at > now {
                     next = next.min(at);
                 }
@@ -201,7 +169,7 @@ pub fn tick(config: &Config) -> Duration {
         }
 
         // The clock.
-        let top = if config.calendar.enabled && config.clock.next_meeting || s.focus.is_some() { countdown(&events, now, s.focus.map(|(end, minutes, _)| (end, minutes))) } else { String::new() };
+        let top = s.focus.map_or_else(String::new, |(end, _, _)| focus_left(now, end));
         let unread = if config.calendar.enabled && config.clock.unread { super::notifications::count() } else { 0 };
         if !top.is_empty() {
             // The countdown moves with the minute.
@@ -255,32 +223,12 @@ pub fn focus_end() -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::calendar::model::{Details, Source};
-
-    fn event(title: &str, start: i64, end: i64) -> Event {
-        Event {
-            when: When::At { start, end },
-            title: title.into(),
-            location: String::new(),
-            link: None,
-            join: None,
-            source: Source::Google,
-            color: [0; 3],
-            calendar: "google:me".into(),
-            details: Details::default(),
-        }
-    }
 
     #[test]
-    fn the_clock_counts_down_to_the_next_meeting_then_says_now() {
+    fn the_focus_time_left_rounds_up_to_the_minute() {
         let now = 1_000_000;
-        let events = vec![event("A very long meeting title indeed", now + 12 * 60 + 5, now + 3600), event("Later", now + 3 * 3600, now + 4 * 3600)];
-        assert_eq!(countdown(&events, now, None), "A very long meeting t… in 13 min");
-        assert_eq!(countdown(&events, now + 13 * 60, None), "A very long meeting t… now");
-        assert_eq!(countdown(&events, now + 20 * 60, None), "", "past its first minutes");
-        assert_eq!(countdown(&events, now, Some((now + 18 * 60, 25))), "Focus 18 min");
-        // An all-day-sized block is not a meeting.
-        assert_eq!(countdown(&[event("Off", now + 60, now + 9 * 3600)], now, None), "");
+        assert_eq!(focus_left(now, now + 18 * 60), "Focus 18 min");
+        assert_eq!(focus_left(now, now + 17 * 60 + 1), "Focus 18 min");
     }
 
     #[test]

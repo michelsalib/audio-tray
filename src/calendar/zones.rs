@@ -96,27 +96,3 @@ pub fn edit() {
     crate::win::shell_open("control.exe", Some("timedate.cpl,,1"));
 }
 
-/// "+6 h", "−5 h 30", "same time".
-pub fn offset_words(offset: i64) -> String {
-    let minutes = (offset / 60).abs();
-    if minutes == 0 {
-        return "same time".into();
-    }
-    let sign = if offset < 0 { "−" } else { "+" };
-    match minutes % 60 {
-        0 => format!("{sign}{} h", minutes / 60),
-        m => format!("{sign}{} h {m:02}", minutes / 60),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::offset_words;
-
-    #[test]
-    fn offsets_read_in_hours_and_minutes() {
-        assert_eq!(offset_words(-6 * 3600), "−6 h");
-        assert_eq!(offset_words(5 * 3600 + 1800), "+5 h 30");
-        assert_eq!(offset_words(0), "same time");
-    }
-}

@@ -93,23 +93,6 @@ pub fn on_day<'a>(events: &'a [Event], day: i32, zone: &dyn Zone) -> Vec<&'a Eve
     list
 }
 
-/// The colours of up to three events on each of `count` days from `first`, for the month grid's dots.
-pub fn dots(events: &[Event], first: i32, count: usize, zone: &dyn Zone) -> Vec<Vec<[u8; 3]>> {
-    let mut out = vec![Vec::new(); count];
-    let mut sorted: Vec<&Event> = events.iter().collect();
-    sorted.sort_by_key(|e| e.order());
-    for event in sorted {
-        let (a, b) = event.days(zone);
-        for day in a.max(first)..=b.min(first + count as i32 - 1) {
-            let slot = &mut out[(day - first) as usize];
-            if slot.len() < 3 && !slot.contains(&event.color) {
-                slot.push(event.color);
-            }
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -152,9 +135,5 @@ mod tests {
         assert_eq!(list[0].title, "Trip");
         assert_eq!(list[1].title, "8h");
         assert!(trip.on_day(day + 2, &zone) && !trip.on_day(day + 3, &zone));
-        let dots = dots(&events, day - 1, 5, &zone);
-        assert_eq!(dots[0].len(), 0);
-        assert_eq!(dots[1], vec![[1, 2, 3]]);
-        assert_eq!(dots[3].len(), 1);
     }
 }

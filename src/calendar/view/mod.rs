@@ -1,17 +1,18 @@
-//! The calendar flyout: Windows' notifications, the day's date and world clocks, a month grid
-//! with a dot per day that has events, the selected day's agenda (or one event's details), and the
-//! focus timer. It opens over the clock's corner, on whichever edge the taskbar is, slides in like
-//! the shell's own flyouts, and closes on a click elsewhere, Escape, or losing the foreground.
+//! The panel: two cards over the clock's corner, the notification centre above the calendar
+//! ([`scene`]). Each card is a per-pixel-alpha layered window over Windows' acrylic, so each has
+//! its own rounded corners and the gap between them is real; both are drawn as one scene off
+//! screen with Direct2D ([`paint`]) and presented whole on every change (no `WM_PAINT`). The
+//! calendar's window holds the mouse capture and takes the input for both.
 //!
-//! A per-pixel-alpha layered window over Windows' acrylic, drawn off screen with Direct2D
-//! ([`paint`]) and presented whole on every change: no `WM_PAINT`.
+//! It opens from whichever screen edge the taskbar is on, slides in like the shell's own flyouts,
+//! and closes on a click elsewhere, Escape, or losing the foreground.
 //!
 //! **Re-entrancy.** Opening a link or Settings can pump messages: that work runs after the view's
 //! state is released ([`After`]).
 
-mod layout;
 mod locale;
 mod paint;
+mod scene;
 
 use std::cell::{Cell, RefCell};
 use std::time::{Duration, Instant};
@@ -24,31 +25,30 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetCapture, ReleaseCapture, SetCapture, VIRTUAL_KEY, VK_DOWN, VK_ESCAPE, VK_HOME, VK_LEFT, VK_NEXT, VK_PRIOR, VK_RIGHT, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    DefWindowProcW, DestroyWindow, GetCursorPos, ShowWindow, SW_SHOWNA, WA_INACTIVE, WHEEL_DELTA, WINDOW_EX_STYLE, WM_ACTIVATE,
+    DefWindowProcW, DestroyWindow, GetCursorPos, ShowWindow, SW_HIDE, SW_SHOWNA, WA_INACTIVE, WHEEL_DELTA, WINDOW_EX_STYLE, WM_ACTIVATE,
     WM_CAPTURECHANGED, WM_DESTROY, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN,
     WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
 };
 
-use super::model::{self, Event, When};
+use super::model::{self, Event, Source, When};
 use super::notifications::Toast;
-use super::time::{self, Local, Zone};
+use super::time::{self, Local, Zone, DAY};
 use super::zones::WorldClock;
 use super::Setup;
-use crate::config::{CalendarLayout, Config};
-use layout::{Hit, Layout, Shape, Showing, R};
-use paint::{Align, Color, Font, Gfx, Palette, Pen};
+use crate::config::Config;
+use paint::{Color, Gfx, Palette, Pen};
+use scene::{Draw, Fill, Hit, Ink, Scene, R};
 
 const CLASS: PCWSTR = w!("AudioTrayCalendar");
-/// A click on the clock right after the calendar closed is the click that closed it.
+const CLASS_TOP: PCWSTR = w!("AudioTrayNotifications");
+/// A click on the clock right after the panel closed is the click that closed it.
 const SETTLE: Duration = Duration::from_millis(400);
-/// The gap between the calendar and the screen's edges, as the shell's flyouts keep.
+/// The gap between the panel and the screen's edges, as the shell's flyouts keep.
 const MARGIN: f32 = 12.0;
-/// How far a wheel notch scrolls the agenda.
+/// How far a wheel notch scrolls a list.
 const SCROLL_STEP: f32 = 48.0;
-/// The focus timer's steps and bounds, in minutes.
-const FOCUS_STEP: u32 = 5;
-const FOCUS_MIN: u32 = 5;
-const FOCUS_MAX: u32 = 240;
+/// How far ahead the next event is looked for.
+const AHEAD: i64 = 7 * DAY;
 
 thread_local! {
     static VIEW: RefCell<Option<View>> = const { RefCell::new(None) };
@@ -58,7 +58,7 @@ thread_local! {
     static CLOSING: Cell<bool> = const { Cell::new(false) };
 }
 
-/// The screen edge the taskbar is on, where the calendar opens from.
+/// The screen edge the taskbar is on, where the panel opens from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Edge {
     Bottom,
@@ -68,47 +68,49 @@ enum Edge {
 }
 
 struct View {
+    /// The calendar's window (input, capture) and the notification centre's.
     hwnd: HWND,
+    top_hwnd: HWND,
     gfx: RefCell<Gfx>,
     palette: Palette,
     scale: f32,
     edge: Edge,
     /// The work area it sits in, in pixels.
     work: RECT,
-    shape: Shape,
-    layout: Layout,
-    /// Where it sits, and its size, in pixels.
-    pos: (i32, i32),
-    size: (i32, i32),
+    scene: Scene,
+    /// The scene's top-left on screen, in pixels.
+    origin: (i32, i32),
     config: Config,
     setup: Setup,
     has_sources: bool,
     today: i32,
     month: (i32, u32),
     selected: i32,
+    month_open: bool,
     first_weekday: u32,
     /// Short day names, Monday first.
     weekdays: [String; 7],
     /// The shown calendars' events, in their chosen colours.
     events: Vec<Event>,
-    /// The selected day's events.
-    agenda: Vec<Event>,
-    /// The agenda row whose details are open.
-    detail: Option<usize>,
-    scroll: f32,
+    /// What the hero and the list show, to open on a click.
+    hero: Option<Event>,
+    rows: Vec<Event>,
+    detail: Option<Event>,
+    toasts: Vec<Toast>,
+    /// Apps whose notifications are open (`None`: the newest app's), and shown in full.
+    open_groups: Option<Vec<String>>,
+    full_groups: Vec<String>,
+    clocks: Vec<WorldClock>,
+    center_scroll: f32,
+    list_scroll: f32,
     hover: Option<Hit>,
     pressed: Option<Hit>,
-    toasts: Vec<Toast>,
-    /// How far the notification centre's list is scrolled.
-    center_scroll: f32,
-    clocks: Vec<WorldClock>,
-    focus_minutes: u32,
 }
 
 /// Work to do once the view's state is released: it may pump messages.
 type After = Box<dyn FnOnce()>;
 
-/// Open the calendar, or close it if it is open.
+/// Open the panel, or close it if it is open.
 pub fn toggle(config: &Config) {
     if OPEN.with(Cell::get) != 0 {
         close();
@@ -127,9 +129,14 @@ pub fn close() {
     if open == 0 || CLOSING.with(|c| c.replace(true)) {
         return;
     }
-    let hwnd = HWND(open as *mut _);
-    with_view(|v| v.animate(crate::win::Flyout::Close));
-    let _ = unsafe { DestroyWindow(hwnd) };
+    let top = with_view(|v| {
+        v.animate(crate::win::Flyout::Close);
+        v.top_hwnd
+    });
+    let _ = unsafe { DestroyWindow(HWND(open as *mut _)) };
+    if let Some(top) = top {
+        let _ = unsafe { DestroyWindow(top) };
+    }
     CLOSING.with(|c| c.set(false));
 }
 
@@ -139,6 +146,7 @@ pub fn refresh() {
         v.reload();
         v.relayout();
     });
+    keep_rect();
 }
 
 fn with_view<R>(f: impl FnOnce(&mut View) -> R) -> Option<R> {
@@ -167,50 +175,53 @@ fn edge_of(rect: &RECT, work: &RECT) -> Edge {
     }
 }
 
-fn empty_shape() -> Shape {
-    Shape { rows: 0, weeks: false, compact: false, agenda_only: false, center: 0.0, clocks: 0 }
-}
-
 fn create(config: &Config) -> Result<()> {
     let mut cursor = POINT::default();
     let _ = unsafe { GetCursorPos(&mut cursor) };
     let (scale, rect, work) = monitor(cursor);
     let style = WINDOW_EX_STYLE(WS_EX_LAYERED.0 | WS_EX_TOOLWINDOW.0 | WS_EX_TOPMOST.0);
     let hwnd = crate::win::create_popup(CLASS, w!("Calendar"), Some(wndproc), style, (0, 0, 1, 1)).context("CreateWindowExW")?;
-    unsafe { crate::layered::style_panel(hwnd, crate::layered::CORNER_ROUND) };
+    let top_hwnd = crate::win::create_popup(CLASS_TOP, w!("Notifications"), Some(top_proc), style, (0, 0, 1, 1)).context("CreateWindowExW")?;
+    unsafe {
+        crate::layered::style_panel(hwnd, crate::layered::CORNER_ROUND);
+        crate::layered::style_panel(top_hwnd, crate::layered::CORNER_ROUND);
+    }
     let today = time::today();
     let (ty, tm, _) = time::civil_from_days(today);
     let setup = config.calendar.setup();
     let first_weekday = config.calendar.first_weekday.map_or_else(locale::first_weekday, |d| d.min(6) as u32);
+    let empty = scene::build(&empty_input());
     let mut view = View {
         hwnd,
+        top_hwnd,
         gfx: RefCell::new(Gfx::new()?),
         palette: Palette::current(),
         scale,
         edge: edge_of(&rect, &work),
         work,
-        shape: empty_shape(),
-        layout: layout::layout(empty_shape()),
-        pos: (0, 0),
-        size: (1, 1),
+        scene: empty,
+        origin: (0, 0),
         has_sources: super::has_sources(&setup),
         setup,
         config: config.clone(),
         today,
         month: (ty, tm),
         selected: today,
+        month_open: false,
         first_weekday,
         weekdays: locale::weekday_names(),
         events: Vec::new(),
-        agenda: Vec::new(),
+        hero: None,
+        rows: Vec::new(),
         detail: None,
-        scroll: 0.0,
+        toasts: Vec::new(),
+        open_groups: None,
+        full_groups: Vec::new(),
+        clocks: Vec::new(),
+        center_scroll: 0.0,
+        list_scroll: 0.0,
         hover: None,
         pressed: None,
-        toasts: Vec::new(),
-        center_scroll: 0.0,
-        clocks: Vec::new(),
-        focus_minutes: config.calendar.focus_minutes.clamp(FOCUS_MIN, FOCUS_MAX),
     };
     super::notifications::set_watching(true);
     view.reload();
@@ -219,10 +230,15 @@ fn create(config: &Config) -> Result<()> {
     view.draw_frame();
     VIEW.with(|cell| *cell.borrow_mut() = Some(view));
     OPEN.with(|o| o.set(hwnd.0 as isize));
-    unsafe {
-        let _ = ShowWindow(hwnd, SW_SHOWNA);
-    }
-    with_view(|v| v.animate(crate::win::Flyout::Open));
+    with_view(|v| {
+        unsafe {
+            let _ = ShowWindow(v.hwnd, SW_SHOWNA);
+            if v.scene.top.is_some() {
+                let _ = ShowWindow(v.top_hwnd, SW_SHOWNA);
+            }
+        }
+        v.animate(crate::win::Flyout::Open);
+    });
     // The click that opened it was swallowed by our hook, so Windows has not lent us the
     // foreground: without it there are no keys (Escape) and no deactivation to close on.
     if crate::music::player::raise(hwnd) == crate::music::player::Raise::Refused {
@@ -237,15 +253,49 @@ fn create(config: &Config) -> Result<()> {
     Ok(())
 }
 
-/// Tell the mouse hook where the calendar is: a click outside it closes it.
+/// What the scene is built from before anything is read (never shown).
+fn empty_input() -> scene::Input {
+    scene::Input {
+        room: 0.0,
+        groups: None,
+        unread: 0,
+        quiet: false,
+        center_scroll: 0.0,
+        weekday: String::new(),
+        date: String::new(),
+        clocks: String::new(),
+        month_open: false,
+        month_title: String::new(),
+        heads: Default::default(),
+        days: Vec::new(),
+        hero: None,
+        list_title: String::new(),
+        rows: Vec::new(),
+        empty: String::new(),
+        list_scroll: 0.0,
+        focus_label: String::new(),
+        focus_running: false,
+        detail: None,
+        hover: None,
+    }
+}
+
+/// Tell the mouse hook where the panel is: a click outside it closes it.
 fn keep_rect() {
-    let rect = with_view(|v| RECT { left: v.pos.0, top: v.pos.1, right: v.pos.0 + v.size.0, bottom: v.pos.1 + v.size.1 });
+    let rect = with_view(|v| {
+        let (x, y) = v.origin;
+        RECT { left: x, top: y, right: x + v.px(scene::W), bottom: y + v.px(v.scene.h) }
+    });
     *super::OPEN_RECT.lock().unwrap_or_else(|e| e.into_inner()) = rect;
 }
 
 impl View {
-    /// Take the cache's events (shown calendars, chosen colours), the selected day's, Windows'
-    /// notifications and the world clocks.
+    fn px(&self, dip: f32) -> i32 {
+        (dip * self.scale).round() as i32
+    }
+
+    /// Take the cache's events (shown calendars, chosen colours), Windows' notifications and the
+    /// world clocks.
     fn reload(&mut self) {
         let calendar = &self.config.calendar;
         self.events = super::events()
@@ -259,10 +309,6 @@ impl View {
                 e
             })
             .collect();
-        self.agenda = model::on_day(&self.events, self.selected, &Local).into_iter().cloned().collect();
-        if self.detail.is_some_and(|i| i >= self.agenda.len()) {
-            self.detail = None;
-        }
         self.toasts = if calendar.notifications { super::notifications::list() } else { Vec::new() };
         self.clocks = if calendar.world_clocks { super::zones::clocks() } else { Vec::new() };
     }
@@ -273,69 +319,192 @@ impl View {
         }
     }
 
-    /// Lay out for what there is now, and put the window in its corner.
-    fn place(&mut self) {
-        let calendar = &self.config.calendar;
-        let mut shape = Shape {
-            rows: (calendar.rows as usize).clamp(layout::ROWS_MIN, 12),
-            weeks: calendar.week_numbers,
-            compact: calendar.layout == CalendarLayout::Compact,
-            agenda_only: calendar.layout == CalendarLayout::AgendaOnly,
-            center: 0.0,
-            clocks: self.clocks.len(),
+    /// The first day of the week holding `day`.
+    fn week_start(&self, day: i32) -> i32 {
+        day - ((time::weekday(day) + 7 - self.first_weekday) % 7) as i32
+    }
+
+    /// What the scene shows now; keeps the hero's and the rows' events to open on a click.
+    fn input(&mut self) -> scene::Input {
+        let now = time::now();
+        let zone = Local;
+        let today = self.today;
+
+        // Notifications, by app; the newest app's open unless the user chose.
+        let groups = (!self.toasts.is_empty()).then(|| {
+            super::notifications::grouped(&self.toasts)
+                .into_iter()
+                .enumerate()
+                .map(|(g, (key, list))| {
+                    let open = match &self.open_groups {
+                        Some(open) => open.contains(&key),
+                        None => g == 0,
+                    };
+                    scene::Group {
+                        name: list.first().map_or_else(String::new, |t| t.app.clone()),
+                        logo: list.first().and_then(|t| t.logo.clone().map(|l| (t.aumid.clone(), l))),
+                        toasts: list
+                            .iter()
+                            .map(|t| scene::Toast {
+                                index: self.toasts.iter().position(|x| x.id == t.id).unwrap_or(0),
+                                title: if t.title.is_empty() { t.app.clone() } else { t.title.clone() },
+                                body: t.body.clone(),
+                            })
+                            .collect(),
+                        when: list.first().map_or_else(String::new, |t| arrived(t.at)),
+                        all: self.full_groups.contains(&key),
+                        open,
+                    }
+                })
+                .collect()
+        });
+
+        // The week of the selected day, or the month shown.
+        let days: Vec<i32> = if self.month_open {
+            let start = self.week_start(time::days_from_civil(self.month.0, self.month.1, 1));
+            (0..42).map(|i| start + i).collect()
+        } else {
+            let start = self.week_start(self.selected);
+            (0..7).map(|i| start + i).collect()
         };
-        let room = (self.work.bottom - self.work.top) as f32 / self.scale - 2.0 * MARGIN;
-        let most = shape.rows;
-        let fit = |shape: Shape| layout::rows_for(Shape { rows: most, ..shape }, room);
-        // The notification centre takes the height the calendar leaves, and scrolls. To leave it
-        // at least a notification and a half, the calendar gives up agenda rows down to two, then
-        // the world clocks; never the month.
-        if calendar.notifications {
-            let wanted = center_height(&self.toasts).min(layout::CENTER_MAX);
-            let enough = wanted.min(layout::GROUP_H + 1.5 * layout::TOAST_H);
-            let header = 41.0;
-            let steps = [
-                Shape { rows: most.min(3), ..shape },
-                Shape { rows: layout::ROWS_MIN, ..shape },
-                Shape { rows: layout::ROWS_MIN, clocks: 0, ..shape },
-            ];
-            let spare = |s: Shape| room - layout::layout(s).h - header;
-            let chosen = steps.iter().copied().find(|s| spare(*s) >= enough).unwrap_or(steps[2]);
-            shape = chosen;
-            shape.center = wanted.min(spare(chosen));
-            if shape.center < layout::EMPTY_H {
-                shape.center = 0.0;
-            }
+        let busy = |day: i32| self.events.iter().filter(|e| e.on_day(day, &zone)).count().min(2) as u8;
+        let cells = days
+            .iter()
+            .map(|&day| {
+                let (_, m, d) = time::civil_from_days(day);
+                scene::DayCell {
+                    day,
+                    label: d.to_string(),
+                    today: day == today,
+                    selected: day == self.selected,
+                    dim: self.month_open && m != self.month.1,
+                    busy: busy(day),
+                }
+            })
+            .collect();
+
+        // The next event (from today), then the rest of its week; or the picked day.
+        let mut hero = None;
+        let rows: Vec<Event>;
+        let list_title;
+        let empty;
+        if self.selected == today {
+            let mut ahead: Vec<&Event> = self
+                .events
+                .iter()
+                .filter(|e| match e.when {
+                    When::At { start, end } => end > now && start < now + AHEAD,
+                    When::AllDay { first, end } => end > today && first < today + 7,
+                })
+                .collect();
+            ahead.sort_by_key(|e| e.order());
+            // Timed events lead: an all-day one is rarely what comes "next".
+            let next = ahead.iter().find(|e| matches!(e.when, When::At { .. })).or(ahead.first()).copied();
+            let week_end = self.week_start(today) + 7;
+            rows = ahead
+                .iter()
+                .filter(|e| Some(**e) != next && e.days(&zone).0 < week_end)
+                .take(12)
+                .map(|e| (*e).clone())
+                .collect();
+            hero = next.cloned();
+            list_title = "Later this week".to_string();
+            empty = "Nothing else this week".to_string();
+        } else {
+            rows = model::on_day(&self.events, self.selected, &zone).into_iter().cloned().collect();
+            list_title = capitalised(&locale::day_title(self.selected));
+            empty = "No events".to_string();
         }
-        shape.rows = fit(shape);
-        if layout::layout(shape).h > room {
-            shape.clocks = 0;
-            shape.rows = fit(shape);
+        let hero_view = hero.as_ref().map(|e| scene::Hero {
+            caption: soon(e, now).to_uppercase(),
+            title: e.title.clone(),
+            when: join_parts(&[span_words(e), e.location.clone()]),
+            color: e.color,
+            joinable: e.join.is_some(),
+        });
+        let row_views = rows
+            .iter()
+            .map(|e| scene::Row {
+                left: if self.selected == today { week_label(e, today) } else { day_label(e, self.selected) },
+                title: e.title.clone(),
+                color: e.color,
+                right: if self.selected == today { String::new() } else { duration_words(e) },
+                joinable: e.join.is_some(),
+            })
+            .collect();
+        self.hero = hero;
+        self.rows = rows;
+
+        let focus = super::schedule::focus_end();
+        let focus_label = match focus {
+            Some(end) => format!("Focus · {} min left", ((end - now) + 59) / 60),
+            None => format!("Focus {} min", self.config.calendar.focus_minutes),
+        };
+        let clocks = self
+            .clocks
+            .iter()
+            .take(2)
+            .map(|c| format!("{} {}", c.name, locale::clock(time::second_of_day(c.wall))))
+            .collect::<Vec<_>>()
+            .join(" · ");
+        let detail = self.detail.as_ref().map(|e| detail_view(e, &self.setup, now, self.selected));
+
+        scene::Input {
+            room: (self.work.bottom - self.work.top) as f32 / self.scale - 2.0 * MARGIN,
+            groups,
+            unread: self.toasts.len(),
+            quiet: super::focus::active(),
+            center_scroll: self.center_scroll,
+            weekday: capitalised(&locale::format(today, "dddd")),
+            date: locale::format(today, "d MMMM"),
+            clocks,
+            month_open: self.month_open,
+            month_title: capitalised(&locale::month_title(self.month.0, self.month.1)),
+            heads: std::array::from_fn(|i| self.weekdays[(self.first_weekday as usize + i) % 7].clone()),
+            days: cells,
+            hero: hero_view,
+            list_title,
+            rows: row_views,
+            empty,
+            list_scroll: self.list_scroll,
+            focus_label,
+            focus_running: focus.is_some(),
+            detail,
+            hover: self.hover,
         }
-        self.shape = shape;
-        self.layout = layout::layout(shape);
-        let (w, h) = ((self.layout.w * self.scale).round() as i32, (self.layout.h * self.scale).round() as i32);
-        let m = (MARGIN * self.scale).round() as i32;
+    }
+
+    /// Lay out for what there is now, and put the panel in its corner.
+    fn place(&mut self) {
+        let input = self.input();
+        self.scene = scene::build(&input);
+        let (w, h) = (self.px(scene::W), self.px(self.scene.h));
+        let m = self.px(MARGIN);
         let work = self.work;
-        self.pos = match self.edge {
+        self.origin = match self.edge {
             Edge::Bottom | Edge::Right => (work.right - w - m, work.bottom - h - m),
             Edge::Top => (work.right - w - m, work.top + m),
             Edge::Left => (work.left + m, work.bottom - h - m),
         };
-        self.size = (w, h);
     }
 
-    /// Lay out again (something came or went) and show it.
+    /// Lay out again (something came, went or was picked) and show it.
     fn relayout(&mut self) {
+        let had_top = self.scene.top.is_some();
         self.place();
-        self.scroll = self.scroll.min(self.layout.max_scroll(self.agenda.len()));
+        let has_top = self.scene.top.is_some();
+        if had_top != has_top {
+            unsafe {
+                let _ = ShowWindow(self.top_hwnd, if has_top { SW_SHOWNA } else { SW_HIDE });
+            }
+        }
         self.render();
     }
 
-    /// Draw the frame off screen.
+    /// Draw the scene off screen.
     fn draw_frame(&self) {
-        let size = (self.size.0 as u32, self.size.1 as u32);
-        if let Err(e) = self.gfx.borrow_mut().frame(size, self.scale, |pen| draw(pen, self)) {
+        let size = (self.px(scene::W) as u32, self.px(self.scene.h) as u32);
+        if let Err(e) = self.gfx.borrow_mut().frame(size, self.scale, |pen| draw(pen, &self.scene, &self.palette)) {
             eprintln!("calendar: could not draw ({e:#})");
         }
     }
@@ -343,32 +512,49 @@ impl View {
     /// Draw and put on screen.
     fn render(&self) {
         self.draw_frame();
-        crate::layered::present_premultiplied(self.hwnd, &self.gfx.borrow().pixels, self.size.0, self.size.1, self.pos.0, self.pos.1, 255);
+        self.present((0, 0), 255);
+    }
+
+    /// Each card's part of the frame to its window, `offset` from its place.
+    fn present(&self, (dx, dy): (i32, i32), alpha: u8) {
+        let gfx = self.gfx.borrow();
+        let full_w = self.px(scene::W);
+        let cut = |card: R| -> (Vec<u8>, i32, i32, i32) {
+            let (y0, h) = (self.px(card.y), self.px(card.h));
+            let row = full_w as usize * 4;
+            let start = (y0.max(0) as usize * row).min(gfx.pixels.len());
+            let end = ((y0 + h).max(0) as usize * row).min(gfx.pixels.len());
+            (gfx.pixels[start..end].to_vec(), full_w, (end - start) as i32 / row.max(1) as i32, y0)
+        };
+        let (x, y) = (self.origin.0 + dx, self.origin.1 + dy);
+        let (pixels, w, h, y0) = cut(self.scene.main);
+        crate::layered::present_premultiplied(self.hwnd, &pixels, w, h, x, y + y0, alpha);
+        if let Some(top) = self.scene.top {
+            let (pixels, w, h, y0) = cut(top);
+            crate::layered::present_premultiplied(self.top_hwnd, &pixels, w, h, x, y + y0, alpha);
+        }
     }
 
     /// Slide in or out from the taskbar's edge, on the last frame drawn.
     fn animate(&self, motion: crate::win::Flyout) {
         let slide = crate::win::FLYOUT_SLIDE * self.scale;
-        let (x, y) = self.pos;
-        let gfx = self.gfx.borrow();
         motion.run(slide, |offset, alpha| {
-            let (ax, ay) = match self.edge {
-                Edge::Bottom => (x, y + offset),
-                Edge::Top => (x, y - offset),
-                Edge::Left => (x - offset, y),
-                Edge::Right => (x + offset, y),
+            let shift = match self.edge {
+                Edge::Bottom => (0, offset),
+                Edge::Top => (0, -offset),
+                Edge::Left => (-offset, 0),
+                Edge::Right => (offset, 0),
             };
-            crate::layered::present_premultiplied(self.hwnd, &gfx.pixels, self.size.0, self.size.1, ax, ay, alpha);
+            self.present(shift, alpha);
         });
     }
 
     fn select(&mut self, day: i32) {
         if day != self.selected {
-            self.scroll = 0.0;
+            self.list_scroll = 0.0;
             self.detail = None;
         }
         self.selected = day;
-        self.agenda = model::on_day(&self.events, day, &Local).into_iter().cloned().collect();
         let (y, m, _) = time::civil_from_days(day);
         if (y, m) != self.month {
             self.month = (y, m);
@@ -381,29 +567,26 @@ impl View {
         self.fetch();
     }
 
-    fn grid_start(&self) -> i32 {
-        layout::grid_start(self.month.0, self.month.1, self.first_weekday)
+    /// The scene's point under client pixel `(x, y)` of the calendar's window.
+    fn scene_point(&self, x: i32, y: i32) -> (f32, f32) {
+        (x as f32 / self.scale, y as f32 / self.scale + self.scene.main.y)
     }
 
     fn hit(&self, x: i32, y: i32) -> Option<Hit> {
-        let (x, y) = (x as f32 / self.scale, y as f32 / self.scale);
-        if let Some(area) = self.layout.center.filter(|a| a.contains(x, y)) {
-            return center_rows(&self.toasts, area, self.center_scroll).into_iter().find(|(r, _)| r.contains(x, y)).map(|(r, row)| match row {
-                Row::Group(g) => Hit::ClearApp(g),
-                Row::Toast(i) if self.layout.dismiss(r).contains(x, y) => Hit::Dismiss(i),
-                Row::Toast(i) => Hit::Toast(i),
-            });
-        }
-        let joinable = |i: usize| self.agenda.get(i).is_some_and(|e| e.join.is_some());
-        let detail = self.detail.and_then(|i| self.agenda.get(i)).map(|e| (e.join.is_some(), e.link.is_some()));
-        layout::hit(&self.layout, x, y, &Showing { scroll: self.scroll, rows: self.agenda.len(), joinable: &joinable, detail })
+        let (x, y) = self.scene_point(x, y);
+        self.scene.hit(x, y)
     }
 
     fn set_hover(&mut self, hover: Option<Hit>) {
         if self.hover != hover {
             self.hover = hover;
-            self.render();
+            self.relayout();
         }
+    }
+
+    /// The key of notification group `g`.
+    fn group_key(&self, g: usize) -> Option<String> {
+        super::notifications::grouped(&self.toasts).get(g).map(|(k, _)| k.clone())
     }
 
     /// Act on a click; what needs the state released comes back.
@@ -415,18 +598,24 @@ impl View {
             }))
         };
         match hit {
-            Hit::Today => {
-                self.today = time::today();
-                self.select(self.today);
+            Hit::Center => {
+                self.month_open = false;
+                self.detail = None;
             }
-            Hit::Prev => self.show_month(-1),
-            Hit::Next => self.show_month(1),
-            Hit::Day(i) => self.select(self.grid_start() + i as i32),
-            Hit::DayPrev => self.select(self.selected - 1),
-            Hit::DayNext => self.select(self.selected + 1),
-            Hit::Quiet => {
-                super::focus::toggle();
-                crate::tray::wake_calendar();
+            Hit::Group(g) => {
+                let key = self.group_key(g)?;
+                let groups = super::notifications::grouped(&self.toasts);
+                let mut open: Vec<String> = self.open_groups.clone().unwrap_or_else(|| groups.first().map(|(k, _)| k.clone()).into_iter().collect());
+                if open.contains(&key) {
+                    open.retain(|k| *k != key);
+                } else {
+                    open.push(key);
+                }
+                self.open_groups = Some(open);
+            }
+            Hit::More(g) => {
+                let key = self.group_key(g)?;
+                self.full_groups.push(key);
             }
             Hit::Toast(i) => {
                 let toast = self.toasts.get(i)?.clone();
@@ -436,10 +625,52 @@ impl View {
                     super::notifications::open_app(&toast.aumid);
                 }));
             }
-            Hit::ClearApp(g) => {
-                let groups = super::notifications::grouped(&self.toasts);
-                let ids: Vec<u32> = groups.get(g)?.1.iter().map(|t| t.id).collect();
-                return self.drop_toasts(ids);
+            Hit::Dismiss(i) => {
+                let id = self.toasts.get(i)?.id;
+                self.toasts.retain(|t| t.id != id);
+                super::notifications::remove(vec![id]);
+                self.hover = None;
+            }
+            Hit::ClearAll => {
+                super::notifications::clear();
+                self.toasts.clear();
+                self.hover = None;
+            }
+            Hit::Quiet => {
+                super::focus::toggle();
+                crate::tray::wake_calendar();
+            }
+            Hit::Today => {
+                self.today = time::today();
+                self.select(self.today);
+            }
+            Hit::Month => {
+                self.month_open = !self.month_open;
+                let (y, m, _) = time::civil_from_days(self.selected);
+                self.month = (y, m);
+            }
+            Hit::Prev => self.show_month(-1),
+            Hit::Next => self.show_month(1),
+            Hit::Day(day) => self.select(day),
+            Hit::Hero => self.detail = self.hero.clone(),
+            Hit::HeroJoin => return open(self.hero.as_ref()?.join.clone()?),
+            Hit::Row(i) => self.detail = self.rows.get(i).cloned(),
+            Hit::Join(i) => return open(self.rows.get(i)?.join.clone()?),
+            Hit::Back => self.detail = None,
+            Hit::DetailJoin => return open(self.detail.as_ref()?.join.clone()?),
+            Hit::DetailOpen => return open(self.detail.as_ref()?.link.clone()?),
+            Hit::Directions => {
+                let place = self.detail.as_ref()?.location.clone();
+                return open(format!("https://www.google.com/maps/search/?api=1&query={}", super::oauth::encode(&place)));
+            }
+            Hit::Focus => {
+                if super::schedule::focus_end().is_some() {
+                    super::schedule::stop_focus();
+                } else {
+                    super::schedule::start_focus(self.config.calendar.focus_minutes);
+                }
+                // The clock and the timer follow.
+                crate::tray::wake_calendar();
             }
             Hit::Settings => {
                 return Some(Box::new(|| {
@@ -453,58 +684,15 @@ impl View {
                     super::zones::edit();
                 }))
             }
-            Hit::Event(i) => {
-                if self.agenda.get(i).is_some() {
-                    self.detail = Some(i);
-                }
-            }
-            Hit::Join(i) => return open(self.agenda.get(i)?.join.clone()?),
-            Hit::Back => self.detail = None,
-            Hit::DetailJoin => return open(self.agenda.get(self.detail?)?.join.clone()?),
-            Hit::DetailOpen => return open(self.agenda.get(self.detail?)?.link.clone()?),
-            Hit::ClearAll => {
-                super::notifications::clear();
-                self.toasts.clear();
-                self.hover = None;
-                self.relayout();
-                return Some(Box::new(keep_rect));
-            }
-            Hit::Dismiss(i) => {
-                let id = self.toasts.get(i)?.id;
-                return self.drop_toasts(vec![id]);
-            }
-            Hit::FocusLess => self.focus_minutes = self.focus_minutes.saturating_sub(FOCUS_STEP).max(FOCUS_MIN),
-            Hit::FocusMore => self.focus_minutes = (self.focus_minutes + FOCUS_STEP).min(FOCUS_MAX),
-            Hit::Focus => {
-                if super::schedule::focus_end().is_some() {
-                    super::schedule::stop_focus();
-                } else {
-                    super::schedule::start_focus(self.focus_minutes);
-                }
-                // The clock and the timer follow.
-                crate::tray::wake_calendar();
-            }
         }
-        self.render();
-        None
-    }
-
-    /// Dismiss these notifications, and lay out without them.
-    fn drop_toasts(&mut self, ids: Vec<u32>) -> Option<After> {
-        self.toasts.retain(|t| !ids.contains(&t.id));
-        super::notifications::remove(ids);
-        self.hover = None;
         self.relayout();
-        let max = (center_height(&self.toasts) - self.layout.center.map_or(0.0, |c| c.h)).max(0.0);
-        self.center_scroll = self.center_scroll.min(max);
-        self.render();
         Some(Box::new(keep_rect))
     }
 
     fn key(&mut self, key: VIRTUAL_KEY) -> Option<After> {
         if key == VK_ESCAPE {
             if self.detail.take().is_some() {
-                self.render();
+                self.relayout();
                 return None;
             }
             return Some(Box::new(close));
@@ -523,61 +711,146 @@ impl View {
             _ => return None,
         };
         self.select(day);
-        self.render();
-        None
+        self.relayout();
+        Some(Box::new(keep_rect))
     }
 
     fn wheel(&mut self, delta: i32, x: i32, y: i32) {
         let notches = delta as f32 / WHEEL_DELTA as f32;
-        let (x, y) = (x as f32 / self.scale, y as f32 / self.scale);
-        if let Some(area) = self.layout.center.filter(|a| a.contains(x, y)) {
-            let max = (center_height(&self.toasts) - area.h).max(0.0);
+        let (x, y) = self.scene_point(x, y);
+        if let Some((_, max)) = self.scene.center_view.filter(|(a, _)| a.contains(x, y)) {
             self.center_scroll = (self.center_scroll - notches * SCROLL_STEP).clamp(0.0, max);
-        } else if self.layout.agenda.contains(x, y) {
-            if self.detail.is_none() {
-                let max = self.layout.max_scroll(self.agenda.len());
-                self.scroll = (self.scroll - notches * SCROLL_STEP).clamp(0.0, max);
-            }
-        } else if delta != 0 && self.layout.month.is_some_and(|m| y >= m.y && y < self.layout.rule2) {
+        } else if let Some((_, max)) = self.scene.list_view.filter(|(a, _)| a.contains(x, y)) {
+            self.list_scroll = (self.list_scroll - notches * SCROLL_STEP).clamp(0.0, max);
+        } else if self.month_open && self.scene.main.contains(x, y) && delta != 0 {
             // Over the month, as in the shell's calendar: a notch is a month.
             self.show_month(if delta > 0 { -1 } else { 1 });
+        } else {
+            return;
         }
-        self.render();
+        self.relayout();
     }
 }
 
-/// A row of the notification centre: an app's heading (by group), or a notification (by its
-/// place in the list).
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum Row {
-    Group(usize),
-    Toast(usize),
+/// "Next · in 6 h 35", "Now · until 21:03", "Next · Monday".
+fn soon(event: &Event, now: i64) -> String {
+    match event.when {
+        When::At { start, end } if start <= now => format!("Now · until {}", locale::clock(time::second_of_day(Local.to_local(end)))),
+        When::At { start, .. } => {
+            let minutes = (start - now + 59) / 60;
+            let day = time::day_of(Local.to_local(start));
+            if day == time::today() || minutes < 12 * 60 {
+                match minutes {
+                    0..=59 => format!("Next · in {minutes} min"),
+                    _ => format!("Next · in {} h {:02}", minutes / 60, minutes % 60),
+                }
+            } else {
+                format!("Next · {}", capitalised(&locale::format(day, "dddd")))
+            }
+        }
+        When::AllDay { first, .. } if first <= time::today() => "Today · all day".into(),
+        When::AllDay { first, .. } => format!("Next · {}", capitalised(&locale::format(first, "dddd"))),
+    }
 }
 
-/// The centre's rows in `area`, scrolled, each with its rectangle.
-fn center_rows(toasts: &[Toast], area: R, scroll: f32) -> Vec<(R, Row)> {
-    let mut rows = Vec::new();
-    let mut y = area.y - scroll;
-    for (g, (_, list)) in super::notifications::grouped(toasts).iter().enumerate() {
-        rows.push((R::new(area.x + 8.0, y, area.w - 16.0, layout::GROUP_H), Row::Group(g)));
-        y += layout::GROUP_H;
-        for toast in list {
-            let i = toasts.iter().position(|t| t.id == toast.id).unwrap_or(0);
-            rows.push((R::new(area.x + 8.0, y, area.w - 16.0, layout::TOAST_H), Row::Toast(i)));
-            y += layout::TOAST_H;
+/// "15:59 – 21:03", "All day".
+fn span_words(event: &Event) -> String {
+    match event.when {
+        When::AllDay { first, end } if end - first > 1 => format!("{} – {}", locale::format(first, "d MMM"), locale::format(end - 1, "d MMM")),
+        When::AllDay { .. } => "All day".into(),
+        When::At { start, end } => {
+            let (s, e) = (Local.to_local(start), Local.to_local(end));
+            let first = locale::clock(time::second_of_day(s));
+            format!("{first} – {}", locale::clock(time::second_of_day(e)))
         }
     }
-    rows
 }
 
-/// The height the centre's list wants: every heading and notification, or the line saying there
-/// are none.
-fn center_height(toasts: &[Toast]) -> f32 {
-    if toasts.is_empty() {
-        return layout::EMPTY_H;
+/// A row's day and time in the week's list: "Mon 09:15", "Tue".
+fn week_label(event: &Event, today: i32) -> String {
+    let (first, _) = event.days(&Local);
+    let day = if first <= today { "Today".to_string() } else { capitalised(&locale::format(first, "ddd")).trim_end_matches('.').to_string() };
+    match event.when {
+        When::At { start, .. } => format!("{day} {}", locale::clock(time::second_of_day(Local.to_local(start)))),
+        When::AllDay { .. } => day,
     }
-    let groups = super::notifications::grouped(toasts).len() as f32;
-    groups * layout::GROUP_H + toasts.len() as f32 * layout::TOAST_H + 4.0
+}
+
+/// A row's time on its day: "09:15", "All day".
+fn day_label(event: &Event, day: i32) -> String {
+    match event.when {
+        When::AllDay { .. } => "All day".into(),
+        When::At { start, .. } => {
+            let s = Local.to_local(start);
+            if time::day_of(s) == day { locale::clock(time::second_of_day(s)) } else { "…".into() }
+        }
+    }
+}
+
+/// "1 h 30", "45 min"; nothing for an all-day event.
+fn duration_words(event: &Event) -> String {
+    match event.when {
+        When::At { start, end } if end > start => {
+            let minutes = (end - start) / 60;
+            match (minutes / 60, minutes % 60) {
+                (0, m) => format!("{m} min"),
+                (h, 0) => format!("{h} h"),
+                (h, m) => format!("{h} h {m:02}"),
+            }
+        }
+        _ => String::new(),
+    }
+}
+
+fn join_parts(parts: &[String]) -> String {
+    parts.iter().filter(|p| !p.is_empty()).cloned().collect::<Vec<_>>().join(" · ")
+}
+
+/// An event's details, in words.
+fn detail_view(event: &Event, setup: &Setup, now: i64, day: i32) -> scene::Detail {
+    let d = &event.details;
+    let initials = d
+        .people
+        .iter()
+        .take(3)
+        .map(|name| name.split([' ', '.', '@']).filter(|w| !w.is_empty()).take(2).filter_map(|w| w.chars().next()).flat_map(char::to_uppercase).collect())
+        .collect();
+    let mut people: Vec<String> = d.people.iter().take(2).map(|p| p.split(' ').next().unwrap_or(p).to_string()).collect();
+    if d.people.len() > 2 {
+        people.push(format!("+{}", d.people.len() - 2));
+    }
+    let mut people = people.join(", ");
+    if !d.response.is_empty() {
+        people = join_parts(&[people, format!("you: {}", d.response.to_lowercase())]);
+    }
+    let source = super::status(setup).calendars.iter().find(|c| c.key == event.calendar).map_or_else(
+        || match event.source {
+            Source::Google => "Google".to_string(),
+            Source::Microsoft => "Outlook".to_string(),
+            Source::Link(i) => setup.links.get(i).map_or_else(|| "Calendar".into(), |l| l.name.clone()),
+        },
+        |c| c.name.clone(),
+    );
+    let open = event.link.as_ref().map(|_| match event.source {
+        Source::Google => "Open in Google Calendar".to_string(),
+        Source::Microsoft => "Open in Outlook".to_string(),
+        Source::Link(_) => "Open".to_string(),
+    });
+    let (first, _) = event.days(&Local);
+    scene::Detail {
+        back: capitalised(&locale::day_title(first.max(day.min(first)))),
+        title: event.title.clone(),
+        when: join_parts(&[span_words(event), duration_words(event)]),
+        soon: soon(event, now),
+        color: event.color,
+        place: event.location.clone(),
+        initials,
+        people,
+        notes: d.notes.clone(),
+        source,
+        open,
+        joinable: event.join.is_some(),
+    }
 }
 
 /// When a notification arrived, in a few words.
@@ -589,389 +862,7 @@ fn arrived(at: i64) -> String {
         0 => "now".into(),
         1..=59 => format!("{minutes} min"),
         _ if time::day_of(wall) == time::day_of(Local.to_local(now)) => locale::clock(time::second_of_day(wall)),
-        _ => capitalised(&locale::day_title(time::day_of(wall))),
-    }
-}
-
-fn draw_center(pen: &Pen, v: &View, area: R) {
-    let p = &v.palette;
-    let hovered = |hit: Hit| v.hover == Some(hit);
-    if v.toasts.is_empty() {
-        pen.text("No new notifications", Font::Body, R::new(area.x + layout::PAD, area.y, area.w - 2.0 * layout::PAD, layout::EMPTY_H), p.text2, Align::Left);
-        return;
-    }
-    let groups = super::notifications::grouped(&v.toasts);
-    pen.clip(area);
-    for (r, row) in center_rows(&v.toasts, area, v.center_scroll) {
-        if r.bottom() < area.y || r.y > area.bottom() {
-            continue;
-        }
-        match row {
-            Row::Group(g) => {
-                let Some((_, list)) = groups.get(g) else { continue };
-                let first = list.first();
-                let name = first.map_or("", |t| t.app.as_str());
-                let mut x = r.x + 4.0;
-                if let Some(toast) = first.filter(|t| t.logo.is_some()) {
-                    let logo = toast.logo.as_deref().map_or(&[][..], |l| l.as_slice());
-                    pen.image(&toast.aumid, logo, R::new(x, r.y + 9.0, 16.0, 16.0));
-                    x += 24.0;
-                }
-                pen.text(name, Font::CaptionStrong, R::new(x, r.y + 4.0, r.right() - 40.0 - x, r.h - 4.0), p.text2, Align::Left);
-                let x = R::new(r.right() - 28.0, r.y + 4.0, 24.0, 24.0);
-                if hovered(Hit::ClearApp(g)) {
-                    pen.fill(x, 4.0, p.hover);
-                }
-                pen.glyph('\u{E711}', Font::IconSmall, x, p.text3);
-            }
-            Row::Toast(i) => {
-                let Some(toast) = v.toasts.get(i) else { continue };
-                let lit = hovered(Hit::Toast(i)) || hovered(Hit::Dismiss(i));
-                pen.fill(R::new(r.x, r.y + 2.0, r.w, r.h - 4.0), 6.0, if lit { p.hover } else { p.raised });
-                let text_w = r.w - 24.0 - if lit { 32.0 } else { 0.0 };
-                let title = if toast.title.is_empty() { toast.app.as_str() } else { toast.title.as_str() };
-                pen.text(title, Font::Body, R::new(r.x + 12.0, r.y + 7.0, text_w - 56.0, 22.0), p.text, Align::Left);
-                pen.text(&arrived(toast.at), Font::Caption, R::new(r.x + 12.0, r.y + 7.0, text_w, 22.0), p.text3, Align::Right);
-                pen.text(&toast.body, Font::Caption, R::new(r.x + 12.0, r.y + 30.0, text_w, 20.0), p.text2, Align::Left);
-                if lit {
-                    let x = v.layout.dismiss(r);
-                    if hovered(Hit::Dismiss(i)) {
-                        pen.fill(x, 4.0, p.hover);
-                    }
-                    pen.glyph('\u{E711}', Font::IconSmall, x, p.text2);
-                }
-            }
-        }
-    }
-    pen.unclip();
-}
-
-fn draw(pen: &Pen, v: &View) {
-    let p = &v.palette;
-    let l = &v.layout;
-    pen.clear(p.bg);
-    let hovered = |hit: Hit| v.hover == Some(hit);
-    let button_bg = |hit: Hit, r: R| {
-        if hovered(hit) {
-            pen.fill(r, 4.0, if v.pressed == Some(hit) { p.pressed } else { p.hover });
-        }
-    };
-
-    // Windows' notifications.
-    if let (Some(title), Some(area)) = (l.toast_title, l.center) {
-        let count = v.toasts.len();
-        let heading = if count == 0 { "Notifications".to_string() } else { format!("Notifications · {count}") };
-        pen.text(&heading, Font::Strong, title, p.text, Align::Left);
-        if let Some(clear) = l.clear.filter(|_| count > 0) {
-            button_bg(Hit::ClearAll, clear);
-            pen.text("Clear all", Font::Caption, clear, p.text2, Align::Center);
-        }
-        draw_center(pen, v, area);
-        pen.fill(R::new(0.0, l.date.y - 1.0, l.w, 1.0), 0.0, p.rule);
-    }
-
-    // The day's date, Do not disturb and Settings, and the world clocks.
-    let date_r = R::new(l.date.x - 8.0, l.date.y + 10.0, l.date.w + 8.0, l.date.h - 20.0);
-    button_bg(Hit::Today, date_r);
-    pen.text(&locale::day_title(v.today), Font::Header, l.date, p.text, Align::Left);
-    if super::focus::active() {
-        pen.fill(l.bell, 4.0, if hovered(Hit::Quiet) { p.accent.alpha(0.85) } else { p.accent });
-        pen.glyph('\u{E708}', Font::Icon, l.bell, p.on_accent);
-    } else {
-        button_bg(Hit::Quiet, l.bell);
-        pen.glyph('\u{E708}', Font::Icon, l.bell, p.text);
-    }
-    button_bg(Hit::Settings, l.gear);
-    pen.glyph('\u{E713}', Font::Icon, l.gear, p.text);
-    let here = time::day_of(Local.to_local(time::now()));
-    for (r, clock) in l.clocks.iter().zip(&v.clocks) {
-        if hovered(Hit::Clocks) {
-            pen.fill(R::new(r.x - 8.0, r.y, r.w + 16.0, r.h), 4.0, p.hover);
-        }
-        let day = match time::day_of(clock.wall) - here {
-            1 => " · tomorrow",
-            -1 => " · yesterday",
-            _ => "",
-        };
-        pen.text(&clock.name, Font::Caption, *r, p.text2, Align::Left);
-        let right = format!("{}{day} · {}", super::zones::offset_words(clock.offset), locale::clock(time::second_of_day(clock.wall)));
-        pen.text(&right, Font::Caption, *r, p.text2, Align::Right);
-    }
-    pen.fill(R::new(0.0, l.rule1, l.w, 1.0), 0.0, p.rule);
-
-    if let Some(month) = l.month {
-        draw_month(pen, v, month);
-        pen.fill(R::new(0.0, l.rule2, l.w, 1.0), 0.0, p.rule);
-    }
-
-    // The agenda, or one event's details.
-    if let Some(event) = v.detail.and_then(|i| v.agenda.get(i)) {
-        button_bg(Hit::Back, l.back());
-        pen.glyph('\u{E72B}', Font::IconSmall, l.back(), p.text);
-        let t = l.agenda_title;
-        pen.text(&event.title, Font::Strong, R::new(t.x + 28.0, t.y, l.w - t.x - 28.0 - layout::PAD, t.h), p.text, Align::Left);
-        draw_detail(pen, v, event);
-    } else {
-        let title = match v.selected - v.today {
-            0 => "Today".to_string(),
-            1 => "Tomorrow".to_string(),
-            -1 => "Yesterday".to_string(),
-            _ => capitalised(&locale::day_title(v.selected)),
-        };
-        pen.text(&title, Font::Strong, l.agenda_title, p.text, Align::Left);
-        if let (Some(prev), Some(next)) = (l.day_prev, l.day_next) {
-            button_bg(Hit::DayPrev, prev);
-            pen.glyph('\u{E76B}', Font::IconSmall, prev, p.text2);
-            button_bg(Hit::DayNext, next);
-            pen.glyph('\u{E76C}', Font::IconSmall, next, p.text2);
-        }
-        draw_agenda(pen, v);
-    }
-
-    draw_footer(pen, v);
-}
-
-fn draw_month(pen: &Pen, v: &View, month: R) {
-    let p = &v.palette;
-    let l = &v.layout;
-    let hovered = |hit: Hit| v.hover == Some(hit);
-    pen.text(&locale::month_title(v.month.0, v.month.1), Font::Strong, month, p.text, Align::Left);
-    for (hit, r, glyph) in [(Hit::Prev, l.prev, '\u{E70E}'), (Hit::Next, l.next, '\u{E70D}')] {
-        if hovered(hit) {
-            pen.fill(r, 4.0, p.hover);
-        }
-        pen.glyph(glyph, Font::IconSmall, r, p.text2);
-    }
-    for (i, r) in l.weekdays.iter().enumerate() {
-        let name = &v.weekdays[(v.first_weekday as usize + i) % 7];
-        pen.text(name, Font::Body, *r, p.text, Align::Center);
-    }
-    let start = v.grid_start();
-    for (row, r) in l.weeks.iter().enumerate() {
-        let week = layout::iso_week(start + row as i32 * 7 + 3);
-        pen.text(&week.to_string(), Font::Caption, *r, p.accent, Align::Left);
-    }
-    let dots = model::dots(&v.events, start, 42, &Local);
-    for (i, cell) in l.cells.iter().enumerate() {
-        let day = start + i as i32;
-        let (_, m, d) = time::civil_from_days(day);
-        let center = (cell.x + cell.w / 2.0, cell.y + cell.h / 2.0 - 1.0);
-        let radius = (cell.h / 2.0 - 3.0).min(cell.w / 2.0 - 2.0);
-        let today = day == v.today;
-        if today {
-            pen.circle(center, radius, p.accent);
-        } else if hovered(Hit::Day(i)) {
-            pen.circle(center, radius, p.hover);
-        }
-        if day == v.selected && !today {
-            pen.ring(center, radius, 1.5, p.accent);
-        }
-        let color = if today { p.on_accent } else if m != v.month.1 { p.text3 } else { p.text };
-        pen.text(&d.to_string(), Font::Body, R::new(cell.x, center.1 - 10.0, cell.w, 20.0), color, Align::Center);
-        let marks = &dots[i];
-        let n = marks.len() as f32;
-        for (k, rgb) in marks.iter().enumerate() {
-            let x = center.0 - (n - 1.0) * 3.0 + k as f32 * 6.0;
-            let c = if today { p.on_accent } else { Color::rgb(*rgb) };
-            pen.circle((x, center.1 + radius - 5.0), 1.75, c);
-        }
-    }
-}
-
-fn draw_agenda(pen: &Pen, v: &View) {
-    let p = &v.palette;
-    let l = &v.layout;
-    if v.agenda.is_empty() {
-        let (text, second) = if !v.has_sources {
-            ("No calendar connected", Some("Connect Google, Outlook or a calendar link in Settings"))
-        } else if super::fetching() && v.events.is_empty() {
-            ("Loading…", None)
-        } else {
-            ("No events", None)
-        };
-        let r = l.agenda;
-        pen.text(text, Font::Body, R::new(r.x + layout::PAD, r.y + 4.0, r.w - 2.0 * layout::PAD, 24.0), p.text2, Align::Left);
-        if let Some(second) = second {
-            pen.text(second, Font::Caption, R::new(r.x + layout::PAD, r.y + 28.0, r.w - 2.0 * layout::PAD, 18.0), p.text3, Align::Left);
-        }
-        return;
-    }
-    pen.clip(l.agenda);
-    for (i, event) in v.agenda.iter().enumerate() {
-        let r = l.row(i, v.scroll);
-        if r.bottom() < l.agenda.y || r.y > l.agenda.bottom() {
-            continue;
-        }
-        if v.hover == Some(Hit::Event(i)) {
-            pen.fill(r, 4.0, p.hover);
-        }
-        let time_r = R::new(r.x + 8.0, r.y, 60.0, r.h);
-        match event.when {
-            When::AllDay { .. } => pen.text("All day", Font::Caption, time_r, p.text2, Align::Left),
-            When::At { start, end } => {
-                let (first, last) = times(v.selected, start, end);
-                pen.text(&first, Font::Body, R::new(time_r.x, r.y + 8.0, time_r.w, 18.0), p.text, Align::Left);
-                if end > start {
-                    pen.text(&last, Font::Caption, R::new(time_r.x, r.y + 28.0, time_r.w, 16.0), p.text2, Align::Left);
-                }
-            }
-        }
-        pen.fill(R::new(r.x + 72.0, r.y + 9.0, 3.0, r.h - 18.0), 1.5, Color::rgb(event.color));
-        let join = event.join.as_ref().map(|_| l.join(r));
-        let text_w = join.map_or(r.right() - 8.0, |j| j.x - 8.0) - (r.x + 84.0);
-        pen.text(&event.title, Font::Body, R::new(r.x + 84.0, r.y + 8.0, text_w, 18.0), p.text, Align::Left);
-        let second = if event.location.is_empty() { source_name(v, event) } else { event.location.clone() };
-        pen.text(&second, Font::Caption, R::new(r.x + 84.0, r.y + 28.0, text_w, 16.0), p.text2, Align::Left);
-        if let Some(j) = join {
-            let fill = if v.hover == Some(Hit::Join(i)) { p.accent.alpha(0.85) } else { p.accent };
-            pen.fill(j, 4.0, fill);
-            pen.text("Join", Font::CaptionStrong, j, p.on_accent, Align::Center);
-        }
-    }
-    pen.unclip();
-}
-
-/// The start and end shown for a timed event on `day` ("…" where it runs over from another day).
-fn times(day: i32, start: i64, end: i64) -> (String, String) {
-    let (s, e) = (Local.to_local(start), Local.to_local(end));
-    let first = if time::day_of(s) == day { locale::clock(time::second_of_day(s)) } else { "…".into() };
-    let last = if time::day_of(e - 1) == day || end == start { locale::clock(time::second_of_day(e)) } else { "…".into() };
-    (first, last)
-}
-
-fn draw_detail(pen: &Pen, v: &View, event: &Event) {
-    let p = &v.palette;
-    let l = &v.layout;
-    let area = l.agenda;
-    let x = layout::PAD;
-    let w = area.w - 2.0 * layout::PAD;
-    let mut y = area.y + 2.0;
-    let mut line = |text: &str, glyph: char, color: Color| {
-        if text.is_empty() {
-            return;
-        }
-        pen.glyph(glyph, Font::IconSmall, R::new(x, y, 16.0, 22.0), p.text2);
-        pen.text(text, Font::Body, R::new(x + 24.0, y, w - 24.0, 22.0), color, Align::Left);
-        y += 24.0;
-    };
-    let when = match event.when {
-        When::AllDay { first, end } if end - first > 1 => format!("{} – {}", locale::day_title(first), locale::day_title(end - 1)),
-        When::AllDay { .. } => "All day".to_string(),
-        When::At { start, end } => {
-            let (a, b) = times(v.selected, start, end);
-            format!("{a} – {b}")
-        }
-    };
-    line(&when, '\u{E823}', p.text);
-    line(&event.location, '\u{E707}', p.text);
-    let d = &event.details;
-    let who = match (d.organizer.is_empty(), d.response.is_empty()) {
-        (false, false) => format!("{} · you: {}", d.organizer, d.response.to_lowercase()),
-        (false, true) => d.organizer.clone(),
-        (true, false) => format!("You: {}", d.response.to_lowercase()),
-        (true, true) => String::new(),
-    };
-    line(&who, '\u{E77B}', p.text2);
-    if !d.people.is_empty() {
-        let shown: Vec<&str> = d.people.iter().take(4).map(String::as_str).collect();
-        let more = d.people.len().saturating_sub(4);
-        let people = if more > 0 { format!("{} +{more}", shown.join(", ")) } else { shown.join(", ") };
-        line(&people, '\u{E716}', p.text2);
-    }
-    line(&source_name(v, event), '\u{E787}', p.text3);
-    let (join_r, open_r) = l.detail_buttons();
-    if !d.notes.is_empty() {
-        let notes = R::new(x, y + 4.0, w, (join_r.y - 8.0 - (y + 4.0)).max(0.0));
-        pen.clip(notes);
-        pen.text(&d.notes, Font::Paragraph, notes, p.text2, Align::Left);
-        pen.unclip();
-    }
-    let mut buttons = Vec::new();
-    if event.join.is_some() {
-        buttons.push((Hit::DetailJoin, "Join", true));
-    }
-    if event.link.is_some() {
-        buttons.push((Hit::DetailOpen, "Open in calendar", false));
-    }
-    for ((hit, label, accent), r) in buttons.into_iter().zip([join_r, open_r]) {
-        let fill = match (accent, v.hover == Some(hit)) {
-            (true, false) => p.accent,
-            (true, true) => p.accent.alpha(0.85),
-            (false, false) => p.raised,
-            (false, true) => p.hover,
-        };
-        pen.fill(r, 4.0, fill);
-        pen.text(label, Font::CaptionStrong, r, if accent { p.on_accent } else { p.text }, Align::Center);
-    }
-}
-
-fn draw_footer(pen: &Pen, v: &View) {
-    let p = &v.palette;
-    let l = &v.layout;
-    let hovered = |hit: Hit| v.hover == Some(hit);
-    pen.fill(R::new(0.0, l.footer.y, l.w, 1.0), 0.0, p.rule);
-    let running = super::schedule::focus_end();
-    let left = R::new(l.footer.x, l.footer.y, l.focus_less.x - l.footer.x - 8.0, l.footer.h);
-    match running {
-        Some(end) => {
-            let minutes = ((end - time::now()) + 59) / 60;
-            pen.text(&format!("Focus · {minutes} min left"), Font::Caption, left, p.text, Align::Left);
-        }
-        None => {
-            let (status, warn) = status_line(v);
-            pen.text(&status, Font::Caption, left, if warn { p.warn } else { p.text2 }, Align::Left);
-            for (hit, r, glyph) in [(Hit::FocusLess, l.focus_less, '\u{E738}'), (Hit::FocusMore, l.focus_more, '\u{E710}')] {
-                if hovered(hit) {
-                    pen.fill(r, 4.0, p.hover);
-                }
-                pen.glyph(glyph, Font::IconSmall, r, p.text2);
-            }
-            let minutes = R::new(l.focus_less.right(), l.focus_less.y, l.focus_more.x - l.focus_less.right(), l.focus_less.h);
-            pen.text(&format!("{} min", v.focus_minutes), Font::CaptionStrong, minutes, p.text, Align::Center);
-        }
-    }
-    let b = l.focus_button;
-    pen.fill(b, 4.0, if hovered(Hit::Focus) { p.hover } else { p.raised });
-    pen.stroke(b, 4.0, 1.0, p.rule);
-    let (glyph, word) = if running.is_some() { ('\u{E71A}', "Stop") } else { ('\u{E768}', "Focus") };
-    pen.glyph(glyph, Font::IconSmall, R::new(b.x + 10.0, b.y, 16.0, b.h), p.text);
-    pen.text(word, Font::CaptionStrong, R::new(b.x + 26.0, b.y, b.w - 32.0, b.h), p.text, Align::Center);
-}
-
-/// Which calendar an event is from.
-fn source_name(v: &View, event: &Event) -> String {
-    let status = super::status(&v.setup);
-    if let Some(calendar) = status.calendars.iter().find(|c| c.key == event.calendar) {
-        return calendar.name.clone();
-    }
-    match event.source {
-        super::Source::Google => "Google".into(),
-        super::Source::Microsoft => "Outlook".into(),
-        super::Source::Link(i) => v.setup.links.get(i).map_or_else(|| "Calendar".into(), |l| l.name.clone()),
-    }
-}
-
-/// The footer: the first problem, else whether the events are being updated or when they were.
-fn status_line(v: &View) -> (String, bool) {
-    if !v.has_sources {
-        return (String::new(), false);
-    }
-    let status = super::status(&v.setup);
-    for provider in super::Provider::ALL {
-        if let Some(problem) = &status.account(provider).problem {
-            return (format!("{}: {problem}", if provider == super::Provider::Microsoft { "Outlook" } else { "Google" }), true);
-        }
-    }
-    if let Some((i, problem)) = status.links.iter().enumerate().find_map(|(i, p)| p.as_ref().map(|p| (i, p))) {
-        let name = v.setup.links.get(i).map_or("A link", |l| l.name.as_str());
-        return (format!("{name}: {problem}"), true);
-    }
-    if super::fetching() {
-        return ("Updating…".into(), false);
-    }
-    match status.fetched {
-        Some(at) => (format!("Updated {}", locale::clock(time::second_of_day(Local.to_local(at)))), false),
-        None => (String::new(), false),
+        _ => capitalised(&locale::format(time::day_of(wall), "ddd d")),
     }
 }
 
@@ -980,6 +871,37 @@ fn capitalised(text: &str) -> String {
     chars.next().map_or_else(String::new, |c| c.to_uppercase().chain(chars).collect())
 }
 
+/// Paint the scene.
+fn draw(pen: &Pen, scene: &Scene, p: &Palette) {
+    pen.clear(Color(0.0, 0.0, 0.0, 0.0));
+    let ink = |ink: Ink| match ink {
+        Ink::Text => p.text,
+        Ink::Text2 => p.text2,
+        Ink::Text3 => p.text3,
+        Ink::Accent => p.accent,
+        Ink::OnAccent => p.on_accent,
+    };
+    let fill = |fill: Fill| match fill {
+        Fill::Raised => p.raised,
+        Fill::Hover => p.hover,
+        Fill::Accent => p.accent,
+        Fill::Rule => p.text.alpha(0.08),
+        Fill::Mark => p.text.alpha(0.5),
+        Fill::Rgb(rgb) => Color::rgb(rgb),
+    };
+    for (r, d) in &scene.items {
+        match d {
+            Draw::Card => pen.fill(*r, 0.0, p.bg),
+            Draw::Rect { fill: f, radius } => pen.fill(*r, *radius, fill(*f)),
+            Draw::Outline { ink: i, radius } => pen.stroke(*r, *radius, 1.0, ink(*i).alpha(0.6)),
+            Draw::Text { text, font, ink: i, align } => pen.text(text, *font, *r, ink(*i), *align),
+            Draw::Glyph { glyph, font, ink: i } => pen.glyph(*glyph, *font, *r, ink(*i)),
+            Draw::Logo { key, bytes } => pen.image(key, bytes, *r),
+            Draw::Clip => pen.clip(*r),
+            Draw::Unclip => pen.unclip(),
+        }
+    }
+}
 
 /// The arrow cursor, whatever was showing when the capture began.
 fn arrow() {
@@ -989,6 +911,11 @@ fn arrow() {
 
 fn client_xy(lparam: LPARAM) -> (i32, i32) {
     ((lparam.0 & 0xFFFF) as u16 as i16 as i32, ((lparam.0 >> 16) & 0xFFFF) as u16 as i16 as i32)
+}
+
+/// The notification centre's window: input goes to the calendar's, which holds the capture.
+unsafe extern "system" fn top_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
 }
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -1014,13 +941,12 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESUL
         WM_LBUTTONDOWN | WM_RBUTTONDOWN => {
             let (x, y) = client_xy(lparam);
             let inside = with_view(|v| {
-                let inside = x >= 0 && y >= 0 && x < v.size.0 && y < v.size.1;
+                let (sx, sy) = v.scene_point(x, y);
                 v.pressed = v.hit(x, y);
-                v.render();
-                inside
+                v.scene.on_card(sx, sy)
             });
             if inside == Some(false) {
-                // Under capture: a click outside the calendar closes it.
+                // Under capture: a click outside the panel closes it.
                 after = Some(Box::new(close));
             }
         }
@@ -1029,11 +955,7 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESUL
             after = with_view(|v| {
                 let pressed = v.pressed.take();
                 let hit = v.hit(x, y);
-                let done = pressed.filter(|p| Some(*p) == hit).and_then(|hit| v.activate(hit));
-                if pressed.is_some() {
-                    v.render();
-                }
-                done
+                pressed.filter(|p| Some(*p) == hit).and_then(|hit| v.activate(hit))
             })
             .flatten();
         }
@@ -1062,7 +984,10 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESUL
             super::notifications::set_watching(false);
             *super::OPEN_RECT.lock().unwrap_or_else(|e| e.into_inner()) = None;
             CLOSED_AT.with(|c| c.set(Some(Instant::now())));
-            drop(VIEW.with(|cell| cell.borrow_mut().take()));
+            let top = VIEW.with(|cell| cell.borrow_mut().take()).map(|v| v.top_hwnd);
+            if let Some(top) = top {
+                let _ = unsafe { DestroyWindow(top) };
+            }
             // Only a capture of our own: capture is per thread, and the audio flyout (on this same
             // thread) may hold it by now; ReleaseCapture would take it from the flyout, which
             // then closes at once.
@@ -1078,7 +1003,7 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESUL
     Some(LRESULT(0))
 }
 
-/// Dev: the calendar alone, on the config's sources, until it closes.
+/// Dev: the panel alone, on the config's sources, until it closes.
 #[cfg(feature = "dev")]
 pub fn preview(config: &Config) {
     use windows::Win32::UI::WindowsAndMessaging::{DispatchMessageW, GetMessageW, SetTimer, TranslateMessage, MSG};

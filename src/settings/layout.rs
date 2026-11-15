@@ -162,7 +162,6 @@ pub(super) enum Toggle {
     ClockWeekday,
     ClockOneLine,
     ClockHideDate,
-    ClockNextMeeting,
     ClockUnread,
     WeekNumbers,
     WorldClocks,
@@ -1426,8 +1425,6 @@ fn calendar_steps(col: &mut Column, model: &Model) {
     col.row(&mut body, None, "Day of the week", plain("Before the date"), false, Control::Toggle(k.weekday, Toggle::ClockWeekday));
     col.row(&mut body, None, "One line", plain("The date after the time"), false, Control::Toggle(k.one_line, Toggle::ClockOneLine));
     col.row(&mut body, None, "Hide the date", None, false, Control::Toggle(k.hide_date, Toggle::ClockHideDate));
-    let next = plain("After the time, from 30 minutes before: \"Stand-up in 12 min\"");
-    col.row(&mut body, None, "Next meeting", next, !c.enabled, Control::Toggle(k.next_meeting, Toggle::ClockNextMeeting));
     let unread = plain("Windows' notifications waiting, after the date");
     col.row(&mut body, None, "Unread count", unread, !c.enabled, Control::Toggle(k.unread, Toggle::ClockUnread));
     col.end_group(body);

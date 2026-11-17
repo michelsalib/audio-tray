@@ -538,13 +538,25 @@ fn click_allowed(what: &dyn std::fmt::Debug) -> bool {
 
 /// A gesture on the injected strip, relayed by the TAP.
 fn on_action(action: Action) {
-    if !click_allowed(&action) {
-        return;
-    }
     if action == Action::OpenCalendar {
-        if let Some(config) = with_tray(|tray| tray.config.clone()) {
+        // The clock's click never reaches the audio panel (the hook takes it, or the shell's own
+        // calendar would open), so it is not the click that closed it: the panel gives way and the
+        // calendar opens once it has ([`open_flyout`]).
+        if with_tray(|tray| tray.flyout_open).unwrap_or(false) {
+            CALENDAR_NEXT.with(|next| next.set(true));
+            // The panel closes on losing the capture (same thread).
+            let _ = unsafe { windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture() };
+            return;
+        }
+        if let Some(config) = with_tray(|tray| {
+            tray.osd.hide();
+            tray.config.clone()
+        }) {
             crate::calendar::open(&config);
         }
+        return;
+    }
+    if !click_allowed(&action) {
         return;
     }
     // A segment's left click does what `[strip] left_click` says.
@@ -649,10 +661,22 @@ fn open_flyout(anchor: Option<flyout::Anchor>) {
     });
     if outcome.quit {
         quit();
+        return;
     }
     if outcome.settings {
         open_settings();
     }
+    // The clock was clicked while the panel was open: the calendar it asked for.
+    if CALENDAR_NEXT.with(|next| next.replace(false)) {
+        if let Some(config) = with_tray(|tray| tray.config.clone()) {
+            crate::calendar::open(&config);
+        }
+    }
+}
+
+thread_local! {
+    /// The calendar is to open as soon as the audio panel has closed.
+    static CALENDAR_NEXT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Have the calendar look again now (the focus timer started, a setting changed).

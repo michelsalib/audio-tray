@@ -2,7 +2,8 @@
 //! ([`scene`]). Each card is a per-pixel-alpha layered window over Windows' acrylic, so each has
 //! its own rounded corners and the gap between them is real; both are drawn as one scene off
 //! screen with Direct2D ([`paint`]) and presented whole on every change (no `WM_PAINT`). The
-//! calendar's window holds the mouse capture and takes the input for both.
+//! calendar's window takes the input for both (no capture: the tray's mouse hook closes it on a
+//! click elsewhere, and that click still lands where it was aimed).
 //!
 //! It opens from whichever screen edge the taskbar is on, slides in like the shell's own flyouts,
 //! and closes on a click elsewhere, Escape, or losing the foreground.
@@ -20,13 +21,13 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
-use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromPoint, ScreenToClient, MONITORINFO, MONITOR_DEFAULTTONEAREST};
+use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MapWindowPoints, MonitorFromPoint, ScreenToClient, MONITORINFO, MONITOR_DEFAULTTONEAREST};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetCapture, ReleaseCapture, SetCapture, VIRTUAL_KEY, VK_BACK, VK_DOWN, VK_ESCAPE, VK_RETURN, VK_HOME, VK_LEFT, VK_NEXT, VK_PRIOR, VK_RIGHT, VK_UP,
+    VIRTUAL_KEY, VK_BACK, VK_DOWN, VK_ESCAPE, VK_RETURN, VK_HOME, VK_LEFT, VK_NEXT, VK_PRIOR, VK_RIGHT, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     DefWindowProcW, DestroyWindow, GetCursorPos, ShowWindow, SW_HIDE, SW_SHOWNA, WA_INACTIVE, WHEEL_DELTA, WINDOW_EX_STYLE, WM_ACTIVATE,
-    WM_CAPTURECHANGED, WM_CHAR, WM_DESTROY, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN,
+    WM_CHAR, WM_DESTROY, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WindowFromPoint, GetAncestor, GA_ROOT,
     WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
 };
 
@@ -42,6 +43,8 @@ use scene::{Draw, Fill, Hit, Ink, Scene, R};
 
 const CLASS: PCWSTR = w!("AudioTrayCalendar");
 const CLASS_TOP: PCWSTR = w!("AudioTrayNotifications");
+/// In `Win32_UI_Controls`, which this crate does not otherwise need.
+const WM_MOUSELEAVE: u32 = 0x02A3;
 /// A click on the clock right after the panel closed is the click that closed it.
 const SETTLE: Duration = Duration::from_millis(400);
 /// The gap between the panel and the screen's edges, as the shell's flyouts keep.
@@ -291,10 +294,8 @@ fn create(config: &Config) -> Result<()> {
     if crate::music::player::raise(hwnd) == crate::music::player::Raise::Refused {
         eprintln!("calendar: could not take the foreground");
     }
-    unsafe {
-        // Like a menu: a click anywhere else comes here first, and closes it.
-        SetCapture(hwnd);
-    }
+    // No mouse capture: a click elsewhere goes where it was aimed (the audio icon opens its panel
+    // at once), and the tray's mouse hook closes the calendar as it passes ([`keep_rect`]).
     arrow();
     keep_rect();
     Ok(())
@@ -1069,15 +1070,41 @@ fn client_xy(lparam: LPARAM) -> (i32, i32) {
     ((lparam.0 & 0xFFFF) as u16 as i16 as i32, ((lparam.0 >> 16) & 0xFFFF) as u16 as i16 as i32)
 }
 
-/// The notification centre's window: input goes to the calendar's, which holds the capture.
-/// The wheel is the exception: it goes to the window under the pointer, capture or not, so it is
-/// passed on (its point is on the screen, which the calendar's window maps to the scene).
+/// The notification centre's window: its mouse input goes to the calendar's window, which takes
+/// the input for both. Points in its client area are moved to the calendar's (the wheel's is on
+/// the screen already); its own leave goes as the calendar's.
 unsafe extern "system" fn top_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     let open = OPEN.with(Cell::get);
-    if msg == WM_MOUSEWHEEL && open != 0 {
-        return unsafe { wndproc(HWND(open as *mut _), msg, wparam, lparam) };
+    if open != 0 && matches!(msg, WM_MOUSEMOVE | WM_LBUTTONDOWN | WM_LBUTTONUP | WM_RBUTTONDOWN | WM_MOUSEWHEEL | WM_MOUSELEAVE) {
+        let main = HWND(open as *mut _);
+        let lparam = if matches!(msg, WM_MOUSEWHEEL | WM_MOUSELEAVE) {
+            lparam
+        } else {
+            let (x, y) = client_xy(lparam);
+            let mut pt = [POINT { x, y }];
+            unsafe { MapWindowPoints(Some(hwnd), Some(main), &mut pt) };
+            LPARAM(((pt[0].y as u16 as isize) << 16) | (pt[0].x as u16 as isize))
+        };
+        if msg == WM_MOUSEMOVE {
+            track_leave(hwnd);
+        }
+        return unsafe { wndproc(main, msg, wparam, lparam) };
     }
     unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+}
+
+/// Where the pointer is, on the screen.
+fn cursor() -> POINT {
+    let mut pt = POINT::default();
+    let _ = unsafe { GetCursorPos(&mut pt) };
+    pt
+}
+
+/// Ask for `WM_MOUSELEAVE` when the pointer leaves `hwnd` (once per entry).
+fn track_leave(hwnd: HWND) {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT};
+    let mut track = TRACKMOUSEEVENT { cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32, dwFlags: TME_LEAVE, hwndTrack: hwnd, dwHoverTime: 0 };
+    let _ = unsafe { TrackMouseEvent(&mut track) };
 }
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -1094,6 +1121,10 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESUL
     match msg {
         WM_MOUSEMOVE => {
             arrow();
+            // Moves forwarded from the other card track their own window.
+            if unsafe { GetAncestor(WindowFromPoint(cursor()), GA_ROOT) } == hwnd {
+                track_leave(hwnd);
+            }
             let (x, y) = client_xy(lparam);
             with_view(|v| {
                 let hit = v.hit(x, y);
@@ -1139,11 +1170,12 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESUL
         WM_ACTIVATE if (wparam.0 & 0xFFFF) as u32 == WA_INACTIVE => {
             after = Some(Box::new(close));
         }
-        WM_CAPTURECHANGED => {
-            // Capture taken away (another app came up): give way to it. Our own release in
-            // WM_DESTROY arrives while closing, when there is nothing left to close.
-            if OPEN.with(Cell::get) == hwnd.0 as isize && unsafe { GetCapture() } != hwnd {
-                after = Some(Box::new(close));
+        WM_MOUSELEAVE => {
+            // Left this card: no hover, unless the pointer went to the other card.
+            let under = unsafe { GetAncestor(WindowFromPoint(cursor()), GA_ROOT) };
+            let ours = with_view(|v| under == v.hwnd || under == v.top_hwnd).unwrap_or(false);
+            if !ours {
+                with_view(|v| v.set_hover(None));
             }
         }
         WM_DESTROY => {
@@ -1154,12 +1186,6 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESUL
             let top = VIEW.with(|cell| cell.borrow_mut().take()).map(|v| v.top_hwnd);
             if let Some(top) = top {
                 let _ = unsafe { DestroyWindow(top) };
-            }
-            // Only a capture of our own: capture is per thread, and the audio flyout (on this same
-            // thread) may hold it by now; ReleaseCapture would take it from the flyout, which
-            // then closes at once.
-            if unsafe { GetCapture() } == hwnd {
-                let _ = unsafe { ReleaseCapture() };
             }
         }
         _ => return None,

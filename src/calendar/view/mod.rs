@@ -28,7 +28,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::{
     DefWindowProcW, DestroyWindow, GetCursorPos, ShowWindow, SW_HIDE, SW_SHOWNA, WA_INACTIVE, WHEEL_DELTA, WINDOW_EX_STYLE, WM_ACTIVATE,
     WM_CHAR, WM_DESTROY, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WindowFromPoint, GetAncestor, GA_ROOT,
-    WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, MA_NOACTIVATE, WM_MOUSEACTIVATE,
 };
 
 use super::model::{self, Event, Source, When};
@@ -229,7 +229,9 @@ fn create(config: &Config) -> Result<()> {
     let (scale, rect, work) = monitor(cursor);
     let style = WINDOW_EX_STYLE(WS_EX_LAYERED.0 | WS_EX_TOOLWINDOW.0 | WS_EX_TOPMOST.0);
     let hwnd = crate::win::create_popup(CLASS, w!("Calendar"), Some(wndproc), style, (0, 0, 1, 1)).context("CreateWindowExW")?;
-    let top_hwnd = crate::win::create_popup(CLASS_TOP, w!("Notifications"), Some(top_proc), style, (0, 0, 1, 1)).context("CreateWindowExW")?;
+    // Never activated: a click on it must not deactivate the calendar's window, which closes on that.
+    let top_style = WINDOW_EX_STYLE(style.0 | WS_EX_NOACTIVATE.0);
+    let top_hwnd = crate::win::create_popup(CLASS_TOP, w!("Notifications"), Some(top_proc), top_style, (0, 0, 1, 1)).context("CreateWindowExW")?;
     unsafe {
         crate::layered::style_panel(hwnd, crate::layered::CORNER_ROUND);
         crate::layered::style_panel(top_hwnd, crate::layered::CORNER_ROUND);
@@ -1074,6 +1076,9 @@ fn client_xy(lparam: LPARAM) -> (i32, i32) {
 /// the input for both. Points in its client area are moved to the calendar's (the wheel's is on
 /// the screen already); its own leave goes as the calendar's.
 unsafe extern "system" fn top_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if msg == WM_MOUSEACTIVATE {
+        return LRESULT(MA_NOACTIVATE as isize);
+    }
     let open = OPEN.with(Cell::get);
     if open != 0 && matches!(msg, WM_MOUSEMOVE | WM_LBUTTONDOWN | WM_LBUTTONUP | WM_RBUTTONDOWN | WM_MOUSEWHEEL | WM_MOUSELEAVE) {
         let main = HWND(open as *mut _);
@@ -1168,7 +1173,11 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESUL
             }
         }
         WM_ACTIVATE if (wparam.0 & 0xFFFF) as u32 == WA_INACTIVE => {
-            after = Some(Box::new(close));
+            // Not to its own notification card (which never takes activation, but in case).
+            let to = HWND(lparam.0 as *mut _);
+            if with_view(|v| v.top_hwnd != to).unwrap_or(true) {
+                after = Some(Box::new(close));
+            }
         }
         WM_MOUSELEAVE => {
             // Left this card: no hover, unless the pointer went to the other card.

@@ -274,8 +274,8 @@ pub struct Input {
     pub hover: Option<Hit>,
     /// The notification centre takes the whole panel, the calendar folded to one line.
     pub center_full: bool,
-    /// The pointer has rested on `hover`: its tooltip shows.
-    pub show_tip: bool,
+    /// Where the pointer rested on `hover`: its tooltip shows by that target.
+    pub show_tip: Option<(f32, f32)>,
 }
 
 pub struct Scene {
@@ -459,11 +459,14 @@ pub fn build(input: &Input) -> Scene {
         }
         None => calendar(&mut ink, main, input, rows),
     };
-    if input.show_tip {
-        tooltip(&mut ink, input, top, main);
+    if let Some(at) = input.show_tip {
+        tooltip(&mut ink, input, at, top, main);
     }
     Scene { top, main, h: main.bottom(), items: ink.items, hits: ink.hits, center_view, list_view }
 }
+
+/// Wider targets carry a label, so they get no tooltip.
+const TIP_TARGET_MAX: f32 = 56.0;
 
 /// What an icon-only target does, in words (`None`: it says it already).
 fn tip_text(hit: Hit, input: &Input) -> Option<&'static str> {
@@ -490,10 +493,16 @@ fn tip_text(hit: Hit, input: &Input) -> Option<&'static str> {
 }
 
 /// The hovered target's tooltip, under it (above it near its card's foot), inside its card.
-fn tooltip(ink: &mut Ink2, input: &Input, top: Option<R>, main: R) {
+fn tooltip(ink: &mut Ink2, input: &Input, (px, py): (f32, f32), top: Option<R>, main: R) {
     let Some(hit) = input.hover else { return };
     let Some(text) = tip_text(hit, input) else { return };
-    let Some(r) = ink.hits.iter().rev().find(|(_, h)| *h == hit).map(|(r, _)| *r) else { return };
+    // The target under the pointer: the same one can sit in two places (the header's moon and the
+    // footer's Do not disturb button).
+    let Some(r) = ink.hits.iter().rev().find(|(r, h)| *h == hit && r.contains(px, py)).map(|(r, _)| *r) else { return };
+    if r.w > TIP_TARGET_MAX && hit != Hit::Clocks {
+        // A labelled button says it already.
+        return;
+    }
     let card = top.filter(|t| t.contains(r.x + 1.0, r.y + 1.0)).unwrap_or(main);
     let w = (text.chars().count() as f32 * 6.5 + 20.0).min(card.w - 16.0);
     let h = 26.0;
@@ -903,7 +912,7 @@ mod tests {
             detail: None,
             hover: None,
             center_full: false,
-            show_tip: false,
+            show_tip: None,
         }
     }
 

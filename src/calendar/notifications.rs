@@ -133,10 +133,13 @@ fn run(asks: Receiver<Ask>, again: Sender<Ask>) {
         println!("notifications: no change events here; following the store on disk");
     }
     let changes = watch_store();
+    // The ids of the last read.
+    let mut seen: Vec<u32> = Vec::new();
     loop {
         let mut last_read = Instant::now();
         match read(&listener) {
             Ok(toasts) => {
+                seen = toasts.iter().map(|t| t.id).collect();
                 let changed = {
                     let mut held = TOASTS.lock().unwrap_or_else(|e| e.into_inner());
                     let changed = held.as_ref() != Some(&toasts);
@@ -158,12 +161,22 @@ fn run(asks: Receiver<Ask>, again: Sender<Ask>) {
                 Ok(Ask::Read) => break,
                 Ok(Ask::Remove(ids)) => {
                     for id in ids {
-                        let _ = listener.RemoveNotification(id);
+                        if let Err(e) = listener.RemoveNotification(id) {
+                            eprintln!("notifications: could not remove {id} ({e})");
+                        }
                     }
                     break;
                 }
                 Ok(Ask::Clear) => {
-                    let _ = listener.ClearNotifications();
+                    // Windows can refuse the whole sweep; one by one then.
+                    if let Err(e) = listener.ClearNotifications() {
+                        println!("notifications: Windows would not clear them all ({e}); removing them one by one");
+                        for &id in &seen {
+                            if let Err(e) = listener.RemoveNotification(id) {
+                                eprintln!("notifications: could not remove {id} ({e})");
+                            }
+                        }
+                    }
                     break;
                 }
                 Err(RecvTimeoutError::Disconnected) => return,

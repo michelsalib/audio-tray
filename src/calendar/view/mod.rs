@@ -113,8 +113,8 @@ struct View {
     menu_for: Option<u32>,
     /// The notifications have the whole panel, the calendar folded to one line.
     center_full: bool,
-    /// The pointer has rested on what it hovers: its tooltip shows.
-    show_tip: bool,
+    /// Where the pointer rested on what it hovers (scene point): its tooltip shows there.
+    show_tip: Option<(f32, f32)>,
     clocks: Vec<WorldClock>,
     center_scroll: f32,
     list_scroll: f32,
@@ -283,7 +283,7 @@ fn create(config: &Config) -> Result<()> {
         list_scroll: 0.0,
         hover: None,
         center_full: false,
-        show_tip: false,
+        show_tip: None,
         pressed: None,
     };
     super::notifications::set_watching(true);
@@ -339,7 +339,7 @@ fn empty_input() -> scene::Input {
         detail: None,
         hover: None,
         center_full: false,
-        show_tip: false,
+        show_tip: None,
     }
 }
 
@@ -653,7 +653,7 @@ impl View {
         if self.hover != hover {
             self.hover = hover;
             // A tooltip waits for the pointer to rest.
-            self.show_tip = false;
+            self.show_tip = None;
             unsafe {
                 let _ = KillTimer(Some(self.hwnd), TIP_TIMER);
                 if hover.is_some() {
@@ -1222,8 +1222,11 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESUL
         WM_TIMER if wparam.0 == TIP_TIMER => {
             let _ = unsafe { KillTimer(Some(hwnd), TIP_TIMER) };
             with_view(|v| {
-                if v.hover.is_some() && !v.show_tip {
-                    v.show_tip = true;
+                if v.hover.is_some() && v.show_tip.is_none() {
+                    // Where the pointer rests: the same target can sit in two places.
+                    let mut point = cursor();
+                    let _ = unsafe { ScreenToClient(v.hwnd, &mut point) };
+                    v.show_tip = Some(v.scene_point(point.x, point.y));
                     v.relayout();
                 }
             });

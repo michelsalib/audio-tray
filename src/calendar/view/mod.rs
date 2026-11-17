@@ -1070,7 +1070,13 @@ fn client_xy(lparam: LPARAM) -> (i32, i32) {
 }
 
 /// The notification centre's window: input goes to the calendar's, which holds the capture.
+/// The wheel is the exception: it goes to the window under the pointer, capture or not, so it is
+/// passed on (its point is on the screen, which the calendar's window maps to the scene).
 unsafe extern "system" fn top_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    let open = OPEN.with(Cell::get);
+    if msg == WM_MOUSEWHEEL && open != 0 {
+        return unsafe { wndproc(HWND(open as *mut _), msg, wparam, lparam) };
+    }
     unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
 }
 

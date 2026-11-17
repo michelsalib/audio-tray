@@ -19,6 +19,8 @@ pub struct Item {
     /// A Teams, Meet or Zoom address found in its description or location.
     pub join: Option<String>,
     pub details: Details,
+    /// Its `UID`: the provider's own id (`…@google.com` for Google's feeds).
+    pub uid: String,
 }
 
 /// A date-time as the feed writes it.
@@ -116,7 +118,7 @@ pub fn parse(text: &str, (from, to): (i32, i32), zone: &dyn Zone) -> Vec<Item> {
             if first < to && last >= from {
                 let details = Details { people: raw.attendees.clone(), organizer: raw.organizer.clone(), response: String::new(), notes: raw.description.clone() };
                 let join = find_join(&raw.description).or_else(|| find_join(&raw.location));
-                out.push(Item { when, title: raw.title.clone(), location: raw.location.clone(), link: raw.url.clone(), join, details });
+                out.push(Item { when, title: raw.title.clone(), location: raw.location.clone(), link: raw.url.clone(), join, details, uid: raw.uid.clone() });
             }
         }
     }

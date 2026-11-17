@@ -1006,9 +1006,11 @@ fn detail_view(event: &Event, setup: &Setup, now: i64, day: i32) -> scene::Detai
         },
         |c| c.name.clone(),
     );
-    let open = event.link.as_ref().map(|_| match event.source {
+    let open = event.link.as_ref().map(|link| match event.source {
         Source::Google => "Open in Google Calendar".to_string(),
         Source::Microsoft => "Open in Outlook".to_string(),
+        Source::Link(_) if link.contains("calendar.google.com") => "Open in Google Calendar".to_string(),
+        Source::Link(_) if link.contains("outlook.") => "Open in Outlook".to_string(),
         Source::Link(_) => "Open".to_string(),
     });
     let (first, _) = event.days(&Local);

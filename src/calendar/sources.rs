@@ -429,13 +429,14 @@ pub fn fetch_link(index: usize, link: &Link, days: (i32, i32), zone: &dyn Zone) 
     }
     let color = LINK_COLORS[index % LINK_COLORS.len()];
     let key = link_key(&link.url);
+    let feed = feed_url(&link.url);
     let events = super::ics::parse(&text, days, zone)
         .into_iter()
         .map(|item| Event {
+            link: item.link.or_else(|| web_link(&feed, &item.uid, &item.when, zone)),
             when: item.when,
             title: if item.title.is_empty() { "(No title)".into() } else { item.title },
             location: item.location,
-            link: item.link,
             join: item.join,
             source: Source::Link(index),
             color,
@@ -444,6 +445,52 @@ pub fn fetch_link(index: usize, link: &Link, days: (i32, i32), zone: &dyn Zone) 
         })
         .collect();
     Ok((events, Calendar { key, name: link.name.clone(), color, source: Source::Link(index) }))
+}
+
+/// Where a linked calendar's event opens on the web, when its feed gives no `URL`: the event itself
+/// for Google's private and public addresses (its `eid` is the event id and the calendar id, in
+/// base64), the event's day for Outlook's published calendars (their `UID`s are not item ids).
+fn web_link(feed: &str, uid: &str, when: &When, zone: &dyn Zone) -> Option<String> {
+    let lower = feed.to_ascii_lowercase();
+    if let Some(at) = lower.find("calendar.google.com/calendar/ical/") {
+        let rest = &feed[at + "calendar.google.com/calendar/ical/".len()..];
+        let calendar = percent_decode(rest.split('/').next()?);
+        let id = uid.strip_suffix("@google.com")?;
+        let eid = super::oauth::base64url(format!("{id} {calendar}").as_bytes()).replace('-', "%2B").replace('_', "%2F");
+        return Some(format!("https://calendar.google.com/calendar/event?eid={eid}"));
+    }
+    let day = match *when {
+        When::AllDay { first, .. } => first,
+        When::At { start, .. } => time::day_of(zone.to_local(start)),
+    };
+    let (y, m, d) = time::civil_from_days(day);
+    if lower.contains("outlook.office365.com/") || lower.contains("outlook.office.com/") {
+        return Some(format!("https://outlook.office.com/calendar/view/day/{y}/{m}/{d}"));
+    }
+    if lower.contains("outlook.live.com/") {
+        return Some(format!("https://outlook.live.com/calendar/0/view/day/{y}/{m}/{d}"));
+    }
+    None
+}
+
+fn percent_decode(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let hex = (bytes[i] == b'%' && i + 2 < bytes.len()).then(|| std::str::from_utf8(&bytes[i + 1..i + 3]).ok().and_then(|h| u8::from_str_radix(h, 16).ok())).flatten();
+        match hex {
+            Some(b) => {
+                out.push(b);
+                i += 3;
+            }
+            None => {
+                out.push(bytes[i]);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// The Microsoft account's calendar's key.
@@ -502,6 +549,21 @@ mod tests {
     use super::*;
     use crate::calendar::time::{days_from_civil, Fixed, DAY};
     use serde_json::json;
+
+    #[test]
+    fn linked_events_open_on_the_web_where_the_feed_lives() {
+        let when = When::At { start: days_from_civil(2026, 11, 20) as i64 * DAY + 18 * 3600, end: days_from_civil(2026, 11, 20) as i64 * DAY + 19 * 3600 };
+        let google = "https://calendar.google.com/calendar/ical/me%40gmail.com/private-abc/basic.ics";
+        let link = web_link(google, "7abc@google.com", &when, &Fixed(0)).expect("a Google link");
+        let eid = link.strip_prefix("https://calendar.google.com/calendar/event?eid=").expect("an event link");
+        let decoded = oauth::base64url_decode(&eid.replace("%2B", "-").replace("%2F", "_")).expect("base64");
+        assert_eq!(String::from_utf8(decoded).unwrap(), "7abc me@gmail.com");
+        // Not a Google event id: no guess.
+        assert_eq!(web_link(google, "other-uid", &when, &Fixed(0)), None);
+        let outlook = "https://outlook.office365.com/owa/calendar/x/y/calendar.ics";
+        assert_eq!(web_link(outlook, "z", &when, &Fixed(0)).as_deref(), Some("https://outlook.office.com/calendar/view/day/2026/11/20"));
+        assert_eq!(web_link("https://example.com/cal.ics", "z", &when, &Fixed(0)), None);
+    }
 
     #[test]
     fn google_events_read_both_shapes_and_skip_declined_ones() {

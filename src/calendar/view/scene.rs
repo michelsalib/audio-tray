@@ -615,14 +615,14 @@ fn calendar(ink: &mut Ink2, card: R, input: &Input, rows: usize) -> Option<(R, f
     let lit = ink.lit(Hit::Today);
     ink.text(R::new(x, y, 200.0, 16.0), input.weekday.clone(), Font::Caption, if lit { Ink::Accent } else { Ink::Text2 }, Align::Left);
     ink.text(R::new(x, y + 16.0, 220.0, 28.0), input.date.clone(), Font::Big, if lit { Ink::Accent } else { Ink::Text }, Align::Left);
-    // The switch says what it opens: "Month ⌄", then "Week ⌃".
+    // The switch says what it opens, with that view's calendar icon: Month, then Week.
     let toggle = R::new(card.right() - PAD - 88.0, y + 12.0, 88.0, 30.0);
     let fill = if ink.lit(Hit::Month) { Fill::Hover } else { Fill::Raised };
     ink.draw(toggle, Draw::Rect { fill, radius: 15.0 });
     ink.draw(toggle, Draw::Outline { ink: Ink::Text3, radius: 15.0 });
-    let label = if input.month_open { "Week" } else { "Month" };
-    ink.text(R::new(toggle.x + 14.0, toggle.y, 50.0, toggle.h), label, Font::Caption, Ink::Text, Align::Left);
-    ink.glyph(R::new(toggle.right() - 30.0, toggle.y, 18.0, toggle.h), if input.month_open { '\u{E70E}' } else { '\u{E70D}' }, Font::IconSmall, Ink::Text);
+    let (glyph, label) = if input.month_open { ('\u{E8C0}', "Week") } else { ('\u{E787}', "Month") };
+    ink.glyph(R::new(toggle.x + 12.0, toggle.y, 16.0, toggle.h), glyph, Font::IconSmall, Ink::Text);
+    ink.text(R::new(toggle.x + 34.0, toggle.y, toggle.w - 42.0, toggle.h), label, Font::Caption, Ink::Text, Align::Left);
     ink.hit(toggle, Hit::Month);
     if !input.clocks.is_empty() {
         // As wide as its text (about 6.5 DIPs a character at 12), right against the switch.

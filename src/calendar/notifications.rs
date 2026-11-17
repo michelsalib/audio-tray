@@ -99,6 +99,7 @@ pub fn refresh() {
 pub fn remove(ids: Vec<u32>) {
     TOASTS.lock().unwrap_or_else(|e| e.into_inner()).iter_mut().for_each(|list| list.retain(|t| !ids.contains(&t.id)));
     ask(Ask::Remove(ids));
+    held_changed();
 }
 
 pub fn clear() {
@@ -106,6 +107,13 @@ pub fn clear() {
         list.clear();
     }
     ask(Ask::Clear);
+    held_changed();
+}
+
+/// The list was changed here, ahead of Windows: the next read then matches it and says nothing,
+/// so the clock's count is told now.
+fn held_changed() {
+    crate::tray::post(super::WM_CALENDAR, super::NOTIFICATIONS, 0);
 }
 
 /// Open the app a notification came from (for an app that takes no buttons from outside).

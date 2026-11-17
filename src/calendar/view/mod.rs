@@ -686,6 +686,12 @@ impl View {
                 let key = self.group_key(g)?;
                 self.full_groups.push(key);
             }
+            Hit::DismissGroup(g) => {
+                let ids: Vec<u32> = super::notifications::grouped(&self.toasts).get(g)?.1.iter().map(|t| t.id).collect();
+                self.toasts.retain(|t| !ids.contains(&t.id));
+                super::notifications::remove(ids);
+                self.hover = None;
+            }
             Hit::Toast(i) => {
                 let toast = self.toasts.get(i)?.clone();
                 super::notifications::remove(vec![toast.id]);

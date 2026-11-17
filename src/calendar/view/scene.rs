@@ -138,6 +138,10 @@ pub enum Hit {
     Focus,
     Settings,
     Clocks,
+    /// Give the notification centre the whole panel, or take it back.
+    Expand,
+    /// The calendar folded to one line: unfold it.
+    Calendar,
 }
 
 pub struct Toast {
@@ -264,6 +268,8 @@ pub struct Input {
     pub focus_running: bool,
     pub detail: Option<Detail>,
     pub hover: Option<Hit>,
+    /// The notification centre takes the whole panel, the calendar folded to one line.
+    pub center_full: bool,
 }
 
 pub struct Scene {
@@ -408,7 +414,12 @@ pub fn build(input: &Input) -> Scene {
     }
     let main_h = main_height(input, rows);
     let mut folded = summary;
-    if center_h > 0.0 && !summary {
+    let full = input.center_full && input.groups.is_some();
+    let main_h = if full { SUMMARY_H } else { main_h };
+    if let (true, Some(groups)) = (full, &input.groups) {
+        center_h = center_height(groups).min(input.room - SUMMARY_H - GAP).max(CENTER_MIN);
+        folded = false;
+    } else if center_h > 0.0 && !summary {
         let spare = input.room - main_h - GAP;
         if spare < CENTER_MIN {
             folded = true;
@@ -432,6 +443,10 @@ pub fn build(input: &Input) -> Scene {
     }
     ink.draw(main, Draw::Card);
     let list_view = match &input.detail {
+        _ if full => {
+            calendar_summary(&mut ink, main, input);
+            None
+        }
         Some(detail) => {
             detail_card(&mut ink, main, detail);
             None
@@ -439,6 +454,16 @@ pub fn build(input: &Input) -> Scene {
         None => calendar(&mut ink, main, input, rows),
     };
     Scene { top, main, h: main.bottom(), items: ink.items, hits: ink.hits, center_view, list_view }
+}
+
+/// The calendar folded to one line, under the notification centre given the whole panel.
+fn calendar_summary(ink: &mut Ink2, card: R, input: &Input) {
+    ink.plate(R::new(card.x + 4.0, card.y + 4.0, card.w - 8.0, card.h - 8.0), Hit::Calendar, 6.0);
+    let y = card.y + (card.h - 20.0) / 2.0;
+    ink.glyph(R::new(card.x + PAD, y, 16.0, 20.0), '\u{E787}', Font::IconSmall, Ink::Text2);
+    let line = format!("{} {}", input.weekday, input.date);
+    ink.text(R::new(card.x + PAD + 28.0, y, card.w - 2.0 * PAD - 60.0, 20.0), line, Font::Strong, Ink::Text, Align::Left);
+    ink.glyph(R::new(card.right() - PAD - 16.0, y, 16.0, 20.0), '\u{E73F}', Font::IconSmall, Ink::Text2);
 }
 
 /// The notification centre folded to one line: its count and the apps' logos.
@@ -556,6 +581,9 @@ fn center(ink: &mut Ink2, card: R, input: &Input, groups: &[Group]) -> (R, f32) 
     ink.text(clear, "Clear all", Font::Caption, Ink::Text, Align::Center);
     ink.hit(clear, Hit::ClearAll);
     ink.icon_button(R::new(clear.x - 40.0, head.y, 32.0, 32.0), '\u{E708}', Hit::Quiet, input.quiet);
+    // The whole panel for the notifications, or back.
+    let expand = if input.center_full { '\u{E73F}' } else { '\u{E740}' };
+    ink.icon_button(R::new(clear.x - 76.0, head.y, 32.0, 32.0), expand, Hit::Expand, false);
 
     let area = R::new(card.x, head.bottom() + 6.0, card.w, card.bottom() - 8.0 - (head.bottom() + 6.0));
     let content = center_height(groups) - (12.0 + 32.0 + 6.0) - 8.0;
@@ -823,6 +851,7 @@ mod tests {
             focus_running: false,
             detail: None,
             hover: None,
+            center_full: false,
         }
     }
 
@@ -882,6 +911,19 @@ mod tests {
         let s = build(&i);
         assert_eq!(s.top.unwrap().h, SUMMARY_H);
         assert!(s.h <= i.room + 0.5);
+    }
+
+    #[test]
+    fn expanded_notifications_take_the_panel_and_the_calendar_folds() {
+        let mut i = input();
+        // As the view gives it: every notification shown.
+        i.groups = Some(vec![Group { all: true, ..group("WhatsApp", 30, true) }]);
+        i.room = 900.0;
+        i.center_full = true;
+        let s = build(&i);
+        assert_eq!(s.main.h, SUMMARY_H);
+        assert!((s.h - i.room).abs() < 0.5, "the cards fill the room: {}", s.h);
+        assert_eq!(s.hit(s.main.x + 20.0, s.main.y + 20.0), Some(Hit::Calendar));
     }
 
     #[test]

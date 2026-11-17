@@ -108,6 +108,8 @@ struct View {
     draft: Option<(u32, String)>,
     /// The notification whose menu is open.
     menu_for: Option<u32>,
+    /// The notifications have the whole panel, the calendar folded to one line.
+    center_full: bool,
     clocks: Vec<WorldClock>,
     center_scroll: f32,
     list_scroll: f32,
@@ -273,6 +275,7 @@ fn create(config: &Config) -> Result<()> {
         center_scroll: 0.0,
         list_scroll: 0.0,
         hover: None,
+        center_full: false,
         pressed: None,
     };
     super::notifications::set_watching(true);
@@ -327,6 +330,7 @@ fn empty_input() -> scene::Input {
         focus_running: false,
         detail: None,
         hover: None,
+        center_full: false,
     }
 }
 
@@ -409,8 +413,8 @@ impl View {
                             })
                             .collect(),
                         when: list.first().map_or_else(String::new, |t| arrived(t.at)),
-                        all: self.full_groups.contains(&key),
-                        open,
+                        all: self.center_full || self.full_groups.contains(&key),
+                        open: open || self.center_full,
                     }
                 })
                 .collect()
@@ -528,6 +532,7 @@ impl View {
             focus_running: focus.is_some(),
             detail,
             hover: self.hover,
+            center_full: self.center_full,
         }
     }
 
@@ -659,6 +664,13 @@ impl View {
                 self.month_open = false;
                 self.detail = None;
             }
+            Hit::Expand => {
+                self.center_full = !self.center_full;
+                self.month_open = false;
+                self.detail = None;
+                self.center_scroll = 0.0;
+            }
+            Hit::Calendar => self.center_full = false,
             Hit::Group(g) => {
                 let key = self.group_key(g)?;
                 let groups = super::notifications::grouped(&self.toasts);

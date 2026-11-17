@@ -595,15 +595,17 @@ fn center(ink: &mut Ink2, card: R, input: &Input, groups: &[Group]) -> (R, f32) 
     let mut y = area.y - scroll;
     for (g, group) in groups.iter().enumerate() {
         let line = R::new(x, y, w, if group.open { GROUP_H } else { FOLDED_H });
-        ink.plate(line, Hit::Group(g), 6.0);
+        // No plate: one would run into the notification under it. The name brightens instead.
+        ink.hit(line, Hit::Group(g));
+        let lit = ink.lit(Hit::Group(g)) || ink.lit(Hit::DismissGroup(g));
         let mut tx = line.x + 8.0;
         if let Some((key, bytes)) = &group.logo {
             ink.draw(R::new(tx, line.y + (line.h - 16.0) / 2.0, 16.0, 16.0), Draw::Logo { key: key.clone(), bytes: bytes.clone() });
             tx += 24.0;
         }
         let name = if group.open { group.name.clone() } else { format!("{} · {}", group.name, group.toasts.len()) };
-        ink.text(R::new(tx, line.y, line.right() - tx - 80.0, line.h), name, Font::CaptionStrong, Ink::Text2, Align::Left);
-        if ink.lit(Hit::Group(g)) || ink.lit(Hit::DismissGroup(g)) {
+        ink.text(R::new(tx, line.y, line.right() - tx - 80.0, line.h), name, Font::CaptionStrong, if lit { Ink::Text } else { Ink::Text2 }, Align::Left);
+        if lit {
             // Under the pointer: clear all of this app's, in place of its time or chevron.
             let x_r = R::new(line.right() - 30.0, line.y + (line.h - 24.0) / 2.0, 24.0, 24.0);
             ink.plate(x_r, Hit::DismissGroup(g), 4.0);

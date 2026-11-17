@@ -609,18 +609,28 @@ fn calendar(ink: &mut Ink2, card: R, input: &Input, rows: usize) -> Option<(R, f
     let mut y = card.y + PAD;
 
     // The date, the world clocks, and the week/month switch.
-    let today = R::new(x - 6.0, y - 4.0, 200.0, 50.0);
-    ink.plate(today, Hit::Today, 6.0);
-    ink.text(R::new(x, y, 200.0, 16.0), input.weekday.clone(), Font::Caption, Ink::Text2, Align::Left);
-    ink.text(R::new(x, y + 16.0, 220.0, 28.0), input.date.clone(), Font::Big, Ink::Text, Align::Left);
-    let toggle = R::new(card.right() - PAD - 32.0, y + 10.0, 32.0, 32.0);
-    ink.draw(toggle, Draw::Rect { fill: if ink.lit(Hit::Month) { Fill::Hover } else { Fill::Raised }, radius: 4.0 });
-    ink.glyph(toggle, if input.month_open { '\u{E70E}' } else { '\u{E70D}' }, Font::IconSmall, Ink::Text);
+    // Hovers here tint the text (a link's), not a plate: plates around short text read as boxes.
+    let today = R::new(x, y, 200.0, 44.0);
+    ink.hit(today, Hit::Today);
+    let lit = ink.lit(Hit::Today);
+    ink.text(R::new(x, y, 200.0, 16.0), input.weekday.clone(), Font::Caption, if lit { Ink::Accent } else { Ink::Text2 }, Align::Left);
+    ink.text(R::new(x, y + 16.0, 220.0, 28.0), input.date.clone(), Font::Big, if lit { Ink::Accent } else { Ink::Text }, Align::Left);
+    // The switch says what it opens: "Month ⌄", then "Week ⌃".
+    let toggle = R::new(card.right() - PAD - 88.0, y + 12.0, 88.0, 30.0);
+    let fill = if ink.lit(Hit::Month) { Fill::Hover } else { Fill::Raised };
+    ink.draw(toggle, Draw::Rect { fill, radius: 15.0 });
+    ink.draw(toggle, Draw::Outline { ink: Ink::Text3, radius: 15.0 });
+    let label = if input.month_open { "Week" } else { "Month" };
+    ink.text(R::new(toggle.x + 14.0, toggle.y, 50.0, toggle.h), label, Font::Caption, Ink::Text, Align::Left);
+    ink.glyph(R::new(toggle.right() - 30.0, toggle.y, 18.0, toggle.h), if input.month_open { '\u{E70E}' } else { '\u{E70D}' }, Font::IconSmall, Ink::Text);
     ink.hit(toggle, Hit::Month);
     if !input.clocks.is_empty() {
-        let r = R::new(toggle.x - 150.0, y + 22.0, 142.0, 20.0);
-        ink.plate(r, Hit::Clocks, 4.0);
-        ink.text(r, input.clocks.clone(), Font::Caption, Ink::Text2, Align::Right);
+        // As wide as its text (about 6.5 DIPs a character at 12), right against the switch.
+        let tw = (input.clocks.chars().count() as f32 * 6.5 + 4.0).min(toggle.x - x - 150.0).max(40.0);
+        let r = R::new(toggle.x - 12.0 - tw, y + 18.0, tw, 20.0);
+        ink.hit(r, Hit::Clocks);
+        let tint = if ink.lit(Hit::Clocks) { Ink::Accent } else { Ink::Text2 };
+        ink.text(r, input.clocks.clone(), Font::Caption, tint, Align::Right);
     }
     y += 44.0 + 14.0;
 

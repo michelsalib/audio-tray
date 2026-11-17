@@ -27,7 +27,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     DefWindowProcW, DestroyWindow, GetCursorPos, ShowWindow, SW_HIDE, SW_SHOWNA, WA_INACTIVE, WHEEL_DELTA, WINDOW_EX_STYLE, WM_ACTIVATE,
-    WM_CHAR, WM_DESTROY, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WindowFromPoint, GetAncestor, GA_ROOT,
+    WM_CHAR, WM_DESTROY, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_TIMER, KillTimer, SetTimer, WindowFromPoint, GetAncestor, GA_ROOT,
     WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, MA_NOACTIVATE, WM_MOUSEACTIVATE,
 };
 
@@ -51,6 +51,9 @@ const SETTLE: Duration = Duration::from_millis(400);
 const MARGIN: f32 = 12.0;
 /// How far a wheel notch scrolls a list.
 const SCROLL_STEP: f32 = 48.0;
+/// How long the pointer rests on a target before its tooltip shows.
+const TIP_TIMER: usize = 1;
+const TIP_DELAY_MS: u32 = 500;
 /// How far ahead the next event is looked for.
 const AHEAD: i64 = 7 * DAY;
 
@@ -110,6 +113,8 @@ struct View {
     menu_for: Option<u32>,
     /// The notifications have the whole panel, the calendar folded to one line.
     center_full: bool,
+    /// The pointer has rested on what it hovers: its tooltip shows.
+    show_tip: bool,
     clocks: Vec<WorldClock>,
     center_scroll: f32,
     list_scroll: f32,
@@ -123,12 +128,14 @@ type After = Box<dyn FnOnce()>;
 /// Open the panel, or close it if it is open.
 pub fn toggle(config: &Config) {
     if OPEN.with(Cell::get) != 0 {
+        println!("calendar: closed by a click on the clock");
         close();
         return;
     }
     if CLOSED_AT.with(Cell::get).is_some_and(|at| at.elapsed() < SETTLE) {
         return;
     }
+    println!("calendar: opening");
     if let Err(e) = create(config) {
         eprintln!("calendar: could not open ({e:#})");
     }
@@ -276,6 +283,7 @@ fn create(config: &Config) -> Result<()> {
         list_scroll: 0.0,
         hover: None,
         center_full: false,
+        show_tip: false,
         pressed: None,
     };
     super::notifications::set_watching(true);
@@ -331,6 +339,7 @@ fn empty_input() -> scene::Input {
         detail: None,
         hover: None,
         center_full: false,
+        show_tip: false,
     }
 }
 
@@ -533,6 +542,7 @@ impl View {
             detail,
             hover: self.hover,
             center_full: self.center_full,
+            show_tip: self.show_tip,
         }
     }
 
@@ -642,6 +652,14 @@ impl View {
     fn set_hover(&mut self, hover: Option<Hit>) {
         if self.hover != hover {
             self.hover = hover;
+            // A tooltip waits for the pointer to rest.
+            self.show_tip = false;
+            unsafe {
+                let _ = KillTimer(Some(self.hwnd), TIP_TIMER);
+                if hover.is_some() {
+                    SetTimer(Some(self.hwnd), TIP_TIMER, TIP_DELAY_MS, None);
+                }
+            }
             self.relayout();
         }
     }
@@ -1064,6 +1082,7 @@ fn draw(pen: &Pen, scene: &Scene, p: &Palette) {
         Fill::Accent => p.accent,
         Fill::Rule => p.text.alpha(0.08),
         Fill::Mark => p.text.alpha(0.5),
+        Fill::Tip => p.tip,
         Fill::Rgb(rgb) => Color::rgb(rgb),
     };
     for (r, d) in &scene.items {
@@ -1196,8 +1215,18 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESUL
             // Not to its own notification card (which never takes activation, but in case).
             let to = HWND(lparam.0 as *mut _);
             if with_view(|v| v.top_hwnd != to).unwrap_or(true) {
+                println!("calendar: closed, the foreground went to {:?} ({})", to.0, crate::win::class_name(to));
                 after = Some(Box::new(close));
             }
+        }
+        WM_TIMER if wparam.0 == TIP_TIMER => {
+            let _ = unsafe { KillTimer(Some(hwnd), TIP_TIMER) };
+            with_view(|v| {
+                if v.hover.is_some() && !v.show_tip {
+                    v.show_tip = true;
+                    v.relayout();
+                }
+            });
         }
         WM_MOUSELEAVE => {
             // Left this card: no hover, unless the pointer went to the other card.

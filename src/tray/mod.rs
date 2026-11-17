@@ -463,7 +463,10 @@ fn handle(msg: Queued) {
                 crate::settings::show_calendar();
             }
         }
-        crate::calendar::WM_CALENDAR if msg.wparam == crate::calendar::CLOSE => crate::calendar::close(),
+        crate::calendar::WM_CALENDAR if msg.wparam == crate::calendar::CLOSE => {
+            println!("calendar: closed by a click outside it");
+            crate::calendar::close()
+        }
         crate::calendar::WM_CALENDAR => {
             crate::calendar::changed();
             reschedule();

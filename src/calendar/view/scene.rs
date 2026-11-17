@@ -75,6 +75,8 @@ pub enum Fill {
     Rule,
     /// The marks under busy days.
     Mark,
+    /// A tooltip's ground: opaque, over anything.
+    Tip,
     Rgb([u8; 3]),
 }
 
@@ -272,6 +274,8 @@ pub struct Input {
     pub hover: Option<Hit>,
     /// The notification centre takes the whole panel, the calendar folded to one line.
     pub center_full: bool,
+    /// The pointer has rested on `hover`: its tooltip shows.
+    pub show_tip: bool,
 }
 
 pub struct Scene {
@@ -455,7 +459,51 @@ pub fn build(input: &Input) -> Scene {
         }
         None => calendar(&mut ink, main, input, rows),
     };
+    if input.show_tip {
+        tooltip(&mut ink, input, top, main);
+    }
     Scene { top, main, h: main.bottom(), items: ink.items, hits: ink.hits, center_view, list_view }
+}
+
+/// What an icon-only target does, in words (`None`: it says it already).
+fn tip_text(hit: Hit, input: &Input) -> Option<&'static str> {
+    Some(match hit {
+        Hit::Quiet if input.quiet => "Turn off Do not disturb",
+        Hit::Quiet => "Do not disturb",
+        Hit::Expand if input.center_full => "Back to the calendar",
+        Hit::Expand => "Show all notifications",
+        Hit::Month if input.month_open => "Show the week",
+        Hit::Month => "Show the month",
+        Hit::Prev => "Previous month",
+        Hit::Next => "Next month",
+        Hit::Settings => "Settings",
+        Hit::Back => "Back",
+        Hit::Dismiss(_) => "Dismiss",
+        Hit::DismissGroup(_) => "Clear all from this app",
+        Hit::Menu(_) => "More options",
+        Hit::Send(_) => "Send",
+        Hit::Clocks => "Change the clocks",
+        Hit::Today => "Go to today",
+        Hit::Calendar => "Back to the calendar",
+        _ => return None,
+    })
+}
+
+/// The hovered target's tooltip, under it (above it near its card's foot), inside its card.
+fn tooltip(ink: &mut Ink2, input: &Input, top: Option<R>, main: R) {
+    let Some(hit) = input.hover else { return };
+    let Some(text) = tip_text(hit, input) else { return };
+    let Some(r) = ink.hits.iter().rev().find(|(_, h)| *h == hit).map(|(r, _)| *r) else { return };
+    let card = top.filter(|t| t.contains(r.x + 1.0, r.y + 1.0)).unwrap_or(main);
+    let w = (text.chars().count() as f32 * 6.5 + 20.0).min(card.w - 16.0);
+    let h = 26.0;
+    let x = (r.x + r.w / 2.0 - w / 2.0).clamp(card.x + 8.0, card.right() - 8.0 - w);
+    let below = r.bottom() + 6.0;
+    let y = if below + h <= card.bottom() - 4.0 { below } else { r.y - 6.0 - h };
+    let tip = R::new(x, y.max(card.y + 4.0), w, h);
+    ink.draw(tip, Draw::Rect { fill: Fill::Tip, radius: 4.0 });
+    ink.draw(tip, Draw::Outline { ink: Ink::Text3, radius: 4.0 });
+    ink.text(tip, text, Font::Caption, Ink::Text, Align::Center);
 }
 
 /// The calendar folded to one line, under the notification centre given the whole panel.
@@ -855,6 +903,7 @@ mod tests {
             detail: None,
             hover: None,
             center_full: false,
+            show_tip: false,
         }
     }
 

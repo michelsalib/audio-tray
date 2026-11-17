@@ -57,6 +57,8 @@ pub struct Palette {
     pub hover: Color,
     pub accent: Color,
     pub on_accent: Color,
+    /// A tooltip's ground.
+    pub tip: Color,
 }
 
 impl Palette {
@@ -74,6 +76,7 @@ impl Palette {
                 hover: Color::hex(0x000000, 0.045),
                 accent: Color::rgb(crate::flyout::theme::accent_shade(4).unwrap_or([0x00, 0x5F, 0xB8])),
                 on_accent: Color::hex(0xFFFFFF, 1.0),
+                tip: Color::hex(0xF9F9F9, 1.0),
             }
         } else {
             let [r, g, b] = crate::flyout::theme::TINT;
@@ -86,6 +89,7 @@ impl Palette {
                 hover: Color::hex(0xFFFFFF, 0.061),
                 accent: Color::rgb(crate::flyout::theme::accent_rgb()),
                 on_accent: Color::hex(0x000000, 1.0),
+                tip: Color::hex(0x2C2C2C, 1.0),
             }
         }
     }

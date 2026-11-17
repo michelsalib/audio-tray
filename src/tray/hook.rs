@@ -91,6 +91,8 @@ unsafe extern "system" fn mouse_hook(code: i32, wparam: WPARAM, lparam: LPARAM) 
             return LRESULT(1);
         }
         if message != WM_LBUTTONUP && outside_calendar(info.pt) {
+            let open = *crate::calendar::OPEN_RECT.lock().unwrap_or_else(|e| e.into_inner());
+            println!("calendar: a click at {},{} is outside {:?}", info.pt.x, info.pt.y, open.map(|r| (r.left, r.top, r.right, r.bottom)));
             // Passed on: the click still does what it does there.
             super::post(crate::calendar::WM_CALENDAR, crate::calendar::CLOSE, 0);
         }

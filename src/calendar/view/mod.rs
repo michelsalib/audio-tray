@@ -264,6 +264,13 @@ fn draw_badge(count: u32) -> Option<Badge> {
 pub fn refresh() {
     with_view(|v| {
         v.reload();
+        if let Some((id, draft)) = super::notifications::take_failure() {
+            // An action the app did not take: its notification is back, with what was typed.
+            if let Some(text) = draft.filter(|t| !t.is_empty()) {
+                v.draft = Some((id, text));
+            }
+            v.say("The app did not take it: open the app to finish");
+        }
         v.relayout();
     });
     keep_rect();
@@ -484,7 +491,18 @@ impl View {
                 e
             })
             .collect();
-        self.toasts = if calendar.notifications { super::notifications::list() } else { Vec::new() };
+        let toasts = if calendar.notifications { super::notifications::list() } else { Vec::new() };
+        if toasts.iter().map(|t| t.id).ne(self.toasts.iter().map(|t| t.id)) {
+            // Targets name a notification by its place, which has moved: a held press or the
+            // keyboard's ring would act on another one.
+            if self.pressed.is_some_and(|h| scene::toast_of(h).is_some()) {
+                self.pressed = None;
+            }
+            if self.focus.is_some_and(|h| scene::toast_of(h).is_some() || matches!(h, Hit::Group(_) | Hit::More(_) | Hit::DismissGroup(_))) {
+                self.focus = None;
+            }
+        }
+        self.toasts = toasts;
         self.clocks = if calendar.world_clocks { super::zones::clocks() } else { Vec::new() };
     }
 
@@ -891,6 +909,11 @@ impl View {
     /// Act on a click; what needs the state released comes back.
     fn activate(&mut self, hit: Hit) -> Option<After> {
         let open = |url: String| -> Option<After> {
+            // A feed's link is anyone's text: only a web address opens (never a file or a share).
+            if !super::web_link(&url) {
+                eprintln!("calendar: not opening {url:?}, not a web address");
+                return None;
+            }
             Some(Box::new(move || {
                 close();
                 crate::win::shell_open(&url, None);
@@ -933,14 +956,14 @@ impl View {
             }
             Hit::Toast(i) => {
                 let toast = self.toasts.get(i)?.clone();
-                super::notifications::remove(vec![toast.id]);
+                super::notifications::hold(toast.id);
                 return Some(Box::new(move || {
                     close();
                     let rich = &toast.rich;
                     if rich.launch.is_empty() && rich.launch_kind != Kind::Protocol {
                         super::notifications::open_app(&toast.aumid);
                     } else {
-                        rich::invoke(&toast.aumid, rich.activator, &rich.launch, rich.launch_kind, Vec::new());
+                        rich::invoke(toast.id, &toast.aumid, rich.activator, &rich.launch, rich.launch_kind, Vec::new());
                     }
                 }));
             }
@@ -991,8 +1014,9 @@ impl View {
             }
             Hit::Quiet => {
                 let was = super::focus::active();
-                if !super::focus::toggle() && !was {
-                    self.say("Windows would not turn on Do not disturb");
+                let on = super::focus::toggle();
+                if on == was {
+                    self.say(if was { "Windows would not turn off Do not disturb" } else { "Windows would not turn on Do not disturb" });
                 }
                 self.quiet = super::focus::active();
                 crate::tray::wake_calendar();
@@ -1051,14 +1075,15 @@ impl View {
     /// closes when the app comes up.
     fn carry_out(&mut self, toast: Toast, action: rich::Action, inputs: Vec<(String, String)>) -> After {
         self.toasts.retain(|t| t.id != toast.id);
-        super::notifications::remove(vec![toast.id]);
+        // Off the list while the app takes it; back, with what was typed, if it does not.
+        super::notifications::hold(toast.id);
         self.hover = None;
         let quiet = action.kind == Kind::Background;
         Box::new(move || {
             if !quiet {
                 close();
             }
-            rich::invoke(&toast.aumid, toast.rich.activator, &action.arguments, action.kind, inputs);
+            rich::invoke(toast.id, &toast.aumid, toast.rich.activator, &action.arguments, action.kind, inputs);
             if quiet {
                 refresh();
                 keep_rect();

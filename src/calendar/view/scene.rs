@@ -754,10 +754,12 @@ fn notification(ink: &mut Ink2, r: R, toast: &Toast) {
                     pills.insert(0, ("Reply".to_string(), Hit::Reply(i)));
                 }
                 for (label, hit) in pills {
-                    let pw = (label.chars().count() as f32 * 7.0 + 28.0).clamp(64.0, end - bx);
-                    if pw < 40.0 {
+                    // What room is left, before sizing: a clamp with less than its minimum panics.
+                    let room = end - bx;
+                    if room < 40.0 {
                         break;
                     }
+                    let pw = (label.chars().count() as f32 * 7.0 + 28.0).max(64.0).min(room);
                     ink.pill(R::new(bx, row.y + 2.0, pw, row.h - 4.0), &label, hit, false);
                     bx += pw + 6.0;
                 }
@@ -1255,6 +1257,20 @@ mod tests {
         let join = s.hits.iter().find(|(_, h)| *h == Hit::Join(0)).unwrap().0;
         let (x, y) = center_of(join);
         assert_eq!(s.hit(x, y), Some(Hit::Join(0)));
+    }
+
+    #[test]
+    fn buttons_that_do_not_fit_are_left_out_not_a_panic() {
+        let mut i = input();
+        let mut many = toast(0);
+        many.buttons = (0..5).map(|n| format!("A rather long button label {n}")).collect();
+        many.reply = Some("Reply".into());
+        many.menu = vec!["Turn off".into()];
+        i.groups = Some(vec![Group { toasts: vec![many], ..group("Teams", 1, true) }]);
+        let s = build(&i);
+        let card = s.top.unwrap();
+        assert!(s.hits.iter().any(|(_, h)| *h == Hit::Reply(0)));
+        assert!(s.hits.iter().filter(|(_, h)| matches!(h, Hit::Action(..))).all(|(r, _)| r.right() <= card.right()));
     }
 
     const BY_THE_CLOCK: Columns = Columns { calendar_left: false, from_top: false };

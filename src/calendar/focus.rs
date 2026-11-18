@@ -78,9 +78,10 @@ pub fn recover() {
     }
 }
 
-/// At exit: end whatever Audio Tray holds, whyever it was started.
+/// At exit: end what Audio Tray started on its own (a timer, a meeting's quiet). Do not disturb
+/// switched on by hand stays on: an update or a restart must not turn it off behind the user's back.
 pub fn release() {
-    if let Some((why, ..)) = OURS.with(Cell::get) {
+    if let Some((why, ..)) = OURS.with(Cell::get).filter(|(why, ..)| *why != Why::Manual) {
         stop(why);
     }
 }
@@ -122,13 +123,27 @@ pub fn start(why: Why, until: i64) -> bool {
         // The user's own session or Do not disturb already keeps things quiet.
         return false;
     }
-    if let Some((_, _, how)) = held.and(OURS.with(Cell::get)) {
-        // Already quiet by Audio Tray: the new reason and end take over, the way stays. A session
-        // that ends sooner is started again then, by the next tick.
-        OURS.with(|o| o.set(Some((why, until, how))));
-        return true;
+    if let Some((_, held_until, how)) = held.and(OURS.with(Cell::get)) {
+        if how == How::Dnd || held_until == until {
+            // Already quiet by Audio Tray, by Do not disturb (which Audio Tray ends itself): the new
+            // reason and end take over.
+            OURS.with(|o| o.set(Some((why, until, how))));
+            if why == Why::Manual {
+                // Kept past a restart (see [`release`]): no longer one for the next start to end.
+                mark(false);
+            }
+            return true;
+        }
+        // A Windows session ends at its own time: one for the new end replaces it, or it would end
+        // the new reason early (a timer started during a meeting's quiet).
+        if let Some(manager) = manager() {
+            let _ = manager.DeactivateFocus();
+        }
+        OURS.with(|o| o.set(None));
     }
-    let session = manager().map(|m| m.TryStartFocusSession2(date_time(until)));
+    // By hand, "until switched off": Do not disturb itself, not a Windows focus session (which also
+    // hides the taskbar's badges and shows a timer running to the year 9999).
+    let session = if why == Why::Manual { None } else { manager().map(|m| m.TryStartFocusSession2(date_time(until))) };
     let how = match session {
         Some(Ok(_)) => How::Session,
         refused => {
@@ -138,7 +153,9 @@ pub fn start(why: Why, until: i64) -> bool {
             if !dnd::set(true) {
                 return false;
             }
-            mark(true);
+            // Audio Tray's own, for the next start to end after a crash; one switched on by hand
+            // stays the user's.
+            mark(why != Why::Manual);
             How::Dnd
         }
     };
@@ -175,8 +192,9 @@ pub fn toggle() -> bool {
                 let _ = manager.DeactivateFocus();
             }
         }
-        if dnd::on() {
-            dnd::set(false);
+        if dnd::on() && !dnd::set(false) {
+            // Windows refused: still on.
+            return true;
         }
         mark(false);
         OURS.with(|o| o.set(None));

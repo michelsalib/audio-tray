@@ -101,10 +101,14 @@ struct State {
     sign_in_problems: Vec<(Provider, String)>,
     /// The calendars the last fetch found.
     calendars: Vec<Calendar>,
+    /// Bumped by a sign-out or a change of links: a fetch begun before brings back what is no
+    /// longer wanted, and is dropped.
+    generation: u64,
 }
 
 static STATE: Mutex<State> = Mutex::new(State {
     events: Vec::new(),
+    generation: 0,
     range: None,
     setup: None,
     fetched: None,
@@ -251,22 +255,27 @@ fn spawn_fetch(setup: Setup, days: (i32, i32)) {
         let _done = Done;
         let (mut setup, mut days) = (setup, days);
         loop {
+            let generation = state().generation;
             let Fetched { events, problems, done, calendars } = fetch_all(&setup, days);
             {
                 let mut state = state();
-                // A source that failed keeps what it had, when it was for the same days.
-                let same = state.range == Some(days);
-                let failed: Vec<Source> = problems.iter().map(|(s, _)| *s).collect();
-                let mut kept: Vec<Event> = if same { state.events.iter().filter(|e| failed.contains(&e.source)).cloned().collect() } else { Vec::new() };
-                kept.extend(events.into_iter().filter(|e| done.contains(&e.source)));
-                state.events = kept;
-                state.range = Some(days);
-                state.setup = Some(setup.clone());
-                state.fetched = Some(time::now());
-                state.problems = problems;
-                // Calendars of a source that failed stay listed.
-                state.calendars.retain(|c| failed.contains(&c.source));
-                state.calendars.extend(calendars);
+                if state.generation != generation {
+                    println!("calendar: a fetch begun before a sign-out or a change of links is dropped");
+                } else {
+                    // A source that failed keeps what it had, when it was for the same days.
+                    let same = state.range == Some(days);
+                    let failed: Vec<Source> = problems.iter().map(|(s, _)| *s).collect();
+                    let mut kept: Vec<Event> = if same { state.events.iter().filter(|e| failed.contains(&e.source)).cloned().collect() } else { Vec::new() };
+                    kept.extend(events.into_iter().filter(|e| done.contains(&e.source)));
+                    state.events = kept;
+                    state.range = Some(days);
+                    state.setup = Some(setup.clone());
+                    state.fetched = Some(time::now());
+                    state.problems = problems;
+                    // Calendars of a source that failed stay listed.
+                    state.calendars.retain(|c| failed.contains(&c.source));
+                    state.calendars.extend(calendars);
+                }
                 match state.again.take() {
                     Some((next_setup, next_days)) => {
                         setup = next_setup;
@@ -432,6 +441,10 @@ pub fn sign_out(provider: Provider) {
     sources::sign_out(provider);
     {
         let mut state = state();
+        state.generation += 1;
+        state.calendars.retain(|c| c.source != provider.source());
+        // Fetched again, without it.
+        state.fetched = None;
         state.events.retain(|e| e.source != provider.source());
         state.problems.retain(|(s, _)| *s != provider.source());
         state.sign_in_problems.retain(|(p, _)| *p != provider);
@@ -442,6 +455,8 @@ pub fn sign_out(provider: Provider) {
 /// The links changed (one added or removed): their events, by index, are no longer right.
 pub fn links_changed() {
     let mut state = state();
+    state.generation += 1;
+    state.calendars.retain(|c| !matches!(c.source, Source::Link(_)));
     state.events.retain(|e| !matches!(e.source, Source::Link(_)));
     state.problems.retain(|(s, _)| !matches!(s, Source::Link(_)));
     state.fetched = None;
@@ -461,9 +476,62 @@ pub fn set_shortcut(on: bool) {
     SHORTCUT.store(on, Ordering::SeqCst);
 }
 
+/// Whether `link` is a web address, the only kind an event's link or join opens: a feed's text
+/// could name a program or a share, which the shell would run.
+pub fn web_link(link: &str) -> bool {
+    let link = link.trim_start().to_ascii_lowercase();
+    link.starts_with("https://") || link.starts_with("http://")
+}
+
+/// Whether `link` is an address a notification's button may open: a URI with a scheme of its own
+/// (`ms-teams:`, `https:`), never a path, a file, or a scheme that runs or searches things.
+pub fn app_link(link: &str) -> bool {
+    const REFUSED: [&str; 9] = ["file", "shell", "ms-msdt", "search-ms", "search", "ms-search", "javascript", "vbscript", "ms-officecmd"];
+    let Some((scheme, _)) = link.trim_start().split_once(':') else { return false };
+    let scheme = scheme.to_ascii_lowercase();
+    // One letter is a drive (`C:\…`).
+    scheme.len() >= 2
+        && scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+        && scheme.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+        && !REFUSED.contains(&scheme.as_str())
+}
+
 /// `#RRGGBB` as a colour.
 pub fn parse_hex(text: &str) -> Option<[u8; 3]> {
     let hex = text.trim().trim_start_matches('#');
-    let n = u32::from_str_radix(hex.get(..6)?, 16).ok()?;
+    // Six hex digits, nothing else (`from_str_radix` alone takes a sign).
+    if hex.len() != 6 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let n = u32::from_str_radix(hex, 16).ok()?;
     Some([(n >> 16) as u8, (n >> 8) as u8, n as u8])
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn only_web_and_app_addresses_open() {
+        assert!(super::web_link("https://teams.microsoft.com/l/meetup-join/x"));
+        assert!(super::web_link("  HTTP://example.com"));
+        assert!(!super::web_link(r"\host\share\x.exe"));
+        assert!(!super::web_link(r"C:\Windows\System32\cmd.exe"));
+        assert!(!super::web_link("file:///C:/x.exe"));
+        assert!(super::app_link("ms-teams:/l/chat"));
+        assert!(super::app_link("https://example.com"));
+        assert!(super::app_link("whatsapp://send?phone=1"));
+        assert!(!super::app_link(r"C:\Windows\System32\cmd.exe"));
+        assert!(!super::app_link(r"\host\share\x.exe"));
+        assert!(!super::app_link("file:///C:/x.exe"));
+        assert!(!super::app_link("search-ms:query=x"));
+        assert!(!super::app_link("SHELL:startup"));
+        assert!(!super::app_link("no scheme here"));
+    }
+
+    #[test]
+    fn colours_are_six_hex_digits() {
+        assert_eq!(super::parse_hex("#1a2B3c"), Some([0x1a, 0x2b, 0x3c]));
+        assert_eq!(super::parse_hex("+12345"), None);
+        assert_eq!(super::parse_hex("#1234567"), None);
+        assert_eq!(super::parse_hex("#12345"), None);
+    }
 }

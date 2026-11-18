@@ -130,15 +130,19 @@ pub fn for_toasts(wanted: &[(u32, String, Option<windows::ApplicationModel::AppI
         };
         let parts = parse(xml);
         let base = Base::of(info.as_ref());
+        let activator = activator(aumid, &base);
+        // Without an activator, an action done in the background reaches nothing: not offered (a
+        // reply typed and sent would vanish).
+        let works = |action: &Action| activator.is_some() || action.kind != Kind::Background;
         let rich = Rich {
             launch: parts.launch,
             launch_kind: parts.launch_kind,
             avatar: None,
             picture: None,
-            reply: parts.reply,
-            buttons: parts.buttons,
-            menu: parts.menu,
-            activator: activator(aumid, &base),
+            reply: parts.reply.filter(|r| works(&r.send)),
+            buttons: parts.buttons.into_iter().filter(|b| works(b)).collect(),
+            menu: parts.menu.into_iter().filter(|b| works(b)).collect(),
+            activator,
         };
         read.push((*id, Known { rich, avatar: parts.avatar, picture: parts.picture, base }));
     }
@@ -507,27 +511,35 @@ fn parse_guid(text: &str) -> Option<u128> {
 }
 
 /// Carry out a notification's button (or its click, or a reply with `inputs`), as Windows' centre
-/// would. On a thread of its own: the app's activator may take a moment to start.
-pub fn invoke(aumid: &str, activator: Option<u128>, arguments: &str, kind: Kind, inputs: Vec<(String, String)>) {
+/// would, for notification `id` (held out of the list meanwhile): removed once done, put back if
+/// the app did not take it, with what was typed. On a thread of its own: the app's activator may
+/// take a moment to start.
+pub fn invoke(id: u32, aumid: &str, activator: Option<u128>, arguments: &str, kind: Kind, inputs: Vec<(String, String)>) {
     let (aumid, arguments) = (aumid.to_string(), arguments.to_string());
     let _ = std::thread::Builder::new().name("notification action".into()).spawn(move || {
-        if kind == Kind::Protocol {
-            crate::win::shell_open(&arguments, None);
-            return;
-        }
-        let Some(clsid) = activator else {
-            if kind == Kind::Foreground {
-                super::notifications::open_app(&aumid);
-            } else {
-                eprintln!("notifications: {aumid} takes no buttons from outside Windows' centre");
+        let done = match kind {
+            // An app's own address only: a toast's text could name a program or a share.
+            Kind::Protocol if super::app_link(&arguments) => crate::win::shell_open(&arguments, None),
+            Kind::Protocol => {
+                eprintln!("notifications: not opening {arguments:?}, not an app's address");
+                false
             }
-            return;
+            _ => match activator.map(|clsid| activate(&aumid, clsid, &arguments, kind, &inputs)) {
+                Some(Ok(())) => true,
+                failed => {
+                    if let Some(Err(e)) = failed {
+                        eprintln!("notifications: {aumid} did not take the action ({e:#})");
+                    }
+                    // In front, the app itself is the next best thing.
+                    kind == Kind::Foreground && super::notifications::open_app(&aumid)
+                }
+            },
         };
-        if let Err(e) = activate(&aumid, clsid, &arguments, kind, &inputs) {
-            eprintln!("notifications: {aumid} did not take the action ({e:#})");
-            if kind == Kind::Foreground {
-                super::notifications::open_app(&aumid);
-            }
+        if done {
+            super::notifications::remove(vec![id]);
+        } else {
+            let draft = inputs.into_iter().next().map(|(_, text)| text);
+            super::notifications::failed(id, draft);
         }
     });
 }

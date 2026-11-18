@@ -3,7 +3,8 @@
 //! `config.toml`, a file people paste into bug reports.
 //!
 //! A credential holds at most 2560 bytes; a longer secret (a Microsoft refresh token) is split
-//! across `name`, `name#1`, `name#2`…, the first part saying how many there are.
+//! across `name`, then `name#1`, `name#2`… or `name#1.1`, `name#1.2`… (two sets taking turns, so a
+//! change is never half written), the first part saying how many there are and in which set.
 
 use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Security::Credentials::{
@@ -69,26 +70,37 @@ fn delete(name: &str) {
     let _ = unsafe { CredDeleteW(PCWSTR(target.as_ptr()), CRED_TYPE_GENERIC, None) };
 }
 
-fn part_name(name: &str, i: usize) -> String {
-    format!("{name}#{i}")
+/// Part `i` of a split secret, in set `set`: two sets take turns, so a new value is written beside
+/// the old one, never over it ([`set`]).
+fn part_name(name: &str, set: u8, i: usize) -> String {
+    if set == 0 {
+        format!("{name}#{i}")
+    } else {
+        format!("{name}#{set}.{i}")
+    }
 }
 
-/// How many parts the secret stored as `name` is in, and its first part's text.
-fn parts(first: &str) -> (usize, &str) {
-    let parsed = first
-        .strip_prefix(SPLIT)
-        .and_then(|rest| rest.split_once(SPLIT))
-        .and_then(|(head, text)| Some((head.strip_prefix("parts=")?.parse().ok()?, text)));
-    parsed.unwrap_or((1, first))
+/// How many parts the secret stored as `name` is in, in which set, and its first part's text:
+/// `\u{1}parts=N\u{1}` (set 0) or `\u{1}parts=N;set=1\u{1}`.
+fn parts(first: &str) -> (usize, u8, &str) {
+    let parsed = first.strip_prefix(SPLIT).and_then(|rest| rest.split_once(SPLIT)).and_then(|(head, text)| {
+        let head = head.strip_prefix("parts=")?;
+        let (count, set) = match head.split_once(";set=") {
+            Some((count, set)) => (count, set.parse().ok()?),
+            None => (head, 0),
+        };
+        Some((count.parse().ok()?, set, text))
+    });
+    parsed.unwrap_or((1, 0, first))
 }
 
 /// The secret stored as `name`, if any.
 pub fn get(name: &str) -> Option<String> {
     let first = read(name)?;
-    let (count, text) = parts(&first);
+    let (count, set, text) = parts(&first);
     let mut value = text.to_string();
     for i in 1..count {
-        value.push_str(&read(&part_name(name, i))?);
+        value.push_str(&read(&part_name(name, set, i))?);
     }
     Some(value)
 }
@@ -99,7 +111,7 @@ fn chunks(value: &str) -> Vec<&str> {
     let mut out = Vec::new();
     let mut rest = value;
     while !rest.is_empty() {
-        let room = if out.is_empty() { BLOB_MAX - 16 } else { BLOB_MAX };
+        let room = if out.is_empty() { BLOB_MAX - 32 } else { BLOB_MAX };
         let mut at = rest.len().min(room);
         while !rest.is_char_boundary(at) {
             at -= 1;
@@ -113,12 +125,18 @@ fn chunks(value: &str) -> Vec<&str> {
 
 /// Store `value` as `name`, or forget it (`None`). Best-effort: a failure is logged.
 pub fn set(name: &str, value: Option<&str>) {
-    let old_parts = read(name).map_or(0, |first| parts(&first).0);
+    let (old_parts, old_set) = read(name).map_or((0, 0), |first| {
+        let (count, set, _) = parts(&first);
+        (count, set)
+    });
+    let forget_old = || {
+        for i in 1..old_parts {
+            delete(&part_name(name, old_set, i));
+        }
+    };
     let Some(value) = value else {
         delete(name);
-        for i in 1..old_parts {
-            delete(&part_name(name, i));
-        }
+        forget_old();
         return;
     };
     if get(name).as_deref() == Some(value) {
@@ -128,14 +146,16 @@ pub fn set(name: &str, value: Option<&str>) {
     if pieces.len() <= 1 && !value.starts_with(SPLIT) {
         write(name, value);
     } else {
+        // The other set: until the first part says otherwise, the old parts still make the old
+        // value whole (a failure midway leaves it, not half of each).
+        let set = 1 - old_set.min(1);
         for (i, piece) in pieces.iter().enumerate().skip(1) {
-            write(&part_name(name, i), piece);
+            write(&part_name(name, set, i), piece);
         }
-        write(name, &format!("{SPLIT}parts={}{SPLIT}{}", pieces.len(), pieces.first().copied().unwrap_or_default()));
+        let head = if set == 0 { format!("parts={}", pieces.len()) } else { format!("parts={};set={set}", pieces.len()) };
+        write(name, &format!("{SPLIT}{head}{SPLIT}{}", pieces.first().copied().unwrap_or_default()));
     }
-    for i in pieces.len().max(1)..old_parts {
-        delete(&part_name(name, i));
-    }
+    forget_old();
 }
 
 #[cfg(test)]
@@ -149,7 +169,15 @@ mod tests {
         let pieces = chunks(&long);
         assert!(pieces.len() == 3 && pieces.iter().all(|p| p.len() <= BLOB_MAX));
         assert_eq!(pieces.concat(), long);
-        assert_eq!(parts("\u{1}parts=3\u{1}abc"), (3, "abc"));
-        assert_eq!(parts("plain"), (1, "plain"));
+        assert_eq!(parts("\u{1}parts=3\u{1}abc"), (3, 0, "abc"));
+        assert_eq!(parts("\u{1}parts=3;set=1\u{1}abc"), (3, 1, "abc"));
+        assert_eq!(parts("plain"), (1, 0, "plain"));
+    }
+
+    #[test]
+    fn the_two_sets_of_parts_never_share_a_name() {
+        assert_eq!(part_name("x", 0, 1), "x#1");
+        assert_eq!(part_name("x", 1, 1), "x#1.1");
+        assert_ne!(part_name("x", 0, 11), part_name("x", 1, 1));
     }
 }

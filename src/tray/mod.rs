@@ -469,7 +469,8 @@ fn handle(msg: Queued) {
             }
         }
         crate::calendar::WM_CALENDAR if msg.wparam == crate::calendar::CLOSE => {
-            println!("calendar: closed by a click outside it");
+            let (x, y) = (msg.lparam as u16 as i16, (msg.lparam >> 16) as u16 as i16);
+            println!("calendar: closed by a click outside it, at {x},{y}");
             crate::calendar::close()
         }
         crate::calendar::WM_CALENDAR if msg.wparam == crate::calendar::NOTIFICATIONS => {
@@ -794,6 +795,8 @@ impl Tray {
         }
         if self.config.calendar.enabled {
             crate::calendar::notifications::start();
+        } else {
+            crate::calendar::notifications::stop();
         }
         crate::calendar::set_shortcut(self.config.calendar.enabled && self.config.calendar.shortcut);
         hook::set_clock_taken(self.config.calendar.enabled);
@@ -843,6 +846,11 @@ impl Tray {
         crate::calendar::schedule::forget_clock();
         if self.config.injects() {
             taskbar::apply_at_startup(Current::read(&self.backend, &self.config).strip_icons());
+        }
+        // The revert dropped the clock's text: say it again once the TAP has taken the revert
+        // (posted, so a text sent at once would be taken first and then wiped by it).
+        if let Some(window) = taskbar::receiver() {
+            unsafe { SetTimer(Some(window), CALENDAR_TIMER, 1500, None) };
         }
         self.music = None;
         self.music = crate::music::spawn(&self.config.music, self.config.tile_shown());

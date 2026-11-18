@@ -123,10 +123,9 @@ unsafe extern "system" fn mouse_hook(code: i32, wparam: WPARAM, lparam: LPARAM) 
             return LRESULT(1);
         }
         if message != WM_LBUTTONUP && outside_calendar(info.pt) {
-            let open = *crate::calendar::OPEN_RECT.lock().unwrap_or_else(|e| e.into_inner());
-            println!("calendar: a click at {},{} is outside {:?}", info.pt.x, info.pt.y, open.map(|r| (r.left, r.top, r.right, r.bottom)));
-            // Passed on: the click still does what it does there.
-            super::post(crate::calendar::WM_CALENDAR, crate::calendar::CLOSE, 0);
+            // Passed on: the click still does what it does there. Logged by the tray thread, not
+            // here: a hook that blocks (on a console write) past Windows' timeout is unhooked.
+            super::post(crate::calendar::WM_CALENDAR, crate::calendar::CLOSE, ((info.pt.y as u16 as isize) << 16) | info.pt.x as u16 as isize);
         }
     }
     if code >= 0 && wparam.0 as u32 == WM_MOUSEWHEEL {
@@ -303,7 +302,7 @@ static SHORTCUT_HELD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicB
 /// open ours, while it replaces Windows'.
 unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     use std::sync::atomic::Ordering::Relaxed;
-    use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LWIN, VK_MENU, VK_RWIN};
+    use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT};
     use windows::Win32::UI::WindowsAndMessaging::{KBDLLHOOKSTRUCT, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP};
     if code >= 0 && crate::calendar::SHORTCUT.load(Relaxed) {
         let key = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
@@ -312,7 +311,9 @@ unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARA
             let down = matches!(wparam.0 as u32, WM_KEYDOWN | WM_SYSKEYDOWN);
             let up = matches!(wparam.0 as u32, WM_KEYUP | WM_SYSKEYUP);
             let held = |vk: windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY| unsafe { GetAsyncKeyState(vk.0 as i32) } as u16 & 0x8000 != 0;
-            let wanted = if key.vkCode == b'D' as u32 { held(VK_MENU) } else { !held(VK_MENU) };
+            // Exactly those: Win+Ctrl+N or Win+Shift+N are other apps' shortcuts.
+            let others = held(VK_CONTROL) || held(VK_SHIFT);
+            let wanted = !others && if key.vkCode == b'D' as u32 { held(VK_MENU) } else { !held(VK_MENU) };
             if down && (held(VK_LWIN) || held(VK_RWIN)) && wanted {
                 if !SHORTCUT_HELD.swap(true, Relaxed) {
                     super::post(crate::taskbar::WM_TASKBAR_ACTION, tap_proto::ACTION_OPEN_CALENDAR, 0);

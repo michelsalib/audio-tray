@@ -247,7 +247,10 @@ fn person(value: &str, params: &[(String, String)]) -> String {
 pub fn find_join(text: &str) -> Option<String> {
     const HOSTS: [&str; 5] = ["https://teams.microsoft.com/l/meetup-join", "https://teams.live.com/meet", "https://meet.google.com/", ".zoom.us/j/", ".webex.com/"];
     HOSTS.iter().filter_map(|host| text.find(host)).min().map(|at| {
-        let start = text[..at].rfind("https://").filter(|_| !text[at..].starts_with("https://")).unwrap_or(at);
+        // A host matched mid-address (`us02web.zoom.us/j/`): its address starts after whatever
+        // separates it from the text before (an `https://` further back is another link's).
+        let separator = |c: char| c.is_whitespace() || matches!(c, '>' | '"' | '<' | '(');
+        let start = if text[at..].starts_with("https://") { at } else { text[..at].rfind(separator).map_or(0, |s| s + text[s..].chars().next().map_or(1, char::len_utf8)) };
         let end = text[start..].find(|c: char| c.is_whitespace() || matches!(c, '>' | '"' | '<' | ')')).map_or(text.len(), |n| start + n);
         text[start..end].to_string()
     })
@@ -364,8 +367,10 @@ impl Rule {
                 "COUNT" => rule.count = value.parse().ok(),
                 "UNTIL" => rule.until = stamp(value, &[]),
                 "BYDAY" => rule.by_day = value.split(',').filter_map(by_day).collect(),
-                "BYMONTHDAY" => rule.by_month_day = list().collect(),
-                "BYMONTH" => rule.by_month = list().map(|m| m as u32).collect(),
+                "BYMONTHDAY" => rule.by_month_day = in_range(list(), 1, 31)?,
+                // A month out of range (a negative one would wrap to a huge month and overflow the
+                // calendar's sums) makes the rule unreadable: its first occurrence stays.
+                "BYMONTH" => rule.by_month = in_range(list().map(|m| m.max(0)), 1, 12)?.into_iter().map(|m| m as u32).collect(),
                 "BYSETPOS" => rule.by_set_pos = list().collect(),
                 "WKST" => rule.week_start = weekday_code(value)?,
                 _ => {}
@@ -380,7 +385,11 @@ impl Rule {
     fn expand(&self, start: i64, (from, to): (i32, i32), zone: &dyn Zone) -> Vec<i64> {
         let first_day = time::day_of(start);
         let clock = time::second_of_day(start);
-        let until = self.until.map(|u| u.wall(zone));
+        // A date alone ends the series with that whole day (Outlook writes one on timed series).
+        let until = self.until.map(|u| match u {
+            Stamp::Date(day) => (day as i64 + 1) * DAY - 1,
+            other => other.wall(zone),
+        });
         let (sy, sm, sd) = time::civil_from_days(first_day);
         let mut out = Vec::new();
         let mut counted = 0u32;
@@ -508,6 +517,12 @@ impl Rule {
 }
 
 /// `MO`, `2TU`, `-1FR`.
+/// The values, each from `low` to `high` either way (a negative one counts from the end); `None` if
+/// any is not.
+fn in_range(values: impl Iterator<Item = i32>, low: i32, high: i32) -> Option<Vec<i32>> {
+    values.map(|v| (low..=high).contains(&v.abs()).then_some(v)).collect()
+}
+
 fn by_day(text: &str) -> Option<(i32, u32)> {
     let text = text.trim();
     let split = text.len().checked_sub(2)?;
@@ -592,7 +607,8 @@ mod tests {
     fn counts_and_until_end_a_series_counted_from_its_start() {
         let text = feed(
             "BEGIN:VEVENT\r\nUID:d\r\nSUMMARY:Daily\r\nDTSTART;VALUE=DATE:20261101\r\nRRULE:FREQ=DAILY;COUNT=5\r\nEND:VEVENT\r\n\
-             BEGIN:VEVENT\r\nUID:u\r\nSUMMARY:Until\r\nDTSTART:20261101T080000Z\r\nRRULE:FREQ=DAILY;INTERVAL=2;UNTIL=20261107T080000Z\r\nEND:VEVENT\r\n",
+             BEGIN:VEVENT\r\nUID:u\r\nSUMMARY:Until\r\nDTSTART:20261101T080000Z\r\nRRULE:FREQ=DAILY;INTERVAL=2;UNTIL=20261107T080000Z\r\nEND:VEVENT\r\n\
+             BEGIN:VEVENT\r\nUID:v\r\nSUMMARY:Until a date\r\nDTSTART:20261101T080000Z\r\nRRULE:FREQ=DAILY;INTERVAL=2;UNTIL=20261107\r\nEND:VEVENT\r\n",
         );
         let zone = Fixed(0);
         let items = parse(&text, (day(2026, 11, 3), day(2026, 11, 30)), &zone);
@@ -600,6 +616,7 @@ mod tests {
         assert_eq!(daily.len(), 3, "the 3rd, 4th and 5th of five");
         let until: Vec<_> = items.iter().filter(|i| i.title == "Until").collect();
         assert_eq!(until.len(), 3, "the 3rd, 5th and 7th");
+        assert_eq!(items.iter().filter(|i| i.title == "Until a date").count(), 3, "a date-only end keeps that day's");
     }
 
     #[test]
@@ -649,6 +666,8 @@ mod tests {
         assert_eq!(item.join.as_deref(), Some("https://teams.microsoft.com/l/meetup-join/abc%40thread"));
         assert!(item.details.notes.starts_with("Join here\n"));
         assert_eq!(find_join("call on https://us02web.zoom.us/j/123?pwd=x now").as_deref(), Some("https://us02web.zoom.us/j/123?pwd=x"));
+        assert_eq!(find_join("Doc: https://docs.x/a
+Join: us02web.zoom.us/j/1").as_deref(), Some("us02web.zoom.us/j/1"), "not the doc's link");
     }
 
     #[test]
@@ -671,7 +690,8 @@ mod tests {
             "BEGIN:VEVENT\r\nUID:a\r\nSUMMARY:Huge\r\nDTSTART:20261113T090000Z\r\nDURATION:PT1H\r\nRRULE:FREQ=YEARLY;INTERVAL=2147483647\r\nEND:VEVENT\r\n\
              BEGIN:VEVENT\r\nUID:b\r\nSUMMARY:Never\r\nDTSTART:20261113T090000Z\r\nDURATION:PT1H\r\nRRULE:FREQ=MONTHLY;BYMONTHDAY=40;INTERVAL=999999\r\nEND:VEVENT\r\n\
              BEGIN:VEVENT\r\nUID:c\r\nSUMMARY:Cut\r\nDTSTART:2026\r\nEND:VEVENT\r\n\
-             BEGIN:VEVENT\r\nUID:d\r\nSUMMARY:Odd days\r\nDTSTART:20261113T090000Z\r\nDURATION:PT1H\r\nRRULE:FREQ=WEEKLY;BYDAY=é1,MO\r\nEND:VEVENT\r\n",
+             BEGIN:VEVENT\r\nUID:d\r\nSUMMARY:Odd days\r\nDTSTART:20261113T090000Z\r\nDURATION:PT1H\r\nRRULE:FREQ=WEEKLY;BYDAY=é1,MO\r\nEND:VEVENT\r\n\
+             BEGIN:VEVENT\r\nUID:e\r\nSUMMARY:Minus month\r\nDTSTART:20261113T090000Z\r\nDURATION:PT1H\r\nRRULE:FREQ=YEARLY;BYMONTH=-1\r\nEND:VEVENT\r\n",
         );
         let zone = Fixed(0);
         let items = parse(&text, (day(2026, 11, 9), day(2026, 11, 23)), &zone);

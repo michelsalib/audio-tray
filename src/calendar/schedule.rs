@@ -32,6 +32,20 @@ struct State {
     sent: Option<ClockText>,
     /// In a call, as the hub last said.
     in_call: bool,
+    /// Audio Tray keeps a meeting's or a call's quiet.
+    quiet_held: bool,
+    /// The user ended that quiet (the moon, Windows' Quick Settings): left off until this meeting
+    /// ends (its end), or this call (`None`: while the call lasts).
+    quiet_off: Option<Option<i64>>,
+}
+
+/// Whether the user's "off" still stands for quiet wanted until `until` (in a call or not).
+fn quiet_overridden(off: Option<Option<i64>>, until: i64, in_call: bool) -> bool {
+    match off {
+        Some(None) => in_call,
+        Some(Some(end)) => until <= end,
+        None => false,
+    }
 }
 
 thread_local! {
@@ -68,11 +82,15 @@ fn reminder_line(start: i64, now: i64, location: &str) -> String {
     line
 }
 
+/// The end of the meeting under way, if quiet is kept in meetings.
+fn meeting_quiet(events: &[Event], now: i64, in_meetings: bool) -> Option<i64> {
+    in_meetings.then(|| events.iter().filter_map(span).filter(|(start, end)| *start <= now && now < *end).map(|(_, end)| end).max()).flatten()
+}
+
 /// Until when things are kept quiet now: the end of the meeting under way (with `in_meetings`),
 /// else a while from now during a call (with `in_call`: its end is not known, so it moves on).
 fn quiet_until(events: &[Event], now: i64, in_meetings: bool, in_call: bool) -> Option<i64> {
-    let meeting = events.iter().filter_map(span).filter(|(start, end)| *start <= now && now < *end).map(|(_, end)| end).max();
-    match (in_meetings.then_some(meeting).flatten(), in_call) {
+    match (meeting_quiet(events, now, in_meetings), in_call) {
         (Some(end), _) => Some(end),
         (None, true) => Some(now + MEETING_MAX),
         (None, false) => None,
@@ -141,12 +159,16 @@ pub fn tick(config: &Config) -> Duration {
     STATE.with(|cell| {
         let mut s = cell.borrow_mut();
 
-        // The focus timer, ended by time or by Windows (the user stopped the session there).
+        // The focus timer, ended by time, or stopped from outside (the moon, Windows' own toggle):
+        // only one that ran its course says so.
         if let Some((end, minutes, held)) = s.focus {
-            if now >= end || (held && !focus::active()) {
+            if now >= end {
                 s.focus = None;
                 focus::stop(Why::Timer);
                 crate::hub::emit(crate::hub::Event::Notice(crate::hub::Notice::FocusDone { minutes }));
+            } else if held && !focus::active() {
+                s.focus = None;
+                focus::stop(Why::Timer);
             } else {
                 next = next.min(end);
             }
@@ -172,16 +194,28 @@ pub fn tick(config: &Config) -> Duration {
         }
 
         // Quiet: during a meeting, or a call.
-        let quiet_until = quiet_until(&events, now, calendar.quiet_in_meetings, calendar.quiet_in_calls && s.in_call);
+        let in_call = calendar.quiet_in_calls && s.in_call;
+        let quiet_until = quiet_until(&events, now, calendar.quiet_in_meetings, in_call);
         match quiet_until {
             Some(until) if s.focus.is_none() => {
+                let ours = focus::still_ours();
+                if s.quiet_held && ours.is_none() {
+                    // Ended by the user: theirs until this meeting or call is over.
+                    s.quiet_held = false;
+                    s.quiet_off = Some(meeting_quiet(&events, now, calendar.quiet_in_meetings));
+                    println!("calendar: quiet switched off by hand, left off until this {} ends", if s.quiet_off == Some(None) { "call" } else { "meeting" });
+                }
                 // A call's end moves with every tick: extended only when it gained a while.
-                if focus::still_ours().is_none_or(|(why, end)| why == Why::Quiet && end + QUIET_SLACK < until) {
-                    focus::start(Why::Quiet, until);
+                if !quiet_overridden(s.quiet_off, until, in_call) && ours.is_none_or(|(why, end)| why == Why::Quiet && end + QUIET_SLACK < until) {
+                    s.quiet_held = focus::start(Why::Quiet, until) || s.quiet_held;
                 }
             }
             Some(_) => {}
-            None => focus::stop(Why::Quiet),
+            None => {
+                focus::stop(Why::Quiet);
+                s.quiet_held = false;
+                s.quiet_off = None;
+            }
         }
         for (start, end) in events.iter().filter_map(span) {
             for at in [start, end] {
@@ -241,7 +275,12 @@ pub fn set_in_call(in_call: bool) -> bool {
 pub fn start_focus(minutes: u32) -> bool {
     let end = time::now() + minutes as i64 * 60;
     let held = focus::start(Why::Timer, end);
-    STATE.with(|cell| cell.borrow_mut().focus = Some((end, minutes, held)));
+    STATE.with(|cell| {
+        let mut s = cell.borrow_mut();
+        s.focus = Some((end, minutes, held));
+        // The timer holds what quiet there was: its end is not the user ending the quiet.
+        s.quiet_held = false;
+    });
     held
 }
 
@@ -288,6 +327,18 @@ mod tests {
         assert_eq!(quiet_until(&events, now, false, false), None);
         assert_eq!(quiet_until(&[], now, true, true), Some(now + MEETING_MAX));
         assert_eq!(quiet_until(&events, now, true, true), Some(now + 1200), "the meeting's end is known");
+    }
+
+    #[test]
+    fn quiet_switched_off_by_hand_stays_off_for_that_meeting_or_call() {
+        let end = 1_000_000;
+        // Off during a meeting: until it ends, not past it.
+        assert!(quiet_overridden(Some(Some(end)), end, false));
+        assert!(!quiet_overridden(Some(Some(end)), end + 1800, false), "the next meeting is quiet again");
+        // Off during a call: while it lasts.
+        assert!(quiet_overridden(Some(None), end + 3600, true));
+        assert!(!quiet_overridden(Some(None), end, false));
+        assert!(!quiet_overridden(None, end, true));
     }
 
     #[test]

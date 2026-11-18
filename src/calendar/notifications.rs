@@ -39,6 +39,8 @@ enum Ask {
     Read,
     Remove(Vec<u32>),
     Clear,
+    /// The calendar was turned off: the reader ends.
+    Stop,
 }
 
 /// How often the list is read again while any are waiting: the store on disk does not always say
@@ -88,7 +90,7 @@ pub fn unseen() -> usize {
 static TOASTS: Mutex<Option<Vec<Toast>>> = Mutex::new(None);
 /// Asks waiting for the reader thread, which [`WAKE`] wakes.
 static ASKS: Mutex<Vec<Ask>> = Mutex::new(Vec::new());
-/// The reader thread's wake-up event (a raw handle); 0 while no reader runs.
+/// The reader thread's wake-up event (a raw handle), made once; 0 before.
 static WAKE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 /// Notifications removed here, and when: a read already under way must not bring them back.
 static REMOVED: Mutex<Vec<(u32, Instant)>> = Mutex::new(Vec::new());
@@ -98,27 +100,31 @@ static REMOVED: Mutex<Vec<(u32, Instant)>> = Mutex::new(Vec::new());
 pub fn start() {
     use std::sync::atomic::Ordering::SeqCst;
     use windows::Win32::System::Threading::CreateEventW;
-    if WAKE.load(SeqCst) != 0 {
+    if RUNNING.swap(true, SeqCst) {
         return;
     }
-    let Ok(event) = (unsafe { CreateEventW(None, false, false, None) }) else { return };
-    if WAKE.compare_exchange(0, event.0 as usize, SeqCst, SeqCst).is_err() {
-        let _ = unsafe { windows::Win32::Foundation::CloseHandle(event) };
-        return;
+    // Made once and never closed: an [`ask`] racing the reader's end must not signal a handle
+    // reused by something else.
+    if WAKE.load(SeqCst) == 0 {
+        let Ok(event) = (unsafe { CreateEventW(None, false, false, None) }) else {
+            RUNNING.store(false, SeqCst);
+            return;
+        };
+        WAKE.store(event.0 as usize, SeqCst);
     }
-    let raw = event.0 as usize;
+    let raw = WAKE.load(SeqCst);
     let spawned = std::thread::Builder::new().name("notifications".into()).spawn(move || {
-        let event = windows::Win32::Foundation::HANDLE(raw as *mut _);
-        run(event);
+        run(windows::Win32::Foundation::HANDLE(raw as *mut _));
         // Refused, or gone: a later start may try again.
-        WAKE.store(0, SeqCst);
-        let _ = unsafe { windows::Win32::Foundation::CloseHandle(event) };
+        RUNNING.store(false, SeqCst);
     });
     if spawned.is_err() {
-        WAKE.store(0, SeqCst);
-        let _ = unsafe { windows::Win32::Foundation::CloseHandle(windows::Win32::Foundation::HANDLE(raw as *mut _)) };
+        RUNNING.store(false, SeqCst);
     }
 }
+
+/// The reader runs (or is starting).
+static RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// The notifications, newest first; empty when there are none or they cannot be read.
 pub fn list() -> Vec<Toast> {
@@ -132,11 +138,17 @@ pub fn count() -> usize {
 
 fn ask(what: Ask) {
     let event = WAKE.load(std::sync::atomic::Ordering::SeqCst);
-    if event == 0 {
+    if event == 0 || !RUNNING.load(std::sync::atomic::Ordering::SeqCst) {
         return;
     }
     ASKS.lock().unwrap_or_else(|e| e.into_inner()).push(what);
     let _ = unsafe { windows::Win32::System::Threading::SetEvent(windows::Win32::Foundation::HANDLE(event as *mut _)) };
+}
+
+/// End the reader (the calendar was turned off): nothing wakes for notifications no one shows.
+pub fn stop() {
+    ask(Ask::Stop);
+    *TOASTS.lock().unwrap_or_else(|e| e.into_inner()) = None;
 }
 
 /// Read the list again now (the calendar is opening, a picture has come).
@@ -149,6 +161,28 @@ pub fn remove(ids: Vec<u32>) {
     ask(Ask::Remove(ids));
     held_changed();
 }
+
+/// Take notification `id` off the list while its action runs ([`super::rich::invoke`]): removed
+/// from Windows once done ([`remove`]), back if not ([`failed`]).
+pub fn hold(id: u32) {
+    hide(&[id]);
+    held_changed();
+}
+
+/// An action the app did not take: `id` comes back, with what was typed (`draft`), and the panel
+/// says so ([`take_failure`]).
+pub fn failed(id: u32, draft: Option<String>) {
+    REMOVED.lock().unwrap_or_else(|e| e.into_inner()).retain(|(r, _)| *r != id);
+    *FAILURE.lock().unwrap_or_else(|e| e.into_inner()) = Some((id, draft));
+    refresh();
+}
+
+/// The last action not taken: its notification and what was typed, once.
+pub fn take_failure() -> Option<(u32, Option<String>)> {
+    FAILURE.lock().unwrap_or_else(|e| e.into_inner()).take()
+}
+
+static FAILURE: Mutex<Option<(u32, Option<String>)>> = Mutex::new(None);
 
 pub fn clear() {
     let ids: Vec<u32> = list().iter().map(|t| t.id).collect();
@@ -230,6 +264,7 @@ fn run(wake: windows::Win32::Foundation::HANDLE) {
         } else if woke == WAIT_OBJECT_0 {
             for asked in std::mem::take(&mut *ASKS.lock().unwrap_or_else(|e| e.into_inner())) {
                 match asked {
+                    Ask::Stop => return,
                     Ask::Read => {}
                     Ask::Remove(ids) => {
                         for id in ids {
@@ -280,11 +315,11 @@ fn publish(mut toasts: Vec<Toast>) {
     if WATCHING.load(std::sync::atomic::Ordering::SeqCst) {
         see(&toasts);
     }
-    {
-        let mut removed = REMOVED.lock().unwrap_or_else(|e| e.into_inner());
-        removed.retain(|(id, at)| at.elapsed() < REMOVED_FOR && toasts.iter().any(|t| t.id == *id));
-        toasts.retain(|t| !removed.iter().any(|(id, _)| *id == t.id));
-    }
+    // Held while the list is replaced: a removal in between ([`hide`]) would come back until the
+    // next read.
+    let mut removed = REMOVED.lock().unwrap_or_else(|e| e.into_inner());
+    removed.retain(|(id, at)| at.elapsed() < REMOVED_FOR && toasts.iter().any(|t| t.id == *id));
+    toasts.retain(|t| !removed.iter().any(|(id, _)| *id == t.id));
     let changed = {
         let mut held = TOASTS.lock().unwrap_or_else(|e| e.into_inner());
         let changed = held.as_ref() != Some(&toasts);
@@ -399,7 +434,10 @@ fn logo_of(app: &str, aumid: &str, info: Option<&windows::ApplicationModel::AppI
         Some(bytes)
     };
     let logo = read().map(std::sync::Arc::new);
-    LOGOS.lock().unwrap_or_else(|e| e.into_inner()).push((key, logo.clone()));
+    // Kept when read: a failure (a moment's refusal) is tried again with the app's next notification.
+    if logo.is_some() {
+        LOGOS.lock().unwrap_or_else(|e| e.into_inner()).push((key, logo.clone()));
+    }
     logo
 }
 

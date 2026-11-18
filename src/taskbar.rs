@@ -1010,6 +1010,10 @@ pub fn release_clock() -> bool {
     send_clock_data(&tap_proto::encode_init([("release", "1".to_string())]))
 }
 
+/// How long the tray waits on a busy Explorer for each clock: a refusal is retried 5 s later
+/// ([`crate::calendar::schedule::tick`]), so the tray thread is not held for long.
+const SEND_WAIT_MS: u32 = 200;
+
 fn send_clock_data(data: &str) -> bool {
     use windows::Win32::Foundation::{LPARAM, WPARAM};
     use windows::Win32::System::DataExchange::COPYDATASTRUCT;
@@ -1025,7 +1029,7 @@ fn send_clock_data(data: &str) -> bool {
     for control in crate::win::windows_by_class(TAP_CONTROL_CLASS) {
         let mut result = 0usize;
         let sent = unsafe {
-            SendMessageTimeoutW(control, WM_COPYDATA, WPARAM(0), LPARAM(&copy as *const COPYDATASTRUCT as isize), SMTO_ABORTIFHUNG, 1_000, Some(&mut result))
+            SendMessageTimeoutW(control, WM_COPYDATA, WPARAM(0), LPARAM(&copy as *const COPYDATASTRUCT as isize), SMTO_ABORTIFHUNG, SEND_WAIT_MS, Some(&mut result))
         };
         taken |= sent.0 != 0 && result == 1;
     }

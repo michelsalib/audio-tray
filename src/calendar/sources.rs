@@ -263,6 +263,16 @@ const OUTLOOK_BLUE: [u8; 3] = [0x47, 0x9E, 0xF5];
 /// The links' colours, in turn.
 pub const LINK_COLORS: [[u8; 3]; 4] = [[0xE8, 0x83, 0x6A], [0x6C, 0xCB, 0x5F], [0xC3, 0x9B, 0xF5], [0xF7, 0xB3, 0x2B]];
 
+/// Pages of events read at most per calendar.
+const PAGES_MAX: usize = 20;
+
+/// Whether a 403's message is Google slowing the app down (`rateLimitExceeded`,
+/// `userRateLimitExceeded`, quotas), not a calendar out of reach.
+fn throttled(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("rate limit") || message.contains("quota")
+}
+
 fn google_events(token: &str, (from, to): (i64, i64)) -> Result<(Vec<Event>, Vec<Calendar>)> {
     let list = oauth::get_json(
         "https://www.googleapis.com/calendar/v3/users/me/calendarList?minAccessRole=reader&fields=items(id,summary,summaryOverride,backgroundColor,selected,primary,hidden)",
@@ -283,7 +293,8 @@ fn google_events(token: &str, (from, to): (i64, i64)) -> Result<(Vec<Event>, Vec
         let name = calendar["summaryOverride"].as_str().or(calendar["summary"].as_str()).unwrap_or(id).to_string();
         calendars.push(Calendar { key: key.clone(), name, color, source: Source::Google });
         let mut page: Option<String> = None;
-        loop {
+        // Bounded, as Microsoft's: a server handing out page after page must not hold the fetch.
+        for _ in 0..PAGES_MAX {
             let mut url = format!(
                 "https://www.googleapis.com/calendar/v3/calendars/{}/events?singleEvents=true&orderBy=startTime&maxResults=2500&timeMin={}&timeMax={}\
                  &fields=nextPageToken,items(summary,description,start,end,location,htmlLink,hangoutLink,status,organizer(displayName,email),attendees(email,displayName,self,responseStatus),conferenceData/entryPoints)",
@@ -296,8 +307,9 @@ fn google_events(token: &str, (from, to): (i64, i64)) -> Result<(Vec<Event>, Vec
             }
             let answer = match oauth::get_json(&url, token, &[]) {
                 Ok(answer) => answer,
-                // A calendar shared and then withdrawn: the others still count.
-                Err(e) if e.downcast_ref::<oauth::Refused>().is_some_and(|r| r.0 == 404 || r.0 == 403) => break,
+                // A calendar shared and then withdrawn: the others still count. Not a 403 for going
+                // too fast (Google's rate limits): that is a failed fetch, whose events are kept.
+                Err(e) if e.downcast_ref::<oauth::Refused>().is_some_and(|r| r.0 == 404 || (r.0 == 403 && !throttled(&r.1))) => break,
                 Err(e) => return Err(e),
             };
             events.extend(answer["items"].as_array().into_iter().flatten().filter_map(|item| google_event(item, color, &key)));
@@ -373,7 +385,7 @@ fn microsoft_events(token: &str, (from, to): (i64, i64), zone: &dyn Zone) -> Res
         oauth::encode(&rfc3339(to))
     );
     let mut events = Vec::new();
-    for _ in 0..20 {
+    for _ in 0..PAGES_MAX {
         let answer = oauth::get_json(&url, token, &[("Prefer", &prefer)])?;
         events.extend(answer["value"].as_array().into_iter().flatten().filter_map(|item| microsoft_event(item, zone)));
         match answer["@odata.nextLink"].as_str() {

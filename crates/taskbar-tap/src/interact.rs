@@ -346,8 +346,10 @@ pub unsafe fn attach_music(
     press == S_OK && tap == S_OK
 }
 
-/// A press on the taskbar clock: marked handled while the calendar is ours, so the shell's
-/// `NotificationCenterButton` never starts its click and its flyout stays shut.
+/// A press on the taskbar clock, marked handled while the calendar is ours. That alone does not
+/// keep the shell's flyout shut (`NotificationCenterButton` opens it regardless: the app's mouse
+/// hook takes mouse clicks before Explorer sees them); it is kept for the log, and for touch and
+/// pen, which that hook never sees.
 #[implement(IPointerEventHandler)]
 struct ClockPress;
 
@@ -385,7 +387,8 @@ impl ITappedEventHandler_Impl for ClockTap_Impl {
     }
 }
 
-/// Wire the clock's view (press suppression and tap).
+/// Wire the clock's button: press, tap, and the pointer entering and leaving it (the app's mouse
+/// hook takes clicks only while the pointer is over the clock). Never detached, so the tokens go.
 ///
 /// # Safety
 /// XAML UI thread only.
@@ -393,16 +396,15 @@ pub unsafe fn attach_clock(diagnostics: &IXamlDiagnostics, element: InstanceHand
     let Some(target) = ui_element(diagnostics, element) else {
         return false;
     };
-    let mut press_token = 0i64;
-    let mut tap_token = 0i64;
+    let mut token = 0i64;
     let pressed: IPointerEventHandler = ClockPress.into();
-    let press = target.add_PointerPressed(pressed.as_raw(), &mut press_token);
+    let press = target.add_PointerPressed(pressed.as_raw(), &mut token);
     let tapped: ITappedEventHandler = ClockTap.into();
-    let tap = target.add_Tapped(tapped.as_raw(), &mut tap_token);
+    let tap = target.add_Tapped(tapped.as_raw(), &mut token);
     let entered: IPointerEventHandler = ClockHover(true).into();
-    let enter = target.add_PointerEntered(entered.as_raw(), &mut tap_token);
+    let enter = target.add_PointerEntered(entered.as_raw(), &mut token);
     let exited: IPointerEventHandler = ClockHover(false).into();
-    let exit = target.add_PointerExited(exited.as_raw(), &mut tap_token);
+    let exit = target.add_PointerExited(exited.as_raw(), &mut token);
     press == S_OK && tap == S_OK && enter == S_OK && exit == S_OK
 }
 

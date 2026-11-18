@@ -52,6 +52,33 @@ fn span(event: &Event) -> Option<(i64, i64)> {
     }
 }
 
+/// Whether an event starting at `start` is to be reminded of now, `ahead` seconds before (and up
+/// to a minute after its start, for a tick that came late).
+fn remind_now(start: i64, ahead: i64, now: i64) -> bool {
+    start - ahead <= now && now < start + 60
+}
+
+/// A reminder's line: "in 5 min · Room 1", "now".
+fn reminder_line(start: i64, now: i64, location: &str) -> String {
+    let minutes = ((start - now) + 59) / 60;
+    let mut line = if minutes > 0 { format!("in {minutes} min") } else { "now".to_string() };
+    if !location.is_empty() {
+        line.push_str(&format!(" · {location}"));
+    }
+    line
+}
+
+/// Until when things are kept quiet now: the end of the meeting under way (with `in_meetings`),
+/// else a while from now during a call (with `in_call`: its end is not known, so it moves on).
+fn quiet_until(events: &[Event], now: i64, in_meetings: bool, in_call: bool) -> Option<i64> {
+    let meeting = events.iter().filter_map(span).filter(|(start, end)| *start <= now && now < *end).map(|(_, end)| end).max();
+    match (in_meetings.then_some(meeting).flatten(), in_call) {
+        (Some(end), _) => Some(end),
+        (None, true) => Some(now + MEETING_MAX),
+        (None, false) => None,
+    }
+}
+
 /// The text after the time: the focus time left, if a focus timer runs. Meetings stay off the
 /// clock: the time is the time.
 fn focus_left(now: i64, end: i64) -> String {
@@ -131,13 +158,9 @@ pub fn tick(config: &Config) -> Duration {
             for event in &events {
                 let Some((start, _)) = span(event) else { continue };
                 let key = (event.title.clone(), start);
-                if start - ahead <= now && now < start + 60 && !s.reminded.contains(&key) {
+                if remind_now(start, ahead, now) && !s.reminded.contains(&key) {
                     s.reminded.insert(key);
-                    let minutes = ((start - now) + 59) / 60;
-                    let mut line = if minutes > 0 { format!("in {minutes} min") } else { "now".to_string() };
-                    if !event.location.is_empty() {
-                        line.push_str(&format!(" · {}", event.location));
-                    }
+                    let line = reminder_line(start, now, &event.location);
                     let url = event.join.clone().or_else(|| event.link.clone());
                     let lasts = (start - now).max(0) as u64 + 120;
                     crate::hub::emit(crate::hub::Event::Notice(crate::hub::Notice::Meeting { title: event.title.clone(), line, url, lasts }));
@@ -149,16 +172,11 @@ pub fn tick(config: &Config) -> Duration {
         }
 
         // Quiet: during a meeting, or a call.
-        let meeting = events.iter().filter_map(span).filter(|(start, end)| *start <= now && now < *end).map(|(_, end)| end).max();
-        let quiet_until = match (calendar.quiet_in_meetings.then_some(meeting).flatten(), calendar.quiet_in_calls && s.in_call) {
-            (Some(end), _) => Some(end),
-            (None, true) => Some(now + MEETING_MAX),
-            (None, false) => None,
-        };
+        let quiet_until = quiet_until(&events, now, calendar.quiet_in_meetings, calendar.quiet_in_calls && s.in_call);
         match quiet_until {
             Some(until) if s.focus.is_none() => {
                 // A call's end moves with every tick: extended only when it gained a while.
-                if focus::ours().is_none_or(|(why, end)| why == Why::Quiet && end + QUIET_SLACK < until) {
+                if focus::still_ours().is_none_or(|(why, end)| why == Why::Quiet && end + QUIET_SLACK < until) {
                     focus::start(Why::Quiet, until);
                 }
             }
@@ -246,6 +264,41 @@ mod tests {
         let now = 1_000_000;
         assert_eq!(focus_left(now, now + 18 * 60), "Focus 18 min");
         assert_eq!(focus_left(now, now + 17 * 60 + 1), "Focus 18 min");
+    }
+
+    fn meeting(start: i64, end: i64) -> Event {
+        Event {
+            when: When::At { start, end },
+            title: "Stand-up".into(),
+            location: String::new(),
+            link: None,
+            join: None,
+            source: super::super::Source::Google,
+            color: [0; 3],
+            calendar: String::new(),
+            details: Default::default(),
+        }
+    }
+
+    #[test]
+    fn quiet_lasts_the_meeting_under_way_or_a_while_into_a_call() {
+        let now = 1_000_000;
+        let events = vec![meeting(now - 600, now + 1200), meeting(now + 3600, now + 7200), meeting(now - 3600, now + 5 * 3600)];
+        assert_eq!(quiet_until(&events, now, true, false), Some(now + 1200), "the all-morning block is no meeting");
+        assert_eq!(quiet_until(&events, now, false, false), None);
+        assert_eq!(quiet_until(&[], now, true, true), Some(now + MEETING_MAX));
+        assert_eq!(quiet_until(&events, now, true, true), Some(now + 1200), "the meeting's end is known");
+    }
+
+    #[test]
+    fn reminders_come_ahead_and_up_to_a_minute_late() {
+        let start = 1_000_000;
+        assert!(!remind_now(start, 300, start - 301));
+        assert!(remind_now(start, 300, start - 300));
+        assert!(remind_now(start, 300, start + 59));
+        assert!(!remind_now(start, 300, start + 60));
+        assert_eq!(reminder_line(start, start - 241, "Room 1"), "in 5 min · Room 1");
+        assert_eq!(reminder_line(start, start + 10, ""), "now");
     }
 
     #[test]

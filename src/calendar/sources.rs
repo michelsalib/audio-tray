@@ -256,12 +256,6 @@ fn rfc3339(secs: i64) -> String {
     format!("{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z", s / 3600, s / 60 % 60, s % 60)
 }
 
-fn hex_color(text: &str) -> Option<[u8; 3]> {
-    let hex = text.trim().trim_start_matches('#');
-    let n = u32::from_str_radix(hex.get(..6)?, 16).ok()?;
-    Some([(n >> 16) as u8, (n >> 8) as u8, n as u8])
-}
-
 /// Google's own default event colour, for a calendar that names none.
 const GOOGLE_BLUE: [u8; 3] = [0x7B, 0x86, 0xC6];
 /// Outlook's calendar blue, lightened to read on a dark panel.
@@ -284,7 +278,7 @@ fn google_events(token: &str, (from, to): (i64, i64)) -> Result<(Vec<Event>, Vec
             continue;
         }
         let Some(id) = calendar["id"].as_str() else { continue };
-        let color = calendar["backgroundColor"].as_str().and_then(hex_color).unwrap_or(GOOGLE_BLUE);
+        let color = calendar["backgroundColor"].as_str().and_then(super::parse_hex).unwrap_or(GOOGLE_BLUE);
         let key = format!("google:{id}");
         let name = calendar["summaryOverride"].as_str().or(calendar["summary"].as_str()).unwrap_or(id).to_string();
         calendars.push(Calendar { key: key.clone(), name, color, source: Source::Google });
@@ -492,7 +486,7 @@ fn web_link(feed: &str, uid: &str, when: &When, zone: &dyn Zone) -> Option<Strin
     let lower = feed.to_ascii_lowercase();
     if let Some(at) = lower.find("calendar.google.com/calendar/ical/") {
         let rest = &feed[at + "calendar.google.com/calendar/ical/".len()..];
-        let calendar = percent_decode(rest.split('/').next()?);
+        let calendar = oauth::percent_decode(rest.split('/').next()?);
         let id = uid.strip_suffix("@google.com")?;
         let eid = super::oauth::base64url(format!("{id} {calendar}").as_bytes()).replace('-', "%2B").replace('_', "%2F");
         return Some(format!("https://calendar.google.com/calendar/event?eid={eid}"));
@@ -509,26 +503,6 @@ fn web_link(feed: &str, uid: &str, when: &When, zone: &dyn Zone) -> Option<Strin
         return Some(format!("https://outlook.live.com/calendar/0/view/day/{y}/{m}/{d}"));
     }
     None
-}
-
-fn percent_decode(text: &str) -> String {
-    let bytes = text.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        let hex = (bytes[i] == b'%' && i + 2 < bytes.len()).then(|| std::str::from_utf8(&bytes[i + 1..i + 3]).ok().and_then(|h| u8::from_str_radix(h, 16).ok())).flatten();
-        match hex {
-            Some(b) => {
-                out.push(b);
-                i += 3;
-            }
-            None => {
-                out.push(bytes[i]);
-                i += 1;
-            }
-        }
-    }
-    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// The Microsoft account's calendar's key.

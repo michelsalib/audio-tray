@@ -95,7 +95,7 @@ pub fn active() -> bool {
 }
 
 /// What Audio Tray holds, if it still runs. Do not disturb it set past its time is ended here.
-pub fn ours() -> Option<(Why, i64)> {
+pub fn still_ours() -> Option<(Why, i64)> {
     let (why, until, how) = OURS.with(Cell::get)?;
     let running = match how {
         How::Session => session_active(),
@@ -117,7 +117,7 @@ pub fn ours() -> Option<(Why, i64)> {
 /// Keep things quiet until `until` (seconds since the epoch), unless they already are and not by
 /// Audio Tray. `false` when Windows refused both ways.
 pub fn start(why: Why, until: i64) -> bool {
-    let held = ours();
+    let held = still_ours();
     if active() && held.is_none() {
         // The user's own session or Do not disturb already keeps things quiet.
         return false;

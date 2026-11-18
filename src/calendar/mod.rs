@@ -448,7 +448,8 @@ pub fn preview(config: &crate::config::Config) {
     view::preview(config);
 }
 
-/// Win+Alt+D opens this calendar (taken by the tray's keyboard hook) while this is on.
+/// Win+Alt+D and Win+N (Windows' shortcuts for its calendar and notification centre) open this
+/// panel while this is on, taken by the tray's keyboard hook (installed only then).
 pub static SHORTCUT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 pub fn set_shortcut(on: bool) {

@@ -157,14 +157,16 @@ fn wait_for_code(listener: &TcpListener, listener6: Option<&TcpListener>, state:
             respond(&mut stream, "404 Not Found", "");
             continue;
         }
+        // The state first: anything on this machine can call the port, and only the sign-in Audio
+        // Tray started may end it, with a code or with an error.
+        if get("state") != Some(state) {
+            respond(&mut stream, "400 Bad Request", &page("Audio Tray could not connect", "That sign-in was not the one Audio Tray started."));
+            continue;
+        }
         if let Some(error) = get("error") {
             let why = get("error_description").unwrap_or(error).to_string();
             respond(&mut stream, "200 OK", &page("Audio Tray could not connect", &why));
             bail!("{error}: {why}");
-        }
-        if get("state") != Some(state) {
-            respond(&mut stream, "400 Bad Request", &page("Audio Tray could not connect", "That sign-in was not the one Audio Tray started."));
-            continue;
         }
         respond(&mut stream, "200 OK", &page("Audio Tray is connected", "You can close this tab."));
         return get("code").map(str::to_string).ok_or_else(|| anyhow!("no code"));
@@ -223,14 +225,19 @@ pub fn parse_query(query: &str) -> Vec<(String, String)> {
         .collect()
 }
 
+/// A form value: `+` is a space, then [`percent_decode`].
 fn decode(text: &str) -> String {
+    percent_decode(&text.replace('+', " "))
+}
+
+/// `%XX` escapes decoded (a stray `%` stays); the bytes read as UTF-8.
+pub fn percent_decode(text: &str) -> String {
     let bytes = text.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
         match bytes[i] {
-            b'+' => out.push(b' '),
-            b'%' => match text.get(i + 1..i + 3).and_then(|hex| u8::from_str_radix(hex, 16).ok()) {
+            b'%' => match text.get(i + 1..i + 3).filter(|hex| hex.bytes().all(|b| b.is_ascii_hexdigit())).and_then(|hex| u8::from_str_radix(hex, 16).ok()) {
                 Some(b) => {
                     out.push(b);
                     i += 2;
@@ -307,23 +314,15 @@ fn sha256(data: &[u8]) -> Vec<u8> {
     sha2::Sha256::digest(data).to_vec()
 }
 
-/// Unpredictable bytes: std's `RandomState` keys come from the OS generator, and each hasher
-/// gets fresh ones; hashed together with the clock.
+/// Unpredictable bytes, from Windows' own generator (what `BCryptGenRandom` and std use).
 fn random_bytes(n: usize) -> Vec<u8> {
-    use std::hash::{BuildHasher, Hasher};
-    let mut pool = Vec::new();
-    while pool.len() < n * 2 {
-        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
-        h.write_u128(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos()));
-        h.write_usize(pool.len());
-        pool.extend_from_slice(&h.finish().to_le_bytes());
+    #[link(name = "bcryptprimitives", kind = "raw-dylib")]
+    unsafe extern "system" {
+        fn ProcessPrng(data: *mut u8, len: usize) -> i32;
     }
-    let mut out = sha256(&pool);
-    while out.len() < n {
-        let more = sha256(&out);
-        out.extend(more);
-    }
-    out.truncate(n);
+    let mut out = vec![0u8; n];
+    // Documented never to fail.
+    unsafe { ProcessPrng(out.as_mut_ptr(), out.len()) };
     out
 }
 

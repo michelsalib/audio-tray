@@ -415,9 +415,9 @@ fn download(src: &str) -> Option<Vec<u8>> {
 /// A picture in a file: the app's own (`ms-appx`, `ms-appdata`) or one on a local drive.
 fn fetch(src: &str, base: &Base) -> Option<Vec<u8>> {
     let path = if let Some(rest) = strip_scheme(src, "file:///") {
-        percent_decoded(rest)
+        super::oauth::percent_decode(rest)
     } else if let Some(rest) = strip_scheme(src, "ms-appx:///") {
-        format!(r"{}\{}", base.installed.as_ref()?, percent_decoded(rest))
+        format!(r"{}\{}", base.installed.as_ref()?, super::oauth::percent_decode(rest))
     } else if let Some(rest) = strip_scheme(src, "ms-appdata:///") {
         let (store, rest) = rest.split_once('/')?;
         let folder = match store.to_ascii_lowercase().as_str() {
@@ -427,7 +427,7 @@ fn fetch(src: &str, base: &Base) -> Option<Vec<u8>> {
             _ => return None,
         };
         let app_data = std::env::var("LOCALAPPDATA").ok()?;
-        format!(r"{app_data}\Packages\{}\{folder}\{}", base.family.as_ref()?, percent_decoded(rest))
+        format!(r"{app_data}\Packages\{}\{folder}\{}", base.family.as_ref()?, super::oauth::percent_decode(rest))
     } else {
         src.to_string()
     };
@@ -448,24 +448,6 @@ fn on_a_local_drive(path: &str) -> bool {
 
 fn strip_scheme<'a>(src: &'a str, scheme: &str) -> Option<&'a str> {
     src.get(..scheme.len()).filter(|s| s.eq_ignore_ascii_case(scheme)).map(|_| &src[scheme.len()..])
-}
-
-fn percent_decoded(text: &str) -> String {
-    let bytes = text.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Some(b) = std::str::from_utf8(&bytes[i + 1..i + 3]).ok().and_then(|h| u8::from_str_radix(h, 16).ok()) {
-                out.push(b);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Activators found so far, by app.
@@ -602,7 +584,7 @@ mod tests {
         assert_eq!(parts.launch_kind, Kind::Protocol);
         assert_eq!(parts.picture.as_deref(), Some("file:///C%3A%5Cx.png"));
         assert_eq!(parts.buttons, vec![Action { label: "Share".into(), arguments: "ms-x:share".into(), kind: Kind::Protocol }]);
-        assert_eq!(percent_decoded("C%3A%5Cx%20y.png"), r"C:\x y.png");
+        assert_eq!(crate::calendar::oauth::percent_decode("C%3A%5Cx%20y.png"), r"C:\x y.png");
     }
 
     #[test]

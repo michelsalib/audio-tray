@@ -151,6 +151,19 @@ pub fn events() -> (Vec<Event>, Option<(i32, i32)>) {
     (state.events.clone(), state.range)
 }
 
+/// The first source that failed, in a few words for the panel (`Outlook: sign in again`).
+pub fn problem(setup: &Setup) -> Option<String> {
+    let state = state();
+    let (source, why) = state.problems.first()?;
+    let name = match source {
+        Source::Google => "Google".to_string(),
+        Source::Microsoft => "Outlook".to_string(),
+        Source::Link(i) => setup.links.get(*i).map_or_else(|| "A calendar link".into(), |l| l.name.clone()),
+    };
+    let short = if why.contains("sign in again") { "sign in again" } else if why.starts_with("Offline") { "offline" } else { "could not refresh" };
+    Some(format!("{name}: {short}"))
+}
+
 /// When events were last fetched.
 pub fn fetched_at() -> Option<i64> {
     state().fetched

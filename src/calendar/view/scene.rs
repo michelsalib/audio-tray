@@ -71,6 +71,8 @@ pub enum Fill {
     /// A notification, the next event: a little lighter than the card.
     Raised,
     Hover,
+    /// Under a press: a step past the hover.
+    Pressed,
     Accent,
     Rule,
     /// The marks under busy days.
@@ -185,7 +187,7 @@ impl Toast {
 }
 
 /// The notification a target belongs to.
-fn toast_of(hit: Hit) -> Option<usize> {
+pub fn toast_of(hit: Hit) -> Option<usize> {
     match hit {
         Hit::Toast(i) | Hit::Dismiss(i) | Hit::Action(i, _) | Hit::Reply(i) | Hit::Draft(i) | Hit::Send(i) | Hit::Menu(i) | Hit::MenuItem(i, _) => Some(i),
         _ => None,
@@ -246,8 +248,29 @@ pub struct Detail {
     pub joinable: bool,
 }
 
+/// How the calendar's sources stand, said where events would be.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub enum Notice {
+    #[default]
+    None,
+    /// No calendar connected.
+    NoSources,
+    /// The first fetch is running, nothing cached yet.
+    Loading,
+    /// A source failed (an expired sign-in, a link down), in a few words.
+    Problem(String),
+}
+
 /// Everything the panel shows.
 pub struct Input {
+    /// How the sources stand.
+    pub notice: Notice,
+    /// The target the keyboard is on (Tab), ringed.
+    pub focus: Option<Hit>,
+    /// The target under a press.
+    pub pressed: Option<Hit>,
+    /// A word for a moment, over the calendar's foot (Windows refused something).
+    pub flash: Option<String>,
     /// The height the cards may take together.
     pub room: f32,
     /// `None`: no notification centre (off, or nothing waiting).
@@ -288,6 +311,8 @@ pub struct Scene {
     /// Where each list scrolls, and how far at most.
     pub center_view: Option<(R, f32)>,
     pub list_view: Option<(R, f32)>,
+    /// Each notification drawn (by its place in the list), whole: unclipped.
+    pub toasts: Vec<(usize, R)>,
 }
 
 impl Scene {
@@ -307,6 +332,9 @@ struct Ink2 {
     items: Vec<(R, Draw)>,
     hits: Vec<(R, Hit)>,
     hover: Option<Hit>,
+    pressed: Option<Hit>,
+    /// Where each notification was drawn, unclipped.
+    places: Vec<(usize, R)>,
     /// The scrolled area drawing is clipped to: targets are clipped the same, so what scrolled
     /// out of sight takes no clicks (and none over the header above it).
     /// Nested (the reply box clips inside the list): each entry is already cut to the one under it.
@@ -321,8 +349,8 @@ fn overlap(a: R, b: R) -> Option<R> {
 }
 
 impl Ink2 {
-    fn new(hover: Option<Hit>) -> Self {
-        Ink2 { items: Vec::new(), hits: Vec::new(), hover, clips: Vec::new() }
+    fn new(hover: Option<Hit>, pressed: Option<Hit>) -> Self {
+        Ink2 { items: Vec::new(), hits: Vec::new(), hover, pressed, places: Vec::new(), clips: Vec::new() }
     }
 
     fn draw(&mut self, r: R, d: Draw) {
@@ -365,10 +393,22 @@ impl Ink2 {
         self.hover == Some(hit)
     }
 
+    /// Under a press: the hover's fill, a step further.
+    fn surface(&self, hit: Hit, rest: Fill) -> Fill {
+        if self.pressed == Some(hit) && self.lit(hit) {
+            Fill::Pressed
+        } else if self.lit(hit) {
+            Fill::Hover
+        } else {
+            rest
+        }
+    }
+
     /// A hover plate under a target.
     fn plate(&mut self, r: R, hit: Hit, radius: f32) {
         if self.lit(hit) {
-            self.draw(r, Draw::Rect { fill: Fill::Hover, radius });
+            let fill = self.surface(hit, Fill::Hover);
+            self.draw(r, Draw::Rect { fill, radius });
         }
         self.hit(r, hit);
     }
@@ -387,11 +427,7 @@ impl Ink2 {
 
     /// A pill with a label; `on` fills it with the accent.
     fn pill(&mut self, r: R, label: &str, hit: Hit, on: bool) {
-        let fill = match (on, self.lit(hit)) {
-            (true, _) => Fill::Accent,
-            (false, true) => Fill::Hover,
-            (false, false) => Fill::Raised,
-        };
+        let fill = if on { Fill::Accent } else { self.surface(hit, Fill::Raised) };
         self.draw(r, Draw::Rect { fill, radius: r.h / 2.0 });
         if !on {
             self.draw(r, Draw::Outline { ink: Ink::Text3, radius: r.h / 2.0 });
@@ -424,14 +460,17 @@ fn center_height(groups: &[Group]) -> f32 {
     h + 8.0
 }
 
-/// The calendar card's height, the list's rows at most `rows`.
-fn main_height(input: &Input, rows: usize) -> f32 {
+/// An event's details at most (shorter when the screen is).
+const DETAIL_H: f32 = 480.0;
+
+/// The calendar card's height, the list's rows at most `rows`, with the next event or not.
+fn main_height(input: &Input, rows: usize, hero: bool) -> f32 {
     if input.detail.is_some() {
-        return 480.0;
+        return DETAIL_H;
     }
     let mut h = PAD + 44.0 + 14.0;
     h += if input.month_open { 32.0 + 22.0 + 6.0 * 40.0 } else { 62.0 };
-    if input.hero.is_some() {
+    if hero {
         h += 14.0 + 76.0;
     }
     h += 14.0 + 24.0 + rows.max(1) as f32 * ROW_H;
@@ -439,7 +478,7 @@ fn main_height(input: &Input, rows: usize) -> f32 {
 }
 
 pub fn build(input: &Input) -> Scene {
-    let mut ink = Ink2::new(input.hover);
+    let mut ink = Ink2::new(input.hover, input.pressed);
 
     // How many list rows fit, and how tall the notification centre may be.
     let mut rows = input.rows.len().clamp(1, 5);
@@ -450,10 +489,17 @@ pub fn build(input: &Input) -> Scene {
         None => 0.0,
     };
     let gap = if center_h > 0.0 { GAP } else { 0.0 };
-    while rows > 1 && main_height(input, rows) + gap + center_h.min(CENTER_MIN) > input.room {
+    let fits = |h: f32| h + gap + center_h.min(CENTER_MIN) <= input.room;
+    // On a short screen the month goes without the next event (it is in the month's marks).
+    let hero = input.hero.is_some() && (!input.month_open || fits(main_height(input, 1, true)));
+    while rows > 1 && !fits(main_height(input, rows, hero)) {
         rows -= 1;
     }
-    let main_h = main_height(input, rows);
+    // An event's details take what there is, never more than their height.
+    let mut main_h = main_height(input, rows, hero);
+    if input.detail.is_some() {
+        main_h = main_h.min(input.room - gap - center_h.min(CENTER_MIN)).max(240.0);
+    }
     let mut folded = summary;
     let full = input.center_full && input.groups.is_some();
     let main_h = if full { SUMMARY_H } else { main_h };
@@ -492,12 +538,26 @@ pub fn build(input: &Input) -> Scene {
             detail_card(&mut ink, main, detail);
             None
         }
-        None => calendar(&mut ink, main, input, rows),
+        None => calendar(&mut ink, main, input, rows, hero),
     };
+    if let Some(text) = &input.flash {
+        let r = R::new(main.x + PAD, main.bottom() - FOOTER_H - 40.0, main.w - 2.0 * PAD, 32.0);
+        ink.draw(r, Draw::Rect { fill: Fill::Tip, radius: 6.0 });
+        ink.draw(r, Draw::Outline { ink: Ink::Text3, radius: 6.0 });
+        ink.text(r, text.clone(), Font::Caption, Ink::Text, Align::Center);
+    }
+    if let Some(focus) = input.focus {
+        // The keyboard's target, ringed (twice over: a 2 DIP ring).
+        if let Some(r) = ink.hits.iter().rev().find(|(_, h)| *h == focus).map(|(r, _)| *r) {
+            for inset in [0.0, 1.0] {
+                ink.draw(R::new(r.x + inset, r.y + inset, r.w - 2.0 * inset, r.h - 2.0 * inset), Draw::Outline { ink: Ink::Accent, radius: 5.0 });
+            }
+        }
+    }
     if let Some(at) = input.show_tip {
         tooltip(&mut ink, input, at, top, main);
     }
-    Scene { top, main, h: main.bottom(), items: ink.items, hits: ink.hits, center_view, list_view }
+    Scene { top, main, h: main.bottom(), items: ink.items, hits: ink.hits, center_view, list_view, toasts: ink.places }
 }
 
 /// Wider targets carry a label, so they get no tooltip.
@@ -580,8 +640,10 @@ fn center_summary(ink: &mut Ink2, card: R, input: &Input, groups: &[Group]) {
 /// reply box, while open) and its menu.
 fn notification(ink: &mut Ink2, r: R, toast: &Toast) {
     let i = toast.index;
+    ink.places.push((i, r));
     let lit = ink.hover.and_then(toast_of) == Some(i) || toast.draft.is_some();
-    ink.draw(r, Draw::Rect { fill: if lit { Fill::Hover } else { Fill::Raised }, radius: 6.0 });
+    let fill = if ink.pressed == Some(Hit::Toast(i)) && ink.lit(Hit::Toast(i)) { Fill::Pressed } else if lit { Fill::Hover } else { Fill::Raised };
+    ink.draw(r, Draw::Rect { fill, radius: 6.0 });
     ink.hit(r, Hit::Toast(i));
     let mut tx = r.x + 12.0;
     if let Some((key, bytes)) = &toast.avatar {
@@ -659,6 +721,17 @@ fn notification(ink: &mut Ink2, r: R, toast: &Toast) {
     }
 }
 
+/// A thin bar at `area`'s right saying there is more than it shows, and where it is: `content` is
+/// the scrolled height, `scroll` how far down it is.
+fn scrollbar(ink: &mut Ink2, area: R, content: f32, scroll: f32) {
+    if content <= area.h + 0.5 {
+        return;
+    }
+    let h = (area.h * area.h / content).max(24.0);
+    let y = area.y + (area.h - h) * (scroll / (content - area.h)).clamp(0.0, 1.0);
+    ink.draw(R::new(area.right() - 6.0, y, 3.0, h), Draw::Rect { fill: Fill::Mark, radius: 1.5 });
+}
+
 /// The unread count in an accent chip at `(x, y)`, as wide as its number (99+ at most).
 fn count_chip(ink: &mut Ink2, x: f32, y: f32, unread: usize) -> R {
     let label = if unread > 99 { "99+".to_string() } else { unread.to_string() };
@@ -709,7 +782,9 @@ fn center(ink: &mut Ink2, card: R, input: &Input, groups: &[Group]) -> (R, f32) 
             ink.plate(x_r, Hit::DismissGroup(g), 4.0);
             ink.glyph(x_r, '\u{E711}', Font::IconSmall, Ink::Text2);
         } else if group.open {
-            ink.text(R::new(line.right() - 80.0, line.y, 72.0, line.h), group.when.clone(), Font::Caption, Ink::Text3, Align::Right);
+            // Its time, and the chevron saying the line folds it.
+            ink.text(R::new(line.right() - 100.0, line.y, 72.0, line.h), group.when.clone(), Font::Caption, Ink::Text3, Align::Right);
+            ink.glyph(R::new(line.right() - 24.0, line.y, 16.0, line.h), '\u{E70E}', Font::IconSmall, Ink::Text3);
         } else {
             ink.glyph(R::new(line.right() - 24.0, line.y, 16.0, line.h), '\u{E70D}', Font::IconSmall, Ink::Text2);
         }
@@ -734,11 +809,12 @@ fn center(ink: &mut Ink2, card: R, input: &Input, groups: &[Group]) -> (R, f32) 
         }
     }
     ink.draw(area, Draw::Unclip);
+    scrollbar(ink, area, content, scroll);
     (area, max)
 }
 
 /// The calendar card. Returns the list's scrolling area.
-fn calendar(ink: &mut Ink2, card: R, input: &Input, rows: usize) -> Option<(R, f32)> {
+fn calendar(ink: &mut Ink2, card: R, input: &Input, rows: usize, hero: bool) -> Option<(R, f32)> {
     let x = card.x + PAD;
     let w = card.w - 2.0 * PAD;
     let mut y = card.y + PAD;
@@ -803,10 +879,11 @@ fn calendar(ink: &mut Ink2, card: R, input: &Input, rows: usize) -> Option<(R, f
     y += (input.days.len().div_ceil(7)) as f32 * cell_h + 4.0;
 
     // The next event.
-    if let Some(hero) = &input.hero {
+    if let Some(hero) = input.hero.as_ref().filter(|_| hero) {
         y += 10.0;
         let r = R::new(x, y, w, 76.0);
-        ink.draw(r, Draw::Rect { fill: if ink.lit(Hit::Hero) { Fill::Hover } else { Fill::Raised }, radius: 6.0 });
+        let fill = ink.surface(Hit::Hero, Fill::Raised);
+        ink.draw(r, Draw::Rect { fill, radius: 6.0 });
         ink.hit(r, Hit::Hero);
         ink.draw(R::new(r.x + 12.0, r.y + 12.0, 3.0, r.h - 24.0), Draw::Rect { fill: Fill::Rgb(hero.color), radius: 1.5 });
         let tw = r.w - 40.0 - if hero.joinable { 64.0 } else { 0.0 };
@@ -822,13 +899,31 @@ fn calendar(ink: &mut Ink2, card: R, input: &Input, rows: usize) -> Option<(R, f
     // The rest of the week, or the picked day.
     y += 14.0;
     ink.text(R::new(x, y, w, 20.0), input.list_title.clone(), Font::CaptionStrong, Ink::Text2, Align::Left);
+    if let Notice::Problem(problem) = &input.notice {
+        // A source failed: said beside the title, a link to where it is mended.
+        let r = R::new(x + w - 190.0, y, 190.0, 20.0);
+        ink.hit(r, Hit::Settings);
+        let tint = if ink.lit(Hit::Settings) { Ink::Accent } else { Ink::Text3 };
+        ink.text(r, problem.clone(), Font::Caption, tint, Align::Right);
+    }
     y += 24.0;
     let area = R::new(card.x, y, card.w, rows.max(1) as f32 * ROW_H);
     let max = (input.rows.len() as f32 * ROW_H - area.h).max(0.0);
     let scroll = input.list_scroll.clamp(0.0, max);
     if input.rows.is_empty() {
-        ink.text(R::new(x, y, w, ROW_H), input.empty.clone(), Font::Body, Ink::Text3, Align::Left);
+        let line = R::new(x, y, w, ROW_H);
+        match &input.notice {
+            Notice::NoSources => {
+                ink.hit(line, Hit::Settings);
+                let tint = if ink.lit(Hit::Settings) { Ink::Accent } else { Ink::Text2 };
+                ink.text(line, "Connect a calendar in Settings", Font::Body, tint, Align::Left);
+            }
+            Notice::Loading => ink.text(line, "Loading…", Font::Body, Ink::Text3, Align::Left),
+            _ => ink.text(line, input.empty.clone(), Font::Body, Ink::Text3, Align::Left),
+        }
     }
+    // The when column as wide as its longest label (12-hour times are longer), within reason.
+    let left_w = input.rows.iter().map(|r| r.left.chars().count() as f32 * 6.5 + 4.0).fold(76.0, f32::max).min(120.0);
     ink.draw(area, Draw::Clip);
     for (i, row) in input.rows.iter().enumerate() {
         let r = R::new(x - 6.0, area.y + i as f32 * ROW_H - scroll, w + 12.0, ROW_H);
@@ -836,10 +931,11 @@ fn calendar(ink: &mut Ink2, card: R, input: &Input, rows: usize) -> Option<(R, f
             continue;
         }
         ink.plate(r, Hit::Row(i), 4.0);
-        ink.text(R::new(r.x + 6.0, r.y, 76.0, r.h), row.left.clone(), Font::Caption, Ink::Text2, Align::Left);
-        ink.draw(R::new(r.x + 88.0, r.y + 13.0, 6.0, 6.0), Draw::Rect { fill: Fill::Rgb(row.color), radius: 3.0 });
+        ink.text(R::new(r.x + 6.0, r.y, left_w, r.h), row.left.clone(), Font::Caption, Ink::Text2, Align::Left);
+        ink.draw(R::new(r.x + left_w + 12.0, r.y + 13.0, 6.0, 6.0), Draw::Rect { fill: Fill::Rgb(row.color), radius: 3.0 });
         let right_w = if row.joinable { 60.0 } else if row.right.is_empty() { 0.0 } else { 56.0 };
-        ink.text(R::new(r.x + 102.0, r.y, r.w - 108.0 - right_w, r.h), row.title.clone(), Font::Body, Ink::Text, Align::Left);
+        let tx = r.x + left_w + 26.0;
+        ink.text(R::new(tx, r.y, r.right() - tx - 6.0 - right_w, r.h), row.title.clone(), Font::Body, Ink::Text, Align::Left);
         if row.joinable {
             ink.join(R::new(r.right() - 58.0, r.y + 4.0, 52.0, 24.0), Hit::Join(i));
         } else if !row.right.is_empty() {
@@ -847,6 +943,7 @@ fn calendar(ink: &mut Ink2, card: R, input: &Input, rows: usize) -> Option<(R, f
         }
     }
     ink.draw(area, Draw::Unclip);
+    scrollbar(ink, area, input.rows.len() as f32 * ROW_H, scroll);
 
     // Focus, Do not disturb, Settings.
     let fy = card.bottom() - FOOTER_H;
@@ -854,7 +951,10 @@ fn calendar(ink: &mut Ink2, card: R, input: &Input, rows: usize) -> Option<(R, f
     let by = fy + (FOOTER_H - 32.0) / 2.0;
     let focus_w = if input.focus_running { 150.0 } else { 112.0 };
     ink.pill(R::new(x, by, focus_w, 32.0), &input.focus_label, Hit::Focus, input.focus_running);
-    ink.pill(R::new(x + focus_w + 8.0, by, 118.0, 32.0), "Do not disturb", Hit::Quiet, input.quiet);
+    // Do not disturb once: the notification centre's moon when it is shown, else here.
+    if input.groups.is_none() {
+        ink.pill(R::new(x + focus_w + 8.0, by, 118.0, 32.0), "Do not disturb", Hit::Quiet, input.quiet);
+    }
     let gear = R::new(card.right() - PAD - 32.0, by, 32.0, 32.0);
     ink.plate(gear, Hit::Settings, 4.0);
     ink.glyph(gear, '\u{E713}', Font::Icon, Ink::Text2);
@@ -872,11 +972,14 @@ fn detail_card(ink: &mut Ink2, card: R, d: &Detail) {
     ink.text(R::new(x + 28.0, y, w - 28.0, 32.0), d.back.clone(), Font::Caption, Ink::Text2, Align::Left);
     y += 44.0;
 
-    ink.draw(R::new(x, y + 2.0, 4.0, 62.0), Draw::Rect { fill: Fill::Rgb(d.color), radius: 2.0 });
-    ink.text(R::new(x + 16.0, y, w - 16.0, 24.0), d.title.clone(), Font::Title, Ink::Text, Align::Left);
-    ink.text(R::new(x + 16.0, y + 26.0, w - 16.0, 20.0), d.when.clone(), Font::Body, Ink::Text2, Align::Left);
-    ink.text(R::new(x + 16.0, y + 46.0, w - 16.0, 18.0), d.soon.clone(), Font::Caption, Ink::Accent, Align::Left);
-    y += 82.0;
+    // The title whole, on two lines when it needs them (about 9.5 DIPs a character at 18).
+    let two = d.title.chars().count() as f32 * 9.5 > w - 16.0;
+    let title_h = if two { 48.0 } else { 24.0 };
+    ink.draw(R::new(x, y + 2.0, 4.0, 38.0 + title_h), Draw::Rect { fill: Fill::Rgb(d.color), radius: 2.0 });
+    ink.text(R::new(x + 16.0, y, w - 16.0, title_h), d.title.clone(), if two { Font::TitleWrap } else { Font::Title }, Ink::Text, Align::Left);
+    ink.text(R::new(x + 16.0, y + title_h + 2.0, w - 16.0, 20.0), d.when.clone(), Font::Body, Ink::Text2, Align::Left);
+    ink.text(R::new(x + 16.0, y + title_h + 22.0, w - 16.0, 18.0), d.soon.clone(), Font::Caption, Ink::Accent, Align::Left);
+    y += 58.0 + title_h;
 
     let line = |ink: &mut Ink2, y: &mut f32, glyph: char, text: &str, h: f32| {
         ink.glyph(R::new(x, *y, 16.0, 20.0), glyph, Font::IconSmall, Ink::Text2);
@@ -919,7 +1022,8 @@ fn detail_card(ink: &mut Ink2, card: R, d: &Detail) {
     }
     if let Some(open) = &d.open {
         let r = R::new(bx, buttons_y, x + w - bx, 34.0);
-        ink.draw(r, Draw::Rect { fill: if ink.lit(Hit::DetailOpen) { Fill::Hover } else { Fill::Raised }, radius: 4.0 });
+        let fill = ink.surface(Hit::DetailOpen, Fill::Raised);
+        ink.draw(r, Draw::Rect { fill, radius: 4.0 });
         ink.text(r, open.clone(), Font::Caption, Ink::Text, Align::Center);
         ink.hit(r, Hit::DetailOpen);
     }
@@ -931,6 +1035,10 @@ mod tests {
 
     fn input() -> Input {
         Input {
+            notice: Notice::None,
+            focus: None,
+            pressed: None,
+            flash: None,
             room: 760.0,
             groups: None,
             unread: 0,
@@ -1006,10 +1114,48 @@ mod tests {
     }
 
     #[test]
+    fn notifications_scrolled_out_of_sight_take_no_clicks() {
+        let mut i = input();
+        let mut whatsapp = group("WhatsApp", 6, true);
+        whatsapp.all = true;
+        i.groups = Some(vec![whatsapp]);
+        i.center_scroll = 10_000.0;
+        let s = build(&i);
+        let top = s.top.unwrap();
+        // The header's buttons stay theirs, whatever scrolled under them.
+        let clear = s.hits.iter().find(|(_, h)| *h == Hit::ClearAll).unwrap().0;
+        assert_eq!(s.hit(clear.x + 2.0, clear.y + 2.0), Some(Hit::ClearAll));
+        // No notification target reaches past its card.
+        assert!(s.hits.iter().filter(|(_, h)| toast_of(*h).is_some()).all(|(r, _)| r.y >= top.y && r.bottom() <= top.bottom()));
+        // And the list says it scrolls.
+        assert!(s.items.iter().any(|(r, d)| matches!(d, Draw::Rect { fill: Fill::Mark, .. }) && r.w == 3.0));
+    }
+
+    #[test]
+    fn the_month_on_a_short_screen_goes_without_the_next_event_and_fits() {
+        let mut i = input();
+        i.month_open = true;
+        i.days = (0..42).map(|n| DayCell { day: 100 + n, label: n.to_string(), today: n == 6, selected: n == 6, dim: false, busy: 0 }).collect();
+        i.hero = Some(Hero { caption: "NEXT".into(), title: "Stand-up".into(), when: "9:00".into(), color: [1, 2, 3], joinable: false });
+        i.room = main_height(&i, 1, false) + 4.0;
+        let s = build(&i);
+        assert!(s.h <= i.room + 0.5);
+        assert!(!s.hits.iter().any(|(_, h)| *h == Hit::Hero));
+    }
+
+    #[test]
+    fn do_not_disturb_is_offered_once() {
+        let mut i = input();
+        assert_eq!(build(&i).hits.iter().filter(|(_, h)| *h == Hit::Quiet).count(), 1, "the footer's, with no notifications");
+        i.groups = Some(vec![group("WhatsApp", 1, true)]);
+        assert_eq!(build(&i).hits.iter().filter(|(_, h)| *h == Hit::Quiet).count(), 1, "the notification centre's moon");
+    }
+
+    #[test]
     fn a_short_screen_folds_the_notifications_rather_than_the_calendar() {
         let mut i = input();
         i.groups = Some(vec![group("WhatsApp", 3, true)]);
-        i.room = main_height(&i, 1) + GAP + 60.0;
+        i.room = main_height(&i, 1, i.hero.is_some()) + GAP + 60.0;
         let s = build(&i);
         assert_eq!(s.top.unwrap().h, SUMMARY_H);
         assert!(s.h <= i.room + 0.5);

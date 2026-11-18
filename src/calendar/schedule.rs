@@ -175,7 +175,7 @@ pub fn tick(config: &Config) -> Duration {
 
         // The clock.
         let top = s.focus.map_or_else(String::new, |(end, _, _)| focus_left(now, end));
-        let unread = if config.calendar.enabled && config.clock.unread { super::notifications::count() } else { 0 };
+        let unread = if config.calendar.enabled && config.clock.unread { super::notifications::unseen() } else { 0 };
         if !top.is_empty() {
             // The countdown moves with the minute.
             next = next.min(now - now % 60 + 60);
@@ -218,11 +218,13 @@ pub fn set_in_call(in_call: bool) -> bool {
     STATE.with(|cell| std::mem::replace(&mut cell.borrow_mut().in_call, in_call) != in_call)
 }
 
-/// Start the focus timer for `minutes`, with Windows' Do not disturb when it allows.
-pub fn start_focus(minutes: u32) {
+/// Start the focus timer for `minutes`, with Windows' Do not disturb when it allows. `false`:
+/// the timer runs, but Windows keeps notifications on.
+pub fn start_focus(minutes: u32) -> bool {
     let end = time::now() + minutes as i64 * 60;
     let held = focus::start(Why::Timer, end);
     STATE.with(|cell| cell.borrow_mut().focus = Some((end, minutes, held)));
+    held
 }
 
 pub fn stop_focus() {

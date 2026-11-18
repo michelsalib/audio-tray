@@ -23,7 +23,8 @@ use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MapWindowPoints, MonitorFromPoint, ScreenToClient, MONITORINFO, MONITOR_DEFAULTTONEAREST};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    VIRTUAL_KEY, VK_BACK, VK_DOWN, VK_ESCAPE, VK_RETURN, VK_HOME, VK_LEFT, VK_NEXT, VK_PRIOR, VK_RIGHT, VK_UP,
+    GetKeyState, VIRTUAL_KEY, VK_BACK, VK_DELETE, VK_DOWN, VK_ESCAPE, VK_RETURN, VK_HOME, VK_LEFT, VK_NEXT, VK_PRIOR, VK_RIGHT, VK_SHIFT,
+    VK_SPACE, VK_TAB, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     DefWindowProcW, DestroyWindow, GetCursorPos, ShowWindow, SW_HIDE, SW_SHOWNA, WA_INACTIVE, WHEEL_DELTA, WINDOW_EX_STYLE, WM_ACTIVATE,
@@ -54,6 +55,13 @@ const SCROLL_STEP: f32 = 48.0;
 /// How long the pointer rests on a target before its tooltip shows.
 const TIP_TIMER: usize = 1;
 const TIP_DELAY_MS: u32 = 500;
+/// A word said for a moment ([`View::say`]), and how long.
+const FLASH_TIMER: usize = 2;
+const FLASH_FOR: std::time::Duration = std::time::Duration::from_secs(4);
+/// While open, the panel looks again now and then: "in 2 h 19", the focus time left, and Do not
+/// disturb switched elsewhere follow.
+const REFRESH_TIMER: usize = 3;
+const REFRESH_MS: u32 = 30_000;
 /// How far ahead the next event is looked for.
 const AHEAD: i64 = 7 * DAY;
 
@@ -124,6 +132,12 @@ struct View {
     list_scroll: f32,
     hover: Option<Hit>,
     pressed: Option<Hit>,
+    /// The keyboard's target (Tab), ringed.
+    focus: Option<Hit>,
+    /// Replies typed and left for another notification's, by notification.
+    stash: Vec<(u32, String)>,
+    /// A word for a moment (Windows refused something), and since when.
+    flash: Option<(String, Instant)>,
 }
 
 /// Work to do once the view's state is released: it may pump messages.
@@ -325,6 +339,9 @@ fn create(config: &Config) -> Result<()> {
         center_full: false,
         show_tip: None,
         pressed: None,
+        focus: None,
+        stash: Vec::new(),
+        flash: None,
     };
     super::notifications::set_watching(true);
     view.reload();
@@ -342,6 +359,7 @@ fn create(config: &Config) -> Result<()> {
         }
         v.animate(crate::win::Flyout::Open);
     });
+    unsafe { SetTimer(Some(hwnd), REFRESH_TIMER, REFRESH_MS, None) };
     // The click that opened it was swallowed by our hook, so Windows has not lent us the
     // foreground: without it there are no keys (Escape) and no deactivation to close on.
     if crate::music::player::raise(hwnd) == crate::music::player::Raise::Refused {
@@ -380,6 +398,10 @@ fn empty_input() -> scene::Input {
         hover: None,
         center_full: false,
         show_tip: None,
+        notice: scene::Notice::None,
+        focus: None,
+        pressed: None,
+        flash: None,
     }
 }
 
@@ -510,7 +532,8 @@ impl View {
             ahead.sort_by_key(|e| e.order());
             // Timed events lead: an all-day one is rarely what comes "next".
             let next = ahead.iter().find(|e| matches!(e.when, When::At { .. })).or(ahead.first()).copied();
-            let week_end = self.week_start(today) + 7;
+            // The next seven days, not the calendar week: on a Saturday, Monday's meetings show.
+            let week_end = today + 7;
             rows = ahead
                 .iter()
                 .filter(|e| Some(**e) != next && e.days(&zone).0 < week_end)
@@ -518,8 +541,8 @@ impl View {
                 .map(|e| (*e).clone())
                 .collect();
             hero = next.cloned();
-            list_title = "Later this week".to_string();
-            empty = "Nothing else this week".to_string();
+            list_title = "Coming up".to_string();
+            empty = "Nothing else in the next 7 days".to_string();
         } else {
             rows = model::on_day(&self.events, self.selected, &zone).into_iter().cloned().collect();
             list_title = capitalised(&locale::day_title(self.selected));
@@ -558,6 +581,15 @@ impl View {
             .collect::<Vec<_>>()
             .join(" · ");
         let detail = self.detail.as_ref().map(|e| detail_view(e, &self.setup, now, self.selected));
+        let notice = if !self.has_sources {
+            scene::Notice::NoSources
+        } else if let Some(problem) = super::problem(&self.setup) {
+            scene::Notice::Problem(problem)
+        } else if self.events.is_empty() && super::fetching() && super::fetched_at().is_none() {
+            scene::Notice::Loading
+        } else {
+            scene::Notice::None
+        };
 
         scene::Input {
             room: (self.work.bottom - self.work.top) as f32 / self.scale - 2.0 * MARGIN,
@@ -583,6 +615,10 @@ impl View {
             hover: self.hover,
             center_full: self.center_full,
             show_tip: self.show_tip,
+            notice,
+            focus: self.focus,
+            pressed: self.pressed,
+            flash: self.flash.as_ref().filter(|(_, at)| at.elapsed() < FLASH_FOR).map(|(text, _)| text.clone()),
         }
     }
 
@@ -598,6 +634,8 @@ impl View {
             Edge::Top => (work.right - w - m, work.top + m),
             Edge::Left => (work.left + m, work.bottom - h - m),
         };
+        // Never above the screen's top, whatever did not fit.
+        self.origin.1 = self.origin.1.max(work.top + m);
     }
 
     /// Lay out again (something came, went or was picked) and show it.
@@ -792,11 +830,23 @@ impl View {
             Hit::Menu(i) => {
                 let id = self.toasts.get(i)?.id;
                 self.menu_for = if self.menu_for == Some(id) { None } else { Some(id) };
+                self.relayout();
+                self.reveal(id);
+                return Some(Box::new(keep_rect));
             }
             Hit::Reply(i) => {
                 let id = self.toasts.get(i)?.id;
-                self.draft = Some((id, String::new()));
+                // Another reply typed meanwhile is kept for when its box opens again.
+                if let Some(left) = self.draft.take().filter(|(_, text)| !text.is_empty()) {
+                    self.stash.retain(|(s, _)| *s != left.0);
+                    self.stash.push(left);
+                }
+                let kept = self.stash.iter().position(|(s, _)| *s == id).map(|at| self.stash.remove(at).1);
+                self.draft = Some((id, kept.unwrap_or_default()));
                 self.menu_for = None;
+                self.relayout();
+                self.reveal(id);
+                return Some(Box::new(keep_rect));
             }
             Hit::Draft(_) => return None,
             Hit::Send(i) => return self.send_reply(i),
@@ -812,7 +862,10 @@ impl View {
                 self.hover = None;
             }
             Hit::Quiet => {
-                super::focus::toggle();
+                let was = super::focus::active();
+                if !super::focus::toggle() && !was {
+                    self.say("Windows would not turn on Do not disturb");
+                }
                 crate::tray::wake_calendar();
             }
             Hit::Today => {
@@ -841,8 +894,8 @@ impl View {
             Hit::Focus => {
                 if super::schedule::focus_end().is_some() {
                     super::schedule::stop_focus();
-                } else {
-                    super::schedule::start_focus(self.config.calendar.focus_minutes);
+                } else if !super::schedule::start_focus(self.config.calendar.focus_minutes) && !super::focus::active() {
+                    self.say("The timer runs, but Windows would not silence notifications");
                 }
                 // The clock and the timer follow.
                 crate::tray::wake_calendar();
@@ -934,16 +987,48 @@ impl View {
             self.relayout();
             return None;
         }
-        if key == VK_ESCAPE && self.menu_for.take().is_some() {
+        if key == VK_ESCAPE {
+            // A step back at a time: the menu, an event's details, the month, the notifications
+            // given the panel; then the panel.
+            let stepped = if self.menu_for.take().is_some() || self.detail.take().is_some() {
+                true
+            } else if self.month_open {
+                self.month_open = false;
+                true
+            } else if self.center_full {
+                self.center_full = false;
+                true
+            } else {
+                false
+            };
+            if !stepped {
+                return Some(Box::new(close));
+            }
+            self.focus = None;
+            self.relayout();
+            return Some(Box::new(keep_rect));
+        }
+        if key == VK_TAB {
+            let back = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
+            self.move_focus(back);
             self.relayout();
             return None;
         }
-        if key == VK_ESCAPE {
-            if self.detail.take().is_some() {
-                self.relayout();
-                return None;
+        if let Some(focus) = self.focus {
+            match key {
+                VK_RETURN | VK_SPACE => {
+                    self.focus = None;
+                    return self.activate(focus);
+                }
+                VK_DELETE => {
+                    if let Some(i) = scene::toast_of(focus) {
+                        self.focus = None;
+                        return self.activate(Hit::Dismiss(i));
+                    }
+                    return None;
+                }
+                _ => {}
             }
-            return Some(Box::new(close));
         }
         let day = match key {
             VK_LEFT => self.selected - 1,
@@ -963,9 +1048,9 @@ impl View {
         Some(Box::new(keep_rect))
     }
 
-    fn wheel(&mut self, delta: i32, x: i32, y: i32) {
+    fn wheel(&mut self, delta: i32, cx: i32, cy: i32) {
         let notches = delta as f32 / WHEEL_DELTA as f32;
-        let (x, y) = self.scene_point(x, y);
+        let (x, y) = self.scene_point(cx, cy);
         if let Some((_, max)) = self.scene.center_view.filter(|(a, _)| a.contains(x, y)) {
             self.center_scroll = (self.center_scroll - notches * SCROLL_STEP).clamp(0.0, max);
         } else if let Some((_, max)) = self.scene.list_view.filter(|(a, _)| a.contains(x, y)) {
@@ -973,10 +1058,60 @@ impl View {
         } else if self.month_open && self.scene.main.contains(x, y) && delta != 0 {
             // Over the month, as in the shell's calendar: a notch is a month.
             self.show_month(if delta > 0 { -1 } else { 1 });
+        } else if !self.month_open && delta != 0 && matches!(self.scene.hit(x, y), Some(Hit::Day(_))) {
+            // Over the week: a notch is a week.
+            self.select(self.selected + if delta > 0 { -7 } else { 7 });
         } else {
             return;
         }
         self.relayout();
+        // What scrolled under the pointer is what it is over now.
+        let hit = self.hit(cx, cy);
+        self.set_hover(hit);
+    }
+
+    /// Say `text` for a moment, over the calendar's foot.
+    fn say(&mut self, text: &str) {
+        self.flash = Some((text.to_string(), Instant::now()));
+        unsafe { SetTimer(Some(self.hwnd), FLASH_TIMER, FLASH_FOR.as_millis() as u32, None) };
+    }
+
+    /// Scroll notification `id` whole into view (its menu or reply box opened under the fold).
+    fn reveal(&mut self, id: u32) {
+        let Some(index) = self.toasts.iter().position(|t| t.id == id) else { return };
+        let Some((area, max)) = self.scene.center_view else { return };
+        let Some(r) = self.scene.toasts.iter().find(|(i, _)| *i == index).map(|(_, r)| *r) else { return };
+        let shift = if r.bottom() > area.bottom() {
+            (r.bottom() - area.bottom() + 8.0).min(r.y - area.y)
+        } else if r.y < area.y {
+            r.y - area.y
+        } else {
+            return;
+        };
+        self.center_scroll = (self.center_scroll + shift).clamp(0.0, max);
+        self.relayout();
+    }
+
+    /// Tab: the next target the keyboard can take (Shift+Tab: the one before), in the order the
+    /// panel is laid out.
+    fn move_focus(&mut self, back: bool) {
+        let mut order: Vec<Hit> = Vec::new();
+        for (_, hit) in &self.scene.hits {
+            if !matches!(hit, Hit::Draft(_)) && order.last() != Some(hit) && !order.contains(hit) {
+                order.push(*hit);
+            }
+        }
+        if order.is_empty() {
+            return;
+        }
+        let at = self.focus.and_then(|f| order.iter().position(|h| *h == f));
+        let next = match (at, back) {
+            (None, false) => 0,
+            (None, true) => order.len() - 1,
+            (Some(i), false) => (i + 1) % order.len(),
+            (Some(i), true) => (i + order.len() - 1) % order.len(),
+        };
+        self.focus = Some(order[next]);
     }
 }
 
@@ -1134,6 +1269,7 @@ fn draw(pen: &Pen, scene: &Scene, p: &Palette) {
     let fill = |fill: Fill| match fill {
         Fill::Raised => p.raised,
         Fill::Hover => p.hover,
+        Fill::Pressed => p.text.alpha(0.12),
         Fill::Accent => p.accent,
         Fill::Rule => p.text.alpha(0.08),
         Fill::Mark => p.text.alpha(0.5),
@@ -1235,6 +1371,10 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESUL
             let inside = with_view(|v| {
                 let (sx, sy) = v.scene_point(x, y);
                 v.pressed = v.hit(x, y);
+                // The press shows; a tooltip goes (what it says may be about to change).
+                v.show_tip = None;
+                let _ = unsafe { KillTimer(Some(v.hwnd), TIP_TIMER) };
+                v.relayout();
                 v.scene.on_card(sx, sy)
             });
             if inside == Some(false) {
@@ -1247,7 +1387,12 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESUL
             after = with_view(|v| {
                 let pressed = v.pressed.take();
                 let hit = v.hit(x, y);
-                pressed.filter(|p| Some(*p) == hit).and_then(|hit| v.activate(hit))
+                let done = pressed.filter(|p| Some(*p) == hit).and_then(|hit| v.activate(hit));
+                if done.is_none() {
+                    // Released elsewhere (or nothing to do): the press is let go of.
+                    v.relayout();
+                }
+                done
             })
             .flatten();
         }
@@ -1273,6 +1418,16 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESUL
                 println!("calendar: closed, the foreground went to {:?} ({})", to.0, crate::win::class_name(to));
                 after = Some(Box::new(close));
             }
+        }
+        WM_TIMER if wparam.0 == FLASH_TIMER => {
+            let _ = unsafe { KillTimer(Some(hwnd), FLASH_TIMER) };
+            with_view(|v| {
+                v.flash = None;
+                v.relayout();
+            });
+        }
+        WM_TIMER if wparam.0 == REFRESH_TIMER => {
+            with_view(View::relayout);
         }
         WM_TIMER if wparam.0 == TIP_TIMER => {
             let _ = unsafe { KillTimer(Some(hwnd), TIP_TIMER) };

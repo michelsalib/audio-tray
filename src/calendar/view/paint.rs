@@ -112,6 +112,8 @@ pub enum Font {
     TinyStrong,
     /// Wrapping text from the top (a notification's body, an event's notes).
     Wrap,
+    /// [`Font::Title`], wrapping (an event's title in its details).
+    TitleWrap,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -160,6 +162,7 @@ impl Gfx {
                 gfx.format(text, DWRITE_FONT_WEIGHT_NORMAL, 11.0, false)?,
                 gfx.format(text, DWRITE_FONT_WEIGHT_SEMI_BOLD, 11.0, false)?,
                 gfx.format(text, DWRITE_FONT_WEIGHT_NORMAL, 13.0, true)?,
+                gfx.format(text, DWRITE_FONT_WEIGHT_SEMI_BOLD, 18.0, true)?,
             ];
             Ok(gfx)
         }

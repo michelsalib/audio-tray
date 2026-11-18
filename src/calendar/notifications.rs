@@ -58,8 +58,29 @@ static WATCHING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::
 pub fn set_watching(on: bool) {
     WATCHING.store(on, std::sync::atomic::Ordering::SeqCst);
     if on {
+        // Looked at: the clock's badge clears, as Windows' does.
+        see(&list());
+        held_changed();
         refresh();
     }
+}
+
+/// Notifications the user has had in front of them (the panel open), by id.
+static SEEN: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+
+fn see(toasts: &[Toast]) {
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    for t in toasts {
+        if !seen.contains(&t.id) {
+            seen.push(t.id);
+        }
+    }
+}
+
+/// How many notifications came since the panel was last open: the clock's badge.
+pub fn unseen() -> usize {
+    let seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    TOASTS.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map_or(0, |list| list.iter().filter(|t| !seen.contains(&t.id)).count())
 }
 
 /// Every notification, newest first, as last read; `None` before the first read or when the
@@ -251,6 +272,14 @@ fn run(wake: windows::Win32::Foundation::HANDLE) {
 
 /// Hold a fresh read (less what was removed here meanwhile), and tell the tray if it changed.
 fn publish(mut toasts: Vec<Toast>) {
+    {
+        // Those gone are forgotten; while the panel is open, what arrives is seen.
+        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        seen.retain(|id| toasts.iter().any(|t| t.id == *id));
+    }
+    if WATCHING.load(std::sync::atomic::Ordering::SeqCst) {
+        see(&toasts);
+    }
     {
         let mut removed = REMOVED.lock().unwrap_or_else(|e| e.into_inner());
         removed.retain(|(id, at)| at.elapsed() < REMOVED_FOR && toasts.iter().any(|t| t.id == *id));

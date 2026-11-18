@@ -587,7 +587,9 @@ fn side_by_side(input: &Input, columns: Columns, groups: &[Group]) -> Plan {
     if input.detail.is_some() {
         main_h = main_h.min(room).max(240.0);
     }
-    let center_h = center_height(groups).min(room).max(CENTER_MIN.min(room));
+    // None waiting: a one-line card, not a tall empty one.
+    let least = if groups.is_empty() { 0.0 } else { CENTER_MIN.min(room) };
+    let center_h = center_height(groups).min(room).max(least);
     let h = main_h.max(center_h);
     let y = |card_h: f32| if columns.from_top { 0.0 } else { h - card_h };
     let (main_x, top_x) = if columns.calendar_left { (0.0, W + GAP) } else { (W + GAP, 0.0) };
@@ -923,7 +925,9 @@ fn center(ink: &mut Ink2, card: R, input: &Input, groups: &[Group]) -> (R, f32) 
         ink.text(clear, t.clear_all, Font::Caption, if lit { Ink::Accent } else { Ink::Text }, Align::Center);
         ink.hit(clear, Hit::ClearAll);
     }
-    let moon = R::new(head.right() - text_w(t.clear_all, Font::Caption) - 20.0 - 40.0, head.y, 32.0, 32.0);
+    // Beside Clear all, or at the edge when there is nothing to clear.
+    let after = if input.unread > 0 { text_w(t.clear_all, Font::Caption) + 20.0 + 8.0 } else { 0.0 };
+    let moon = R::new(head.right() - after - 32.0, head.y, 32.0, 32.0);
     ink.icon_button(moon, '\u{E708}', Hit::Quiet, input.quiet);
     let clear = R::new(moon.x + 40.0, head.y, 0.0, 0.0);
     // The whole panel for the notifications, or back (side by side, they have it already).
@@ -1511,6 +1515,13 @@ mod tests {
         assert!(build(&i).hits.iter().any(|(_, h)| *h == Hit::Allow), "says where to allow it");
         i.month_open = true;
         assert!(!build(&i).hits.iter().any(|(_, h)| *h == Hit::Center), "nothing to fold");
+        // Side by side too: one line, on the taskbar's edge, the moon at the card's edge.
+        i.columns = Some(BY_THE_CLOCK);
+        let s = build(&i);
+        let top = s.top.unwrap();
+        assert!(top.h < CENTER_MIN && (top.bottom() - s.h).abs() < 0.5, "one line: {}", top.h);
+        let moon = s.hits.iter().find(|(_, h)| *h == Hit::Quiet).unwrap().0;
+        assert!(top.right() - moon.right() < 16.0, "moon at the edge");
     }
 
     #[test]

@@ -38,18 +38,36 @@ impl WheelHook {
                 let hook = unsafe { SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook), None, 0) };
                 let _ = ready.send(hook.is_ok().then(|| unsafe { GetCurrentThreadId() }));
                 let Ok(hook) = hook else { return };
-                // Win+Alt+D, for the calendar; it passes everything else straight on.
-                let keys = unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook), None, 0) }.ok();
+                // Win+Alt+D and Win+N, for the calendar, only while its shortcut is on: a keyboard
+                // hook routes every keystroke in the session through this thread.
+                let mut keys = None;
+                let want = |on: bool, keys: &mut Option<windows::Win32::UI::WindowsAndMessaging::HHOOK>| {
+                    match (on, keys.is_some()) {
+                        (true, false) => *keys = unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook), None, 0) }.ok(),
+                        (false, true) => {
+                            if let Some(k) = keys.take() {
+                                let _ = unsafe { UnhookWindowsHookEx(k) };
+                            }
+                        }
+                        _ => {}
+                    }
+                };
+                want(crate::calendar::SHORTCUT.load(std::sync::atomic::Ordering::SeqCst), &mut keys);
                 let mut msg = MSG::default();
-                while unsafe { GetMessageW(&mut msg, None, 0, 0) }.0 > 0 {}
-                if let Some(keys) = keys {
-                    let _ = unsafe { UnhookWindowsHookEx(keys) };
+                while unsafe { GetMessageW(&mut msg, None, 0, 0) }.0 > 0 {
+                    if msg.message == WM_WANT_KEYS {
+                        want(msg.wParam.0 != 0, &mut keys);
+                    }
                 }
+                want(false, &mut keys);
                 let _ = unsafe { UnhookWindowsHookEx(hook) };
             })
             .ok()?;
         match started.recv().ok().flatten() {
-            Some(thread) => Some(Self { thread, join: Some(join) }),
+            Some(thread) => {
+                HOOK_THREAD.store(thread, std::sync::atomic::Ordering::SeqCst);
+                Some(Self { thread, join: Some(join) })
+            }
             None => {
                 let _ = join.join();
                 None
@@ -58,8 +76,22 @@ impl WheelHook {
     }
 }
 
+/// Hook thread message: install (`wParam` 1) or remove (0) the keyboard hook.
+const WM_WANT_KEYS: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 1;
+/// The hook thread, for [`want_keys`] (0: none).
+static HOOK_THREAD: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// The calendar's shortcut on or off: the keyboard hook follows (call after `set_shortcut`).
+pub(super) fn want_keys(on: bool) {
+    let thread = HOOK_THREAD.load(std::sync::atomic::Ordering::SeqCst);
+    if thread != 0 {
+        let _ = unsafe { PostThreadMessageW(thread, WM_WANT_KEYS, WPARAM(on as usize), LPARAM(0)) };
+    }
+}
+
 impl Drop for WheelHook {
     fn drop(&mut self) {
+        HOOK_THREAD.store(0, std::sync::atomic::Ordering::SeqCst);
         let _ = unsafe { PostThreadMessageW(self.thread, WM_QUIT, WPARAM(0), LPARAM(0)) };
         if let Some(join) = self.join.take() {
             let _ = join.join();

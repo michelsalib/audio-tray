@@ -336,6 +336,7 @@ pub fn run(backend: WasapiBackend, settings: bool) -> Result<()> {
     }
     crate::calendar::set_shortcut(with_tray(|tray| tray.config.calendar.enabled && tray.config.calendar.shortcut).unwrap_or(false));
     hook::set_clock_taken(with_tray(|tray| tray.config.calendar.enabled).unwrap_or(false));
+    hook::want_keys(crate::calendar::SHORTCUT.load(std::sync::atomic::Ordering::SeqCst));
     reschedule();
     if settings {
         post(crate::settings::WM_OPEN_SETTINGS, 0, 0);
@@ -470,6 +471,10 @@ fn handle(msg: Queued) {
         crate::calendar::WM_CALENDAR if msg.wparam == crate::calendar::CLOSE => {
             println!("calendar: closed by a click outside it");
             crate::calendar::close()
+        }
+        crate::calendar::WM_CALENDAR if msg.wparam == crate::calendar::NOTIFICATIONS => {
+            crate::calendar::notifications_changed();
+            reschedule();
         }
         crate::calendar::WM_CALENDAR => {
             crate::calendar::changed();
@@ -788,6 +793,7 @@ impl Tray {
         }
         crate::calendar::set_shortcut(self.config.calendar.enabled && self.config.calendar.shortcut);
         hook::set_clock_taken(self.config.calendar.enabled);
+        hook::want_keys(self.config.calendar.enabled && self.config.calendar.shortcut);
         if before.calendar != self.config.calendar || before.clock != self.config.clock {
             post(WM_TIMER, CALENDAR_TIMER, 0);
         }

@@ -381,14 +381,34 @@ pub fn unauthorized(error: &anyhow::Error) -> bool {
     error.downcast_ref::<Refused>().is_some_and(|r| r.0 == 401)
 }
 
-/// GET `url` as text (a calendar feed).
-pub fn get_text(url: &str) -> Result<String> {
-    let mut response = agent().get(url).call().context("could not reach the link")?;
+/// What a server said identifies a resource's version (`ETag`, `Last-Modified`), to ask again
+/// only for a change.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Validators {
+    pub etag: Option<String>,
+    pub modified: Option<String>,
+}
+
+/// [`get_text`], unless it is unchanged since `known` (`None`: unchanged, as the server said).
+pub fn get_text_since(url: &str, known: &Validators) -> Result<Option<(String, Validators)>> {
+    let mut request = agent().get(url);
+    if let Some(etag) = &known.etag {
+        request = request.header("If-None-Match", etag);
+    }
+    if let Some(modified) = &known.modified {
+        request = request.header("If-Modified-Since", modified);
+    }
+    let mut response = request.call().context("could not reach the link")?;
     let status = response.status().as_u16();
+    if status == 304 && (known.etag.is_some() || known.modified.is_some()) {
+        return Ok(None);
+    }
     if !(200..300).contains(&status) {
         return Err(Refused(status, String::new()).into());
     }
-    Ok(response.body_mut().with_config().limit(32 * 1024 * 1024).read_to_string()?)
+    let header = |name: &str| response.headers().get(name).and_then(|v| v.to_str().ok()).map(str::to_string);
+    let validators = Validators { etag: header("etag"), modified: header("last-modified") };
+    Ok(Some((response.body_mut().with_config().limit(32 * 1024 * 1024).read_to_string()?, validators)))
 }
 
 #[cfg(test)]

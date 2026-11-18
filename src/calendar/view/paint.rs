@@ -130,9 +130,14 @@ pub struct Gfx {
     surface: Option<((u32, u32), IWICBitmap, ID2D1RenderTarget)>,
     /// The last frame, premultiplied BGRA.
     pub pixels: Vec<u8>,
-    /// Images drawn for this surface, by key and pixel size.
+    /// Images drawn for this surface, by key and pixel size, oldest first.
     images: std::cell::RefCell<Vec<(String, u32, Option<ID2D1Bitmap>)>>,
+    /// The size of the last frame (the surface can be taller).
+    drawn: (u32, u32),
 }
+
+/// Images kept decoded at most (logos, photos and pictures of the notifications listed).
+const IMAGES_MAX: usize = 64;
 
 impl Gfx {
     pub fn new() -> Result<Self> {
@@ -140,7 +145,7 @@ impl Gfx {
             let factory: ID2D1Factory = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None).context("D2D1CreateFactory")?;
             let dwrite: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED).context("DWriteCreateFactory")?;
             let wic: IWICImagingFactory = CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER).context("WIC")?;
-            let mut gfx = Gfx { factory, dwrite, wic, formats: Vec::new(), surface: None, pixels: Vec::new(), images: Default::default() };
+            let mut gfx = Gfx { factory, dwrite, wic, formats: Vec::new(), surface: None, pixels: Vec::new(), images: Default::default(), drawn: (0, 0) };
             let text = w!("Segoe UI Variable Text");
             let icons = w!("Segoe Fluent Icons");
             gfx.formats = vec![
@@ -180,7 +185,10 @@ impl Gfx {
     /// Draw a frame of `size` pixels at `scale` pixels per DIP into [`Gfx::pixels`].
     pub fn frame(&mut self, size: (u32, u32), scale: f32, draw: impl FnOnce(&Pen)) -> Result<()> {
         unsafe {
-            if self.surface.as_ref().map(|(s, ..)| *s) != Some(size) {
+            // The surface only grows (same width): a panel growing or shrinking keeps its target,
+            // and so its decoded pictures. Only the top `size.1` rows are read back.
+            let fits = self.surface.as_ref().is_some_and(|((w, h), ..)| *w == size.0 && *h >= size.1);
+            if !fits {
                 let bitmap = self.wic.CreateBitmap(size.0.max(1), size.1.max(1), &GUID_WICPixelFormat32bppPBGRA, WICBitmapCacheOnLoad).context("CreateBitmap")?;
                 let props = D2D1_RENDER_TARGET_PROPERTIES {
                     r#type: D2D1_RENDER_TARGET_TYPE_DEFAULT,
@@ -197,8 +205,9 @@ impl Gfx {
             target.BeginDraw();
             draw(&Pen { gfx: self, target: target.clone(), scale });
             target.EndDraw(None, None).context("EndDraw")?;
+            self.drawn = size;
 
-            let rect = WICRect { X: 0, Y: 0, Width: size.0 as i32, Height: size.1 as i32 };
+            let rect = WICRect { X: 0, Y: 0, Width: size.0 as i32, Height: size.1.max(1) as i32 };
             let lock = bitmap.Lock(&rect, WICBitmapLockRead.0 as u32).context("Lock")?;
             let stride = lock.GetStride()? as usize;
             let mut len = 0u32;
@@ -229,7 +238,10 @@ impl Gfx {
             encoder.CreateNewFrame(&mut frame, std::ptr::null_mut())?;
             let frame = frame.context("no frame")?;
             frame.Initialize(None)?;
-            frame.WriteSource(bitmap, std::ptr::null())?;
+            // The frame drawn, not the whole (taller) surface.
+            let (w, h) = self.drawn;
+            let source = self.wic.CreateBitmapFromSourceRect(bitmap, 0, 0, w.max(1), h.max(1))?;
+            frame.WriteSource(&source, std::ptr::null())?;
             frame.Commit()?;
             encoder.Commit()?;
         }
@@ -333,7 +345,11 @@ impl Pen<'_> {
             return b;
         }
         let made = make().and_then(|(rgba, w, h)| self.bitmap(&rgba, w, h));
-        self.gfx.images.borrow_mut().push((key.to_string(), px, made.clone()));
+        let mut images = self.gfx.images.borrow_mut();
+        if images.len() >= IMAGES_MAX {
+            images.remove(0);
+        }
+        images.push((key.to_string(), px, made.clone()));
         made
     }
 

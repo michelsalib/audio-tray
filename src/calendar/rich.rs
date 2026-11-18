@@ -79,13 +79,28 @@ struct Parts {
     menu: Vec<Action>,
 }
 
+/// A notification read: its extras without pictures, and where its pictures come from (they are
+/// looked up at each read, so one downloaded meanwhile shows).
+struct Known {
+    rich: Rich,
+    avatar: Option<String>,
+    picture: Option<String>,
+    base: Base,
+}
+
 /// What is known of each notification already read, by id.
-static READ: Mutex<Vec<(u32, Rich)>> = Mutex::new(Vec::new());
+static READ: Mutex<Vec<(u32, Known)>> = Mutex::new(Vec::new());
+/// Notifications not found in Windows' store, and how many reads looked for them.
+static MISSES: Mutex<Vec<(u32, u8)>> = Mutex::new(Vec::new());
+/// Reads that look for a notification missing from the store before it stays plain.
+const MISSES_MAX: u8 = 5;
 
 /// Each notification's extras, read once (what is no longer listed is forgotten).
 pub fn for_toasts(wanted: &[(u32, String, Option<windows::ApplicationModel::AppInfo>)]) -> Vec<Rich> {
     let mut read = READ.lock().unwrap_or_else(|e| e.into_inner());
     read.retain(|(id, _)| wanted.iter().any(|(w, ..)| w == id));
+    let mut misses = MISSES.lock().unwrap_or_else(|e| e.into_inner());
+    misses.retain(|(id, _)| wanted.iter().any(|(w, ..)| w == id));
     let missing: Vec<u32> = wanted.iter().map(|(id, ..)| *id).filter(|id| !read.iter().any(|(r, _)| r == id)).collect();
     let payloads = if missing.is_empty() { Vec::new() } else { payloads(&missing).unwrap_or_else(|e| {
         eprintln!("notifications: could not read Windows' store ({e:#})");
@@ -96,8 +111,21 @@ pub fn for_toasts(wanted: &[(u32, String, Option<windows::ApplicationModel::AppI
             continue;
         }
         let Some((_, xml)) = payloads.iter().find(|(p, _)| p == id) else {
-            println!("notifications: {id} ({aumid}) is not in Windows' store yet");
-            // Not in the store (yet): plain, and asked again next time.
+            // Not in the store (yet): plain, and looked for again a few times.
+            let tries = match misses.iter_mut().find(|(m, _)| m == id) {
+                Some((_, n)) => {
+                    *n += 1;
+                    *n
+                }
+                None => {
+                    misses.push((*id, 1));
+                    1
+                }
+            };
+            if tries >= MISSES_MAX {
+                println!("notifications: {id} ({aumid}) never reached Windows' store; shown plain");
+                read.push((*id, Known { rich: Rich::default(), avatar: None, picture: None, base: Base::default() }));
+            }
             continue;
         };
         let parts = parse(xml);
@@ -105,16 +133,30 @@ pub fn for_toasts(wanted: &[(u32, String, Option<windows::ApplicationModel::AppI
         let rich = Rich {
             launch: parts.launch,
             launch_kind: parts.launch_kind,
-            avatar: parts.avatar.as_deref().and_then(|src| picture(src, &base)),
-            picture: parts.picture.as_deref().and_then(|src| picture(src, &base)),
+            avatar: None,
+            picture: None,
             reply: parts.reply,
             buttons: parts.buttons,
             menu: parts.menu,
             activator: activator(aumid, &base),
         };
-        read.push((*id, rich));
+        read.push((*id, Known { rich, avatar: parts.avatar, picture: parts.picture, base }));
     }
-    wanted.iter().map(|(id, ..)| read.iter().find(|(r, _)| r == id).map(|(_, rich)| rich.clone()).unwrap_or_default()).collect()
+    let out: Vec<Rich> = wanted
+        .iter()
+        .map(|(id, ..)| {
+            let Some((_, known)) = read.iter().find(|(r, _)| r == id) else { return Rich::default() };
+            Rich {
+                avatar: known.avatar.as_deref().and_then(|src| picture(src, &known.base)),
+                picture: known.picture.as_deref().and_then(|src| picture(src, &known.base)),
+                ..known.rich.clone()
+            }
+        })
+        .collect();
+    // Pictures no listed notification shows are let go.
+    let shown: Vec<&str> = read.iter().flat_map(|(_, k)| [k.avatar.as_deref(), k.picture.as_deref()]).flatten().collect();
+    PICTURES.lock().unwrap_or_else(|e| e.into_inner()).retain(|(src, _)| shown.contains(&src.as_str()));
+    out
 }
 
 /// The payloads of notifications `ids`, from Windows' store.
@@ -287,6 +329,7 @@ fn parse(xml: &str) -> Parts {
 }
 
 /// Where an app's own files are, for its pictures and its manifest.
+#[derive(Clone, Default)]
 struct Base {
     /// The package's install folder and family name, for a packaged app.
     installed: Option<String>,
@@ -306,37 +349,71 @@ impl Base {
     }
 }
 
-/// Pictures fetched so far, by address: each is fetched once.
+/// Pictures fetched so far, by address (`None`: there is none), for the listed notifications only.
 static PICTURES: Mutex<Vec<(String, Option<Bytes>)>> = Mutex::new(Vec::new());
+/// Web pictures being downloaded, on threads of their own.
+static DOWNLOADING: Mutex<Vec<String>> = Mutex::new(Vec::new());
 /// A file's bytes, shared.
 type Bytes = Arc<Vec<u8>>;
 /// No picture bigger than this is kept.
 const PICTURE_MAX: u64 = 4 * 1024 * 1024;
+/// Nor more than this in all: the oldest go first.
+const PICTURES_MAX: usize = 32 * 1024 * 1024;
 
 fn picture(src: &str, base: &Base) -> Option<Picture> {
     if let Some((_, bytes)) = PICTURES.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|(s, _)| s == src) {
         return bytes.clone().map(|bytes| Picture { key: src.to_string(), bytes });
     }
-    let bytes = fetch(src, base).filter(|b| !b.is_empty()).map(Arc::new);
-    let mut held = PICTURES.lock().unwrap_or_else(|e| e.into_inner());
-    if held.len() > 200 {
-        held.drain(..100);
+    if is_web(src) {
+        // Downloaded aside, so a slow host never holds up the list; the list is read again when
+        // it has come.
+        let mut downloading = DOWNLOADING.lock().unwrap_or_else(|e| e.into_inner());
+        if !downloading.iter().any(|s| s == src) {
+            downloading.push(src.to_string());
+            let src = src.to_string();
+            let _ = std::thread::Builder::new().name("toast-picture".into()).spawn(move || {
+                let bytes = download(&src);
+                keep(&src, bytes);
+                DOWNLOADING.lock().unwrap_or_else(|e| e.into_inner()).retain(|s| *s != src);
+                super::notifications::refresh();
+            });
+        }
+        return None;
     }
-    held.push((src.to_string(), bytes.clone()));
+    let bytes = keep(src, fetch(src, base));
     bytes.map(|bytes| Picture { key: src.to_string(), bytes })
 }
 
-fn fetch(src: &str, base: &Base) -> Option<Vec<u8>> {
-    let lower = src.to_ascii_lowercase();
-    if lower.starts_with("https://") || lower.starts_with("http://") {
-        // Short: a slow picture host must not hold up the list.
-        let request = super::oauth::agent().get(src).config().timeout_global(Some(std::time::Duration::from_secs(5))).build();
-        let mut response = request.call().ok()?;
-        if response.status() != 200 {
-            return None;
-        }
-        return response.body_mut().with_config().limit(PICTURE_MAX).read_to_vec().ok();
+/// Cache a picture's bytes (or that there is none), within [`PICTURES_MAX`].
+fn keep(src: &str, bytes: Option<Vec<u8>>) -> Option<Bytes> {
+    let bytes = bytes.filter(|b| !b.is_empty()).map(Arc::new);
+    let mut held = PICTURES.lock().unwrap_or_else(|e| e.into_inner());
+    held.retain(|(s, _)| s != src);
+    held.push((src.to_string(), bytes.clone()));
+    let size = |held: &[(String, Option<Bytes>)]| held.iter().filter_map(|(_, b)| b.as_ref()).map(|b| b.len()).sum::<usize>();
+    while held.len() > 1 && size(&held) > PICTURES_MAX {
+        held.remove(0);
     }
+    bytes
+}
+
+fn is_web(src: &str) -> bool {
+    let lower = src.get(..8).unwrap_or(src).to_ascii_lowercase();
+    lower.starts_with("https://") || lower.starts_with("http://")
+}
+
+fn download(src: &str) -> Option<Vec<u8>> {
+    // Short: a slow picture host is given up on.
+    let request = super::oauth::agent().get(src).config().timeout_global(Some(std::time::Duration::from_secs(10))).build();
+    let mut response = request.call().ok()?;
+    if response.status() != 200 {
+        return None;
+    }
+    response.body_mut().with_config().limit(PICTURE_MAX).read_to_vec().ok()
+}
+
+/// A picture in a file: the app's own (`ms-appx`, `ms-appdata`) or one on a local drive.
+fn fetch(src: &str, base: &Base) -> Option<Vec<u8>> {
     let path = if let Some(rest) = strip_scheme(src, "file:///") {
         percent_decoded(rest)
     } else if let Some(rest) = strip_scheme(src, "ms-appx:///") {

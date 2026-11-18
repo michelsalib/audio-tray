@@ -102,7 +102,9 @@ pub fn tick(config: &Config) -> Duration {
     let now = time::now();
     let calendar = &config.calendar;
     let setup = calendar.setup();
-    if calendar.enabled && super::has_sources(&setup) {
+    // In the background every quarter hour (the panel opening refreshes sooner).
+    let due = super::fetched_at().is_none_or(|at| now - at >= REFRESH_EVERY);
+    if calendar.enabled && due && super::has_sources(&setup) {
         let (y, m, _) = time::civil_from_days(time::today());
         super::fetch(&setup, super::days_around(y, m), false);
     }

@@ -87,11 +87,23 @@ fn load_grant(provider: Provider) -> Option<Grant> {
 fn save_grant(provider: Provider, grant: Option<&Grant>) {
     let text = grant.and_then(|g| serde_json::to_string(g).ok());
     crate::secrets::set(provider.secret_name(), text.as_deref());
+    let mut known = SIGNED_IN.lock().unwrap_or_else(|e| e.into_inner());
+    known.retain(|(p, _)| *p != provider);
+    known.push((provider, grant.map(|g| g.email.clone())));
 }
+
+/// Who is signed in with each provider, as last read or saved: the credential store is asked once,
+/// not at every tick and repaint.
+static SIGNED_IN: Mutex<Vec<(Provider, Option<String>)>> = Mutex::new(Vec::new());
 
 /// The address of the account signed in with `provider`, if any.
 pub fn signed_in(provider: Provider) -> Option<String> {
-    load_grant(provider).map(|g| g.email)
+    if let Some((_, email)) = SIGNED_IN.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|(p, _)| *p == provider) {
+        return email.clone();
+    }
+    let email = load_grant(provider).map(|g| g.email);
+    SIGNED_IN.lock().unwrap_or_else(|e| e.into_inner()).push((provider, email.clone()));
+    email
 }
 
 /// Access tokens in hand, with their expiry.
@@ -423,14 +435,24 @@ pub fn feed_url(url: &str) -> String {
 
 /// Calendar link `index`'s events on the local days `[from, to)`, and the calendar itself.
 pub fn fetch_link(index: usize, link: &Link, days: (i32, i32), zone: &dyn Zone) -> Result<(Vec<Event>, Calendar)> {
-    let text = oauth::get_text(&feed_url(&link.url))?;
-    if !text.contains("BEGIN:VCALENDAR") {
-        bail!("not a calendar");
-    }
     let color = LINK_COLORS[index % LINK_COLORS.len()];
     let key = link_key(&link.url);
     let feed = feed_url(&link.url);
-    let events = super::ics::parse(&text, days, zone)
+    let calendar = Calendar { key: key.clone(), name: link.name.clone(), color, source: Source::Link(index) };
+    // The same feed for the same days, unchanged on the server: its events as last read (a feed
+    // can be megabytes, fetched every quarter hour).
+    let known = FEEDS.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|f| f.url == feed && f.days == days && f.index == index).map(|f| f.validators.clone());
+    let Some((text, validators)) = oauth::get_text_since(&feed, &known.unwrap_or_default())? else {
+        let held = FEEDS.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(f) = held.iter().find(|f| f.url == feed && f.days == days && f.index == index) {
+            return Ok((f.events.iter().map(|e| Event { color, ..e.clone() }).collect(), calendar));
+        }
+        bail!("the link answered \"unchanged\" to a first look");
+    };
+    if !text.contains("BEGIN:VCALENDAR") {
+        bail!("not a calendar");
+    }
+    let events: Vec<Event> = super::ics::parse(&text, days, zone)
         .into_iter()
         .map(|item| Event {
             link: item.link.or_else(|| web_link(&feed, &item.uid, &item.when, zone)),
@@ -444,8 +466,24 @@ pub fn fetch_link(index: usize, link: &Link, days: (i32, i32), zone: &dyn Zone) 
             details: item.details,
         })
         .collect();
-    Ok((events, Calendar { key, name: link.name.clone(), color, source: Source::Link(index) }))
+    if validators.etag.is_some() || validators.modified.is_some() {
+        let mut held = FEEDS.lock().unwrap_or_else(|e| e.into_inner());
+        held.retain(|f| f.url != feed);
+        held.push(Feed { url: feed, index, days, validators, events: events.clone() });
+    }
+    Ok((events, calendar))
 }
+
+/// A link as last read: what identifies that version, and its events for those days.
+struct Feed {
+    url: String,
+    index: usize,
+    days: (i32, i32),
+    validators: oauth::Validators,
+    events: Vec<Event>,
+}
+
+static FEEDS: Mutex<Vec<Feed>> = Mutex::new(Vec::new());
 
 /// Where a linked calendar's event opens on the web, when its feed gives no `URL`: the event itself
 /// for Google's private and public addresses (its `eid` is the event id and the calendar id, in

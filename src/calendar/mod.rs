@@ -140,10 +140,20 @@ pub fn changed() {
     crate::settings::calendar_changed();
 }
 
+/// The notifications changed: only the panel shows them (Settings lists accounts and fetches).
+pub fn notifications_changed() {
+    view::refresh();
+}
+
 /// The events fetched, and the days they cover.
 pub fn events() -> (Vec<Event>, Option<(i32, i32)>) {
     let state = state();
     (state.events.clone(), state.range)
+}
+
+/// When events were last fetched.
+pub fn fetched_at() -> Option<i64> {
+    state().fetched
 }
 
 /// Whether a fetch is running.

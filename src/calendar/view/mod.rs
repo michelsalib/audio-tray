@@ -59,6 +59,8 @@ const AHEAD: i64 = 7 * DAY;
 
 thread_local! {
     static VIEW: RefCell<Option<View>> = const { RefCell::new(None) };
+    /// The drawing kit of the last panel, kept for the next (its pictures stay decoded).
+    static SPARE_GFX: RefCell<Option<Gfx>> = const { RefCell::new(None) };
     static OPEN: Cell<isize> = const { Cell::new(0) };
     static CLOSED_AT: Cell<Option<Instant>> = const { Cell::new(None) };
     /// The close animation is running.
@@ -79,6 +81,8 @@ struct View {
     hwnd: HWND,
     top_hwnd: HWND,
     gfx: RefCell<Gfx>,
+    /// What each window (main, top) last showed, to skip sending the same again (0: unknown).
+    shown: Cell<[u64; 2]>,
     palette: Palette,
     scale: f32,
     edge: Edge,
@@ -152,10 +156,30 @@ pub fn close() {
     CLOSING.with(|c| c.set(false));
 }
 
+/// A badge: its PNG, its width in DIPs, the DPI it was drawn at.
+pub type Badge = (String, u32, u32);
+
 /// The clock's unread badge: an accent pill with `count`, drawn at the taskbar's scale into a PNG
 /// the TAP paints beside the clock. Gives the file, its width in DIPs and the taskbar's DPI.
 /// Each look (count, colour, scale) is its own file, drawn once: XAML caches images by address.
-pub fn badge(count: u32) -> Option<(String, u32, u32)> {
+pub fn badge(count: u32) -> Option<Badge> {
+    // Asked at every tick: the same count within a while is the same badge (the accent and scale
+    // seldom change, and are looked up again after).
+    thread_local! {
+        static LAST: RefCell<Option<(u32, Instant, Option<Badge>)>> = const { RefCell::new(None) };
+    }
+    if let Some(badge) = LAST.with(|l| l.borrow().as_ref().filter(|(n, at, _)| *n == count && at.elapsed() < BADGE_FRESH).map(|(.., b)| b.clone())) {
+        return badge;
+    }
+    let badge = draw_badge(count);
+    LAST.with(|l| *l.borrow_mut() = Some((count, Instant::now(), badge.clone())));
+    badge
+}
+
+/// How long a badge looked up stands for its count.
+const BADGE_FRESH: std::time::Duration = std::time::Duration::from_secs(60);
+
+fn draw_badge(count: u32) -> Option<Badge> {
     use windows::Win32::UI::HiDpi::GetDpiForWindow;
     use windows::Win32::UI::WindowsAndMessaging::FindWindowW;
     const H: f32 = 18.0;
@@ -175,6 +199,13 @@ pub fn badge(count: u32) -> Option<(String, u32, u32)> {
     let path = dir.join(format!("{label}-{}-{}-{dpi}.png", hex(p.accent), hex(ink)).replace('+', "p"));
     if !path.exists() {
         let _ = std::fs::create_dir_all(&dir);
+        // Another colour or scale: the old looks go (one per count is kept for the current one).
+        let look = format!("-{}-{}-{dpi}.png", hex(p.accent), hex(ink));
+        for old in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            if !old.file_name().to_string_lossy().ends_with(&look) {
+                let _ = std::fs::remove_file(old.path());
+            }
+        }
         let size = ((w * scale).round() as u32, (H * scale).round() as u32);
         let drawn = Gfx::new().and_then(|mut gfx| {
             gfx.frame(size, scale, |pen| {
@@ -231,8 +262,12 @@ fn create(config: &Config) -> Result<()> {
     let mut cursor = POINT::default();
     let _ = unsafe { GetCursorPos(&mut cursor) };
     let (scale, rect, work) = monitor(cursor);
-    // First what can fail without windows to clean up after.
-    let gfx = Gfx::new()?;
+    // First what can fail without windows to clean up after. The last panel's, if any: its
+    // pictures are decoded already.
+    let gfx = match SPARE_GFX.with(|s| s.borrow_mut().take()) {
+        Some(gfx) => gfx,
+        None => Gfx::new()?,
+    };
     let style = WINDOW_EX_STYLE(WS_EX_LAYERED.0 | WS_EX_TOOLWINDOW.0 | WS_EX_TOPMOST.0);
     let hwnd = crate::win::create_popup(CLASS, w!("Calendar"), Some(wndproc), style, (0, 0, 1, 1)).context("CreateWindowExW")?;
     // Never activated: a click on it must not deactivate the calendar's window, which closes on that.
@@ -258,6 +293,7 @@ fn create(config: &Config) -> Result<()> {
         hwnd,
         top_hwnd,
         gfx: RefCell::new(gfx),
+        shown: Cell::new([0; 2]),
         palette: Palette::current(),
         scale,
         edge: edge_of(&rect, &work),
@@ -593,22 +629,37 @@ impl View {
 
     /// Each card's part of the frame to its window, `offset` from its place.
     fn present(&self, (dx, dy): (i32, i32), alpha: u8) {
+        use std::hash::{Hash, Hasher};
         let gfx = self.gfx.borrow();
         let full_w = self.px(scene::W);
-        let cut = |card: R| -> (Vec<u8>, i32, i32, i32) {
+        let cut = |card: R| -> (&[u8], i32, i32, i32) {
             let (y0, h) = (self.px(card.y), self.px(card.h));
             let row = full_w as usize * 4;
             let start = (y0.max(0) as usize * row).min(gfx.pixels.len());
             let end = ((y0 + h).max(0) as usize * row).min(gfx.pixels.len());
-            (gfx.pixels[start..end].to_vec(), full_w, (end - start) as i32 / row.max(1) as i32, y0)
+            (&gfx.pixels[start..end], full_w, (end - start) as i32 / row.max(1) as i32, y0)
         };
         let (x, y) = (self.origin.0 + dx, self.origin.1 + dy);
-        let (pixels, w, h, y0) = cut(self.scene.main);
-        crate::layered::present_premultiplied(self.hwnd, &pixels, w, h, x, y + y0, alpha);
+        // A card that looks and sits as it did is not sent again (a hover changes one card at most).
+        let still = dx == 0 && dy == 0 && alpha == 255;
+        let mut shown = self.shown.get();
+        let mut show = |slot: usize, hwnd: HWND, card: R| {
+            let (pixels, w, h, y0) = cut(card);
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            (pixels, w, h, x, y + y0).hash(&mut hasher);
+            let look = if still { hasher.finish() } else { 0 };
+            if look != 0 && shown[slot] == look {
+                return;
+            }
+            shown[slot] = look;
+            crate::layered::present_premultiplied(hwnd, pixels, w, h, x, y + y0, alpha);
+        };
+        // Growing upward, the notification card goes first, so the two never overlap for a frame.
         if let Some(top) = self.scene.top {
-            let (pixels, w, h, y0) = cut(top);
-            crate::layered::present_premultiplied(self.top_hwnd, &pixels, w, h, x, y + y0, alpha);
+            show(1, self.top_hwnd, top);
         }
+        show(0, self.hwnd, self.scene.main);
+        self.shown.set(shown);
     }
 
     /// Slide in or out from the taskbar's edge, on the last frame drawn.
@@ -1248,7 +1299,10 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESUL
             super::notifications::set_watching(false);
             *super::OPEN_RECT.lock().unwrap_or_else(|e| e.into_inner()) = None;
             CLOSED_AT.with(|c| c.set(Some(Instant::now())));
-            let top = VIEW.with(|cell| cell.borrow_mut().take()).map(|v| v.top_hwnd);
+            let top = VIEW.with(|cell| cell.borrow_mut().take()).map(|v| {
+                SPARE_GFX.with(|s| *s.borrow_mut() = Some(v.gfx.into_inner()));
+                v.top_hwnd
+            });
             if let Some(top) = top {
                 let _ = unsafe { DestroyWindow(top) };
             }

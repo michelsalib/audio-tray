@@ -3,13 +3,13 @@
 //! ([`super::rich`]): all of them for the calendar's notification centre, and how many for the
 //! clock, with opening one's app, dismissing one, an app's, or all.
 //!
-//! A thread of its own (the listener's calls block on async operations, which an STA must not do).
-//! It reads again when the listener says something changed, when the notification store changes
-//! on disk, when the calendar opens, and once a minute while any are waiting (a dismissal in
-//! Windows' own centre is not always written promptly, and the count must not go stale).
+//! A thread of its own (the listener's calls block on async operations, which an STA must not do),
+//! asleep until something happens: it reads when the listener says something changed, when the
+//! store changes on disk (once per burst, and only if the store itself changed), when asked (the
+//! calendar opening, a picture downloaded), every few seconds while the calendar is open, and once a
+//! minute while any are waiting (a dismissal in Windows' own centre is not always written promptly).
 
-use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use windows::core::HSTRING;
@@ -41,10 +41,15 @@ enum Ask {
     Clear,
 }
 
-/// How often the list is read again: the store on disk does not always say when it changes.
+/// How often the list is read again while any are waiting: the store on disk does not always say
+/// when one goes (a dismissal in Windows' own centre).
 const RECHECK: Duration = Duration::from_secs(60);
 /// …and while the calendar is open, so what it lists follows what arrives.
 const RECHECK_OPEN: Duration = Duration::from_secs(3);
+/// Windows writes its store in bursts: one read once it has settled.
+const SETTLE: Duration = Duration::from_millis(300);
+/// How long a notification removed here stays hidden from reads that may predate its removal.
+const REMOVED_FOR: Duration = Duration::from_secs(10);
 
 /// The calendar is open.
 static WATCHING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -60,19 +65,38 @@ pub fn set_watching(on: bool) {
 /// Every notification, newest first, as last read; `None` before the first read or when the
 /// listener is not allowed.
 static TOASTS: Mutex<Option<Vec<Toast>>> = Mutex::new(None);
-static ASK: OnceLock<Sender<Ask>> = OnceLock::new();
+/// Asks waiting for the reader thread, which [`WAKE`] wakes.
+static ASKS: Mutex<Vec<Ask>> = Mutex::new(Vec::new());
+/// The reader thread's wake-up event (a raw handle); 0 while no reader runs.
+static WAKE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// Notifications removed here, and when: a read already under way must not bring them back.
+static REMOVED: Mutex<Vec<(u32, Instant)>> = Mutex::new(Vec::new());
 
-/// Start reading (once). The tray hears of each change as [`super::WM_CALENDAR`] with
-/// [`super::NOTIFICATIONS`].
+/// Start reading (once; again if Windows refused the last time). The tray hears of each change as
+/// [`super::WM_CALENDAR`] with [`super::NOTIFICATIONS`].
 pub fn start() {
-    if ASK.get().is_some() {
+    use std::sync::atomic::Ordering::SeqCst;
+    use windows::Win32::System::Threading::CreateEventW;
+    if WAKE.load(SeqCst) != 0 {
         return;
     }
-    let (send, asks) = channel();
-    if ASK.set(send.clone()).is_err() {
+    let Ok(event) = (unsafe { CreateEventW(None, false, false, None) }) else { return };
+    if WAKE.compare_exchange(0, event.0 as usize, SeqCst, SeqCst).is_err() {
+        let _ = unsafe { windows::Win32::Foundation::CloseHandle(event) };
         return;
     }
-    let _ = std::thread::Builder::new().name("notifications".into()).spawn(move || run(asks, send));
+    let raw = event.0 as usize;
+    let spawned = std::thread::Builder::new().name("notifications".into()).spawn(move || {
+        let event = windows::Win32::Foundation::HANDLE(raw as *mut _);
+        run(event);
+        // Refused, or gone: a later start may try again.
+        WAKE.store(0, SeqCst);
+        let _ = unsafe { windows::Win32::Foundation::CloseHandle(event) };
+    });
+    if spawned.is_err() {
+        WAKE.store(0, SeqCst);
+        let _ = unsafe { windows::Win32::Foundation::CloseHandle(windows::Win32::Foundation::HANDLE(raw as *mut _)) };
+    }
 }
 
 /// The notifications, newest first; empty when there are none or they cannot be read.
@@ -86,28 +110,39 @@ pub fn count() -> usize {
 }
 
 fn ask(what: Ask) {
-    if let Some(ask) = ASK.get() {
-        let _ = ask.send(what);
+    let event = WAKE.load(std::sync::atomic::Ordering::SeqCst);
+    if event == 0 {
+        return;
     }
+    ASKS.lock().unwrap_or_else(|e| e.into_inner()).push(what);
+    let _ = unsafe { windows::Win32::System::Threading::SetEvent(windows::Win32::Foundation::HANDLE(event as *mut _)) };
 }
 
-/// Read the list again now (the calendar is opening).
+/// Read the list again now (the calendar is opening, a picture has come).
 pub fn refresh() {
     ask(Ask::Read);
 }
 
 pub fn remove(ids: Vec<u32>) {
-    TOASTS.lock().unwrap_or_else(|e| e.into_inner()).iter_mut().for_each(|list| list.retain(|t| !ids.contains(&t.id)));
+    hide(&ids);
     ask(Ask::Remove(ids));
     held_changed();
 }
 
 pub fn clear() {
-    if let Some(list) = TOASTS.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
-        list.clear();
-    }
+    let ids: Vec<u32> = list().iter().map(|t| t.id).collect();
+    hide(&ids);
     ask(Ask::Clear);
     held_changed();
+}
+
+/// Take `ids` off the list now, and off reads for a while.
+fn hide(ids: &[u32]) {
+    let now = Instant::now();
+    REMOVED.lock().unwrap_or_else(|e| e.into_inner()).extend(ids.iter().map(|&id| (id, now)));
+    if let Some(list) = TOASTS.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        list.retain(|t| !ids.contains(&t.id));
+    }
 }
 
 /// The list was changed here, ahead of Windows: the next read then matches it and says nothing,
@@ -121,7 +156,11 @@ pub fn open_app(aumid: &str) -> bool {
     !aumid.is_empty() && crate::win::shell_open(&format!(r"shell:AppsFolder\{aumid}"), None)
 }
 
-fn run(asks: Receiver<Ask>, again: Sender<Ask>) {
+/// The reader: it sleeps until asked, until the store changes on disk, or until a recheck is due,
+/// and then reads once.
+fn run(wake: windows::Win32::Foundation::HANDLE) {
+    use windows::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
+    use windows::Win32::System::Threading::{WaitForMultipleObjects, INFINITE};
     unsafe {
         let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_MULTITHREADED);
     }
@@ -134,97 +173,131 @@ fn run(asks: Receiver<Ask>, again: Sender<Ask>) {
     };
     // The listener's own word on changes, where Windows sends it to an unpackaged app.
     let handler = TypedEventHandler::new(move |_, _| {
-        let _ = again.send(Ask::Read);
+        refresh();
         Ok(())
     });
     if listener.NotificationChanged(&handler).is_err() {
         println!("notifications: no change events here; following the store on disk");
     }
     let changes = watch_store();
-    // The ids of the last read.
-    let mut seen: Vec<u32> = Vec::new();
+    let mut known = Known::default();
+    let mut stamp = store_stamp();
+    let mut read_now = true;
     loop {
-        let mut last_read = Instant::now();
-        match read(&listener) {
-            Ok(toasts) => {
-                seen = toasts.iter().map(|t| t.id).collect();
-                let changed = {
-                    let mut held = TOASTS.lock().unwrap_or_else(|e| e.into_inner());
-                    let changed = held.as_ref() != Some(&toasts);
-                    if changed {
-                        println!("notifications: {} waiting", toasts.len());
-                    }
-                    *held = Some(toasts);
-                    changed
-                };
-                if changed {
-                    crate::tray::post(super::WM_CALENDAR, super::NOTIFICATIONS, 0);
-                }
+        if read_now {
+            stamp = store_stamp();
+            match read(&listener, &mut known) {
+                Ok(toasts) => publish(toasts),
+                Err(e) => eprintln!("notifications: could not read them ({e:#})"),
             }
-            Err(e) => eprintln!("notifications: could not read them ({e:#})"),
         }
-        // Until something changes, or the calendar asks for something.
-        loop {
-            match asks.recv_timeout(Duration::from_millis(500)) {
-                Ok(Ask::Read) => break,
-                Ok(Ask::Remove(ids)) => {
-                    for id in ids {
-                        if let Err(e) = listener.RemoveNotification(id) {
-                            eprintln!("notifications: could not remove {id} ({e})");
-                        }
-                    }
-                    break;
-                }
-                Ok(Ask::Clear) => {
-                    // Windows can refuse the whole sweep; one by one then.
-                    if let Err(e) = listener.ClearNotifications() {
-                        println!("notifications: Windows would not clear them all ({e}); removing them one by one");
-                        for &id in &seen {
+        let waiting = TOASTS.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|l| !l.is_empty());
+        let timeout = if WATCHING.load(std::sync::atomic::Ordering::SeqCst) {
+            RECHECK_OPEN.as_millis() as u32
+        } else if waiting {
+            RECHECK.as_millis() as u32
+        } else {
+            INFINITE
+        };
+        let mut handles = vec![wake];
+        if let Some(c) = &changes {
+            handles.push(c.0);
+        }
+        let woke = unsafe { WaitForMultipleObjects(&handles, false, timeout) };
+        if woke == WAIT_TIMEOUT {
+            read_now = true;
+        } else if woke == WAIT_OBJECT_0 {
+            for asked in std::mem::take(&mut *ASKS.lock().unwrap_or_else(|e| e.into_inner())) {
+                match asked {
+                    Ask::Read => {}
+                    Ask::Remove(ids) => {
+                        for id in ids {
                             if let Err(e) = listener.RemoveNotification(id) {
                                 eprintln!("notifications: could not remove {id} ({e})");
                             }
                         }
                     }
-                    break;
+                    Ask::Clear => {
+                        // Windows can refuse the whole sweep; one by one then.
+                        if let Err(e) = listener.ClearNotifications() {
+                            println!("notifications: Windows would not clear them all ({e}); removing them one by one");
+                            for &(id, _) in &known.toasts {
+                                if let Err(e) = listener.RemoveNotification(id) {
+                                    eprintln!("notifications: could not remove {id} ({e})");
+                                }
+                            }
+                        }
+                    }
                 }
-                Err(RecvTimeoutError::Disconnected) => return,
-                Err(RecvTimeoutError::Timeout) => {}
             }
-            if changes.as_ref().is_some_and(|c| c.changed()) {
-                // Windows writes in bursts: let it finish.
-                std::thread::sleep(Duration::from_millis(300));
-                if let Some(c) = &changes {
-                    c.changed();
-                }
-                break;
+            read_now = true;
+        } else if woke.0 == WAIT_OBJECT_0.0 + 1 {
+            if let Some(c) = &changes {
+                c.rearm();
+                std::thread::sleep(SETTLE);
+                // What came meanwhile is the same burst.
+                c.take();
             }
-            let every = if WATCHING.load(std::sync::atomic::Ordering::SeqCst) { RECHECK_OPEN } else { RECHECK };
-            if last_read.elapsed() >= every {
-                last_read = Instant::now();
-                break;
-            }
+            // Reading the store touches its shared-memory file, which signals a change too: only
+            // a change to the store itself is worth a read.
+            read_now = store_stamp() != stamp;
+        } else {
+            // The watch failed: no busy loop.
+            std::thread::sleep(RECHECK_OPEN);
+            read_now = true;
         }
     }
 }
 
+/// Hold a fresh read (less what was removed here meanwhile), and tell the tray if it changed.
+fn publish(mut toasts: Vec<Toast>) {
+    {
+        let mut removed = REMOVED.lock().unwrap_or_else(|e| e.into_inner());
+        removed.retain(|(id, at)| at.elapsed() < REMOVED_FOR && toasts.iter().any(|t| t.id == *id));
+        toasts.retain(|t| !removed.iter().any(|(id, _)| *id == t.id));
+    }
+    let changed = {
+        let mut held = TOASTS.lock().unwrap_or_else(|e| e.into_inner());
+        let changed = held.as_ref() != Some(&toasts);
+        if changed {
+            println!("notifications: {} waiting", toasts.len());
+        }
+        *held = Some(toasts);
+        changed
+    };
+    if changed {
+        crate::tray::post(super::WM_CALENDAR, super::NOTIFICATIONS, 0);
+    }
+}
+
+/// What the reader knows of each listed notification, by id: what it says never changes, so it is
+/// asked of Windows once.
+#[derive(Default)]
+struct Known {
+    toasts: Vec<(u32, Detail)>,
+}
+
+struct Detail {
+    toast: Toast,
+    /// When it leaves Windows' centre, in seconds since the epoch.
+    expires: Option<i64>,
+    info: Option<windows::ApplicationModel::AppInfo>,
+}
+
 /// Every toast in Windows' notification centre, newest first.
-fn read(listener: &UserNotificationListener) -> anyhow::Result<Vec<Toast>> {
+fn read(listener: &UserNotificationListener, known: &mut Known) -> anyhow::Result<Vec<Toast>> {
     let all = listener.GetNotificationsAsync(NotificationKinds::Toast)?.get()?;
     let generic: HSTRING = KnownNotificationBindings::ToastGeneric()?;
     let now = super::time::now();
-    let mut toasts = Vec::new();
-    let mut infos = Vec::new();
+    let mut listed = Vec::new();
     for n in all {
-        let notification = n.Notification().ok();
-        // One past its expiry has left Windows' centre, whatever the listener still holds.
-        let expired = notification
-            .as_ref()
-            .and_then(|x| x.ExpirationTime().ok())
-            .and_then(|t| t.Value().ok())
-            .is_some_and(|t| super::time::from_filetime(t.UniversalTime) <= now);
-        if expired {
+        let id = n.Id().unwrap_or_default();
+        if let Some(i) = known.toasts.iter().position(|(k, _)| *k == id) {
+            listed.push(known.toasts.swap_remove(i));
             continue;
         }
+        let notification = n.Notification().ok();
+        let expires = notification.as_ref().and_then(|x| x.ExpirationTime().ok()).and_then(|t| t.Value().ok()).map(|t| super::time::from_filetime(t.UniversalTime));
         let info = n.AppInfo().ok();
         let app = info.as_ref().and_then(|a| a.DisplayInfo().ok()).and_then(|d| d.DisplayName().ok()).map(|s| s.to_string()).unwrap_or_default();
         let aumid = info.as_ref().and_then(|a| a.AppUserModelId().ok()).map(|s| s.to_string()).unwrap_or_default();
@@ -235,10 +308,8 @@ fn read(listener: &UserNotificationListener) -> anyhow::Result<Vec<Toast>> {
             .map(|list| list.into_iter().filter_map(|t| t.Text().ok().map(|s| s.to_string())).collect())
             .unwrap_or_default();
         let at = n.CreationTime().map_or(0, |t| super::time::from_filetime(t.UniversalTime));
-        let logo = logo_of(&aumid, info.as_ref());
-        let id = n.Id().unwrap_or_default();
-        infos.push((id, aumid.clone(), info));
-        toasts.push(Toast {
+        let logo = logo_of(&app, &aumid, info.as_ref());
+        let toast = Toast {
             id,
             app,
             aumid,
@@ -247,11 +318,19 @@ fn read(listener: &UserNotificationListener) -> anyhow::Result<Vec<Toast>> {
             at,
             logo,
             rich: Default::default(),
-        });
+        };
+        listed.push((id, Detail { toast, expires, info }));
     }
-    for (toast, rich) in toasts.iter_mut().zip(super::rich::for_toasts(&infos)) {
-        toast.rich = rich;
-    }
+    // One past its expiry has left Windows' centre, whatever the listener still holds.
+    listed.retain(|(_, d)| d.expires.is_none_or(|t| t > now));
+    known.toasts = listed;
+    let infos: Vec<(u32, String, Option<windows::ApplicationModel::AppInfo>)> = known.toasts.iter().map(|(id, d)| (*id, d.toast.aumid.clone(), d.info.clone())).collect();
+    let mut toasts: Vec<Toast> = known
+        .toasts
+        .iter()
+        .zip(super::rich::for_toasts(&infos))
+        .map(|((_, d), rich)| Toast { rich, ..d.toast.clone() })
+        .collect();
     toasts.sort_by_key(|t| std::cmp::Reverse(t.at));
     Ok(toasts)
 }
@@ -262,9 +341,11 @@ static LOGOS: Mutex<Vec<(String, Option<Logo>)>> = Mutex::new(Vec::new());
 /// An image file's bytes, shared.
 type Logo = std::sync::Arc<Vec<u8>>;
 
-/// An app's logo, as its notifications show it in Windows' centre.
-fn logo_of(aumid: &str, info: Option<&windows::ApplicationModel::AppInfo>) -> Option<std::sync::Arc<Vec<u8>>> {
-    if let Some((_, logo)) = LOGOS.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|(a, _)| a == aumid) {
+/// An app's logo, as its notifications show it in Windows' centre (by its id, else its name: apps
+/// without an id must not share one's logo).
+fn logo_of(app: &str, aumid: &str, info: Option<&windows::ApplicationModel::AppInfo>) -> Option<std::sync::Arc<Vec<u8>>> {
+    let key = if aumid.is_empty() { format!("name:{app}") } else { aumid.to_string() };
+    if let Some((_, logo)) = LOGOS.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|(a, _)| *a == key) {
         return logo.clone();
     }
     let read = || -> Option<Vec<u8>> {
@@ -282,23 +363,38 @@ fn logo_of(aumid: &str, info: Option<&windows::ApplicationModel::AppInfo>) -> Op
         Some(bytes)
     };
     let logo = read().map(std::sync::Arc::new);
-    LOGOS.lock().unwrap_or_else(|e| e.into_inner()).push((aumid.to_string(), logo.clone()));
+    LOGOS.lock().unwrap_or_else(|e| e.into_inner()).push((key, logo.clone()));
     logo
+}
+
+/// The store's files as they stand (size and last write of the database and its log), to tell a
+/// real change from the reader's own traces.
+fn store_stamp() -> Vec<(u64, Option<std::time::SystemTime>)> {
+    let Ok(folder) = std::env::var("LOCALAPPDATA") else { return Vec::new() };
+    ["wpndatabase.db", "wpndatabase.db-wal"]
+        .iter()
+        .map(|name| {
+            let meta = std::fs::metadata(format!(r"{folder}\Microsoft\Windows\Notifications\{name}")).ok();
+            (meta.as_ref().map_or(0, |m| m.len()), meta.and_then(|m| m.modified().ok()))
+        })
+        .collect()
 }
 
 /// A change notification on the folder of Windows' notification store.
 struct StoreWatch(windows::Win32::Foundation::HANDLE);
 
 impl StoreWatch {
-    /// Whether the store changed since the last look (and re-arm).
-    fn changed(&self) -> bool {
-        use windows::Win32::Storage::FileSystem::FindNextChangeNotification;
+    /// Watch for the next change.
+    fn rearm(&self) {
+        let _ = unsafe { windows::Win32::Storage::FileSystem::FindNextChangeNotification(self.0) };
+    }
+
+    /// Take a change signalled since (and re-arm).
+    fn take(&self) {
         use windows::Win32::System::Threading::WaitForSingleObject;
-        let signalled = unsafe { WaitForSingleObject(self.0, 0) }.0 == 0;
-        if signalled {
-            let _ = unsafe { FindNextChangeNotification(self.0) };
+        if unsafe { WaitForSingleObject(self.0, 0) }.0 == 0 {
+            self.rearm();
         }
-        signalled
     }
 }
 

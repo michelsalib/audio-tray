@@ -1414,7 +1414,7 @@ fn calendar_steps(col: &mut Column, model: &Model) {
     let hint = |button| model.hint.filter(|(b, _, _)| *b == button).map(|(_, h, tone)| (h.to_string(), tone));
     let mut body = col.group();
     let what = plain("The clock opens this calendar, with Windows' notifications beside it");
-    col.row(&mut body, None, "Opens from the taskbar clock", what, !c.enabled, Control::Toggle(c.enabled, Toggle::Calendar));
+    col.row(&mut body, None, "Opens from the taskbar clock", what, false, Control::Toggle(c.enabled, Toggle::Calendar));
     col.end_group(body);
 
     // The clock's own text.
@@ -1955,6 +1955,15 @@ mod tests {
         m.config.keyboards.enabled = false;
         let laid = page(&m, 900.0, &measure);
         assert!(!laid.hits.iter().any(|(_, t)| matches!(t, Target::Button(Button::AddKeyboard) | Target::Choice(Choice::KeyboardLayout(_), _))));
+    }
+
+    #[test]
+    fn the_calendar_turns_on_from_off() {
+        // Off is the default: its own switch must still take a click (it once dimmed itself).
+        let mut m = model(Page::Calendar);
+        m.config.calendar.enabled = false;
+        let laid = page(&m, 900.0, &measure);
+        assert!(laid.hits.iter().any(|(_, t)| *t == Target::Toggle(Toggle::Calendar)));
     }
 
     #[test]

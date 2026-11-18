@@ -26,12 +26,9 @@ pub(crate) fn present(hwnd: HWND, src_buf: &[u8], w: i32, h: i32, x: i32, y: i32
     });
 }
 
-/// [`present`] for pixels already premultiplied BGRA (Direct2D's), copied as they are.
-pub(crate) fn present_premultiplied(hwnd: HWND, bgra: &[u8], w: i32, h: i32, x: i32, y: i32, alpha: u8) {
-    present_with(hwnd, w, h, x, y, alpha, |dst| dst.copy_from_slice(&bgra[..dst.len()]));
-}
-
-fn present_with(hwnd: HWND, w: i32, h: i32, x: i32, y: i32, alpha: u8, fill: impl FnOnce(&mut [u8])) {
+/// Put `w`×`h` pixels on the layered window at `(x, y)`: `fill` writes them, premultiplied BGRA
+/// (Direct2D's), into the bitmap.
+pub(crate) fn present_with(hwnd: HWND, w: i32, h: i32, x: i32, y: i32, alpha: u8, fill: impl FnOnce(&mut [u8])) {
     unsafe {
         let screen = GetDC(None);
         let mem = CreateCompatibleDC(Some(screen));

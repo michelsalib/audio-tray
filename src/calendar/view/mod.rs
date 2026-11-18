@@ -376,6 +376,7 @@ fn create(config: &Config) -> Result<()> {
 fn empty_input() -> scene::Input {
     scene::Input {
         room: 0.0,
+        columns: None,
         groups: None,
         unread: 0,
         quiet: false,
@@ -409,7 +410,7 @@ fn empty_input() -> scene::Input {
 fn keep_rect() {
     let rect = with_view(|v| {
         let (x, y) = v.origin;
-        RECT { left: x, top: y, right: x + v.px(scene::W), bottom: y + v.px(v.scene.h) }
+        RECT { left: x, top: y, right: x + v.px(v.scene.w), bottom: y + v.px(v.scene.h) }
     });
     *super::OPEN_RECT.lock().unwrap_or_else(|e| e.into_inner()) = rect;
 }
@@ -455,7 +456,8 @@ impl View {
         let zone = Local;
         let today = self.today;
 
-        // Notifications, by app; the newest app's open unless the user chose.
+        // Notifications, by app; the newest app's open unless the user chose (side by side, all are).
+        let wide = self.columns().is_some();
         let groups = (!self.toasts.is_empty()).then(|| {
             super::notifications::grouped(&self.toasts)
                 .into_iter()
@@ -463,7 +465,7 @@ impl View {
                 .map(|(g, (key, list))| {
                     let open = match &self.open_groups {
                         Some(open) => open.contains(&key),
-                        None => g == 0,
+                        None => wide || g == 0,
                     };
                     scene::Group {
                         name: list.first().map_or_else(String::new, |t| t.app.clone()),
@@ -593,6 +595,7 @@ impl View {
 
         scene::Input {
             room: (self.work.bottom - self.work.top) as f32 / self.scale - 2.0 * MARGIN,
+            columns: self.columns(),
             groups,
             unread: self.toasts.len(),
             quiet: super::focus::active(),
@@ -622,11 +625,18 @@ impl View {
         }
     }
 
+    /// The cards side by side where the work area is wide enough for both, the calendar by the
+    /// taskbar's clock; else stacked.
+    fn columns(&self) -> Option<scene::Columns> {
+        let width = (self.work.right - self.work.left) as f32 / self.scale - 2.0 * MARGIN;
+        (width >= 2.0 * scene::W + scene::GAP).then_some(scene::Columns { calendar_left: self.edge == Edge::Left, from_top: self.edge == Edge::Top })
+    }
+
     /// Lay out for what there is now, and put the panel in its corner.
     fn place(&mut self) {
         let input = self.input();
         self.scene = scene::build(&input);
-        let (w, h) = (self.px(scene::W), self.px(self.scene.h));
+        let (w, h) = (self.px(self.scene.w), self.px(self.scene.h));
         let m = self.px(MARGIN);
         let work = self.work;
         self.origin = match self.edge {
@@ -653,7 +663,7 @@ impl View {
 
     /// Draw the scene off screen.
     fn draw_frame(&self) {
-        let size = (self.px(scene::W) as u32, self.px(self.scene.h) as u32);
+        let size = (self.px(self.scene.w) as u32, self.px(self.scene.h) as u32);
         if let Err(e) = self.gfx.borrow_mut().frame(size, self.scale, |pen| draw(pen, &self.scene, &self.palette)) {
             eprintln!("calendar: could not draw ({e:#})");
         }
@@ -669,28 +679,40 @@ impl View {
     fn present(&self, (dx, dy): (i32, i32), alpha: u8) {
         use std::hash::{Hash, Hasher};
         let gfx = self.gfx.borrow();
-        let full_w = self.px(scene::W);
-        let cut = |card: R| -> (&[u8], i32, i32, i32) {
-            let (y0, h) = (self.px(card.y), self.px(card.h));
-            let row = full_w as usize * 4;
-            let start = (y0.max(0) as usize * row).min(gfx.pixels.len());
-            let end = ((y0 + h).max(0) as usize * row).min(gfx.pixels.len());
-            (&gfx.pixels[start..end], full_w, (end - start) as i32 / row.max(1) as i32, y0)
+        let full_w = self.px(self.scene.w).max(0);
+        let row = full_w as usize * 4;
+        let full_h = (gfx.pixels.len() / row.max(1)) as i32;
+        // A card's rectangle of the frame, in pixels, kept inside it.
+        let cut = |card: R| -> (i32, i32, i32, i32) {
+            let (x0, y0) = (self.px(card.x).clamp(0, full_w), self.px(card.y).clamp(0, full_h));
+            (x0, y0, self.px(card.w).min(full_w - x0).max(0), self.px(card.h).min(full_h - y0).max(0))
+        };
+        let line = |x0: i32, y0: i32, w: i32, r: i32| -> &[u8] {
+            let start = (y0 + r) as usize * row + x0 as usize * 4;
+            &gfx.pixels[start..start + w as usize * 4]
         };
         let (x, y) = (self.origin.0 + dx, self.origin.1 + dy);
         // A card that looks and sits as it did is not sent again (a hover changes one card at most).
         let still = dx == 0 && dy == 0 && alpha == 255;
         let mut shown = self.shown.get();
         let mut show = |slot: usize, hwnd: HWND, card: R| {
-            let (pixels, w, h, y0) = cut(card);
+            let (x0, y0, w, h) = cut(card);
             let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            (pixels, w, h, x, y + y0).hash(&mut hasher);
+            (w, h, x + x0, y + y0).hash(&mut hasher);
+            for r in 0..h {
+                line(x0, y0, w, r).hash(&mut hasher);
+            }
             let look = if still { hasher.finish() } else { 0 };
             if look != 0 && shown[slot] == look {
                 return;
             }
             shown[slot] = look;
-            crate::layered::present_premultiplied(hwnd, pixels, w, h, x, y + y0, alpha);
+            let span = w as usize * 4;
+            crate::layered::present_with(hwnd, w, h, x + x0, y + y0, alpha, |dst| {
+                for (r, out) in dst.chunks_exact_mut(span.max(1)).enumerate().take(h as usize) {
+                    out.copy_from_slice(line(x0, y0, w, r as i32));
+                }
+            });
         };
         // Growing upward, the notification card goes first, so the two never overlap for a frame.
         if let Some(top) = self.scene.top {
@@ -734,7 +756,7 @@ impl View {
 
     /// The scene's point under client pixel `(x, y)` of the calendar's window.
     fn scene_point(&self, x: i32, y: i32) -> (f32, f32) {
-        (x as f32 / self.scale, y as f32 / self.scale + self.scene.main.y)
+        (x as f32 / self.scale + self.scene.main.x, y as f32 / self.scale + self.scene.main.y)
     }
 
     fn hit(&self, x: i32, y: i32) -> Option<Hit> {

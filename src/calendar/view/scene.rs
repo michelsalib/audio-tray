@@ -271,8 +271,10 @@ pub struct Input {
     pub pressed: Option<Hit>,
     /// A word for a moment, over the calendar's foot (Windows refused something).
     pub flash: Option<String>,
-    /// The height the cards may take together.
+    /// The height the cards may take together (stacked), or each (side by side).
     pub room: f32,
+    /// Side by side, where the screen is wide enough: `None` stacks them.
+    pub columns: Option<Columns>,
     /// `None`: no notification centre (off, or nothing waiting).
     pub groups: Option<Vec<Group>>,
     pub unread: usize,
@@ -301,10 +303,21 @@ pub struct Input {
     pub show_tip: Option<(f32, f32)>,
 }
 
+/// The two cards side by side, each the screen's height to fill.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Columns {
+    /// The calendar on the left (the taskbar is): it stays by the clock.
+    pub calendar_left: bool,
+    /// Both hang from the top (the taskbar is there), else stand on the bottom.
+    pub from_top: bool,
+}
+
 pub struct Scene {
     /// The notification centre's card, when shown, and the calendar's.
     pub top: Option<R>,
     pub main: R,
+    /// The frame's size: both cards and what lies between them.
+    pub w: f32,
     pub h: f32,
     pub items: Vec<(R, Draw)>,
     pub hits: Vec<(R, Hit)>,
@@ -477,48 +490,48 @@ fn main_height(input: &Input, rows: usize, hero: bool) -> f32 {
     h + 8.0 + FOOTER_H
 }
 
-pub fn build(input: &Input) -> Scene {
-    let mut ink = Ink2::new(input.hover, input.pressed);
+/// Where the cards go, and how much each shows.
+struct Plan {
+    top: Option<R>,
+    main: R,
+    /// The notification centre folded to its summary.
+    folded: bool,
+    /// The notification centre given the whole panel, the calendar folded.
+    full: bool,
+    rows: usize,
+    hero: bool,
+}
 
-    // How many list rows fit, and how tall the notification centre may be.
-    let mut rows = input.rows.len().clamp(1, 5);
-    let summary = input.month_open || input.detail.is_some();
-    let mut center_h = match &input.groups {
-        Some(groups) if summary => SUMMARY_H,
-        Some(groups) => center_height(groups),
-        None => 0.0,
-    };
-    let gap = if center_h > 0.0 { GAP } else { 0.0 };
-    let fits = |h: f32| h + gap + center_h.min(CENTER_MIN) <= input.room;
-    // On a short screen the month goes without the next event (it is in the month's marks).
-    let hero = input.hero.is_some() && (!input.month_open || fits(main_height(input, 1, true)));
-    while rows > 1 && !fits(main_height(input, rows, hero)) {
+/// Side by side, a list shows this many events at most (more scroll).
+const ROWS_WIDE: usize = 12;
+
+/// Side by side: each card takes the height it needs, up to the screen's, and neither squeezes the
+/// other. Both stand on the taskbar's edge (or hang from it at the top).
+fn side_by_side(input: &Input, columns: Columns, groups: &[Group]) -> Plan {
+    let room = input.room;
+    let hero = input.hero.is_some() && (!input.month_open || main_height(input, 1, true) <= room);
+    let mut rows = input.rows.len().clamp(1, ROWS_WIDE);
+    while rows > 1 && main_height(input, rows, hero) > room {
         rows -= 1;
     }
-    // An event's details take what there is, never more than their height.
     let mut main_h = main_height(input, rows, hero);
     if input.detail.is_some() {
-        main_h = main_h.min(input.room - gap - center_h.min(CENTER_MIN)).max(240.0);
+        main_h = main_h.min(room).max(240.0);
     }
-    let mut folded = summary;
-    let full = input.center_full && input.groups.is_some();
-    let main_h = if full { SUMMARY_H } else { main_h };
-    if let (true, Some(groups)) = (full, &input.groups) {
-        center_h = center_height(groups).min(input.room - SUMMARY_H - GAP).max(CENTER_MIN);
-        folded = false;
-    } else if center_h > 0.0 && !summary {
-        let spare = input.room - main_h - GAP;
-        if spare < CENTER_MIN {
-            folded = true;
-            center_h = SUMMARY_H;
-        } else {
-            center_h = center_h.min(spare);
-        }
-    }
+    let center_h = center_height(groups).min(room).max(CENTER_MIN.min(room));
+    let h = main_h.max(center_h);
+    let y = |card_h: f32| if columns.from_top { 0.0 } else { h - card_h };
+    let (main_x, top_x) = if columns.calendar_left { (0.0, W + GAP) } else { (W + GAP, 0.0) };
+    Plan { top: Some(R::new(top_x, y(center_h), W, center_h)), main: R::new(main_x, y(main_h), W, main_h), folded: false, full: false, rows, hero }
+}
 
-    let top = (center_h > 0.0).then(|| R::new(0.0, 0.0, W, center_h));
-    let main_y = if top.is_some() { center_h + GAP } else { 0.0 };
-    let main = R::new(0.0, main_y, W, main_h);
+pub fn build(input: &Input) -> Scene {
+    let mut ink = Ink2::new(input.hover, input.pressed);
+    let plan = match (input.columns, &input.groups) {
+        (Some(columns), Some(groups)) => side_by_side(input, columns, groups),
+        _ => stacked(input),
+    };
+    let Plan { top, main, folded, full, rows, hero } = plan;
     let mut center_view = None;
     if let (Some(card), Some(groups)) = (top, &input.groups) {
         ink.draw(card, Draw::Card);
@@ -557,7 +570,53 @@ pub fn build(input: &Input) -> Scene {
     if let Some(at) = input.show_tip {
         tooltip(&mut ink, input, at, top, main);
     }
-    Scene { top, main, h: main.bottom(), items: ink.items, hits: ink.hits, center_view, list_view, toasts: ink.places }
+    let w = top.map_or(main.right(), |t| t.right().max(main.right()));
+    let h = top.map_or(main.bottom(), |t| t.bottom().max(main.bottom()));
+    Scene { top, main, w, h, items: ink.items, hits: ink.hits, center_view, list_view, toasts: ink.places }
+}
+
+/// One above the other: the calendar takes what it needs first, the notification centre what is
+/// left (folded to its summary below [`CENTER_MIN`]), unless it was given the whole panel.
+fn stacked(input: &Input) -> Plan {
+    // How many list rows fit, and how tall the notification centre may be.
+    let mut rows = input.rows.len().clamp(1, 5);
+    let summary = input.month_open || input.detail.is_some();
+    let mut center_h = match &input.groups {
+        Some(groups) if summary => SUMMARY_H,
+        Some(groups) => center_height(groups),
+        None => 0.0,
+    };
+    let gap = if center_h > 0.0 { GAP } else { 0.0 };
+    let fits = |h: f32| h + gap + center_h.min(CENTER_MIN) <= input.room;
+    // On a short screen the month goes without the next event (it is in the month's marks).
+    let hero = input.hero.is_some() && (!input.month_open || fits(main_height(input, 1, true)));
+    while rows > 1 && !fits(main_height(input, rows, hero)) {
+        rows -= 1;
+    }
+    // An event's details take what there is, never more than their height.
+    let mut main_h = main_height(input, rows, hero);
+    if input.detail.is_some() {
+        main_h = main_h.min(input.room - gap - center_h.min(CENTER_MIN)).max(240.0);
+    }
+    let mut folded = summary;
+    let full = input.center_full && input.groups.is_some();
+    let main_h = if full { SUMMARY_H } else { main_h };
+    if let (true, Some(groups)) = (full, &input.groups) {
+        center_h = center_height(groups).min(input.room - SUMMARY_H - GAP).max(CENTER_MIN);
+        folded = false;
+    } else if center_h > 0.0 && !summary {
+        let spare = input.room - main_h - GAP;
+        if spare < CENTER_MIN {
+            folded = true;
+            center_h = SUMMARY_H;
+        } else {
+            center_h = center_h.min(spare);
+        }
+    }
+
+    let top = (center_h > 0.0).then(|| R::new(0.0, 0.0, W, center_h));
+    let main_y = if top.is_some() { center_h + GAP } else { 0.0 };
+    Plan { top, main: R::new(0.0, main_y, W, main_h), folded, full, rows, hero }
 }
 
 /// Wider targets carry a label, so they get no tooltip.
@@ -754,9 +813,11 @@ fn center(ink: &mut Ink2, card: R, input: &Input, groups: &[Group]) -> (R, f32) 
     ink.text(clear, "Clear all", Font::Caption, if lit { Ink::Accent } else { Ink::Text }, Align::Center);
     ink.hit(clear, Hit::ClearAll);
     ink.icon_button(R::new(clear.x - 40.0, head.y, 32.0, 32.0), '\u{E708}', Hit::Quiet, input.quiet);
-    // The whole panel for the notifications, or back.
-    let expand = if input.center_full { '\u{E73F}' } else { '\u{E740}' };
-    ink.icon_button(R::new(clear.x - 76.0, head.y, 32.0, 32.0), expand, Hit::Expand, false);
+    // The whole panel for the notifications, or back (side by side, they have it already).
+    if input.columns.is_none() {
+        let expand = if input.center_full { '\u{E73F}' } else { '\u{E740}' };
+        ink.icon_button(R::new(clear.x - 76.0, head.y, 32.0, 32.0), expand, Hit::Expand, false);
+    }
 
     let area = R::new(card.x, head.bottom() + 6.0, card.w, card.bottom() - 8.0 - (head.bottom() + 6.0));
     let content = center_height(groups) - (12.0 + 32.0 + 6.0) - 8.0;
@@ -1040,6 +1101,7 @@ mod tests {
             pressed: None,
             flash: None,
             room: 760.0,
+            columns: None,
             groups: None,
             unread: 0,
             quiet: false,
@@ -1184,5 +1246,53 @@ mod tests {
         let join = s.hits.iter().find(|(_, h)| *h == Hit::Join(0)).unwrap().0;
         let (x, y) = center_of(join);
         assert_eq!(s.hit(x, y), Some(Hit::Join(0)));
+    }
+
+    const BY_THE_CLOCK: Columns = Columns { calendar_left: false, from_top: false };
+
+    #[test]
+    fn side_by_side_neither_card_squeezes_the_other() {
+        let mut i = input();
+        i.columns = Some(BY_THE_CLOCK);
+        i.groups = Some(vec![Group { all: true, ..group("WhatsApp", 12, true) }, group("Edge", 2, true)]);
+        i.rows = (0..10).map(|n| Row { left: "Mon".into(), title: format!("e{n}"), color: [0; 3], right: String::new(), joinable: false }).collect();
+        i.month_open = true;
+        i.days = (0..42).map(|n| DayCell { day: 100 + n, label: n.to_string(), today: n == 6, selected: n == 6, dim: false, busy: 0 }).collect();
+        let s = build(&i);
+        let (top, main) = (s.top.unwrap(), s.main);
+        // Notifications left, the calendar by the clock; both on the taskbar's edge.
+        assert_eq!((top.x, main.x), (0.0, W + GAP));
+        assert_eq!((s.w, top.bottom(), main.bottom()), (2.0 * W + GAP, s.h, s.h));
+        // The month open, the notifications still listed in full, up to the room.
+        assert!((top.h - i.room).abs() < 0.5, "notifications take the height: {}", top.h);
+        assert!(s.hits.iter().any(|(_, h)| *h == Hit::Group(0)) && !s.hits.iter().any(|(_, h)| *h == Hit::Center));
+        // More events than stacked, and no way to expand what is shown already.
+        let (area, _) = s.list_view.unwrap();
+        assert!(area.h > 5.0 * ROW_H);
+        assert!(!s.hits.iter().any(|(_, h)| *h == Hit::Expand));
+        // Each card's targets are its own.
+        let day = s.hits.iter().find(|(_, h)| *h == Hit::Day(110)).unwrap().0;
+        assert!(main.contains(day.x, day.y));
+        let (x, y) = center_of(day);
+        assert_eq!(s.hit(x, y), Some(Hit::Day(110)));
+    }
+
+    #[test]
+    fn side_by_side_a_left_or_top_taskbar_keeps_the_calendar_by_it() {
+        let mut i = input();
+        i.groups = Some(vec![group("WhatsApp", 1, true)]);
+        i.columns = Some(Columns { calendar_left: true, from_top: true });
+        let s = build(&i);
+        assert_eq!((s.main.x, s.top.unwrap().x), (0.0, W + GAP));
+        assert_eq!((s.main.y, s.top.unwrap().y), (0.0, 0.0));
+    }
+
+    #[test]
+    fn side_by_side_without_notifications_is_the_calendar_alone() {
+        let mut i = input();
+        i.columns = Some(BY_THE_CLOCK);
+        let s = build(&i);
+        assert!(s.top.is_none());
+        assert_eq!((s.main.x, s.w), (0.0, W));
     }
 }

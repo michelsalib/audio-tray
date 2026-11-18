@@ -290,6 +290,13 @@ fn publish(mut toasts: Vec<Toast>) {
         let changed = held.as_ref() != Some(&toasts);
         if changed {
             println!("notifications: {} waiting", toasts.len());
+            let old = held.as_deref().unwrap_or_default();
+            for t in toasts.iter().filter(|t| !old.iter().any(|o| o.id == t.id)) {
+                println!("notifications: + {} {} \"{}\" at {}", t.id, t.app, t.title, t.at);
+            }
+            for t in old.iter().filter(|o| !toasts.iter().any(|t| t.id == o.id)) {
+                println!("notifications: - {} {} \"{}\" at {}", t.id, t.app, t.title, t.at);
+            }
         }
         *held = Some(toasts);
         changed

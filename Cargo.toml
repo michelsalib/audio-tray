@@ -69,6 +69,9 @@ serde_json = "1"
 tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
 # Discord's OAuth token exchange and avatars; the same ureq and SChannel TLS self_update uses.
 ureq = { version = "3", default-features = false, features = ["native-tls"] }
+# Reads Windows' notification store (wpndatabase.db) for what the listener leaves out: pictures,
+# the reply box and the buttons. Bundled: no system SQLite on Windows.
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 [dependencies.windows]
 version = "0.61"
@@ -108,6 +111,7 @@ features = [
     "Win32_Devices_DeviceAndDriverInstallation",
     "Win32_Devices_Properties",
     "Win32_UI_Shell",
+    "Win32_UI_Notifications",
     "Win32_UI_Shell_PropertiesSystem",
     # PKEY_AppUserModel_ID — the shell's identity for a window, which is how the player's own
     # window is told from a browser tab showing the same title. windows-rs files every canonical
@@ -159,6 +163,14 @@ features = [
     # only, never the key), and the language names come from the locale API.
     "Win32_UI_Input",
     "Win32_Globalization",
+    # The calendar (src/calendar): times on the local clock with the time zone's DST rules, and its
+    # name for Microsoft Graph.
+    "Win32_System_Time",
+    # Windows' focus sessions (Do not disturb) for the focus timer and quiet meetings, and the
+    # notification listener for the clock's unread count and the calendar's list.
+    "UI_Shell",
+    "UI_Notifications_Management",
+    "ApplicationModel",
 ]
 
 [build-dependencies]

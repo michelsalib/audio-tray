@@ -139,3 +139,27 @@ pub fn send_status(bits: usize) -> bool {
 pub fn send_code(code: usize) {
     let _ = post(WM_TASKBAR_ACTION, code, 0);
 }
+
+/// Whether audio-tray's receiver window is there to take a gesture.
+pub fn receiver_present() -> bool {
+    receiver().is_some()
+}
+
+/// A click on the clock. Explorer has the foreground (the click was its): it lends it to
+/// audio-tray, so the calendar comes up active and closes when clicked away from.
+pub fn send_calendar() {
+    use windows::Win32::UI::WindowsAndMessaging::{AllowSetForegroundWindow, GetWindowThreadProcessId};
+    if let Some(hwnd) = receiver() {
+        let mut pid = 0u32;
+        unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
+        if pid != 0 {
+            let _ = unsafe { AllowSetForegroundWindow(pid) };
+        }
+    }
+    let _ = post(WM_TASKBAR_ACTION, tap_proto::ACTION_OPEN_CALENDAR, 0);
+}
+
+/// The pointer entered (`true`) or left the clock.
+pub fn send_clock_hover(over: bool) {
+    let _ = post(tap_proto::WM_TASKBAR_CLOCK_HOVER, usize::from(over), 0);
+}

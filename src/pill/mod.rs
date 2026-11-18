@@ -73,6 +73,8 @@ pub enum Action {
     /// Change this flow's volume by so many wheel notches.
     Volume(crate::audio::Flow, f32),
     Acknowledge(crate::hub::Notice),
+    /// Open an address (a meeting to join).
+    Open(String),
     /// Screens came or went: the pill goes back where it was placed on this set of them.
     DisplaysChanged,
 }
@@ -1002,8 +1004,12 @@ impl Pill {
             }
             (View::Banner { action, .. }, Some(_)) => match (action, right) {
                 // Right click only dismisses.
-                (view::Action::MuteAndAcknowledge(notice) | view::Action::Dismiss(notice), true) => {
+                (view::Action::MuteAndAcknowledge(notice) | view::Action::Dismiss(notice) | view::Action::Open(_, notice), true) => {
                     act(Action::Acknowledge(notice.clone()))
+                }
+                (view::Action::Open(url, notice), false) => {
+                    act(Action::Open(url.clone()));
+                    act(Action::Acknowledge(notice.clone()));
                 }
                 (view::Action::MuteAndAcknowledge(notice), false) => {
                     act(Action::MuteMicrophone);

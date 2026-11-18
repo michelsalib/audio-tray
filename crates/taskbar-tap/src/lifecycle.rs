@@ -143,12 +143,17 @@ unsafe extern "system" fn control_proc(
     if msg == WM_COPYDATA {
         let caught = std::panic::catch_unwind(|| {
             let copy = unsafe { (lparam.0 as *const COPYDATASTRUCT).as_ref() }?;
-            if copy.dwData != HANDOVER_MAGIC || copy.lpData.is_null() {
+            if (copy.dwData != HANDOVER_MAGIC && copy.dwData != tap_proto::CLOCK_MAGIC) || copy.lpData.is_null() {
                 return None;
             }
             let units = unsafe { core::slice::from_raw_parts(copy.lpData as *const u16, copy.cbData as usize / 2) };
             let data = String::from_utf16_lossy(units);
-            Some(crate::hand_over(data.trim_end_matches('\0')))
+            let data = data.trim_end_matches('\0');
+            if copy.dwData == tap_proto::CLOCK_MAGIC {
+                crate::clock::set_text(data);
+                return Some(1);
+            }
+            Some(crate::hand_over(data))
         });
         match caught {
             Ok(Some(code)) => return LRESULT(code),
@@ -173,6 +178,20 @@ unsafe extern "system" fn control_proc(
         } else {
             unsafe { SetTimer(Some(hwnd), REPIN_TIMER, REPIN_RETRY_MS, None) };
         }
+        return LRESULT(0);
+    }
+    if msg == WM_TIMER && wparam.0 == crate::clock::TEXT_TIMER {
+        let next = std::panic::catch_unwind(|| unsafe { crate::clock::tick() }).unwrap_or_else(|_| {
+            logf!("clock tick panicked");
+            None
+        });
+        match next {
+            Some(ms) => unsafe { SetTimer(Some(hwnd), crate::clock::TEXT_TIMER, ms, None) },
+            None => {
+                let _ = unsafe { KillTimer(Some(hwnd), crate::clock::TEXT_TIMER) };
+                0
+            }
+        };
         return LRESULT(0);
     }
     if msg == WM_TIMER && wparam.0 == SWEEP_TIMER {
@@ -243,6 +262,14 @@ pub fn nudge_repin() {
     let posted = unsafe { PostMessageW(Some(HWND(hwnd as *mut core::ffi::c_void)), WM_TAP_REPIN, WPARAM(0), LPARAM(0)) };
     if posted.is_err() {
         REPIN_PENDING.store(false, Ordering::SeqCst);
+    }
+}
+
+/// (Re)start the clock text timer to fire in `ms`. Tray thread only.
+pub fn arm_clock_timer(ms: u32) {
+    let hwnd = WINDOW.load(Ordering::SeqCst);
+    if hwnd != 0 {
+        unsafe { SetTimer(Some(HWND(hwnd as *mut core::ffi::c_void)), crate::clock::TEXT_TIMER, ms, None) };
     }
 }
 

@@ -38,6 +38,145 @@ pub struct Config {
     pub batteries: Batteries,
     /// How the progress and volume bars move — see [`Motion`].
     pub motion: Motion,
+    /// The calendar that replaces the taskbar clock's — see [`crate::calendar`].
+    pub calendar: Calendar,
+    /// How the taskbar clock reads.
+    pub clock: Clock,
+}
+
+/// The calendar: a click on the taskbar clock opens Audio Tray's, with the events of the accounts
+/// signed in here (each through an app registration of the user's own) and of calendar links.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Calendar {
+    /// Replace the taskbar clock's calendar.
+    pub enabled: bool,
+    /// The Google Cloud OAuth client (a desktop app) the Google account signs in through.
+    pub google_client_id: Option<String>,
+    /// Its secret, kept in the Credential Manager like [`Discord::client_secret`].
+    #[serde(skip_serializing)]
+    pub google_client_secret: Option<String>,
+    /// The Microsoft Entra app registration the Microsoft account signs in through.
+    pub microsoft_client_id: Option<String>,
+    /// Which accounts it takes: `common` (any), `organizations`, `consumers` or a tenant id.
+    pub microsoft_tenant: String,
+    /// Calendar links (ICS), kept in the Credential Manager: an address reads the calendar.
+    #[serde(skip_serializing)]
+    pub links: Vec<crate::calendar::Link>,
+    /// Minutes before an event the pill reminds of it; 0: no reminders.
+    pub remind_minutes: u32,
+    /// The focus timer's length, in minutes.
+    pub focus_minutes: u32,
+    /// Do not disturb (a Windows focus session) during calendar events…
+    pub quiet_in_meetings: bool,
+    /// …and during calls (Teams, Discord, or an app holding the microphone in a meeting).
+    pub quiet_in_calls: bool,
+    pub week_numbers: bool,
+    pub layout: CalendarLayout,
+    /// The agenda's rows, at most.
+    pub rows: u8,
+    /// The week's first day, Monday 0 to Sunday 6; `None`: the locale's.
+    pub first_weekday: Option<u8>,
+    /// Calendars left out, by key ([`crate::calendar::Calendar::key`]).
+    pub hidden: Vec<String>,
+    /// Colours chosen for calendars, by key: `#RRGGBB`.
+    pub colors: std::collections::BTreeMap<String, String>,
+    /// Win+Alt+D opens this calendar.
+    pub shortcut: bool,
+    /// Windows' notifications listed above the month, with Clear all.
+    pub notifications: bool,
+    /// Windows' additional clocks under the date.
+    pub world_clocks: bool,
+}
+
+/// How the calendar is laid out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CalendarLayout {
+    #[default]
+    Comfortable,
+    /// Shorter days in the month.
+    Compact,
+    /// No month: the agenda alone, a day at a time.
+    AgendaOnly,
+}
+
+impl Default for Calendar {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            google_client_id: None,
+            google_client_secret: None,
+            microsoft_client_id: None,
+            microsoft_tenant: "common".into(),
+            links: Vec::new(),
+            remind_minutes: 5,
+            focus_minutes: 25,
+            quiet_in_meetings: false,
+            quiet_in_calls: false,
+            week_numbers: false,
+            layout: CalendarLayout::Comfortable,
+            rows: 5,
+            first_weekday: None,
+            hidden: Vec::new(),
+            colors: Default::default(),
+            shortcut: true,
+            notifications: true,
+            world_clocks: true,
+        }
+    }
+}
+
+/// How the taskbar clock reads (drawn by the TAP once anything differs from Windows' own).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Clock {
+    pub seconds: bool,
+    /// The day's short name before the date.
+    pub weekday: bool,
+    /// Time and date on one line.
+    pub one_line: bool,
+    pub hide_date: bool,
+    /// Your own `GetTimeFormatEx` pattern (`HH:mm`), over the above; empty: none.
+    pub time_pattern: String,
+    /// Your own `GetDateFormatEx` pattern (`ddd d MMM`); empty: none.
+    pub date_pattern: String,
+    /// Windows' unread notifications, counted after the date.
+    pub unread: bool,
+}
+
+impl Default for Clock {
+    fn default() -> Self {
+        Self {
+            seconds: false,
+            weekday: false,
+            one_line: false,
+            hide_date: false,
+            time_pattern: String::new(),
+            date_pattern: String::new(),
+            unread: true,
+        }
+    }
+}
+
+impl Clock {
+    /// Whether the format itself differs from Windows'.
+    pub fn styled(&self) -> bool {
+        self.seconds || self.weekday || self.one_line || self.hide_date || !self.time_pattern.is_empty() || !self.date_pattern.is_empty()
+    }
+}
+
+impl Calendar {
+    /// What a fetch needs.
+    pub fn setup(&self) -> crate::calendar::Setup {
+        crate::calendar::Setup {
+            google_id: self.google_client_id.clone(),
+            google_secret: self.google_client_secret.clone(),
+            microsoft_id: self.microsoft_client_id.clone(),
+            tenant: self.microsoft_tenant.clone(),
+            links: self.links.clone(),
+        }
+    }
 }
 
 /// How the bars move, each on its own: the pill's progress ring, the card's track bar, and the
@@ -502,7 +641,7 @@ impl Config {
     /// Whether anything is drawn into the taskbar (the audio buttons or the music tile), which is
     /// what injecting into Explorer is for.
     pub fn injects(&self) -> bool {
-        self.strip.enabled || self.tile_shown()
+        self.strip.enabled || self.tile_shown() || self.calendar.enabled || self.clock.styled()
     }
 
     /// Whether the music tile is drawn.
@@ -533,6 +672,10 @@ impl Config {
         if config.teams.token.is_none() {
             config.teams.token = crate::secrets::get(crate::secrets::TEAMS_TOKEN);
         }
+        config.calendar.google_client_secret = crate::secrets::get(crate::secrets::CALENDAR_GOOGLE_SECRET);
+        config.calendar.links = crate::secrets::get(crate::secrets::CALENDAR_LINKS)
+            .and_then(|text| serde_json::from_str(&text).ok())
+            .unwrap_or_default();
         config
     }
 
@@ -579,6 +722,9 @@ impl Config {
     pub fn save(&self) -> Result<()> {
         crate::secrets::set(crate::secrets::DISCORD_SECRET, self.discord.client_secret.as_deref());
         crate::secrets::set(crate::secrets::TEAMS_TOKEN, self.teams.token.as_deref());
+        crate::secrets::set(crate::secrets::CALENDAR_GOOGLE_SECRET, self.calendar.google_client_secret.as_deref());
+        let links = (!self.calendar.links.is_empty()).then(|| serde_json::to_string(&self.calendar.links).ok()).flatten();
+        crate::secrets::set(crate::secrets::CALENDAR_LINKS, links.as_deref());
         let path = Self::path()?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)

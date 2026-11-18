@@ -50,6 +50,8 @@ pub const APPLY: usize = 0;
 pub const QUIT: usize = 1;
 /// Relaunch into a staged update.
 pub const RESTART: usize = 2;
+/// [`WM_OPEN_SETTINGS`]'s `wParam` to open on the Calendar page.
+pub const OPEN_CALENDAR: usize = 1;
 
 /// Posted to this window: something in [`INBOX`] to read.
 const WM_FOLLOW: u32 = WM_APP + 1;
@@ -85,6 +87,7 @@ struct Inbox {
     config: Option<Config>,
     status: Option<Status>,
     devices: bool,
+    calendar: bool,
 }
 
 struct Window {
@@ -152,6 +155,26 @@ pub fn devices_changed() {
     wake();
 }
 
+/// A calendar sign-in or fetch finished: its accounts' state may have changed.
+pub fn calendar_changed() {
+    if HWND_OPEN.with(Cell::get) == 0 {
+        return;
+    }
+    INBOX.with(|inbox| inbox.borrow_mut().calendar = true);
+    wake();
+}
+
+/// Show the Calendar page (the calendar's gear opens it).
+pub fn show_calendar() {
+    with_window(|w| {
+        w.model.page = Page::Calendar;
+        w.model.calendar = crate::calendar::status(&w.model.config.calendar.setup());
+        w.scroll = 0.0;
+        w.relayout();
+        w.invalidate();
+    });
+}
+
 /// The config this window changed, for the tray to apply ([`WM_SETTINGS`]).
 pub fn take_pending() -> Option<Config> {
     PENDING.with(|p| p.borrow_mut().take())
@@ -214,6 +237,7 @@ fn create(config: &Config) -> Result<()> {
         .unwrap_or_else(|| Status { batteries: crate::batteries::read(), ..Default::default() });
     model.update = crate::update::pending_version();
     model.read_keyboards();
+    model.calendar = crate::calendar::status(&config.calendar.setup());
     let mut window = Window {
         hwnd,
         gfx: Gfx::new()?,
@@ -381,6 +405,9 @@ impl Window {
                     if page == Page::Keyboards {
                         self.model.read_keyboards();
                     }
+                    if page == Page::Calendar {
+                        self.model.calendar = crate::calendar::status(&self.model.config.calendar.setup());
+                    }
                     self.scroll = 0.0;
                     self.relayout();
                     self.invalidate();
@@ -396,6 +423,16 @@ impl Window {
                         crate::integrations::poke_teams();
                     }));
                 }
+            }
+            Target::Toggle(Toggle::CalendarShown(i)) => {
+                let key = self.model.calendar.calendars.get(i)?.key.clone();
+                self.change(|c| {
+                    if c.calendar.hidden.contains(&key) {
+                        c.calendar.hidden.retain(|k| *k != key);
+                    } else {
+                        c.calendar.hidden.push(key);
+                    }
+                });
             }
             Target::Toggle(Toggle::Site(i)) => {
                 let (key, _, _) = crate::integrations::browser::SITES.get(i)?;
@@ -427,6 +464,19 @@ impl Window {
                     Toggle::Mpc => &mut c.mpc.enabled,
                     Toggle::Discord => &mut c.discord.enabled,
                     Toggle::Teams => &mut c.teams.enabled,
+                    Toggle::Calendar => &mut c.calendar.enabled,
+                    Toggle::ClockSeconds => &mut c.clock.seconds,
+                    Toggle::ClockWeekday => &mut c.clock.weekday,
+                    Toggle::ClockOneLine => &mut c.clock.one_line,
+                    Toggle::ClockHideDate => &mut c.clock.hide_date,
+                    Toggle::ClockUnread => &mut c.clock.unread,
+                    Toggle::WeekNumbers => &mut c.calendar.week_numbers,
+                    Toggle::WorldClocks => &mut c.calendar.world_clocks,
+                    Toggle::CalendarNotifications => &mut c.calendar.notifications,
+                    Toggle::CalendarShortcut => &mut c.calendar.shortcut,
+                    Toggle::QuietMeetings => &mut c.calendar.quiet_in_meetings,
+                    Toggle::QuietCalls => &mut c.calendar.quiet_in_calls,
+                    Toggle::CalendarShown(_) => return,
                     Toggle::Batteries => &mut c.batteries.enabled,
                     Toggle::BatteryFlyout => &mut c.batteries.flyout,
                     Toggle::BatteryTooltip => &mut c.batteries.tooltip,
@@ -460,6 +510,11 @@ impl Window {
                     Choice::WaveColour => {
                         c.motion.colour = if i == 1 { crate::config::WaveColour::Cover } else { crate::config::WaveColour::Accent }
                     }
+                    Choice::CalendarLayout => c.calendar.layout = layout::CALENDAR_LAYOUTS[i.min(2)],
+                    Choice::AgendaRows => c.calendar.rows = layout::AGENDA_ROWS[i.min(2)],
+                    Choice::WeekStart => c.calendar.first_weekday = [None, Some(0), Some(6)][i.min(2)],
+                    Choice::Reminder => c.calendar.remind_minutes = layout::REMINDERS[i.min(3)],
+                    Choice::FocusLength => c.calendar.focus_minutes = layout::FOCUS_LENGTHS[i.min(3)],
                 })
             }
             Target::Slot(i, edge, align) => {
@@ -473,6 +528,17 @@ impl Window {
             Target::Monitor(i) => {
                 let name = self.pin(i, self.model.config.pill.edge);
                 self.change(|c| c.pill.monitor = name);
+            }
+            Target::Swatch(i, j) => {
+                let key = self.model.calendar.calendars.get(i)?.key.clone();
+                self.change(|c| match j.checked_sub(1).and_then(|j| layout::SWATCHES.get(j)) {
+                    Some([r, g, b]) => {
+                        c.calendar.colors.insert(key, format!("#{r:02X}{g:02X}{b:02X}"));
+                    }
+                    None => {
+                        c.calendar.colors.remove(&key);
+                    }
+                });
             }
             Target::Connector(connector) => {
                 self.model.open = if self.model.open == Some(connector) { None } else { Some(connector) };
@@ -545,6 +611,7 @@ impl Window {
                     }
                 }
             },
+            Button::Cal(cal) => return self.press_calendar(cal),
             Button::Restart => {
                 crate::tray::post(WM_SETTINGS, RESTART, 0);
             }
@@ -605,6 +672,70 @@ impl Window {
                     }
                 }));
             }
+        }
+        None
+    }
+
+    /// The calendar connector's buttons.
+    fn press_calendar(&mut self, cal: layout::Cal) -> Option<After> {
+        use layout::Cal;
+        use model::CalendarKey;
+        let button = Button::Cal(cal);
+        let open = |url: &'static str| -> Option<After> { Some(Box::new(move || {
+            crate::win::shell_open(url, None);
+        })) };
+        match cal {
+            Cal::GoogleApi => return open("https://console.cloud.google.com/apis/library/calendar-json.googleapis.com"),
+            Cal::GoogleCredentials => return open("https://console.cloud.google.com/apis/credentials"),
+            Cal::MicrosoftPortal => return open("https://entra.microsoft.com/#view/Microsoft_AAD_RegisteredApps/ApplicationsListBlade/quickStartType~/null/sourceType/Microsoft_AAD_IAM"),
+            Cal::MicrosoftRedirect => match crate::win::set_clipboard_text("http://localhost") {
+                true => self.say(button, "Copied: add it under Mobile and desktop applications", model::Tone::Good),
+                false => self.hint(button, "The clipboard is busy: copy again"),
+            },
+            Cal::GoogleId | Cal::GoogleSecret | Cal::MicrosoftId | Cal::AddLink => {
+                let key = match cal {
+                    Cal::GoogleId => CalendarKey::GoogleId,
+                    Cal::GoogleSecret => CalendarKey::GoogleSecret,
+                    Cal::MicrosoftId => CalendarKey::MicrosoftId,
+                    _ => CalendarKey::Link,
+                };
+                let text = match crate::win::clipboard_text() {
+                    Err(()) => {
+                        self.hint(button, "The clipboard is busy: paste again");
+                        return None;
+                    }
+                    Ok(text) => text.unwrap_or_default(),
+                };
+                match model::paste_calendar(key, &text) {
+                    Err(hint) => self.hint(button, hint),
+                    Ok(value) => match key {
+                        CalendarKey::GoogleId => self.change(|c| c.calendar.google_client_id = Some(value)),
+                        CalendarKey::GoogleSecret => self.change(|c| c.calendar.google_client_secret = Some(value)),
+                        CalendarKey::MicrosoftId => self.change(|c| c.calendar.microsoft_client_id = Some(value)),
+                        CalendarKey::Link => {
+                            if self.model.config.calendar.links.iter().any(|l| l.url == value) {
+                                self.hint(button, "That calendar is already here");
+                            } else {
+                                let name = crate::calendar::link_name(&value);
+                                self.change(|c| c.calendar.links.push(crate::calendar::Link { name, url: value }));
+                            }
+                        }
+                    },
+                }
+            }
+            Cal::RemoveLink(i) => self.change(|c| {
+                if i < c.calendar.links.len() {
+                    c.calendar.links.remove(i);
+                }
+            }),
+            Cal::SignIn(provider) => {
+                let setup = self.model.config.calendar.setup();
+                // The browser comes up: started once the window's state is released.
+                return Some(Box::new(move || crate::calendar::sign_in(provider, &setup)));
+            }
+            Cal::CancelSignIn(provider) => crate::calendar::cancel_sign_in(provider),
+            Cal::SignOut(provider) => crate::calendar::sign_out(provider),
+            Cal::EditClocks => return Some(Box::new(crate::calendar::zones::edit)),
         }
         None
     }
@@ -714,7 +845,7 @@ impl Window {
         let inbox = INBOX.with(|inbox| std::mem::take(&mut *inbox.borrow_mut()));
         // Only the hub's same status again (it moves on for every song): nothing to draw. An empty
         // inbox is a paint that was missed, and draws.
-        if inbox.config.is_none() && !inbox.devices && inbox.status.as_ref() == Some(&self.model.status) {
+        if inbox.config.is_none() && !inbox.devices && !inbox.calendar && inbox.status.as_ref() == Some(&self.model.status) {
             return;
         }
         if let Some(config) = inbox.config {
@@ -727,6 +858,9 @@ impl Window {
         }
         if inbox.devices {
             self.model.read_devices(&self.backend);
+        }
+        if inbox.calendar {
+            self.model.calendar = crate::calendar::status(&self.model.config.calendar.setup());
         }
         self.model.update = crate::update::pending_version();
         self.relayout();
@@ -908,6 +1042,10 @@ pub fn preview(config: &Config, page: &str) {
             w.invalidate();
         }
     });
+    // `calendar`: Connectors, with the calendar's card open.
+    if page.eq_ignore_ascii_case("calendar") {
+        show_calendar();
+    }
     let mut msg = windows::Win32::UI::WindowsAndMessaging::MSG::default();
     while HWND_OPEN.with(Cell::get) != 0 && crate::wait::get_message(&mut msg) {
         unsafe {

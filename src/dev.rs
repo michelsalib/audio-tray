@@ -12,6 +12,8 @@
 //!                                  the edge pill alone there, with a song and the devices
 //!   --settings-preview [page]      the settings window alone (taskbar, pill, devices, connectors,
 //!                                  about); changes are not applied, there is no tray to apply them
+//!   --calendar [ics-url …]         the calendar flyout alone, on the config's accounts and links
+//!                                  plus these links (for this run only)
 //!   --vol <up|down|get>            nudge or read the default output volume by one scroll notch
 //!   --osd [out|in] [level%]        preview the scroll readout beside the cursor until it fades
 //!   --mic [secs]                   who holds the microphone, then watch it change
@@ -69,6 +71,14 @@ pub fn run(args: &[String], backend: &WasapiBackend) -> Result<bool> {
             println!("flyout: closed (quit={}, restart={})", outcome.quit, outcome.restart);
         }
         Some("--pill-preview") => pill_preview(backend, &args[1..])?,
+        Some("--calendar") => {
+            // Extra calendar links for this run only (nothing is saved).
+            let mut config = Config::load();
+            for url in &args[1..] {
+                config.calendar.links.push(crate::calendar::Link { name: crate::calendar::link_name(url), url: url.clone() });
+            }
+            crate::calendar::preview(&config);
+        }
         Some("--settings-preview") => crate::settings::preview(&Config::load(), args.get(1).map_or("", String::as_str)),
         Some("--list") => list(backend)?,
         Some("--set") => {

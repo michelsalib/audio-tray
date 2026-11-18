@@ -6,6 +6,7 @@
 //! edit is made from the timer-driven [`sweep`], which holds the rules for when a XAML call is safe.
 
 mod budget;
+mod clock;
 mod decorate;
 mod interact;
 mod ipc;
@@ -327,6 +328,8 @@ fn configure(data: &str) {
     // Absent (an older app) means on, as before the switch existed.
     reorder::set_enabled(value_from(data, "reorder").as_deref() != Some("0"));
     BUTTONS.store(value_from(data, "buttons").as_deref() != Some("0"), Ordering::SeqCst);
+    // Absent (an older app, or the calendar off) leaves the clock to the shell.
+    clock::set_enabled(value_from(data, "clock").as_deref() == Some("1"));
     // A new owner gets a fresh grace period and its own copy of the status.
     *lock(&STOOD_UP) = Some(std::time::Instant::now());
     LAST_STATUS.store(usize::MAX, Ordering::SeqCst);
@@ -738,6 +741,9 @@ pub(crate) unsafe fn stand_down() {
             restore::revert(&diagnostics);
             // The music tile keeps its own record (widths and margins on the shell's elements).
             music::revert(&diagnostics);
+            // The clock's width let go; the shell writes its own text at the next minute.
+            clock::release_text();
+            clock::restore(&diagnostics);
         }
         None => logf!("stand down: no IXamlDiagnostics — cannot revert"),
     }
@@ -850,6 +856,7 @@ unsafe fn sweep_claimed() {
     if tree::quiet_for(QUIET_BEFORE_WIRING) {
         let _phase = watch::enter("sweep: wire transport");
         wire_transport_now(&diagnostics);
+        clock::wire(&diagnostics);
     }
 
     // **Do not remove.** `put_Content` while the event stream is still running never returns and
@@ -873,7 +880,10 @@ unsafe fn sweep_claimed() {
     if REAPPLY_PENDING.swap(false, Ordering::SeqCst) {
         let _phase = watch::enter("sweep: re-apply after a handover");
         logf!("handover changed the shell edits — reverting and applying them again");
+        // The same app stays: its clock text too (it is not sent again).
+        let text = clock::keep_text();
         stand_down();
+        clock::put_back_text(text);
         // Back up for the same owner: `stand_down` cleared the active flags and the status clock.
         ACTIVE.store(true, Ordering::SeqCst);
         CURRENT.store(GENERATION.load(Ordering::SeqCst), Ordering::SeqCst);
@@ -944,10 +954,9 @@ unsafe fn sweep_claimed() {
     // Drop to the idle pace once nothing is left to apply. Segments are wired on the tick after
     // the strip is drawn, hence `segments_wired`. With a music tile the sweep never settles: the
     // hover preview's buttons are rebuilt per hover and must be wired within it.
-    let settled = strip_placed()
-        && reorder::settled()
-        && segments_wired()
-        && music::tile::host().is_none();
+    // Without the audio buttons there is no strip to wait for.
+    let strip_settled = !BUTTONS.load(Ordering::SeqCst) || (strip_placed() && reorder::settled() && segments_wired());
+    let settled = strip_settled && music::tile::host().is_none() && clock::settled();
     lifecycle::set_sweep_pace(settled);
     report_status();
 }
@@ -1157,10 +1166,10 @@ unsafe fn report_slot_metrics(diagnostics: &xamlom::IXamlDiagnostics) {
 }
 
 /// The shell's own tray icons (volume, mic, wifi…), as opposed to notify icons and our strip.
-const ICON_VIEW: &str = "SystemTray.IconView";
+pub(crate) const ICON_VIEW: &str = "SystemTray.IconView";
 
 /// Climbs the recorded tree looking for an ancestor of a given XAML type.
-fn ancestor_of_type(start: xamlom::InstanceHandle, wanted: &str, max_up: usize) -> Option<u64> {
+pub(crate) fn ancestor_of_type(start: xamlom::InstanceHandle, wanted: &str, max_up: usize) -> Option<u64> {
     let mut handle = start;
     for _ in 0..max_up {
         handle = tree::parent_of(handle)?;

@@ -734,6 +734,16 @@ fn draw_item(pen: &Pen, s: &Scene, items: &[Item], index: usize, item: &Item) {
             pen.text(label, Font::Body, R::new(r.x + 8.0, r.y - 1.0, r.w - 16.0, r.h), text.alpha(a), Align::Center);
         }
         Kind::Logo => pen.logo(r),
+        Kind::Swatch { rgb, selected, target } => {
+            let (cx, cy) = (r.x + r.w / 2.0, r.y + r.h / 2.0);
+            if *selected {
+                pen.circle(cx, cy, r.w / 2.0 + 3.0, p.text);
+                pen.circle(cx, cy, r.w / 2.0 + 1.5, p.card);
+            } else if hover(*target) {
+                pen.circle(cx, cy, r.w / 2.0 + 2.0, p.control_hover);
+            }
+            pen.circle(cx, cy, r.w / 2.0, Color::rgb(*rgb));
+        }
         Kind::Chip { icon, selected, target } => {
             let fill = if hover(*target) { p.control_hover } else { p.control };
             pen.fill(r, 6.0, fill);

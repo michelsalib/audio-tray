@@ -222,6 +222,8 @@ pub enum Event {
     KeyboardSwitched { keyboard: String, layout: String },
     /// Every connected device that reports a battery, by name (see [`crate::batteries`]).
     Batteries(Vec<Battery>),
+    /// A notice from the calendar (a meeting about to start, the focus timer done).
+    Notice(Notice),
 }
 
 /// A short-lived notice the pill shows on top of the steady state.
@@ -237,6 +239,11 @@ pub enum Notice {
     KeyboardSwitched { keyboard: String, layout: String },
     /// A device's battery went low ([`State::low_battery_at`]).
     LowBattery { name: String, kind: BatteryKind, level: u8 },
+    /// A calendar event about to start: its title, when and where, the meeting (or the event) to
+    /// open, and how long the reminder stays, in seconds.
+    Meeting { title: String, line: String, url: Option<String>, lasts: u64 },
+    /// The focus timer ran out.
+    FocusDone { minutes: u32 },
 }
 
 impl Notice {
@@ -250,6 +257,9 @@ impl Notice {
             Notice::KeyboardSwitched { .. } => Some(std::time::Duration::from_millis(1500)),
             // Long enough to be seen on coming back to the desk; the flyout keeps the level.
             Notice::LowBattery { .. } => Some(std::time::Duration::from_secs(12)),
+            // Until the event starts, and a little past.
+            Notice::Meeting { lasts, .. } => Some(std::time::Duration::from_secs(*lasts)),
+            Notice::FocusDone { .. } => Some(std::time::Duration::from_secs(10)),
         }
     }
 }
@@ -402,6 +412,10 @@ impl State {
             }
             Event::KeyboardSwitched { keyboard, layout } => {
                 self.push_notice(Notice::KeyboardSwitched { keyboard, layout });
+                true
+            }
+            Event::Notice(notice) => {
+                self.push_notice(notice);
                 true
             }
             Event::Batteries(batteries) => {

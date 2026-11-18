@@ -65,6 +65,8 @@ pub(super) enum Page {
     /// What Audio Tray is doing, at a glance, with the switches most changed.
     Home,
     Taskbar,
+    /// The calendar that replaces the taskbar clock's: its switch, accounts and links.
+    Calendar,
     Pill,
     /// How the bars move: the pill's ring, the card's bar, the volume sliders.
     Motion,
@@ -78,12 +80,13 @@ pub(super) enum Page {
 }
 
 impl Page {
-    pub(super) const ALL: [Page; 9] = [Page::Home, Page::Taskbar, Page::Pill, Page::Motion, Page::Devices, Page::Batteries, Page::Keyboards, Page::Connectors, Page::About];
+    pub(super) const ALL: [Page; 10] = [Page::Home, Page::Taskbar, Page::Calendar, Page::Pill, Page::Motion, Page::Devices, Page::Batteries, Page::Keyboards, Page::Connectors, Page::About];
 
     pub(super) fn title(self) -> &'static str {
         match self {
             Page::Home => "Home",
             Page::Taskbar => "Taskbar",
+            Page::Calendar => "Clock & calendar",
             Page::Pill => "Edge pill",
             Page::Motion => "Look & motion",
             Page::Devices => "Audio devices",
@@ -98,6 +101,7 @@ impl Page {
         match self {
             Page::Home => '\u{E80F}',
             Page::Taskbar => '\u{E75B}',
+            Page::Calendar => '\u{E787}',
             Page::Pill => '\u{E7F4}',
             Page::Motion => '\u{E771}',
             Page::Devices => '\u{E767}',
@@ -152,6 +156,44 @@ pub(super) enum Toggle {
     Site(usize),
     Discord,
     Teams,
+    /// The calendar replaces the taskbar clock's.
+    Calendar,
+    ClockSeconds,
+    ClockWeekday,
+    ClockOneLine,
+    ClockHideDate,
+    ClockUnread,
+    WeekNumbers,
+    WorldClocks,
+    CalendarNotifications,
+    CalendarShortcut,
+    QuietMeetings,
+    QuietCalls,
+    /// Calendar `i` of [`super::model::Model::calendar`]'s list shown.
+    CalendarShown(usize),
+}
+
+/// The calendar connector's buttons.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum Cal {
+    /// Google Cloud's console, where the Calendar API is enabled.
+    GoogleApi,
+    /// Its credentials page, where the OAuth client is made.
+    GoogleCredentials,
+    GoogleId,
+    GoogleSecret,
+    /// Entra's app registrations.
+    MicrosoftPortal,
+    /// Copy the redirect the registration needs.
+    MicrosoftRedirect,
+    MicrosoftId,
+    SignIn(crate::calendar::Provider),
+    CancelSignIn(crate::calendar::Provider),
+    SignOut(crate::calendar::Provider),
+    AddLink,
+    RemoveLink(usize),
+    /// Windows' Date and time settings, where the world clocks are kept.
+    EditClocks,
 }
 
 /// A segmented choice.
@@ -175,6 +217,16 @@ pub(super) enum Choice {
     VolumeMotion,
     /// Accent, or the cover's colour.
     WaveColour,
+    /// [`CALENDAR_LAYOUTS`].
+    CalendarLayout,
+    /// [`AGENDA_ROWS`].
+    AgendaRows,
+    /// The locale's, Monday or Sunday.
+    WeekStart,
+    /// [`REMINDERS`].
+    Reminder,
+    /// [`FOCUS_LENGTHS`].
+    FocusLength,
 }
 
 /// A button (or a whole card that acts like one).
@@ -191,6 +243,7 @@ pub(super) enum Button {
     DiscordRedirect,
     DiscordId,
     DiscordSecret,
+    Cal(Cal),
     Restart,
     Releases,
     ConfigFolder,
@@ -225,6 +278,8 @@ pub(super) enum Target {
     Slot(usize, PillEdge, PillAlign),
     /// A display in the pill's map.
     Monitor(usize),
+    /// Colour `j` of [`SWATCHES`] (0: the calendar's own) for calendar `i`.
+    Swatch(usize, usize),
 }
 
 /// What to paint. Controls are separate items inside their card's rectangle.
@@ -269,6 +324,8 @@ pub(super) enum Kind {
     Pick { label: String, selected: bool, dim: bool, target: Target },
     /// The app's logo, as its icon draws it.
     Logo,
+    /// A colour to pick, as a dot; ringed when it is the one.
+    Swatch { rgb: [u8; 3], selected: bool, target: Target },
 }
 
 /// What a [`Kind::Tile`] draws.
@@ -365,6 +422,11 @@ pub(super) fn attention(model: &Model, page: Page) -> usize {
     let s = &model.status;
     match page {
         Page::Connectors => usize::from(s.discord_problem.is_some()) + usize::from(s.teams_problem.is_some()),
+        Page::Calendar => {
+            let cal = &model.calendar;
+            let accounts = [&cal.google, &cal.microsoft].into_iter().filter(|a| a.problem.is_some()).count();
+            if model.config.calendar.enabled { accounts + cal.links.iter().filter(|l| l.is_some()).count() } else { 0 }
+        }
         Page::Taskbar => usize::from(s.notice.is_some()),
         Page::Batteries => {
             let b = &model.config.batteries;
@@ -683,6 +745,7 @@ pub(super) fn page(model: &Model, width: f32, measure: &dyn Fn(&str) -> f32) -> 
         Page::Batteries => batteries(&mut col, model),
         Page::Keyboards => keyboards(&mut col, model),
         Page::Connectors => connectors(&mut col, model),
+        Page::Calendar => calendar_steps(&mut col, model),
         Page::About => about(&mut col, model),
     }
     col.laid.height = col.y + PAGE_PAD;
@@ -1341,6 +1404,208 @@ fn connectors(col: &mut Column, model: &Model) {
         col.laid.push(R::new(col.x, col.y, col.w, 20.0), Kind::Text("Click a connector for its steps and options.".into()));
         col.y += 24.0;
     }
+}
+
+/// The Calendar page: what the clock does, then a card per account and one for the links.
+fn calendar_steps(col: &mut Column, model: &Model) {
+    use crate::calendar::Provider;
+    let c = &model.config.calendar;
+    let s = &model.calendar;
+    let hint = |button| model.hint.filter(|(b, _, _)| *b == button).map(|(_, h, tone)| (h.to_string(), tone));
+    let mut body = col.group();
+    let what = plain("The clock opens this calendar, with Windows' notifications beside it");
+    col.row(&mut body, None, "Opens from the taskbar clock", what, !c.enabled, Control::Toggle(c.enabled, Toggle::Calendar));
+    col.end_group(body);
+
+    // The clock's own text.
+    let k = &model.config.clock;
+    col.section("Taskbar clock");
+    let mut body = col.group();
+    col.row(&mut body, None, "Seconds", None, false, Control::Toggle(k.seconds, Toggle::ClockSeconds));
+    col.row(&mut body, None, "Day of the week", plain("Before the date"), false, Control::Toggle(k.weekday, Toggle::ClockWeekday));
+    col.row(&mut body, None, "One line", plain("The date after the time"), false, Control::Toggle(k.one_line, Toggle::ClockOneLine));
+    col.row(&mut body, None, "Hide the date", None, false, Control::Toggle(k.hide_date, Toggle::ClockHideDate));
+    let unread = plain("New notifications since you last opened it, before the time");
+    col.row(&mut body, None, "Unread count", unread, !c.enabled || !c.notifications, Control::Toggle(k.unread, Toggle::ClockUnread));
+    col.end_group(body);
+    col.laid.push(R::new(col.x + 2.0, col.y - 4.0, col.w, 18.0), Kind::Text("Your own patterns: time_pattern and date_pattern under [clock] in config.toml".into()));
+    col.y += 20.0;
+
+    let dim = !c.enabled;
+    col.section("Calendar");
+    let mut body = col.group();
+    let layout_at = CALENDAR_LAYOUTS.iter().position(|l| *l == c.layout).unwrap_or(0);
+    col.row(&mut body, None, "Layout", None, dim, Control::Segments(vec!["Comfortable".into(), "Compact".into(), "Agenda only".into()], layout_at, Choice::CalendarLayout));
+    let rows_at = AGENDA_ROWS.iter().position(|r| *r == c.rows).unwrap_or(1);
+    col.row(&mut body, None, "Agenda rows", plain("At most; fewer on a short screen"), dim, Control::Segments(AGENDA_ROWS.iter().map(|r| r.to_string()).collect(), rows_at, Choice::AgendaRows));
+    let week_at = match c.first_weekday {
+        None => 0,
+        Some(0) => 1,
+        Some(_) => 2,
+    };
+    col.row(&mut body, None, "Week starts", None, dim, Control::Segments(vec!["As Windows".into(), "Monday".into(), "Sunday".into()], week_at, Choice::WeekStart));
+    col.row(&mut body, None, "Week numbers", None, dim, Control::Toggle(c.week_numbers, Toggle::WeekNumbers));
+    let clocks = hint(Button::Cal(Cal::EditClocks)).or(plain("Windows' additional clocks, under the date"));
+    col.row(&mut body, None, "World clocks", clocks, dim, Control::Toggle(c.world_clocks, Toggle::WorldClocks));
+    col.row(&mut body, None, "Choose the world clocks", plain("In Windows' Date and time settings"), dim, Control::Button("Open", false, Some('\u{E8A7}'), Button::Cal(Cal::EditClocks)));
+    let notes = plain("Its notification centre, above the month: grouped by app, to open, dismiss or clear");
+    col.row(&mut body, None, "Notification centre", notes, dim, Control::Toggle(c.notifications, Toggle::CalendarNotifications));
+    col.row(&mut body, None, "Win+N and Win+Alt+D open it", plain("Windows' shortcuts for its notification centre and calendar"), dim, Control::Toggle(c.shortcut, Toggle::CalendarShortcut));
+    col.end_group(body);
+
+    col.section("Meetings and focus");
+    let mut body = col.group();
+    let remind_at = REMINDERS.iter().position(|r| *r == c.remind_minutes).unwrap_or(2);
+    let labels = REMINDERS.iter().map(|r| if *r == 0 { "Off".to_string() } else { format!("{r} min") }).collect();
+    col.row(&mut body, None, "Remind me on the pill", plain("Before an event, with Join"), dim, Control::Segments(labels, remind_at, Choice::Reminder));
+    let focus_at = FOCUS_LENGTHS.iter().position(|f| *f == c.focus_minutes).unwrap_or(1);
+    let labels = FOCUS_LENGTHS.iter().map(|f| format!("{f} min")).collect();
+    col.row(&mut body, None, "Focus timer", plain("Its length to start with; Windows' Do not disturb while it runs"), dim, Control::Segments(labels, focus_at, Choice::FocusLength));
+    col.row(&mut body, None, "Do not disturb in meetings", plain("While a calendar event runs"), dim, Control::Toggle(c.quiet_in_meetings, Toggle::QuietMeetings));
+    col.row(&mut body, None, "Do not disturb in calls", plain("Teams, Discord, or a meeting app on the microphone"), dim, Control::Toggle(c.quiet_in_calls, Toggle::QuietCalls));
+    col.end_group(body);
+
+    // Each calendar found: shown or not, and its colour.
+    if !s.calendars.is_empty() {
+        col.section("Calendars");
+        let mut body = col.group();
+        for (i, calendar) in s.calendars.iter().enumerate() {
+            let shown = !c.hidden.contains(&calendar.key);
+            let chosen = c.colors.get(&calendar.key).and_then(|hex| crate::calendar::parse_hex(hex));
+            col.calendar_row(&mut body, i, &calendar.name, calendar.color, chosen, shown, dim);
+        }
+        col.end_group(body);
+    }
+
+    for provider in Provider::ALL {
+        let account = s.account(provider);
+        let google = provider == Provider::Google;
+        col.section(if google { "Google account" } else { "Microsoft account (Outlook, work or school)" });
+        let mut body = col.group();
+        let sign_in = Button::Cal(Cal::SignIn(provider));
+        let cancel = Button::Cal(Cal::CancelSignIn(provider));
+        if let Some(email) = &account.email {
+            let (desc, buttons) = match &account.problem {
+                Some(problem) => (
+                    (problem.clone(), Tone::Warn),
+                    vec![("Sign in again".to_string(), true, None, sign_in), ("Sign out".to_string(), false, None, Button::Cal(Cal::SignOut(provider)))],
+                ),
+                None => (("Signed in".to_string(), Tone::Good), vec![("Sign out".to_string(), false, None, Button::Cal(Cal::SignOut(provider)))]),
+            };
+            let control = if account.signing_in { Control::Button("Cancel", false, None, cancel) } else { Control::Buttons(buttons) };
+            let desc = if account.signing_in { ("Finish signing in in your browser".to_string(), Tone::Plain) } else { desc };
+            col.row(&mut body, None, email, Some(desc), false, control);
+            col.end_group(body);
+            continue;
+        }
+        let registered = if google { c.google_client_id.is_some() && c.google_client_secret.is_some() } else { c.microsoft_client_id.is_some() };
+        if google {
+            let api = plain("Enable it, then set up the consent screen: External, and Publish it");
+            col.row(&mut body, Some((1, registered)), "Enable the Calendar API", api, false, Control::Button("Open", false, Some('\u{E8A7}'), Button::Cal(Cal::GoogleApi)));
+            let client = plain("Credentials > Create > OAuth client ID > Desktop app");
+            col.row(&mut body, Some((2, registered)), "Create a desktop client", client, false, Control::Button("Open", false, Some('\u{E8A7}'), Button::Cal(Cal::GoogleCredentials)));
+            let id = hint(Button::Cal(Cal::GoogleId)).or_else(|| c.google_client_id.clone().map(|id| (id, Tone::Plain)));
+            col.row(&mut body, None, "Client ID", id.or(plain("Not set")), false, Control::Button("Paste", false, Some('\u{E77F}'), Button::Cal(Cal::GoogleId)));
+            let secret = hint(Button::Cal(Cal::GoogleSecret)).or_else(|| c.google_client_secret.as_deref().map(|s| (tail(s), Tone::Plain)));
+            col.row(&mut body, None, "Client secret", secret.or(plain("Not set")), false, Control::Button("Paste", false, Some('\u{E77F}'), Button::Cal(Cal::GoogleSecret)));
+        } else {
+            let register = plain("New registration: any organisation + personal; then Calendars.Read");
+            col.row(&mut body, Some((1, registered)), "Register an app", register, false, Control::Button("Open", false, Some('\u{E8A7}'), Button::Cal(Cal::MicrosoftPortal)));
+            let redirect = hint(Button::Cal(Cal::MicrosoftRedirect)).or(plain("Authentication > Mobile and desktop applications: http://localhost"));
+            col.row(&mut body, Some((2, false)), "Add the redirect", redirect, false, Control::Button("Copy", false, Some('\u{E8C8}'), Button::Cal(Cal::MicrosoftRedirect)));
+            let id = hint(Button::Cal(Cal::MicrosoftId)).or_else(|| c.microsoft_client_id.clone().map(|id| (id, Tone::Plain)));
+            col.row(&mut body, None, "Application (client) ID", id.or(plain("Not set")), false, Control::Button("Paste", false, Some('\u{E77F}'), Button::Cal(Cal::MicrosoftId)));
+        }
+        let (desc, control) = if account.signing_in {
+            (plain("Finish signing in in your browser"), Control::Button("Cancel", false, None, cancel))
+        } else {
+            let desc = account.problem.clone().map(|p| (p, Tone::Warn)).or(plain("Opens the sign-in in your browser"));
+            (desc, Control::Button("Sign in", registered, None, sign_in))
+        };
+        col.row(&mut body, Some((3, false)), "Sign in", desc, !registered, control);
+        col.end_group(body);
+    }
+
+    col.section("Calendar links");
+    let mut body = col.group();
+    for (i, link) in c.links.iter().enumerate() {
+        let desc = match s.links.get(i).cloned().flatten() {
+            Some(problem) => (problem, Tone::Warn),
+            None => (link_host(&link.url), Tone::Plain),
+        };
+        col.row(&mut body, None, &link.name, Some(desc), false, Control::Button("Remove", false, Some('\u{E74D}'), Button::Cal(Cal::RemoveLink(i))));
+    }
+    let add = hint(Button::Cal(Cal::AddLink))
+        .or(plain("A secret iCal address: Google's Integrate calendar, Outlook's Publish"));
+    col.row(&mut body, None, "Add a link", add, false, Control::Button("Paste link", c.links.is_empty(), Some('\u{E77F}'), Button::Cal(Cal::AddLink)));
+    col.end_group(body);
+}
+
+/// The calendar's layouts, in their segments' order.
+pub(super) const CALENDAR_LAYOUTS: [crate::config::CalendarLayout; 3] =
+    [crate::config::CalendarLayout::Comfortable, crate::config::CalendarLayout::Compact, crate::config::CalendarLayout::AgendaOnly];
+pub(super) const AGENDA_ROWS: [u8; 3] = [3, 5, 8];
+/// Minutes before an event; 0 is off.
+pub(super) const REMINDERS: [u32; 4] = [0, 1, 5, 10];
+pub(super) const FOCUS_LENGTHS: [u32; 4] = [15, 25, 45, 60];
+/// The colours a calendar can take, after its own.
+pub(super) const SWATCHES: [[u8; 3]; 8] = [
+    [0xE8, 0x83, 0x6A],
+    [0xF7, 0xB3, 0x2B],
+    [0x6C, 0xCB, 0x5F],
+    [0x4F, 0xC3, 0xF7],
+    [0x47, 0x9E, 0xF5],
+    [0x7B, 0x86, 0xC6],
+    [0xC3, 0x9B, 0xF5],
+    [0xF0, 0x62, 0x92],
+];
+
+impl Column<'_> {
+    /// A calendar's row: its name, its colours to pick from (its own first), and its switch.
+    #[allow(clippy::too_many_arguments)]
+    fn calendar_row(&mut self, group: &mut Group, i: usize, name: &str, own: [u8; 3], chosen: Option<[u8; 3]>, shown: bool, dim: bool) {
+        if group.rows > 0 {
+            self.laid.push(R::new(self.x, self.y, self.w, 1.0), Kind::Divider);
+        }
+        group.rows += 1;
+        let row = R::new(self.x, self.y, self.w, ROW_H);
+        let switch = self.toggle_in(row, row.right() - CARD_PAD, shown, dim, Toggle::CalendarShown(i));
+        if !dim {
+            self.laid.hits.push((R::new(row.right() - CARD_PAD - switch, row.y, switch, row.h), Target::Toggle(Toggle::CalendarShown(i))));
+        }
+        const DOT: f32 = 18.0;
+        const STEP: f32 = 24.0;
+        let colours: Vec<[u8; 3]> = std::iter::once(own).chain(SWATCHES).collect();
+        let mut x = row.right() - CARD_PAD - switch - 20.0 - colours.len() as f32 * STEP;
+        let current = chosen.unwrap_or(own);
+        for (j, rgb) in colours.iter().enumerate() {
+            let r = R::new(x + (STEP - DOT) / 2.0, row.y + (row.h - DOT) / 2.0, DOT, DOT);
+            let target = Target::Swatch(i, j);
+            let selected = if j == 0 { chosen.is_none() } else { *rgb == current && chosen.is_some() };
+            self.laid.push(r, Kind::Swatch { rgb: *rgb, selected, target });
+            if !dim {
+                self.laid.hits.push((r, target));
+            }
+            x += STEP;
+        }
+        let end = row.right() - CARD_PAD - switch - 20.0 - colours.len() as f32 * STEP - 12.0;
+        let tx = row.x + CARD_TEXT_X;
+        self.laid.push(R::new(tx, row.y, end - tx, ROW_H), Kind::Label { title: name.to_string(), desc: None, dim: dim || !shown });
+        self.y += ROW_H;
+    }
+}
+
+/// A secret's last characters: it is never shown whole.
+fn tail(secret: &str) -> String {
+    let tail: String = secret.chars().rev().take(4).collect::<Vec<_>>().into_iter().rev().collect();
+    format!("••••{tail}")
+}
+
+/// Where a link points, without the secret part of its address.
+fn link_host(url: &str) -> String {
+    let url = crate::calendar::feed_url(url);
+    let host = url.split("://").nth(1).and_then(|rest| rest.split('/').next()).unwrap_or_default();
+    format!("{host}/••••")
 }
 
 /// What an opened connector shows under the grid: its setup steps until it is set up, then what can

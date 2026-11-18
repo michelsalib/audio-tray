@@ -346,6 +346,10 @@ fn init_data(icons: StripIcons, owner_pid: u32, payload: Payload) -> String {
     if config.strip.hide_windows_language {
         pairs.push(("hidelanguage", "1".to_string()));
     }
+    // The clock's clicks open our calendar instead of the shell's. Off is the default.
+    if config.calendar.enabled {
+        pairs.push(("clock", "1".to_string()));
+    }
     // The DLL path only matters to a handover's compatibility check, which comes by WM_COPYDATA
     // (no length cap); the injection's initialization data cannot spare its 70-odd characters.
     if payload == Payload::Handover {
@@ -487,6 +491,8 @@ pub enum Action {
     CycleOutput,
     CycleInput,
     OpenPanel,
+    /// A click on the taskbar clock.
+    OpenCalendar,
     /// Music transport. Codes 10+, deliberately far from the audio ones on the same window.
     MusicPrevious,
     MusicPlayPause,
@@ -500,6 +506,7 @@ impl Action {
             tap_proto::ACTION_CYCLE_OUTPUT => Some(Self::CycleOutput),
             tap_proto::ACTION_CYCLE_INPUT => Some(Self::CycleInput),
             tap_proto::ACTION_OPEN_PANEL => Some(Self::OpenPanel),
+            tap_proto::ACTION_OPEN_CALENDAR => Some(Self::OpenCalendar),
             tap_proto::ACTION_MUSIC_PREVIOUS => Some(Self::MusicPrevious),
             tap_proto::ACTION_MUSIC_PLAY_PAUSE => Some(Self::MusicPlayPause),
             tap_proto::ACTION_MUSIC_NEXT => Some(Self::MusicNext),
@@ -514,6 +521,7 @@ impl Action {
             Self::CycleOutput => tap_proto::ACTION_CYCLE_OUTPUT,
             Self::CycleInput => tap_proto::ACTION_CYCLE_INPUT,
             Self::OpenPanel => tap_proto::ACTION_OPEN_PANEL,
+            Self::OpenCalendar => tap_proto::ACTION_OPEN_CALENDAR,
             Self::MusicPrevious => tap_proto::ACTION_MUSIC_PREVIOUS,
             Self::MusicPlayPause => tap_proto::ACTION_MUSIC_PLAY_PAUSE,
             Self::MusicNext => tap_proto::ACTION_MUSIC_NEXT,
@@ -962,4 +970,68 @@ mod tests {
         let all = tap_proto::STATUS_NO_STRIP | tap_proto::STATUS_REORDER_FAILED | tap_proto::STATUS_SHAPE_CHANGED;
         assert_eq!(status_notice(all), status_notice(tap_proto::STATUS_SHAPE_CHANGED));
     }
+}
+
+/// How the taskbar clock reads, for the TAP (see `tap_proto::CLOCK_MAGIC`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ClockText {
+    /// A `GetTimeFormatEx` pattern; empty: the locale's short time.
+    pub time: String,
+    /// A `GetDateFormatEx` pattern; empty: the locale's short date; `-`: hidden.
+    pub date: String,
+    pub one_line: bool,
+    /// After the time: the focus time left, never a meeting (the time stays the time).
+    pub top: String,
+    /// Notifications new since the panel was last opened (0: none).
+    pub badge: u32,
+    /// The badge drawn for it (`calendar::view::badge`): the PNG, its width in DIPs and the DPI it
+    /// was drawn for. Without one, the TAP puts an emoji dot and the count before the time.
+    pub badge_image: Option<crate::calendar::Badge>,
+}
+
+/// Tell the loaded TAP how the clock reads. `false` when no TAP took it.
+pub fn send_clock(text: &ClockText) -> bool {
+    let flag = |on: bool| u8::from(on).to_string();
+    let data = tap_proto::encode_init([
+        ("time", text.time.clone()),
+        ("date", text.date.clone()),
+        ("oneline", flag(text.one_line)),
+        ("top", text.top.clone()),
+        ("badge", text.badge.to_string()),
+        ("badge_image", text.badge_image.as_ref().map(|b| b.0.clone()).unwrap_or_default()),
+        ("badge_width", text.badge_image.as_ref().map(|b| b.1.to_string()).unwrap_or_default()),
+        ("badge_scale", text.badge_image.as_ref().map(|b| (b.2 as f32 / 96.0).to_string()).unwrap_or_default()),
+    ]);
+    send_clock_data(&data)
+}
+
+/// Hand the clock back to the shell: the TAP stops writing it and undoes what it changed.
+pub fn release_clock() -> bool {
+    send_clock_data(&tap_proto::encode_init([("release", "1".to_string())]))
+}
+
+/// How long the tray waits on a busy Explorer for each clock: a refusal is retried 5 s later
+/// ([`crate::calendar::schedule::tick`]), so the tray thread is not held for long.
+const SEND_WAIT_MS: u32 = 200;
+
+fn send_clock_data(data: &str) -> bool {
+    use windows::Win32::Foundation::{LPARAM, WPARAM};
+    use windows::Win32::System::DataExchange::COPYDATASTRUCT;
+    use windows::Win32::UI::WindowsAndMessaging::{SendMessageTimeoutW, SMTO_ABORTIFHUNG, WM_COPYDATA};
+
+    let payload = crate::win::wide(data);
+    let copy = COPYDATASTRUCT {
+        dwData: tap_proto::CLOCK_MAGIC,
+        cbData: (payload.len() * 2) as u32,
+        lpData: payload.as_ptr() as *mut core::ffi::c_void,
+    };
+    let mut taken = false;
+    for control in crate::win::windows_by_class(TAP_CONTROL_CLASS) {
+        let mut result = 0usize;
+        let sent = unsafe {
+            SendMessageTimeoutW(control, WM_COPYDATA, WPARAM(0), LPARAM(&copy as *const COPYDATASTRUCT as isize), SMTO_ABORTIFHUNG, SEND_WAIT_MS, Some(&mut result))
+        };
+        taken |= sent.0 != 0 && result == 1;
+    }
+    taken
 }

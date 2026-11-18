@@ -36,6 +36,30 @@ pub fn sprite(bytes: &[u8], size: u32, radius: f32) -> Result<Vec<u8>> {
     }
 }
 
+/// `bytes` whole, scaled to fit within `max_w`×`max_h` pixels (never enlarged past twice its size):
+/// straight-alpha RGBA, with its width and height.
+pub fn fitted(bytes: &[u8], max_w: u32, max_h: u32) -> Result<(Vec<u8>, u32, u32)> {
+    unsafe {
+        let wic: IWICImagingFactory = CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER).context("WIC factory")?;
+        let stream = wic.CreateStream()?;
+        stream.InitializeFromMemory(bytes)?;
+        let decoder = wic.CreateDecoderFromStream(&stream, std::ptr::null(), WICDecodeMetadataCacheOnDemand).context("not an image")?;
+        let frame = decoder.GetFrame(0)?;
+        let (mut w, mut h) = (0u32, 0u32);
+        frame.GetSize(&mut w, &mut h)?;
+        let (w, h) = (w.max(1), h.max(1));
+        let k = (max_w as f32 / w as f32).min(max_h as f32 / h as f32).min(2.0);
+        let (fw, fh) = (((w as f32 * k).round() as u32).max(1), ((h as f32 * k).round() as u32).max(1));
+        let scaler = wic.CreateBitmapScaler()?;
+        scaler.Initialize(&frame, fw, fh, WICBitmapInterpolationModeHighQualityCubic)?;
+        let converter = wic.CreateFormatConverter()?;
+        converter.Initialize(&scaler, &GUID_WICPixelFormat32bppRGBA, WICBitmapDitherTypeNone, None, 0.0, WICBitmapPaletteTypeMedianCut)?;
+        let mut rgba = vec![0u8; (fw * fh * 4) as usize];
+        converter.CopyPixels(std::ptr::null(), fw * 4, &mut rgba)?;
+        Ok((rgba, fw, fh))
+    }
+}
+
 /// The icon of the program at `exe`, `px` pixels square, as PNG (what the pill decodes).
 pub fn exe_icon_png(exe: &str, px: u32) -> Result<Vec<u8>> {
     use windows::core::PCWSTR;
@@ -108,15 +132,20 @@ fn encode_png(wic: &IWICImagingFactory, bitmap: &windows::Win32::Graphics::Imagi
 
 /// Fade the alpha outside a rounded square, anti-aliased over one pixel.
 fn mask_corners(rgba: &mut [u8], size: u32, radius: f32) {
-    let half = size as f32 / 2.0;
-    let r = radius.min(half);
-    for y in 0..size {
-        for x in 0..size {
-            let qx = ((x as f32 + 0.5) - half).abs() - (half - r);
-            let qy = ((y as f32 + 0.5) - half).abs() - (half - r);
+    round_corners(rgba, size, size, radius);
+}
+
+/// Fade the alpha outside a `w`×`h` rounded rectangle, anti-aliased over one pixel.
+pub fn round_corners(rgba: &mut [u8], w: u32, h: u32, radius: f32) {
+    let (half_w, half_h) = (w as f32 / 2.0, h as f32 / 2.0);
+    let r = radius.min(half_w).min(half_h);
+    for y in 0..h {
+        for x in 0..w {
+            let qx = ((x as f32 + 0.5) - half_w).abs() - (half_w - r);
+            let qy = ((y as f32 + 0.5) - half_h).abs() - (half_h - r);
             let sd = qx.max(0.0).hypot(qy.max(0.0)) + qx.max(qy).min(0.0) - r;
             let coverage = (0.5 - sd).clamp(0.0, 1.0);
-            let a = &mut rgba[((y * size + x) * 4 + 3) as usize];
+            let a = &mut rgba[((y * w + x) * 4 + 3) as usize];
             *a = (*a as f32 * coverage).round() as u8;
         }
     }

@@ -79,6 +79,77 @@ pub(crate) fn windows_by_class(class: &str) -> Vec<windows::Win32::Foundation::H
     found
 }
 
+/// How a flyout comes and goes, as Windows' own tray flyouts do: up from the taskbar and fading in
+/// over 200 ms (decelerating), back down and out over 120 ms (accelerating).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Flyout {
+    Open,
+    Close,
+}
+
+/// How far a flyout travels, in DIPs.
+pub(crate) const FLYOUT_SLIDE: f32 = 24.0;
+
+impl Flyout {
+    fn duration(self) -> std::time::Duration {
+        std::time::Duration::from_millis(match self {
+            Flyout::Open => 200,
+            Flyout::Close => 120,
+        })
+    }
+
+    /// At `t` (0..=1 of the way): how far from its resting place it is (1 = the whole slide
+    /// below it), and its opacity.
+    pub(crate) fn at(self, t: f32) -> (f32, f32) {
+        let t = t.clamp(0.0, 1.0);
+        match self {
+            // Ease-out cubic; the fade done in the first two thirds, as the shell's.
+            Flyout::Open => {
+                let e = 1.0 - (1.0 - t).powi(3);
+                (1.0 - e, (t * 1.5).min(1.0))
+            }
+            // Ease-in quad.
+            Flyout::Close => {
+                let e = t * t;
+                (e, 1.0 - e)
+            }
+        }
+    }
+
+    /// Run the motion, calling `frame(offset in px, alpha 0..=255)` once per compositor frame.
+    pub(crate) fn run(self, slide_px: f32, mut frame: impl FnMut(i32, u8)) {
+        use windows::Win32::Graphics::Dwm::DwmFlush;
+        if !animations_on() {
+            // Windows' "Animation effects" off: straight to where it ends.
+            let (offset, alpha) = self.at(1.0);
+            frame((offset * slide_px).round() as i32, (alpha * 255.0).round() as u8);
+            return;
+        }
+        let start = std::time::Instant::now();
+        let total = self.duration().as_secs_f32();
+        loop {
+            let t = start.elapsed().as_secs_f32() / total;
+            let (offset, alpha) = self.at(t);
+            frame((offset * slide_px).round() as i32, (alpha * 255.0).round() as u8);
+            if t >= 1.0 {
+                break;
+            }
+            // Paced on the compositor; a fixed step where it will not say.
+            if unsafe { DwmFlush() }.is_err() {
+                std::thread::sleep(std::time::Duration::from_millis(8));
+            }
+        }
+    }
+}
+
+/// Whether Windows animates (Settings, Accessibility, Visual effects, Animation effects).
+pub(crate) fn animations_on() -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::{SystemParametersInfoW, SPI_GETCLIENTAREAANIMATION, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS};
+    let mut on = windows::core::BOOL(1);
+    let asked = unsafe { SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, Some(&mut on as *mut _ as *mut _), SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0)) };
+    asked.is_err() || on.as_bool()
+}
+
 /// Register `class` (re-registering is a no-op) and create a `WS_POPUP` window of it. The class
 /// carries the arrow cursor because a captured window gets no `WM_SETCURSOR`.
 pub(crate) fn create_popup(
@@ -402,5 +473,21 @@ mod scroll_tests {
         assert!(source.touchpad(-27, 1_000), "a fine step is a touchpad");
         assert!(source.touchpad(-120, 1_200), "a whole notch mid-gesture stays the touchpad's");
         assert!(!source.touchpad(120, 2_000), "a notch well after is a wheel again");
+    }
+}
+
+#[cfg(test)]
+mod flyout_tests {
+    use super::Flyout;
+
+    #[test]
+    fn a_flyout_opens_from_below_into_place_and_closes_back_down() {
+        assert_eq!(Flyout::Open.at(0.0), (1.0, 0.0));
+        assert_eq!(Flyout::Open.at(1.0), (0.0, 1.0));
+        assert_eq!(Flyout::Close.at(0.0), (0.0, 1.0));
+        assert_eq!(Flyout::Close.at(1.0), (1.0, 0.0));
+        // Decelerating in: most of the way there by half time, and opaque before the end.
+        let (offset, alpha) = Flyout::Open.at(0.5);
+        assert!(offset < 0.2 && alpha == 0.75);
     }
 }

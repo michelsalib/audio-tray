@@ -1,8 +1,9 @@
 //! What audio-tray and its TAP (inside `explorer.exe`) must agree on. The exe and DLL can be
 //! different builds (RELEASING.md), so values are never renumbered, only added.
 //!
-//! Message ids share the app's receiver window with app-internal ones: `WM_APP + 1..=19` and
-//! `+ 30..=39` are the app's own (audio and tray), `+ 20..=29` and `+ 40..` are this crate's.
+//! Message ids share the app's receiver window with app-internal ones: `WM_APP + 1..=19`,
+//! `+ 30..=39` and `+ 41..=49` are the app's own (audio, tray, calendar); `+ 20..=29`, `+ 40` and
+//! `+ 50..` are this crate's.
 
 /// `WM_APP`, spelled out so this crate needs no Windows bindings.
 const WM_APP: u32 = 0x8000;
@@ -43,6 +44,9 @@ pub const WM_TAP_MUSIC_CHANGED: u32 = WM_APP + 29;
 /// TAP → app: which parts of the taskbar integration are not working (`wParam`, `STATUS_*` bits;
 /// 0 = all well). Posted when it changes, after a start-up grace period.
 pub const WM_TASKBAR_STATUS: u32 = WM_APP + 40;
+/// TAP → app: the pointer is over the taskbar clock (`wParam` 1) or has left it (0), while the
+/// calendar replaces the shell's. The app's mouse hook then takes the clock's left clicks.
+pub const WM_TASKBAR_CLOCK_HOVER: u32 = WM_APP + 50;
 
 /// Our buttons are not on the taskbar (the notification icon was not found or not decorated).
 pub const STATUS_NO_STRIP: usize = 1 << 0;
@@ -60,6 +64,8 @@ pub const RESTYLE_RECORDING: usize = 1 << 25;
 pub const ACTION_CYCLE_OUTPUT: usize = 1;
 pub const ACTION_CYCLE_INPUT: usize = 2;
 pub const ACTION_OPEN_PANEL: usize = 3;
+/// A click on the taskbar clock, when the calendar replaces the shell's (init data `clock=1`).
+pub const ACTION_OPEN_CALENDAR: usize = 4;
 pub const ACTION_MUSIC_PREVIOUS: usize = 10;
 pub const ACTION_MUSIC_PLAY_PAUSE: usize = 11;
 pub const ACTION_MUSIC_NEXT: usize = 12;
@@ -72,6 +78,12 @@ pub const FLOW_INPUT: usize = 1;
 pub const HANDOVER_MAGIC: usize = 0x4154_4831;
 pub const HANDOVER_ACCEPTED: isize = 1;
 pub const HANDOVER_DECLINED: isize = 2;
+/// App → TAP `WM_COPYDATA` tag ("ATC1"): how the clock reads, as init-data pairs: `time` and
+/// `date` (`GetTimeFormatEx`/`GetDateFormatEx` patterns, empty for the locale's, `date=-` to hide
+/// it), `oneline`, `top` (text after the time), `badge` (the unread count) and `badge_image`,
+/// `badge_width`, `badge_scale` (the app-drawn badge PNG, its width in DIPs, its pixels per DIP).
+/// `release=1` alone hands the clock back to the shell (the TAP undoes its changes and stops).
+pub const CLOCK_MAGIC: usize = 0x4154_4331;
 
 /// Plane-15 PUA markers (Segoe Fluent owns the BMP PUA) for earbuds the TAP draws as vectors.
 pub const GLYPH_WIRELESS_EARBUDS: char = '\u{F0001}';
@@ -83,7 +95,7 @@ pub const MUSIC_STATE_FILE: &str = "audio-tray-music.txt";
 /// Version of the app ↔ TAP contract (init-data keys, messages, state file). A loaded TAP adopts a
 /// new app on a handover when this matches and the DLL file is the same, instead of requiring the
 /// identical app version. Bump it on any change an older TAP or app would misread.
-pub const PROTOCOL: u32 = 3;
+pub const PROTOCOL: u32 = 4;
 
 /// Encodes init data: `key=value` pairs joined by `;`. Values escape `%`, `;` and `=` as `%25`,
 /// `%3B` and `%3D`, so a tile name or install path containing them survives; anything else is
@@ -180,7 +192,7 @@ mod tests {
         let ids = [
             WM_TASKBAR_ACTION, WM_TAP_REVERT, WM_TASKBAR_RESTARTED, WM_TAP_RESTYLE, WM_TASKBAR_SCROLL,
             WM_MUSIC_PROGRESS, WM_TAP_WIRE_TRANSPORT, WM_TAP_REPIN, WM_TAP_PROGRESS_WINDOW,
-            WM_TAP_MUSIC_CHANGED, WM_TASKBAR_STATUS,
+            WM_TAP_MUSIC_CHANGED, WM_TASKBAR_STATUS, WM_TASKBAR_CLOCK_HOVER,
         ];
         for (i, a) in ids.iter().enumerate() {
             assert!(ids[i + 1..].iter().all(|b| a != b));

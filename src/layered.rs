@@ -14,6 +14,21 @@ use windows::Win32::UI::WindowsAndMessaging::{UpdateLayeredWindow, ULW_ALPHA};
 /// Push a straight-alpha RGBA buffer (`w`×`h`) to a layered window at `(x, y)`, scaled by a
 /// global `alpha`. This also moves and resizes the window.
 pub(crate) fn present(hwnd: HWND, src_buf: &[u8], w: i32, h: i32, x: i32, y: i32, alpha: u8) {
+    present_with(hwnd, w, h, x, y, alpha, |dst| {
+        // straight-alpha RGBA -> premultiplied BGRA
+        for (d, s) in dst.as_chunks_mut::<4>().0.iter_mut().zip(src_buf.as_chunks::<4>().0) {
+            let a = s[3] as u32;
+            d[0] = ((s[2] as u32 * a) / 255) as u8;
+            d[1] = ((s[1] as u32 * a) / 255) as u8;
+            d[2] = ((s[0] as u32 * a) / 255) as u8;
+            d[3] = a as u8;
+        }
+    });
+}
+
+/// Put `w`×`h` pixels on the layered window at `(x, y)`: `fill` writes them, premultiplied BGRA
+/// (Direct2D's), into the bitmap.
+fn present_with(hwnd: HWND, w: i32, h: i32, x: i32, y: i32, alpha: u8, fill: impl FnOnce(&mut [u8])) {
     unsafe {
         let screen = GetDC(None);
         let mem = CreateCompatibleDC(Some(screen));
@@ -38,19 +53,8 @@ pub(crate) fn present(hwnd: HWND, src_buf: &[u8], w: i32, h: i32, x: i32, y: i32
             return;
         };
 
-        // straight-alpha RGBA -> premultiplied BGRA
         let px = (w * h) as usize;
-        let dst = std::slice::from_raw_parts_mut(bits as *mut u8, px * 4);
-        for i in 0..px {
-            let r = src_buf[i * 4] as u32;
-            let g = src_buf[i * 4 + 1] as u32;
-            let b = src_buf[i * 4 + 2] as u32;
-            let a = src_buf[i * 4 + 3] as u32;
-            dst[i * 4] = ((b * a) / 255) as u8;
-            dst[i * 4 + 1] = ((g * a) / 255) as u8;
-            dst[i * 4 + 2] = ((r * a) / 255) as u8;
-            dst[i * 4 + 3] = a as u8;
-        }
+        fill(std::slice::from_raw_parts_mut(bits as *mut u8, px * 4));
 
         let old = SelectObject(mem, HGDIOBJ(hbm.0));
         let src = POINT { x: 0, y: 0 };
@@ -79,6 +83,101 @@ pub(crate) fn present(hwnd: HWND, src_buf: &[u8], w: i32, h: i32, x: i32, y: i32
         let _ = DeleteDC(mem);
         ReleaseDC(None, screen);
     }
+}
+
+/// A layered window's pixels, kept between frames: the bitmap is made once per size, a frame is
+/// written into it, and a window only moved or faded is not sent its pixels again.
+pub(crate) struct Canvas {
+    dc: windows::Win32::Graphics::Gdi::HDC,
+    bitmap: HGDIOBJ,
+    old: HGDIOBJ,
+    bits: *mut u8,
+    size: (i32, i32),
+}
+
+impl Canvas {
+    pub(crate) const fn new() -> Self {
+        Canvas { dc: windows::Win32::Graphics::Gdi::HDC(std::ptr::null_mut()), bitmap: HGDIOBJ(std::ptr::null_mut()), old: HGDIOBJ(std::ptr::null_mut()), bits: std::ptr::null_mut(), size: (0, 0) }
+    }
+
+    /// The pixels last written (premultiplied BGRA, `size` wide and high, row after row).
+    pub(crate) fn pixels(&self) -> &[u8] {
+        if self.bits.is_null() {
+            return &[];
+        }
+        unsafe { std::slice::from_raw_parts(self.bits, (self.size.0 * self.size.1) as usize * 4) }
+    }
+
+    pub(crate) fn size(&self) -> (i32, i32) {
+        self.size
+    }
+
+    fn free(&mut self) {
+        unsafe {
+            if !self.dc.is_invalid() {
+                SelectObject(self.dc, self.old);
+                let _ = DeleteObject(self.bitmap);
+                let _ = DeleteDC(self.dc);
+            }
+        }
+        // Field by field: assigning a whole Canvas would drop this one, and free it again.
+        self.dc = windows::Win32::Graphics::Gdi::HDC(std::ptr::null_mut());
+        self.bitmap = HGDIOBJ(std::ptr::null_mut());
+        self.old = HGDIOBJ(std::ptr::null_mut());
+        self.bits = std::ptr::null_mut();
+        self.size = (0, 0);
+    }
+
+    /// `w`×`h` pixels, written by `fill`, on `hwnd` at `(x, y)` faded to `alpha`.
+    pub(crate) fn present(&mut self, hwnd: HWND, (w, h): (i32, i32), (x, y): (i32, i32), alpha: u8, fill: impl FnOnce(&mut [u8])) {
+        if w <= 0 || h <= 0 {
+            return;
+        }
+        unsafe {
+            if self.size != (w, h) || self.dc.is_invalid() {
+                self.free();
+                let dc = CreateCompatibleDC(None);
+                let bmi = BITMAPINFO {
+                    bmiHeader: BITMAPINFOHEADER {
+                        biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                        biWidth: w,
+                        biHeight: -h, // top-down
+                        biPlanes: 1,
+                        biBitCount: 32,
+                        biCompression: BI_RGB.0,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                };
+                let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
+                let Ok(hbm) = CreateDIBSection(Some(dc), &bmi, DIB_RGB_COLORS, &mut bits, None, 0) else {
+                    let _ = DeleteDC(dc);
+                    return;
+                };
+                let old = SelectObject(dc, HGDIOBJ(hbm.0));
+                (self.dc, self.bitmap, self.old, self.bits, self.size) = (dc, HGDIOBJ(hbm.0), old, bits.cast(), (w, h));
+            }
+            fill(std::slice::from_raw_parts_mut(self.bits, (w * h) as usize * 4));
+            let src = POINT { x: 0, y: 0 };
+            let size = SIZE { cx: w, cy: h };
+            let _ = UpdateLayeredWindow(hwnd, None, Some(&POINT { x, y }), Some(&size), Some(self.dc), Some(&src), COLORREF(0), Some(&blend(alpha)), ULW_ALPHA);
+        }
+    }
+
+    /// Move `hwnd` to `(x, y)` and fade it to `alpha`, its pixels as they are.
+    pub(crate) fn shift(hwnd: HWND, x: i32, y: i32, alpha: u8) {
+        let _ = unsafe { UpdateLayeredWindow(hwnd, None, Some(&POINT { x, y }), None, None, None, COLORREF(0), Some(&blend(alpha)), ULW_ALPHA) };
+    }
+}
+
+impl Drop for Canvas {
+    fn drop(&mut self) {
+        self.free();
+    }
+}
+
+fn blend(alpha: u8) -> BLENDFUNCTION {
+    BLENDFUNCTION { BlendOp: AC_SRC_OVER as u8, BlendFlags: 0, SourceConstantAlpha: alpha, AlphaFormat: AC_SRC_ALPHA as u8 }
 }
 
 /// Corner radii DWM offers for a panel: `ROUND` for the flyout, `ROUNDSMALL` for the
@@ -113,7 +212,7 @@ pub(crate) unsafe fn style_panel(hwnd: HWND, corner: i32) {
 ///
 /// # Safety
 /// `hwnd` must be a live window this process owns.
-unsafe fn enable_acrylic(hwnd: HWND) {
+pub(crate) unsafe fn enable_acrylic(hwnd: HWND) {
     #[repr(C)]
     struct AccentPolicy {
         accent_state: u32,

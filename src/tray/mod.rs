@@ -97,6 +97,13 @@ const WM_ICON_RECT_CHECK: u32 = WM_APP + 41;
 
 /// The receiver window's timer for the next timed notice (`osd::TIMER_ID` is the other one).
 const NOTICE_TIMER: usize = 0x4E54;
+/// The receiver window's timer for the calendar's next moment ([`crate::calendar::schedule`]).
+const CALENDAR_TIMER: usize = 0x4341;
+/// The receiver window's timer for drawing the closed panel ahead ([`crate::calendar::prewarm`]),
+/// once a burst of notifications has settled.
+const PREWARM_TIMER: usize = 0x5057;
+/// How long a burst has to settle.
+const PREWARM_AFTER_MS: u32 = 2000;
 
 /// Re-registration checks after a restart, and the first gap (doubling): ~1 min in all.
 const ICON_CHECKS: usize = 6;
@@ -279,7 +286,7 @@ pub fn run(backend: WasapiBackend, settings: bool) -> Result<()> {
     let icon = build_tray(&backend, &config)?;
     TrayIconEvent::set_event_handler(Some(on_tray_event));
     let _notifications = notify::register()?;
-    let _wheel = hook::WheelHook::spawn();
+    let _wheel = hook::Hooks::spawn();
 
     let devices = backend.enumerate_flow(Flow::Output).map(|d| d.len()).unwrap_or(0);
     let gestures = if taskbar::buttons_up() {
@@ -328,6 +335,16 @@ pub fn run(backend: WasapiBackend, settings: bool) -> Result<()> {
         })
     });
     with_tray(Tray::refresh);
+    crate::calendar::focus::recover();
+    if with_tray(|tray| tray.config.calendar.enabled).unwrap_or(false) {
+        crate::calendar::notifications::start();
+        // The first open finds its fonts loaded and its pictures decoded.
+        prewarm_later(10_000);
+    }
+    crate::calendar::set_shortcut(with_tray(|tray| tray.config.calendar.enabled && tray.config.calendar.shortcut).unwrap_or(false));
+    hook::set_clock_taken(with_tray(|tray| tray.config.calendar.enabled).unwrap_or(false));
+    hook::want_keys(crate::calendar::SHORTCUT.load(std::sync::atomic::Ordering::SeqCst));
+    reschedule();
     if settings {
         post(crate::settings::WM_OPEN_SETTINGS, 0, 0);
     }
@@ -337,6 +354,9 @@ pub fn run(backend: WasapiBackend, settings: bool) -> Result<()> {
     crate::wait::run();
     crate::integrations::stop();
 
+    crate::calendar::close();
+    // Do not disturb Audio Tray set ends with it.
+    crate::calendar::focus::release();
     crate::settings::destroy();
     crate::pill::destroy();
     // The progress bar sits on *another app's* button, so it has to come off here, while this
@@ -357,6 +377,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
     // A plain store, read when the flyout opens: nothing to queue.
     if msg == tap_proto::WM_TASKBAR_STATUS {
         taskbar::set_status(wparam.0);
+        return LRESULT(0);
+    }
+    // A plain store too, read by the mouse hook on its own thread.
+    if msg == tap_proto::WM_TASKBAR_CLOCK_HOVER {
+        hook::set_clock_hover(wparam.0 != 0);
         return LRESULT(0);
     }
     if !is_ours(msg, wparam.0) {
@@ -389,7 +414,8 @@ fn is_ours(msg: u32, wparam: usize) -> bool {
             | crate::pill::WM_PILL_ACTION
             | crate::settings::WM_SETTINGS
             | crate::settings::WM_OPEN_SETTINGS
-    ) || (msg == WM_TIMER && (wparam == crate::osd::TIMER_ID || wparam == NOTICE_TIMER))
+            | crate::calendar::WM_CALENDAR
+    ) || (msg == WM_TIMER && (wparam == crate::osd::TIMER_ID || wparam == NOTICE_TIMER || wparam == CALENDAR_TIMER || wparam == PREWARM_TIMER))
 }
 
 /// Handle queued messages, oldest first, unless a handler further up the stack already is.
@@ -443,7 +469,36 @@ fn handle(msg: Queued) {
                 with_tray(Tray::adopt_settings);
             }
         },
-        crate::settings::WM_OPEN_SETTINGS => open_settings(),
+        crate::settings::WM_OPEN_SETTINGS => {
+            open_settings();
+            if msg.wparam == crate::settings::OPEN_CALENDAR {
+                crate::settings::show_calendar();
+            }
+        }
+        crate::calendar::WM_CALENDAR if msg.wparam == crate::calendar::CLOSE => {
+            let (x, y) = (msg.lparam as u16 as i16, (msg.lparam >> 16) as u16 as i16);
+            println!("calendar: closed by a click outside it, at {x},{y}");
+            crate::calendar::close()
+        }
+        crate::calendar::WM_CALENDAR if msg.wparam == crate::calendar::NOTIFICATIONS => {
+            crate::calendar::notifications_changed();
+            // New pictures decoded before the panel opens, once the burst has settled.
+            prewarm_later(PREWARM_AFTER_MS);
+            reschedule();
+        }
+        crate::calendar::WM_CALENDAR => {
+            crate::calendar::changed();
+            reschedule();
+        }
+        WM_TIMER if msg.wparam == CALENDAR_TIMER => reschedule(),
+        WM_TIMER if msg.wparam == PREWARM_TIMER => {
+            if let Some(window) = taskbar::receiver() {
+                let _ = unsafe { KillTimer(Some(window), PREWARM_TIMER) };
+            }
+            if let Some(config) = with_tray(|tray| tray.config.clone()).filter(|c| c.calendar.enabled) {
+                crate::calendar::prewarm(&config);
+            }
+        }
         WM_TIMER if msg.wparam == NOTICE_TIMER => {
             with_tray(Tray::expire_notices);
         }
@@ -489,6 +544,8 @@ fn handle(msg: Queued) {
         }
         WM_TRAY_CLICK => on_tray_click(msg.wparam, msg.lparam),
         WM_TASKBAR_RESTARTED => {
+            // The clock the TAP said the pointer was over is gone with the old shell.
+            hook::set_clock_hover(false);
             with_tray(Tray::taskbar_restarted);
         }
         _ => {}
@@ -511,6 +568,31 @@ fn click_allowed(what: &dyn std::fmt::Debug) -> bool {
 
 /// A gesture on the injected strip, relayed by the TAP.
 fn on_action(action: Action) {
+    if action == Action::OpenCalendar {
+        // One click can arrive twice (the mouse hook and the TAP's tap handler, for touch or pen):
+        // opening toggles, so the second would close what the first opened.
+        let now = std::time::Instant::now();
+        let echo = LAST_OPEN.with(|last| last.replace(Some(now))).is_some_and(|at| now - at < std::time::Duration::from_millis(300));
+        if echo {
+            return;
+        }
+        // The clock's click never reaches the audio panel (the hook takes it, or the shell's own
+        // calendar would open), so it is not the click that closed it: the panel gives way and the
+        // calendar opens once it has ([`open_flyout`]).
+        if with_tray(|tray| tray.flyout_open).unwrap_or(false) {
+            CALENDAR_NEXT.with(|next| next.set(true));
+            // The panel closes on losing the capture (same thread).
+            let _ = unsafe { windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture() };
+            return;
+        }
+        if let Some(config) = with_tray(|tray| {
+            tray.osd.hide();
+            tray.config.clone()
+        }) {
+            crate::calendar::open(&config);
+        }
+        return;
+    }
     if !click_allowed(&action) {
         return;
     }
@@ -585,6 +667,8 @@ fn unpack_point(packed: isize) -> (i32, i32) {
 /// microphone dot, scrolls and the progress bar stay live; refreshes wait for it (see
 /// [`waits_for_flyout`]) and clicks are dropped ([`click_allowed`]).
 fn open_flyout(anchor: Option<flyout::Anchor>) {
+    // One flyout at a time: the calendar goes before the panel takes the mouse.
+    crate::calendar::close();
     let opened = with_tray(|tray| {
         if tray.flyout_open {
             return None;
@@ -614,9 +698,43 @@ fn open_flyout(anchor: Option<flyout::Anchor>) {
     });
     if outcome.quit {
         quit();
+        return;
     }
     if outcome.settings {
         open_settings();
+    }
+    // The clock was clicked while the panel was open: the calendar it asked for.
+    if CALENDAR_NEXT.with(|next| next.replace(false)) {
+        if let Some(config) = with_tray(|tray| tray.config.clone()) {
+            crate::calendar::open(&config);
+        }
+    }
+}
+
+thread_local! {
+    /// The calendar is to open as soon as the audio panel has closed.
+    static CALENDAR_NEXT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// When the clock last asked for the calendar, to drop the same click's echo.
+    static LAST_OPEN: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) };
+}
+
+/// Have the calendar look again now (the focus timer started, a setting changed).
+/// Draw the closed panel ahead in `ms` (a call meanwhile pushes it back).
+fn prewarm_later(ms: u32) {
+    if let Some(window) = taskbar::receiver() {
+        unsafe { SetTimer(Some(window), PREWARM_TIMER, ms, None) };
+    }
+}
+
+pub(crate) fn wake_calendar() {
+    post(WM_TIMER, CALENDAR_TIMER, 0);
+}
+
+/// Let the calendar do what is due, and set its timer for the next moment.
+fn reschedule() {
+    let Some(delay) = with_tray(|tray| crate::calendar::schedule::tick(&tray.config)) else { return };
+    if let Some(window) = taskbar::receiver() {
+        unsafe { SetTimer(Some(window), CALENDAR_TIMER, delay.as_millis().min(u32::MAX as u128) as u32, None) };
     }
 }
 
@@ -687,10 +805,24 @@ impl Tray {
         // The strip and the tile need a fresh injection.
         let drawn = |c: &Config| {
             let s = &c.strip;
-            (s.enabled, s.next_to_wifi, s.hide_windows_volume, s.hide_windows_mic, s.hide_windows_language, c.music.enabled, c.music.tile_style)
+            (s.enabled, s.next_to_wifi, s.hide_windows_volume, s.hide_windows_mic, s.hide_windows_language, c.music.enabled, c.music.tile_style, c.calendar.enabled, c.injects())
         };
         if drawn(&before) != drawn(c) {
             self.apply_taskbar();
+        }
+        if before.calendar.links != self.config.calendar.links {
+            crate::calendar::links_changed();
+        }
+        if self.config.calendar.enabled {
+            crate::calendar::notifications::start();
+        } else {
+            crate::calendar::notifications::stop();
+        }
+        crate::calendar::set_shortcut(self.config.calendar.enabled && self.config.calendar.shortcut);
+        hook::set_clock_taken(self.config.calendar.enabled);
+        hook::want_keys(self.config.calendar.enabled && self.config.calendar.shortcut);
+        if before.calendar != self.config.calendar || before.clock != self.config.clock {
+            post(WM_TIMER, CALENDAR_TIMER, 0);
         }
         if before.icons != self.config.icons {
             self.refresh();
@@ -728,9 +860,17 @@ impl Tray {
     /// progress bar and state file follow the tile.
     fn apply_taskbar(&mut self) {
         taskbar::revert(0);
+        // The TAP that said the pointer was over the clock goes: its word with it.
+        hook::set_clock_hover(false);
         self.strip = None;
+        crate::calendar::schedule::forget_clock();
         if self.config.injects() {
             taskbar::apply_at_startup(Current::read(&self.backend, &self.config).strip_icons());
+        }
+        // The revert dropped the clock's text: say it again once the TAP has taken the revert
+        // (posted, so a text sent at once would be taken first and then wiped by it).
+        if let Some(window) = taskbar::receiver() {
+            unsafe { SetTimer(Some(window), CALENDAR_TIMER, 1500, None) };
         }
         self.music = None;
         self.music = crate::music::spawn(&self.config.music, self.config.tile_shown());
@@ -850,6 +990,11 @@ impl Tray {
     /// The hub state changed: bring the surfaces in line, and arm the next notice's expiry.
     fn hub_changed(&mut self) {
         HUB_GENERATION.fetch_add(1, Ordering::SeqCst);
+        // A call starting or ending can turn Do not disturb on or off.
+        let in_call = self.hub.call().is_some() || self.hub.mic_users.iter().any(|u| crate::hub::names::is_meeting_app(&crate::hub::names::app_name(u)));
+        if crate::calendar::schedule::set_in_call(in_call) {
+            post(WM_TIMER, CALENDAR_TIMER, 0);
+        }
         let (_, next) = self.hub.expire(Instant::now());
         crate::pill::update(&self.hub);
         crate::settings::follow(&self.hub);
@@ -937,6 +1082,9 @@ impl Tray {
             Action::Acknowledge(notice) => {
                 self.hub.acknowledge(&notice);
                 self.hub_changed();
+            }
+            Action::Open(url) => {
+                crate::win::shell_open(&url, None);
             }
             Action::DisplaysChanged => {
                 if self.config.pill.recall(&crate::win::displays()) {
@@ -1098,6 +1246,8 @@ impl Tray {
     /// Explorer restarted: the strip, the progress bar and the thumbnail toolbar died with it.
     fn taskbar_restarted(&mut self) {
         self.strip = None;
+        crate::calendar::schedule::forget_clock();
+        post(WM_TIMER, CALENDAR_TIMER, 0);
         if self.config.injects() {
             taskbar::apply_at_restart(Current::read(&self.backend, &self.config).strip_icons());
         }
@@ -1176,7 +1326,7 @@ impl Tray {
         let flow = match action {
             Action::CycleOutput => Flow::Output,
             Action::CycleInput => Flow::Input,
-            Action::OpenPanel => return Ok(()), // handled by `on_action`
+            Action::OpenPanel | Action::OpenCalendar => return Ok(()), // handled by `on_action`
             // Handed to the feed thread and not awaited: a slow media session must not stall this
             // thread. The strip catches up on the next poll.
             Action::MusicPrevious | Action::MusicPlayPause | Action::MusicNext => {
@@ -1484,11 +1634,14 @@ mod tests {
             crate::pill::WM_PILL_ACTION,
             crate::settings::WM_SETTINGS,
             crate::settings::WM_OPEN_SETTINGS,
+            WM_ICON_RECT_CHECK,
+            crate::calendar::WM_CALENDAR,
             tap_proto::WM_TASKBAR_ACTION,
             tap_proto::WM_TASKBAR_RESTARTED,
             tap_proto::WM_TASKBAR_SCROLL,
             tap_proto::WM_MUSIC_PROGRESS,
             tap_proto::WM_TASKBAR_STATUS,
+            tap_proto::WM_TASKBAR_CLOCK_HOVER,
         ];
         for (i, a) in ids.iter().enumerate() {
             assert!(ids[i + 1..].iter().all(|b| a != b), "0x{a:x} is used twice");

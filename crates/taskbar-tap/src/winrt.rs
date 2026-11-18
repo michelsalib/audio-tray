@@ -39,14 +39,42 @@ pub unsafe trait IDependencyObject: IUnknown {
     pub fn ClearValue(&self, dp: *mut c_void) -> HRESULT;
     pub fn ReadLocalValue(&self, dp: *mut c_void, value: *mut *mut c_void) -> HRESULT;
     pub fn GetAnimationBaseValue(&self, dp: *mut c_void, value: *mut *mut c_void) -> HRESULT;
-    pub fn RegisterPropertyChangedCallback(
-        &self,
-        dp: *mut c_void,
-        callback: *mut c_void,
-        token: *mut i64,
-    ) -> HRESULT;
-    pub fn UnregisterPropertyChangedCallback(&self, dp: *mut c_void, token: i64) -> HRESULT;
     pub fn get_Dispatcher(&self, value: *mut *mut c_void) -> HRESULT;
+}
+
+/// `Windows.UI.Xaml.IDependencyObject2`: a property's changes, followed.
+#[interface("29fed85d-3d22-43a1-add0-17027c08b212")]
+pub unsafe trait IDependencyObject2: IUnknown {
+    pub fn GetIids(&self, count: *mut u32, iids: *mut *mut windows_core::GUID) -> HRESULT;
+    pub fn GetRuntimeClassName(&self, name: *mut *mut c_void) -> HRESULT;
+    pub fn GetTrustLevel(&self, level: *mut i32) -> HRESULT;
+    pub fn RegisterPropertyChangedCallback(&self, dp: *mut c_void, callback: *mut c_void, token: *mut i64) -> HRESULT;
+    pub fn UnregisterPropertyChangedCallback(&self, dp: *mut c_void, token: i64) -> HRESULT;
+}
+
+/// `Windows.UI.Xaml.DependencyPropertyChangedCallback`.
+#[interface("45883d16-27bf-4bc1-ac26-94c1601f3a49")]
+pub unsafe trait IDependencyPropertyChangedCallback: IUnknown {
+    pub fn Invoke(&self, sender: *mut c_void, dp: *mut c_void) -> HRESULT;
+}
+
+/// `Windows.UI.Xaml.Controls.ITextBlockStatics`: `TextProperty` is its eleventh property.
+#[interface("193ec042-a847-4552-b4e8-db36655b840a")]
+pub unsafe trait ITextBlockStatics: IUnknown {
+    pub fn GetIids(&self, count: *mut u32, iids: *mut *mut windows_core::GUID) -> HRESULT;
+    pub fn GetRuntimeClassName(&self, name: *mut *mut c_void) -> HRESULT;
+    pub fn GetTrustLevel(&self, level: *mut i32) -> HRESULT;
+    pub fn get_FontSizeProperty(&self, value: *mut *mut c_void) -> HRESULT;
+    pub fn get_FontFamilyProperty(&self, value: *mut *mut c_void) -> HRESULT;
+    pub fn get_FontWeightProperty(&self, value: *mut *mut c_void) -> HRESULT;
+    pub fn get_FontStyleProperty(&self, value: *mut *mut c_void) -> HRESULT;
+    pub fn get_FontStretchProperty(&self, value: *mut *mut c_void) -> HRESULT;
+    pub fn get_CharacterSpacingProperty(&self, value: *mut *mut c_void) -> HRESULT;
+    pub fn get_ForegroundProperty(&self, value: *mut *mut c_void) -> HRESULT;
+    pub fn get_TextWrappingProperty(&self, value: *mut *mut c_void) -> HRESULT;
+    pub fn get_TextTrimmingProperty(&self, value: *mut *mut c_void) -> HRESULT;
+    pub fn get_TextAlignmentProperty(&self, value: *mut *mut c_void) -> HRESULT;
+    pub fn get_TextProperty(&self, value: *mut *mut c_void) -> HRESULT;
 }
 
 /// `Windows.UI.Xaml.Media.IVisualTreeHelperStatics` (the `Find*` slots are unused).
@@ -96,7 +124,7 @@ pub unsafe trait IVisualTreeHelperStatics: IUnknown {
 pub const VISIBILITY_COLLAPSED: i32 = 1;
 
 /// `Windows.UI.Xaml.IUIElement`. Slot numbers follow the header: `get_Opacity` 9,
-/// `get_Visibility` 21, the pointer and tap events 57..80.
+/// `get_IsHitTestVisible` 19, `get_Visibility` 21, the pointer and tap events 57..80.
 #[interface("676d0be9-b65c-41c6-ba40-58cf87f201c1")]
 pub unsafe trait IUIElement: IUnknown {
     pub fn GetIids(&self, count: *mut u32, iids: *mut *mut windows_core::GUID) -> HRESULT;
@@ -115,8 +143,8 @@ pub unsafe trait IUIElement: IUnknown {
     pub fn _reserved16(&self) -> HRESULT;
     pub fn _reserved17(&self) -> HRESULT;
     pub fn _reserved18(&self) -> HRESULT;
-    pub fn _reserved19(&self) -> HRESULT;
-    pub fn _reserved20(&self) -> HRESULT;
+    pub fn get_IsHitTestVisible(&self, value: *mut u8) -> HRESULT;
+    pub fn put_IsHitTestVisible(&self, value: u8) -> HRESULT;
     pub fn get_Visibility(&self, value: *mut i32) -> HRESULT;
     pub fn put_Visibility(&self, value: i32) -> HRESULT;
     // Slots 23..56 — RenderSize, transitions, drag/drop and friends.
@@ -488,4 +516,31 @@ pub unsafe trait ITappedRoutedEventArgs: IUnknown {
     pub fn get_Handled(&self, value: *mut u8) -> HRESULT;
     pub fn put_Handled(&self, value: u8) -> HRESULT;
     pub fn GetPosition(&self, relative_to: *mut c_void, value: *mut c_void) -> HRESULT;
+}
+/// `Windows.UI.Xaml.Controls.IPanel`. `Background` is how the clock's badge is drawn: a brush is
+/// a property value, which the shell accepts where it refuses new children.
+#[interface("a50a4bbd-8361-469c-90da-e9a40c7474df")]
+pub unsafe trait IPanel: IUnknown {
+    pub fn GetIids(&self, count: *mut u32, iids: *mut *mut windows_core::GUID) -> HRESULT;
+    pub fn GetRuntimeClassName(&self, name: *mut *mut c_void) -> HRESULT;
+    pub fn GetTrustLevel(&self, level: *mut i32) -> HRESULT;
+    pub fn get_Children(&self, value: *mut *mut c_void) -> HRESULT;
+    pub fn get_Background(&self, value: *mut *mut c_void) -> HRESULT;
+    pub fn put_Background(&self, value: *mut c_void) -> HRESULT;
+}
+
+/// `Windows.UI.Xaml.Controls.IStackPanel2`: its `Padding` makes room for the badge.
+#[interface("36f23359-040e-48f7-9a98-f2664591959c")]
+pub unsafe trait IStackPanel2: IUnknown {
+    pub fn GetIids(&self, count: *mut u32, iids: *mut *mut windows_core::GUID) -> HRESULT;
+    pub fn GetRuntimeClassName(&self, name: *mut *mut c_void) -> HRESULT;
+    pub fn GetTrustLevel(&self, level: *mut i32) -> HRESULT;
+    pub fn get_BorderBrush(&self, value: *mut *mut c_void) -> HRESULT;
+    pub fn put_BorderBrush(&self, value: *mut c_void) -> HRESULT;
+    pub fn get_BorderThickness(&self, value: *mut Thickness) -> HRESULT;
+    pub fn put_BorderThickness(&self, value: Thickness) -> HRESULT;
+    pub fn _reserved10(&self) -> HRESULT;
+    pub fn _reserved11(&self) -> HRESULT;
+    pub fn get_Padding(&self, value: *mut Thickness) -> HRESULT;
+    pub fn put_Padding(&self, value: Thickness) -> HRESULT;
 }

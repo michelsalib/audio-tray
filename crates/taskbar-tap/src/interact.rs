@@ -345,3 +345,84 @@ pub unsafe fn attach_music(
     let tap = target.add_Tapped(tapped.as_raw(), &mut tap_token);
     press == S_OK && tap == S_OK
 }
+
+/// A press on the taskbar clock, marked handled while the calendar is ours. That alone does not
+/// keep the shell's flyout shut (`NotificationCenterButton` opens it regardless: the app's mouse
+/// hook takes mouse clicks before Explorer sees them); it is kept for the log, and for touch and
+/// pen, which that hook never sees.
+#[implement(IPointerEventHandler)]
+struct ClockPress;
+
+impl IPointerEventHandler_Impl for ClockPress_Impl {
+    unsafe fn Invoke(&self, _sender: *mut c_void, args: *mut c_void) -> HRESULT {
+        guard("clock-press", || {
+            // Not deduped: every delivery must be suppressed.
+            let enabled = crate::clock::enabled();
+            let suppressed = enabled && suppress_pointer(args);
+            if crate::log::verbose() {
+                logf!("clock: press (ours {enabled}, handled {suppressed}; {})", crate::clock::why());
+            }
+        })
+    }
+}
+
+/// A completed click on the clock: open audio-tray's calendar.
+#[implement(ITappedEventHandler)]
+struct ClockTap;
+
+impl ITappedEventHandler_Impl for ClockTap_Impl {
+    unsafe fn Invoke(&self, _sender: *mut c_void, args: *mut c_void) -> HRESULT {
+        guard("clock-tap", || {
+            if !crate::clock::enabled() {
+                logf!("clock: tap left to the shell ({})", crate::clock::why());
+                return;
+            }
+            suppress_tap(args);
+            if already_seen(args) {
+                return;
+            }
+            logf!("clock: tap — opening the calendar");
+            crate::ipc::send_calendar();
+        })
+    }
+}
+
+/// Wire the clock's button: press, tap, and the pointer entering and leaving it (the app's mouse
+/// hook takes clicks only while the pointer is over the clock). Never detached, so the tokens go.
+///
+/// # Safety
+/// XAML UI thread only.
+pub unsafe fn attach_clock(diagnostics: &IXamlDiagnostics, element: InstanceHandle) -> bool {
+    let Some(target) = ui_element(diagnostics, element) else {
+        return false;
+    };
+    let mut token = 0i64;
+    let pressed: IPointerEventHandler = ClockPress.into();
+    let press = target.add_PointerPressed(pressed.as_raw(), &mut token);
+    let tapped: ITappedEventHandler = ClockTap.into();
+    let tap = target.add_Tapped(tapped.as_raw(), &mut token);
+    let entered: IPointerEventHandler = ClockHover(true).into();
+    let enter = target.add_PointerEntered(entered.as_raw(), &mut token);
+    let exited: IPointerEventHandler = ClockHover(false).into();
+    let exit = target.add_PointerExited(exited.as_raw(), &mut token);
+    press == S_OK && tap == S_OK && enter == S_OK && exit == S_OK
+}
+
+/// The pointer entering (`true`) or leaving the clock, told to the app: its mouse hook takes the
+/// clock's clicks before Explorer sees them (marking the press handled here does not stop
+/// `NotificationCenterButton`, which opens its flyout regardless).
+#[implement(IPointerEventHandler)]
+struct ClockHover(bool);
+
+impl IPointerEventHandler_Impl for ClockHover_Impl {
+    unsafe fn Invoke(&self, _sender: *mut c_void, _args: *mut c_void) -> HRESULT {
+        guard("clock-hover", || {
+            // Leaving is always told, so the app never keeps a stale "over the clock".
+            if self.0 && !crate::clock::enabled() {
+                return;
+            }
+            crate::ipc::send_clock_hover(self.0);
+            crate::clock::watch_closely();
+        })
+    }
+}

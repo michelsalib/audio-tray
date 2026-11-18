@@ -25,6 +25,7 @@ use windows::Win32::UI::HiDpi::{
 
 mod audio;
 mod batteries;
+mod calendar;
 mod canvas;
 mod config;
 #[cfg(feature = "dev")]

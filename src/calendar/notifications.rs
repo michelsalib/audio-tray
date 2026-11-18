@@ -157,6 +157,13 @@ fn ask(what: Ask) {
     let _ = unsafe { windows::Win32::System::Threading::SetEvent(windows::Win32::Foundation::HANDLE(event as *mut _)) };
 }
 
+/// Windows does not let Audio Tray read notifications (Settings, Privacy, Notifications).
+pub fn denied() -> bool {
+    DENIED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+static DENIED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// End the reader (the calendar was turned off): nothing wakes for notifications no one shows.
 pub fn stop() {
     ask(Ask::Stop);
@@ -232,9 +239,14 @@ fn run(wake: windows::Win32::Foundation::HANDLE) {
         let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_MULTITHREADED);
     }
     let listener = match UserNotificationListener::Current() {
-        Ok(listener) if listener.GetAccessStatus().ok() == Some(UserNotificationListenerAccessStatus::Allowed) => listener,
+        Ok(listener) if listener.GetAccessStatus().ok() == Some(UserNotificationListenerAccessStatus::Allowed) => {
+            DENIED.store(false, std::sync::atomic::Ordering::SeqCst);
+            listener
+        }
         _ => {
             eprintln!("notifications: Windows does not let Audio Tray read them");
+            DENIED.store(true, std::sync::atomic::Ordering::SeqCst);
+            held_changed();
             return;
         }
     };

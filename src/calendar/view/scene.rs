@@ -10,6 +10,7 @@
 use std::sync::Arc;
 
 use super::paint::{Align, Font};
+use super::words::words;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct R {
@@ -52,6 +53,10 @@ const FOLDED_H: f32 = 36.0;
 const SUMMARY_H: f32 = 48.0;
 const ROW_H: f32 = 32.0;
 const FOOTER_H: f32 = 52.0;
+/// The notification centre's line when it has none.
+const EMPTY_H: f32 = 36.0;
+/// A failed source's line over the list.
+const PROBLEM_H: f32 = 24.0;
 /// The notification centre never takes less than this; below it, it folds to its summary.
 const CENTER_MIN: f32 = 150.0;
 
@@ -74,6 +79,9 @@ pub enum Fill {
     /// Under a press: a step past the hover.
     Pressed,
     Accent,
+    /// An accent button under the pointer, and pressed.
+    AccentHover,
+    AccentPressed,
     Rule,
     /// The marks under busy days.
     Mark,
@@ -110,6 +118,8 @@ pub enum Hit {
     More(usize),
     /// Clear all of an app's notifications.
     DismissGroup(usize),
+    /// Windows' page where Audio Tray is allowed to read notifications.
+    Allow,
     /// A notification (by its place in the list): opens its app.
     Toast(usize),
     Dismiss(usize),
@@ -154,6 +164,8 @@ pub struct Toast {
     /// Its place in the notification list.
     pub index: usize,
     pub title: String,
+    /// When it came, in a few words.
+    pub when: String,
     pub body: String,
     pub avatar: Option<(String, Arc<Vec<u8>>)>,
     pub picture: Option<(String, Arc<Vec<u8>>)>,
@@ -246,6 +258,8 @@ pub struct Detail {
     pub source: String,
     pub open: Option<String>,
     pub joinable: bool,
+    /// The place is one to go to (not an online meeting's): directions offered.
+    pub directions: bool,
 }
 
 /// How the calendar's sources stand, said where events would be.
@@ -269,14 +283,21 @@ pub struct Input {
     pub focus: Option<Hit>,
     /// The target under a press.
     pub pressed: Option<Hit>,
-    /// A word for a moment, over the calendar's foot (Windows refused something).
-    pub flash: Option<String>,
+    /// A word for a moment (Windows refused something), and whether it is the notification card's.
+    pub flash: Option<(String, bool)>,
     /// The height the cards may take together (stacked), or each (side by side).
     pub room: f32,
     /// Side by side, where the screen is wide enough: `None` stacks them.
     pub columns: Option<Columns>,
-    /// `None`: no notification centre (off, or nothing waiting).
+    pub grid: Grid,
+    /// The agenda's rows at most, stacked (Settings' Agenda rows); side by side, at least twelve.
+    pub rows_max: usize,
+    /// Each grid row's ISO week number; empty when not shown.
+    pub week_numbers: Vec<u32>,
+    /// `None`: no notification centre (turned off); empty: none waiting.
     pub groups: Option<Vec<Group>>,
+    /// Windows does not let Audio Tray read them.
+    pub notifications_denied: bool,
     pub unread: usize,
     pub quiet: bool,
     pub center_scroll: f32,
@@ -303,6 +324,16 @@ pub struct Input {
     pub show_tip: Option<(f32, f32)>,
 }
 
+/// The days' grid, as Settings has it (Layout).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Grid {
+    Comfortable,
+    /// Shorter days.
+    Compact,
+    /// No grid: the agenda alone.
+    None,
+}
+
 /// The two cards side by side, each the screen's height to fill.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Columns {
@@ -326,6 +357,8 @@ pub struct Scene {
     pub list_view: Option<(R, f32)>,
     /// Each notification drawn (by its place in the list), whole: unclipped.
     pub toasts: Vec<(usize, R)>,
+    /// Every target in order, out of sight too (unclipped): the keyboard's Tab order.
+    pub order: Vec<(R, Hit)>,
 }
 
 impl Scene {
@@ -346,8 +379,13 @@ struct Ink2 {
     hits: Vec<(R, Hit)>,
     hover: Option<Hit>,
     pressed: Option<Hit>,
+    /// The keyboard's target: lit as the pointer's is (a notification's X shows for it).
+    focus: Option<Hit>,
     /// Where each notification was drawn, unclipped.
     places: Vec<(usize, R)>,
+    /// Every target in order, out of sight too: the keyboard's Tab goes through them all,
+    /// scrolling each into view.
+    order: Vec<(R, Hit)>,
     /// The scrolled area drawing is clipped to: targets are clipped the same, so what scrolled
     /// out of sight takes no clicks (and none over the header above it).
     /// Nested (the reply box clips inside the list): each entry is already cut to the one under it.
@@ -362,8 +400,8 @@ fn overlap(a: R, b: R) -> Option<R> {
 }
 
 impl Ink2 {
-    fn new(hover: Option<Hit>, pressed: Option<Hit>) -> Self {
-        Ink2 { items: Vec::new(), hits: Vec::new(), hover, pressed, places: Vec::new(), clips: Vec::new() }
+    fn new(hover: Option<Hit>, pressed: Option<Hit>, focus: Option<Hit>) -> Self {
+        Ink2 { items: Vec::new(), hits: Vec::new(), hover, pressed, focus, places: Vec::new(), order: Vec::new(), clips: Vec::new() }
     }
 
     fn draw(&mut self, r: R, d: Draw) {
@@ -395,6 +433,7 @@ impl Ink2 {
     }
 
     fn hit(&mut self, r: R, hit: Hit) {
+        self.order.push((r, hit));
         let r = match self.clips.last() {
             Some(&c) => match overlap(r, c) {
                 Some(cut) => cut,
@@ -406,7 +445,18 @@ impl Ink2 {
     }
 
     fn lit(&self, hit: Hit) -> bool {
-        self.hover == Some(hit)
+        self.hover == Some(hit) || self.focus == Some(hit)
+    }
+
+    /// An accent button's fill: lighter under the pointer, lighter still pressed.
+    fn accent(&self, hit: Hit) -> Fill {
+        if self.pressed == Some(hit) && self.lit(hit) {
+            Fill::AccentPressed
+        } else if self.hover == Some(hit) {
+            Fill::AccentHover
+        } else {
+            Fill::Accent
+        }
     }
 
     /// Under a press: the hover's fill, a step further.
@@ -432,7 +482,8 @@ impl Ink2 {
     /// A small square button with a glyph.
     fn icon_button(&mut self, r: R, glyph: char, hit: Hit, on: bool) {
         if on {
-            self.draw(r, Draw::Rect { fill: Fill::Accent, radius: 4.0 });
+            let fill = self.accent(hit);
+            self.draw(r, Draw::Rect { fill, radius: 4.0 });
             self.hit(r, hit);
             self.glyph(r, glyph, Font::Icon, Ink::OnAccent);
         } else {
@@ -443,7 +494,7 @@ impl Ink2 {
 
     /// A pill with a label; `on` fills it with the accent.
     fn pill(&mut self, r: R, label: &str, hit: Hit, on: bool) {
-        let fill = if on { Fill::Accent } else { self.surface(hit, Fill::Raised) };
+        let fill = if on { self.accent(hit) } else { self.surface(hit, Fill::Raised) };
         self.draw(r, Draw::Rect { fill, radius: r.h / 2.0 });
         if !on {
             self.draw(r, Draw::Outline { ink: Ink::Text3, radius: r.h / 2.0 });
@@ -452,16 +503,28 @@ impl Ink2 {
         self.hit(r, hit);
     }
 
-    fn join(&mut self, r: R, hit: Hit) {
-        self.draw(r, Draw::Rect { fill: Fill::Accent, radius: 4.0 });
-        self.text(r, "Join", Font::CaptionStrong, Ink::OnAccent, Align::Center);
+    /// An accent Join button (its label measured: wider in French), right-aligned at `right`.
+    fn join(&mut self, right: f32, y: f32, h: f32, hit: Hit) -> R {
+        let r = R::new(right - join_w(), y, join_w(), h);
+        let fill = self.accent(hit);
+        self.draw(r, Draw::Rect { fill, radius: 4.0 });
+        self.text(r, words().join, Font::CaptionStrong, Ink::OnAccent, Align::Center);
         self.hit(r, hit);
+        r
     }
+}
+
+/// A Join button's width, as its label needs.
+fn join_w() -> f32 {
+    (text_w(words().join, Font::CaptionStrong) + 24.0).max(52.0)
 }
 
 /// The notification centre's natural height (open), for `groups`.
 fn center_height(groups: &[Group]) -> f32 {
     let mut h = 12.0 + 32.0 + 6.0;
+    if groups.is_empty() {
+        return h + EMPTY_H + 8.0;
+    }
     for g in groups {
         if g.open {
             let shown = if g.all { g.toasts.len() } else { 1 };
@@ -485,11 +548,14 @@ fn main_height(input: &Input, rows: usize, hero: bool) -> f32 {
         return DETAIL_H;
     }
     let mut h = PAD + 44.0 + 14.0;
-    h += if input.month_open { 32.0 + 22.0 + 6.0 * 40.0 } else { 62.0 };
+    h += grid_height(input);
     if hero {
         h += 14.0 + 76.0;
     }
     h += 14.0 + 24.0 + rows.max(1) as f32 * ROW_H;
+    if matches!(input.notice, Notice::Problem(_)) {
+        h += PROBLEM_H;
+    }
     h + 8.0 + FOOTER_H
 }
 
@@ -513,7 +579,7 @@ const ROWS_WIDE: usize = 12;
 fn side_by_side(input: &Input, columns: Columns, groups: &[Group]) -> Plan {
     let room = input.room;
     let hero = input.hero.is_some() && (!input.month_open || main_height(input, 1, true) <= room);
-    let mut rows = input.rows.len().clamp(1, ROWS_WIDE);
+    let mut rows = input.rows.len().clamp(1, ROWS_WIDE.max(input.rows_max));
     while rows > 1 && main_height(input, rows, hero) > room {
         rows -= 1;
     }
@@ -529,7 +595,7 @@ fn side_by_side(input: &Input, columns: Columns, groups: &[Group]) -> Plan {
 }
 
 pub fn build(input: &Input) -> Scene {
-    let mut ink = Ink2::new(input.hover, input.pressed);
+    let mut ink = Ink2::new(input.hover, input.pressed, input.focus);
     let plan = match (input.columns, &input.groups) {
         (Some(columns), Some(groups)) => side_by_side(input, columns, groups),
         _ => stacked(input),
@@ -556,17 +622,24 @@ pub fn build(input: &Input) -> Scene {
         }
         None => calendar(&mut ink, main, input, rows, hero),
     };
-    if let Some(text) = &input.flash {
-        let r = R::new(main.x + PAD, main.bottom() - FOOTER_H - 40.0, main.w - 2.0 * PAD, 32.0);
+    if let Some((text, in_top)) = &input.flash {
+        // In the card of what was pressed, over its foot; two lines when it needs them.
+        let (card, foot) = match top.filter(|_| *in_top) {
+            Some(top) => (top, 8.0),
+            None => (main, FOOTER_H + 8.0),
+        };
+        let r = R::new(card.x + PAD, card.bottom() - foot - 48.0, card.w - 2.0 * PAD, 48.0);
         ink.draw(r, Draw::Rect { fill: Fill::Tip, radius: 6.0 });
         ink.draw(r, Draw::Outline { ink: Ink::Text3, radius: 6.0 });
-        ink.text(r, text.clone(), Font::Caption, Ink::Text, Align::Center);
+        ink.text(R::new(r.x + 12.0, r.y + 6.0, r.w - 24.0, r.h - 12.0), text.clone(), Font::Wrap, Ink::Text, Align::Left);
     }
     if let Some(focus) = input.focus {
         // The keyboard's target, ringed (twice over: a 2 DIP ring).
         if let Some(r) = ink.hits.iter().rev().find(|(_, h)| *h == focus).map(|(r, _)| *r) {
+            // A day's ring goes round its circle, not its cell.
+            let (r, radius) = if matches!(focus, Hit::Day(_)) { (R::new(r.x + (r.w - 34.0) / 2.0, r.y, 34.0, 34.0), 17.0) } else { (r, 5.0) };
             for inset in [0.0, 1.0] {
-                ink.draw(R::new(r.x + inset, r.y + inset, r.w - 2.0 * inset, r.h - 2.0 * inset), Draw::Outline { ink: Ink::Accent, radius: 5.0 });
+                ink.draw(R::new(r.x + inset, r.y + inset, r.w - 2.0 * inset, r.h - 2.0 * inset), Draw::Outline { ink: Ink::Accent, radius: radius - inset });
             }
         }
     }
@@ -575,17 +648,18 @@ pub fn build(input: &Input) -> Scene {
     }
     let w = top.map_or(main.right(), |t| t.right().max(main.right()));
     let h = top.map_or(main.bottom(), |t| t.bottom().max(main.bottom()));
-    Scene { top, main, w, h, items: ink.items, hits: ink.hits, center_view, list_view, toasts: ink.places }
+    Scene { top, main, w, h, items: ink.items, hits: ink.hits, center_view, list_view, toasts: ink.places, order: ink.order }
 }
 
 /// One above the other: the calendar takes what it needs first, the notification centre what is
 /// left (folded to its summary below [`CENTER_MIN`]), unless it was given the whole panel.
 fn stacked(input: &Input) -> Plan {
     // How many list rows fit, and how tall the notification centre may be.
-    let mut rows = input.rows.len().clamp(1, 5);
+    let mut rows = input.rows.len().clamp(1, input.rows_max.max(1));
     let summary = input.month_open || input.detail.is_some();
     let mut center_h = match &input.groups {
-        Some(groups) if summary => SUMMARY_H,
+        // None waiting: its one line, whatever else is open.
+        Some(groups) if summary && !groups.is_empty() => SUMMARY_H,
         Some(groups) => center_height(groups),
         None => 0.0,
     };
@@ -601,7 +675,7 @@ fn stacked(input: &Input) -> Plan {
     if input.detail.is_some() {
         main_h = main_h.min(input.room - gap - center_h.min(CENTER_MIN)).max(240.0);
     }
-    let mut folded = summary;
+    let mut folded = summary && input.groups.as_ref().is_some_and(|g| !g.is_empty());
     let full = input.center_full && input.groups.is_some();
     let main_h = if full { SUMMARY_H } else { main_h };
     if let (true, Some(groups)) = (full, &input.groups) {
@@ -609,7 +683,7 @@ fn stacked(input: &Input) -> Plan {
         folded = false;
     } else if center_h > 0.0 && !summary {
         let spare = input.room - main_h - GAP;
-        if spare < CENTER_MIN {
+        if spare < CENTER_MIN.min(center_h) {
             folded = true;
             center_h = SUMMARY_H;
         } else {
@@ -627,26 +701,41 @@ const TIP_TARGET_MAX: f32 = 56.0;
 
 /// What an icon-only target does, in words (`None`: it says it already).
 fn tip_text(hit: Hit, input: &Input) -> Option<&'static str> {
+    let t = words();
     Some(match hit {
-        Hit::Quiet if input.quiet => "Turn off Do not disturb",
-        Hit::Quiet => "Do not disturb",
-        Hit::Expand if input.center_full => "Back to the calendar",
-        Hit::Expand => "Show all notifications",
-        Hit::Month if input.month_open => "Show the week",
-        Hit::Month => "Show the month",
-        Hit::Prev => "Previous month",
-        Hit::Next => "Next month",
-        Hit::Settings => "Settings",
-        Hit::Back => "Back",
-        Hit::Dismiss(_) => "Dismiss",
-        Hit::DismissGroup(_) => "Clear all from this app",
-        Hit::Menu(_) => "More options",
-        Hit::Send(_) => "Send",
-        Hit::Clocks => "Change the clocks",
-        Hit::Today => "Go to today",
-        Hit::Calendar => "Back to the calendar",
+        Hit::Quiet if input.quiet => t.turn_off_dnd,
+        Hit::Quiet => t.do_not_disturb,
+        Hit::Expand if input.center_full => t.back_to_calendar,
+        Hit::Expand => t.show_all,
+        Hit::Month if input.month_open => t.show_week,
+        Hit::Month => t.show_month,
+        Hit::Prev => t.previous_month,
+        Hit::Next => t.next_month,
+        Hit::Settings => t.settings,
+        Hit::Back => t.back,
+        Hit::Dismiss(_) => t.dismiss,
+        Hit::DismissGroup(_) => t.clear_app,
+        Hit::Menu(_) => t.more_options,
+        Hit::Send(_) => t.send,
+        Hit::Clocks => t.change_clocks,
+        Hit::Today => t.go_to_today,
+        Hit::Calendar => t.back_to_calendar,
         _ => return None,
     })
+}
+
+/// About how wide `text` is in `font`, in DIPs: Segoe UI Variable's average advance, enough to
+/// size a button to its label in either language.
+fn text_w(text: &str, font: Font) -> f32 {
+    let per = match font {
+        Font::Tiny | Font::TinyStrong => 6.0,
+        Font::Caption => 6.4,
+        Font::CaptionStrong => 6.8,
+        Font::Body | Font::Wrap => 7.2,
+        Font::Strong => 7.6,
+        _ => 9.0,
+    };
+    text.chars().count() as f32 * per
 }
 
 /// The hovered target's tooltip, under it (above it near its card's foot), inside its card.
@@ -656,12 +745,12 @@ fn tooltip(ink: &mut Ink2, input: &Input, (px, py): (f32, f32), top: Option<R>, 
     // The target under the pointer: the same one can sit in two places (the header's moon and the
     // footer's Do not disturb button).
     let Some(r) = ink.hits.iter().rev().find(|(r, h)| *h == hit && r.contains(px, py)).map(|(r, _)| *r) else { return };
-    if r.w > TIP_TARGET_MAX && hit != Hit::Clocks {
+    if r.w > TIP_TARGET_MAX && !matches!(hit, Hit::Clocks | Hit::Today | Hit::Calendar) {
         // A labelled button says it already.
         return;
     }
     let card = top.filter(|t| t.contains(r.x + 1.0, r.y + 1.0)).unwrap_or(main);
-    let w = (text.chars().count() as f32 * 6.5 + 20.0).min(card.w - 16.0);
+    let w = (text_w(text, Font::Caption) + 20.0).min(card.w - 16.0);
     let h = 26.0;
     let x = (r.x + r.w / 2.0 - w / 2.0).clamp(card.x + 8.0, card.right() - 8.0 - w);
     let below = r.bottom() + 6.0;
@@ -686,8 +775,9 @@ fn calendar_summary(ink: &mut Ink2, card: R, input: &Input) {
 fn center_summary(ink: &mut Ink2, card: R, input: &Input, groups: &[Group]) {
     ink.plate(R::new(card.x + 4.0, card.y + 4.0, card.w - 8.0, card.h - 8.0), Hit::Center, 6.0);
     let y = card.y + (card.h - 20.0) / 2.0;
-    ink.text(R::new(card.x + PAD, y, 110.0, 20.0), "Notifications", Font::Strong, Ink::Text, Align::Left);
-    let chip = count_chip(ink, card.x + PAD + 104.0, y + 1.0, input.unread);
+    let title_w = text_w(words().notifications, Font::Strong) + 4.0;
+    ink.text(R::new(card.x + PAD, y, title_w, 20.0), words().notifications, Font::Strong, Ink::Text, Align::Left);
+    let chip = count_chip(ink, card.x + PAD + title_w + 4.0, y + 1.0, input.unread);
     let mut x = chip.right() + 10.0;
     for group in groups.iter().take(5) {
         if let Some((key, bytes)) = &group.logo {
@@ -703,7 +793,7 @@ fn center_summary(ink: &mut Ink2, card: R, input: &Input, groups: &[Group]) {
 fn notification(ink: &mut Ink2, r: R, toast: &Toast) {
     let i = toast.index;
     ink.places.push((i, r));
-    let lit = ink.hover.and_then(toast_of) == Some(i) || toast.draft.is_some();
+    let lit = ink.hover.and_then(toast_of) == Some(i) || ink.focus.and_then(toast_of) == Some(i) || toast.draft.is_some();
     let fill = if ink.pressed == Some(Hit::Toast(i)) && ink.lit(Hit::Toast(i)) { Fill::Pressed } else if lit { Fill::Hover } else { Fill::Raised };
     ink.draw(r, Draw::Rect { fill, radius: 6.0 });
     ink.hit(r, Hit::Toast(i));
@@ -712,12 +802,16 @@ fn notification(ink: &mut Ink2, r: R, toast: &Toast) {
         ink.draw(R::new(tx, r.y + 12.0, 36.0, 36.0), Draw::Avatar { key: key.clone(), bytes: bytes.clone() });
         tx += 48.0;
     }
-    ink.text(R::new(tx, r.y + 8.0, r.right() - tx - 40.0, 20.0), toast.title.clone(), Font::Strong, Ink::Text, Align::Left);
+    ink.text(R::new(tx, r.y + 8.0, r.right() - tx - 76.0, 20.0), toast.title.clone(), Font::Strong, Ink::Text, Align::Left);
     ink.text(R::new(tx, r.y + 30.0, r.right() - tx - 12.0, 38.0), toast.body.clone(), Font::Wrap, Ink::Text2, Align::Left);
     if lit {
-        let x_r = R::new(r.right() - 32.0, r.y + 6.0, 26.0, 26.0);
+        // A full-size target, under the pointer or the keyboard.
+        let x_r = R::new(r.right() - 38.0, r.y + 4.0, 32.0, 32.0);
         ink.plate(x_r, Hit::Dismiss(i), 4.0);
         ink.glyph(x_r, '\u{E711}', Font::IconSmall, Ink::Text2);
+    } else {
+        // Its own time, in the X's place.
+        ink.text(R::new(r.right() - 76.0, r.y + 8.0, 64.0, 20.0), toast.when.clone(), Font::Caption, Ink::Text3, Align::Right);
     }
     let mut y = r.y + TOAST_H - 4.0;
     if let Some((key, bytes)) = &toast.picture {
@@ -745,7 +839,8 @@ fn notification(ink: &mut Ink2, r: R, toast: &Toast) {
                     ink.draw(inner, Draw::Unclip);
                 }
                 let send = R::new(row.right() - ACTIONS_H, row.y, ACTIONS_H, ACTIONS_H);
-                ink.draw(send, Draw::Rect { fill: Fill::Accent, radius: 4.0 });
+                let fill = ink.accent(Hit::Send(i));
+                ink.draw(send, Draw::Rect { fill, radius: 4.0 });
                 ink.glyph(send, '\u{E724}', Font::IconSmall, Ink::OnAccent);
                 ink.hit(send, Hit::Send(i));
             }
@@ -754,7 +849,7 @@ fn notification(ink: &mut Ink2, r: R, toast: &Toast) {
                 let end = if toast.menu.is_empty() { row.right() } else { row.right() - ACTIONS_H - 6.0 };
                 let mut pills: Vec<(String, Hit)> = toast.buttons.iter().enumerate().map(|(n, label)| (label.clone(), Hit::Action(i, n))).collect();
                 if toast.reply.is_some() {
-                    pills.insert(0, ("Reply".to_string(), Hit::Reply(i)));
+                    pills.insert(0, (words().reply.to_string(), Hit::Reply(i)));
                 }
                 for (label, hit) in pills {
                     // What room is left, before sizing: a clamp with less than its minimum panics.
@@ -796,12 +891,13 @@ fn scrollbar(ink: &mut Ink2, area: R, content: f32, scroll: f32) {
     ink.draw(R::new(area.right() - 6.0, y, 3.0, h), Draw::Rect { fill: Fill::Mark, radius: 1.5 });
 }
 
-/// The unread count in an accent chip at `(x, y)`, as wide as its number (99+ at most).
+/// How many are waiting in all, in an outlined chip at `(x, y)`, as wide as its number (99+ at
+/// most). Grey, not the accent: the clock's accent badge counts only the new ones.
 fn count_chip(ink: &mut Ink2, x: f32, y: f32, unread: usize) -> R {
     let label = if unread > 99 { "99+".to_string() } else { unread.to_string() };
     let chip = R::new(x, y, (label.chars().count() as f32 * 7.0 + 10.0).max(24.0), 18.0);
-    ink.draw(chip, Draw::Rect { fill: Fill::Accent, radius: 9.0 });
-    ink.text(chip, label, Font::CaptionStrong, Ink::OnAccent, Align::Center);
+    ink.draw(chip, Draw::Outline { ink: Ink::Text3, radius: 9.0 });
+    ink.text(chip, label, Font::CaptionStrong, Ink::Text2, Align::Center);
     chip
 }
 
@@ -809,15 +905,27 @@ fn count_chip(ink: &mut Ink2, x: f32, y: f32, unread: usize) -> R {
 fn center(ink: &mut Ink2, card: R, input: &Input, groups: &[Group]) -> (R, f32) {
     let x = card.x + 8.0;
     let w = card.w - 16.0;
+    let t = words();
     let head = R::new(x, card.y + 10.0, w, 32.0);
-    ink.text(R::new(head.x + 8.0, head.y, 110.0, head.h), "Notifications", Font::Strong, Ink::Text, Align::Left);
-    count_chip(ink, head.x + 112.0, head.y + 7.0, input.unread);
-    // A text link, tinted under the pointer like the calendar's.
-    let clear = R::new(head.right() - 80.0, head.y + 2.0, 80.0, 28.0);
-    let lit = ink.lit(Hit::ClearAll);
-    ink.text(clear, "Clear all", Font::Caption, if lit { Ink::Accent } else { Ink::Text }, Align::Center);
-    ink.hit(clear, Hit::ClearAll);
-    ink.icon_button(R::new(clear.x - 40.0, head.y, 32.0, 32.0), '\u{E708}', Hit::Quiet, input.quiet);
+    let title_w = text_w(t.notifications, Font::Strong) + 4.0;
+    ink.text(R::new(head.x + 8.0, head.y, title_w, head.h), t.notifications, Font::Strong, Ink::Text, Align::Left);
+    if input.unread > 0 {
+        count_chip(ink, head.x + 8.0 + title_w + 4.0, head.y + 7.0, input.unread);
+    }
+    // A text link, tinted under the pointer like the calendar's, and plated under a press.
+    if input.unread > 0 {
+        let clear_w = text_w(t.clear_all, Font::Caption) + 20.0;
+        let clear = R::new(head.right() - clear_w, head.y + 2.0, clear_w, 28.0);
+        if ink.pressed == Some(Hit::ClearAll) && ink.lit(Hit::ClearAll) {
+            ink.draw(clear, Draw::Rect { fill: Fill::Pressed, radius: 4.0 });
+        }
+        let lit = ink.lit(Hit::ClearAll);
+        ink.text(clear, t.clear_all, Font::Caption, if lit { Ink::Accent } else { Ink::Text }, Align::Center);
+        ink.hit(clear, Hit::ClearAll);
+    }
+    let moon = R::new(head.right() - text_w(t.clear_all, Font::Caption) - 20.0 - 40.0, head.y, 32.0, 32.0);
+    ink.icon_button(moon, '\u{E708}', Hit::Quiet, input.quiet);
+    let clear = R::new(moon.x + 40.0, head.y, 0.0, 0.0);
     // The whole panel for the notifications, or back (side by side, they have it already).
     if input.columns.is_none() {
         let expand = if input.center_full { '\u{E73F}' } else { '\u{E740}' };
@@ -825,6 +933,18 @@ fn center(ink: &mut Ink2, card: R, input: &Input, groups: &[Group]) -> (R, f32) 
     }
 
     let area = R::new(card.x, head.bottom() + 6.0, card.w, card.bottom() - 8.0 - (head.bottom() + 6.0));
+    if groups.is_empty() {
+        // None waiting, as Windows' centre says it; or none readable, and where to allow it.
+        let line = R::new(x + 8.0, area.y, w - 16.0, EMPTY_H - 8.0);
+        if input.notifications_denied {
+            ink.hit(line, Hit::Allow);
+            let tint = if ink.lit(Hit::Allow) { Ink::Accent } else { Ink::Text2 };
+            ink.text(line, t.not_allowed, Font::Body, tint, Align::Left);
+        } else {
+            ink.text(line, t.no_notifications, Font::Body, Ink::Text3, Align::Left);
+        }
+        return (area, 0.0);
+    }
     let content = center_height(groups) - (12.0 + 32.0 + 6.0) - 8.0;
     let max = (content - area.h).max(0.0);
     let scroll = input.center_scroll.clamp(0.0, max);
@@ -873,7 +993,7 @@ fn center(ink: &mut Ink2, card: R, input: &Input, groups: &[Group]) -> (R, f32) 
             let more = R::new(x + 4.0, y, w - 8.0, 22.0);
             ink.plate(more, Hit::More(g), 4.0);
             let n = group.toasts.len() - 1;
-            ink.text(R::new(more.x + 8.0, more.y, more.w - 16.0, more.h), format!("{n} more from {}", group.name), Font::Caption, Ink::Accent, Align::Left);
+            ink.text(R::new(more.x + 8.0, more.y, more.w - 16.0, more.h), (words().more_from)(n, &group.name), Font::Caption, Ink::Accent, Align::Left);
             y += 22.0;
         }
     }
@@ -898,60 +1018,27 @@ fn calendar(ink: &mut Ink2, card: R, input: &Input, rows: usize, hero: bool) -> 
     // Expand to the month, reduce to the week: the same pair as the notification centre's. Side by
     // side the month always shows, so there is no switch.
     let toggle = R::new(card.right() - PAD - 32.0, y + 10.0, 32.0, 32.0);
-    let edge = if input.columns.is_some() {
+    let edge = if input.columns.is_some() || input.grid == Grid::None {
         card.right() - PAD + 12.0
     } else {
         ink.icon_button(toggle, if input.month_open { '\u{E73F}' } else { '\u{E740}' }, Hit::Month, false);
         toggle.x
     };
     if !input.clocks.is_empty() {
-        // As wide as its text (about 6.5 DIPs a character at 12), right against the switch.
-        let tw = (input.clocks.chars().count() as f32 * 6.5 + 4.0).min(edge - x - 150.0).max(40.0);
-        let r = R::new(edge - 12.0 - tw, y + 18.0, tw, 20.0);
+        // On the weekday's line, right against the switch: the big date beneath keeps its room
+        // (side by side, or stacked with two clocks, they ran into it).
+        let tw = (text_w(&input.clocks, Font::Caption) + 4.0).min(edge - 12.0 - x - 90.0).max(40.0);
+        let r = R::new(edge - 12.0 - tw, y - 2.0, tw, 18.0);
         ink.hit(r, Hit::Clocks);
         let tint = if ink.lit(Hit::Clocks) { Ink::Accent } else { Ink::Text2 };
         ink.text(r, input.clocks.clone(), Font::Caption, tint, Align::Right);
     }
     y += 44.0 + 14.0;
 
-    // This week, or the month.
-    if input.month_open {
-        ink.text(R::new(x, y, w - 72.0, 28.0), input.month_title.clone(), Font::Strong, Ink::Text, Align::Left);
-        let next = R::new(card.right() - PAD - 28.0, y, 28.0, 28.0);
-        let prev = R::new(next.x - 32.0, y, 28.0, 28.0);
-        ink.plate(prev, Hit::Prev, 4.0);
-        ink.glyph(prev, '\u{E76B}', Font::IconSmall, Ink::Text2);
-        ink.plate(next, Hit::Next, 4.0);
-        ink.glyph(next, '\u{E76C}', Font::IconSmall, Ink::Text2);
-        y += 32.0;
+    // This week, or the month; nothing with the agenda alone.
+    if input.grid != Grid::None {
+        y = days_grid(ink, card, input, y);
     }
-    let col = w / 7.0;
-    for (i, head) in input.heads.iter().enumerate() {
-        ink.text(R::new(x + i as f32 * col, y, col, 18.0), head.clone(), Font::Tiny, Ink::Text3, Align::Center);
-    }
-    y += if input.month_open { 22.0 } else { 18.0 };
-    let cell_h = if input.month_open { 40.0 } else { 44.0 };
-    for (i, cell) in input.days.iter().enumerate() {
-        let r = R::new(x + (i % 7) as f32 * col, y + (i / 7) as f32 * cell_h, col, cell_h);
-        let circle = R::new(r.x + (r.w - 30.0) / 2.0, r.y + 2.0, 30.0, 30.0);
-        if cell.today {
-            ink.draw(circle, Draw::Rect { fill: Fill::Accent, radius: 15.0 });
-        } else if ink.lit(Hit::Day(cell.day)) {
-            ink.draw(circle, Draw::Rect { fill: Fill::Hover, radius: 15.0 });
-        }
-        if cell.selected && !cell.today {
-            ink.draw(circle, Draw::Outline { ink: Ink::Accent, radius: 15.0 });
-        }
-        let color = if cell.today { Ink::OnAccent } else if cell.dim { Ink::Text3 } else { Ink::Text };
-        ink.text(circle, cell.label.clone(), Font::Body, color, Align::Center);
-        if cell.busy > 0 {
-            let bw = if cell.busy > 1 { 10.0 } else { 4.0 };
-            let mark = R::new(r.x + (r.w - bw) / 2.0, circle.bottom() + 3.0, bw, 4.0);
-            ink.draw(mark, Draw::Rect { fill: if cell.today { Fill::Accent } else { Fill::Mark }, radius: 2.0 });
-        }
-        ink.hit(r, Hit::Day(cell.day));
-    }
-    y += (input.days.len().div_ceil(7)) as f32 * cell_h + 4.0;
 
     // The next event.
     if let Some(hero) = input.hero.as_ref().filter(|_| hero) {
@@ -961,12 +1048,12 @@ fn calendar(ink: &mut Ink2, card: R, input: &Input, rows: usize, hero: bool) -> 
         ink.draw(r, Draw::Rect { fill, radius: 6.0 });
         ink.hit(r, Hit::Hero);
         ink.draw(R::new(r.x + 12.0, r.y + 12.0, 3.0, r.h - 24.0), Draw::Rect { fill: Fill::Rgb(hero.color), radius: 1.5 });
-        let tw = r.w - 40.0 - if hero.joinable { 64.0 } else { 0.0 };
+        let tw = r.w - 40.0 - if hero.joinable { join_w() + 12.0 } else { 0.0 };
         ink.text(R::new(r.x + 26.0, r.y + 10.0, tw, 16.0), hero.caption.clone(), Font::TinyStrong, Ink::Accent, Align::Left);
         ink.text(R::new(r.x + 26.0, r.y + 27.0, tw, 20.0), hero.title.clone(), Font::Strong, Ink::Text, Align::Left);
         ink.text(R::new(r.x + 26.0, r.y + 48.0, tw, 18.0), hero.when.clone(), Font::Caption, Ink::Text2, Align::Left);
         if hero.joinable {
-            ink.join(R::new(r.right() - 64.0, r.y + 25.0, 52.0, 26.0), Hit::HeroJoin);
+            ink.join(r.right() - 12.0, r.y + 25.0, 26.0, Hit::HeroJoin);
         }
         y += 76.0;
     }
@@ -974,14 +1061,17 @@ fn calendar(ink: &mut Ink2, card: R, input: &Input, rows: usize, hero: bool) -> 
     // The rest of the week, or the picked day.
     y += 14.0;
     ink.text(R::new(x, y, w, 20.0), input.list_title.clone(), Font::CaptionStrong, Ink::Text2, Align::Left);
-    if let Notice::Problem(problem) = &input.notice {
-        // A source failed: said beside the title, a link to where it is mended.
-        let r = R::new(x + w - 190.0, y, 190.0, 20.0);
-        ink.hit(r, Hit::Settings);
-        let tint = if ink.lit(Hit::Settings) { Ink::Accent } else { Ink::Text3 };
-        ink.text(r, problem.clone(), Font::Caption, tint, Align::Right);
-    }
     y += 24.0;
+    if let Notice::Problem(problem) = &input.notice {
+        // A source failed: a line of its own, in the accent, a link to where it is mended (the
+        // events under it may be old).
+        let r = R::new(x, y, w, PROBLEM_H - 4.0);
+        ink.hit(r, Hit::Settings);
+        ink.glyph(R::new(r.x, r.y, 16.0, r.h), '\u{E7BA}', Font::IconSmall, Ink::Accent);
+        let tint = if ink.lit(Hit::Settings) { Ink::Text } else { Ink::Accent };
+        ink.text(R::new(r.x + 24.0, r.y, r.w - 24.0, r.h), format!("{problem} \u{2192}"), Font::Caption, tint, Align::Left);
+        y += PROBLEM_H;
+    }
     let area = R::new(card.x, y, card.w, rows.max(1) as f32 * ROW_H);
     let max = (input.rows.len() as f32 * ROW_H - area.h).max(0.0);
     let scroll = input.list_scroll.clamp(0.0, max);
@@ -991,9 +1081,9 @@ fn calendar(ink: &mut Ink2, card: R, input: &Input, rows: usize, hero: bool) -> 
             Notice::NoSources => {
                 ink.hit(line, Hit::Settings);
                 let tint = if ink.lit(Hit::Settings) { Ink::Accent } else { Ink::Text2 };
-                ink.text(line, "Connect a calendar in Settings", Font::Body, tint, Align::Left);
+                ink.text(line, words().connect, Font::Body, tint, Align::Left);
             }
-            Notice::Loading => ink.text(line, "Loading…", Font::Body, Ink::Text3, Align::Left),
+            Notice::Loading => ink.text(line, words().loading, Font::Body, Ink::Text3, Align::Left),
             _ => ink.text(line, input.empty.clone(), Font::Body, Ink::Text3, Align::Left),
         }
     }
@@ -1008,11 +1098,11 @@ fn calendar(ink: &mut Ink2, card: R, input: &Input, rows: usize, hero: bool) -> 
         ink.plate(r, Hit::Row(i), 4.0);
         ink.text(R::new(r.x + 6.0, r.y, left_w, r.h), row.left.clone(), Font::Caption, Ink::Text2, Align::Left);
         ink.draw(R::new(r.x + left_w + 12.0, r.y + 13.0, 6.0, 6.0), Draw::Rect { fill: Fill::Rgb(row.color), radius: 3.0 });
-        let right_w = if row.joinable { 60.0 } else if row.right.is_empty() { 0.0 } else { 56.0 };
+        let right_w = if row.joinable { join_w() + 8.0 } else if row.right.is_empty() { 0.0 } else { 56.0 };
         let tx = r.x + left_w + 26.0;
         ink.text(R::new(tx, r.y, r.right() - tx - 6.0 - right_w, r.h), row.title.clone(), Font::Body, Ink::Text, Align::Left);
         if row.joinable {
-            ink.join(R::new(r.right() - 58.0, r.y + 4.0, 52.0, 24.0), Hit::Join(i));
+            ink.join(r.right() - 6.0, r.y + 4.0, 24.0, Hit::Join(i));
         } else if !row.right.is_empty() {
             ink.text(R::new(r.right() - 62.0, r.y, 56.0, r.h), row.right.clone(), Font::Caption, Ink::Text3, Align::Right);
         }
@@ -1024,16 +1114,88 @@ fn calendar(ink: &mut Ink2, card: R, input: &Input, rows: usize, hero: bool) -> 
     let fy = card.bottom() - FOOTER_H;
     ink.draw(R::new(card.x, fy, card.w, 1.0), Draw::Rect { fill: Fill::Rule, radius: 0.0 });
     let by = fy + (FOOTER_H - 32.0) / 2.0;
-    let focus_w = if input.focus_running { 150.0 } else { 112.0 };
+    // Each as wide as its label (French ones are longer), short of the gear.
+    let pill_w = |label: &str| (text_w(label, Font::Caption) + 32.0).max(96.0);
+    let focus_w = pill_w(&input.focus_label).min(w - 40.0);
     ink.pill(R::new(x, by, focus_w, 32.0), &input.focus_label, Hit::Focus, input.focus_running);
     // Do not disturb once: the notification centre's moon when it is shown, else here.
-    if input.groups.is_none() {
-        ink.pill(R::new(x + focus_w + 8.0, by, 118.0, 32.0), "Do not disturb", Hit::Quiet, input.quiet);
+    let dnd_w = pill_w(words().do_not_disturb);
+    if input.groups.is_none() && focus_w + 8.0 + dnd_w <= w - 40.0 {
+        ink.pill(R::new(x + focus_w + 8.0, by, dnd_w, 32.0), words().do_not_disturb, Hit::Quiet, input.quiet);
     }
     let gear = R::new(card.right() - PAD - 32.0, by, 32.0, 32.0);
     ink.plate(gear, Hit::Settings, 4.0);
     ink.glyph(gear, '\u{E713}', Font::Icon, Ink::Text2);
     Some((area, max))
+}
+
+
+/// A day cell's height and its circle's size, for the grid and the week or month.
+fn cell_size(grid: Grid, month: bool) -> (f32, f32) {
+    match (grid, month) {
+        (Grid::Compact, true) => (32.0, 24.0),
+        (Grid::Compact, false) => (36.0, 26.0),
+        (_, true) => (40.0, 30.0),
+        (_, false) => (44.0, 30.0),
+    }
+}
+
+/// The grid's height (its title, the weekdays, the days).
+fn grid_height(input: &Input) -> f32 {
+    if input.grid == Grid::None {
+        return 0.0;
+    }
+    let (cell, _) = cell_size(input.grid, input.month_open);
+    if input.month_open { 32.0 + 22.0 + 6.0 * cell } else { 18.0 + cell }
+}
+
+/// The days of the week or the month from `y`, with week numbers when asked. Returns where it ends.
+fn days_grid(ink: &mut Ink2, card: R, input: &Input, mut y: f32) -> f32 {
+    let x = card.x + PAD;
+    let w = card.w - 2.0 * PAD;
+    if input.month_open {
+        ink.text(R::new(x, y, w - 72.0, 28.0), input.month_title.clone(), Font::Strong, Ink::Text, Align::Left);
+        let next = R::new(card.right() - PAD - 28.0, y, 28.0, 28.0);
+        let prev = R::new(next.x - 32.0, y, 28.0, 28.0);
+        ink.plate(prev, Hit::Prev, 4.0);
+        ink.glyph(prev, '\u{E76B}', Font::IconSmall, Ink::Text2);
+        ink.plate(next, Hit::Next, 4.0);
+        ink.glyph(next, '\u{E76C}', Font::IconSmall, Ink::Text2);
+        y += 32.0;
+    }
+    // Week numbers in a narrow column of their own, before Monday (or the week's first day).
+    let numbers = if input.week_numbers.is_empty() { 0.0 } else { 22.0 };
+    let gx = x + numbers;
+    let col = (w - numbers) / 7.0;
+    for (i, head) in input.heads.iter().enumerate() {
+        ink.text(R::new(gx + i as f32 * col, y, col, 18.0), head.clone(), Font::Tiny, Ink::Text3, Align::Center);
+    }
+    y += if input.month_open { 22.0 } else { 18.0 };
+    let (cell_h, d) = cell_size(input.grid, input.month_open);
+    for (row, number) in input.week_numbers.iter().enumerate() {
+        ink.text(R::new(x, y + row as f32 * cell_h + 2.0, numbers - 4.0, d), number.to_string(), Font::Tiny, Ink::Text3, Align::Left);
+    }
+    for (i, cell) in input.days.iter().enumerate() {
+        let r = R::new(gx + (i % 7) as f32 * col, y + (i / 7) as f32 * cell_h, col, cell_h);
+        let circle = R::new(r.x + (r.w - d) / 2.0, r.y + 2.0, d, d);
+        if cell.today {
+            ink.draw(circle, Draw::Rect { fill: Fill::Accent, radius: d / 2.0 });
+        } else if ink.lit(Hit::Day(cell.day)) {
+            ink.draw(circle, Draw::Rect { fill: Fill::Hover, radius: d / 2.0 });
+        }
+        if cell.selected && !cell.today {
+            ink.draw(circle, Draw::Outline { ink: Ink::Accent, radius: d / 2.0 });
+        }
+        let color = if cell.today { Ink::OnAccent } else if cell.dim { Ink::Text3 } else { Ink::Text };
+        ink.text(circle, cell.label.clone(), Font::Body, color, Align::Center);
+        if cell.busy > 0 {
+            let bw = if cell.busy > 1 { 10.0 } else { 4.0 };
+            let mark = R::new(r.x + (r.w - bw) / 2.0, (circle.bottom() + 3.0).min(r.bottom() - 4.0), bw, 4.0);
+            ink.draw(mark, Draw::Rect { fill: if cell.today { Fill::Accent } else { Fill::Mark }, radius: 2.0 });
+        }
+        ink.hit(r, Hit::Day(cell.day));
+    }
+    y + (input.days.len().div_ceil(7)) as f32 * cell_h + 4.0
 }
 
 /// One event's details, in place of the calendar.
@@ -1063,10 +1225,13 @@ fn detail_card(ink: &mut Ink2, card: R, d: &Detail) {
     };
     if !d.place.is_empty() {
         line(ink, &mut y, '\u{E707}', &d.place, 20.0);
-        let dir = R::new(x + 26.0, y - 8.0, 80.0, 20.0);
-        ink.plate(dir, Hit::Directions, 4.0);
-        ink.text(R::new(dir.x + 4.0, dir.y, dir.w, dir.h), "Directions", Font::Caption, Ink::Accent, Align::Left);
-        y += 16.0;
+        // A place one can go to, not an online meeting's.
+        if d.directions {
+            let dir = R::new(x + 26.0, y - 8.0, text_w(words().directions, Font::Caption) + 12.0, 20.0);
+            ink.plate(dir, Hit::Directions, 4.0);
+            ink.text(R::new(dir.x + 4.0, dir.y, dir.w, dir.h), words().directions, Font::Caption, Ink::Accent, Align::Left);
+            y += 16.0;
+        }
     }
     if !d.people.is_empty() {
         ink.glyph(R::new(x, y + 2.0, 16.0, 24.0), '\u{E716}', Font::IconSmall, Ink::Text2);
@@ -1089,11 +1254,12 @@ fn detail_card(ink: &mut Ink2, card: R, d: &Detail) {
 
     let mut bx = x;
     if d.joinable {
-        let r = R::new(bx, buttons_y, 96.0, 34.0);
-        ink.draw(r, Draw::Rect { fill: Fill::Accent, radius: 4.0 });
-        ink.text(r, "Join", Font::CaptionStrong, Ink::OnAccent, Align::Center);
+        let r = R::new(bx, buttons_y, (text_w(words().join, Font::CaptionStrong) + 40.0).max(96.0), 34.0);
+        let fill = ink.accent(Hit::DetailJoin);
+        ink.draw(r, Draw::Rect { fill, radius: 4.0 });
+        ink.text(r, words().join, Font::CaptionStrong, Ink::OnAccent, Align::Center);
         ink.hit(r, Hit::DetailJoin);
-        bx += 104.0;
+        bx += r.w + 8.0;
     }
     if let Some(open) = &d.open {
         let r = R::new(bx, buttons_y, x + w - bx, 34.0);
@@ -1116,6 +1282,10 @@ mod tests {
             flash: None,
             room: 760.0,
             columns: None,
+            grid: Grid::Comfortable,
+            rows_max: 5,
+            week_numbers: Vec::new(),
+            notifications_denied: false,
             groups: None,
             unread: 0,
             quiet: false,
@@ -1142,7 +1312,7 @@ mod tests {
     }
 
     fn toast(i: usize) -> Toast {
-        Toast { index: i, title: format!("t{i}"), body: String::new(), avatar: None, picture: None, buttons: Vec::new(), reply: None, menu: Vec::new(), draft: None, menu_open: false }
+        Toast { index: i, title: format!("t{i}"), when: String::new(), body: String::new(), avatar: None, picture: None, buttons: Vec::new(), reply: None, menu: Vec::new(), draft: None, menu_open: false }
     }
 
     fn group(name: &str, n: usize, open: bool) -> Group {
@@ -1195,6 +1365,7 @@ mod tests {
         let mut whatsapp = group("WhatsApp", 6, true);
         whatsapp.all = true;
         i.groups = Some(vec![whatsapp]);
+        i.unread = 6;
         i.center_scroll = 10_000.0;
         let s = build(&i);
         let top = s.top.unwrap();
@@ -1324,5 +1495,54 @@ mod tests {
         let s = build(&i);
         assert!(s.top.is_none());
         assert_eq!((s.main.x, s.w), (0.0, W));
+    }
+
+    #[test]
+    fn with_none_waiting_the_card_says_so_and_keeps_its_moon() {
+        let mut i = input();
+        i.groups = Some(Vec::new());
+        let s = build(&i);
+        let top = s.top.expect("the card stays");
+        assert!(top.h < CENTER_MIN, "one line: {}", top.h);
+        assert!(s.hits.iter().any(|(_, h)| *h == Hit::Quiet));
+        assert!(!s.hits.iter().any(|(_, h)| *h == Hit::ClearAll));
+        assert!(s.items.iter().any(|(_, d)| matches!(d, Draw::Text { text, .. } if text == words().no_notifications)));
+        i.notifications_denied = true;
+        assert!(build(&i).hits.iter().any(|(_, h)| *h == Hit::Allow), "says where to allow it");
+        i.month_open = true;
+        assert!(!build(&i).hits.iter().any(|(_, h)| *h == Hit::Center), "nothing to fold");
+    }
+
+    #[test]
+    fn the_layout_setting_shapes_the_grid() {
+        let mut i = input();
+        let full = build(&i);
+        i.grid = Grid::Compact;
+        let compact = build(&i);
+        assert!(compact.main.h < full.main.h);
+        i.grid = Grid::None;
+        let agenda = build(&i);
+        assert!(!agenda.hits.iter().any(|(_, h)| matches!(h, Hit::Day(_) | Hit::Month)));
+        assert!(agenda.main.h < compact.main.h);
+    }
+
+    #[test]
+    fn week_numbers_take_a_column_before_the_days() {
+        let mut i = input();
+        let first_day = |s: &Scene| s.hits.iter().find(|(_, h)| *h == Hit::Day(100)).unwrap().0.x;
+        let without = first_day(&build(&i));
+        i.week_numbers = vec![47];
+        let with = build(&i);
+        assert!(first_day(&with) > without);
+        assert!(with.items.iter().any(|(_, d)| matches!(d, Draw::Text { text, .. } if text == "47")));
+    }
+
+    #[test]
+    fn the_agenda_rows_setting_caps_the_stacked_list() {
+        let mut i = input();
+        i.rows = (0..8).map(|n| Row { left: "Mon".into(), title: format!("e{n}"), color: [0; 3], right: String::new(), joinable: false }).collect();
+        i.rows_max = 3;
+        let (area, _) = build(&i).list_view.unwrap();
+        assert!((area.h - 3.0 * ROW_H).abs() < 0.5);
     }
 }

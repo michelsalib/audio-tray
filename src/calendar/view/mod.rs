@@ -14,6 +14,7 @@
 mod locale;
 mod paint;
 mod scene;
+pub(super) mod words;
 
 use std::cell::{Cell, RefCell};
 use std::time::{Duration, Instant};
@@ -71,6 +72,9 @@ thread_local! {
     static VIEW: RefCell<Option<View>> = const { RefCell::new(None) };
     /// The drawing kit of the last panel, kept for the next (its pictures stay decoded).
     static SPARE_GFX: RefCell<Option<Gfx>> = const { RefCell::new(None) };
+    /// Replies typed and not sent, by notification: kept across opens (the panel closes when it
+    /// loses the foreground, a draft with it).
+    static DRAFTS: RefCell<Vec<(u32, String)>> = const { RefCell::new(Vec::new()) };
     static OPEN: Cell<isize> = const { Cell::new(0) };
     static CLOSED_AT: Cell<Option<Instant>> = const { Cell::new(None) };
     /// The close animation is running.
@@ -165,7 +169,9 @@ struct View {
     /// Replies typed and left for another notification's, by notification.
     stash: Vec<(u32, String)>,
     /// A word for a moment (Windows refused something), and since when.
-    flash: Option<(String, Instant)>,
+    flash: Option<(String, Instant, bool)>,
+    /// After a keyboard action, the Tab order's place the ring goes back to (the next target).
+    refocus: Option<usize>,
 }
 
 /// Work to do once the view's state is released: it may pump messages.
@@ -274,7 +280,7 @@ pub fn refresh() {
             if let Some(text) = draft.filter(|t| !t.is_empty()) {
                 v.draft = Some((id, text));
             }
-            v.say("The app did not take it: open the app to finish");
+            v.say(words::words().app_did_not_take, true);
         }
         v.relayout();
     });
@@ -387,7 +393,8 @@ fn make(config: &Config, windowless: bool) -> Result<View> {
         show_tip: None,
         pressed: None,
         focus: None,
-        stash: Vec::new(),
+        stash: DRAFTS.with(|d| d.borrow().clone()),
+        refocus: None,
         flash: None,
     };
     Ok(view)
@@ -459,6 +466,10 @@ fn empty_input() -> scene::Input {
     scene::Input {
         room: 0.0,
         columns: None,
+        grid: scene::Grid::Comfortable,
+        rows_max: 5,
+        week_numbers: Vec::new(),
+        notifications_denied: false,
         groups: None,
         unread: 0,
         quiet: false,
@@ -554,7 +565,9 @@ impl View {
         // Notifications, by app; the newest app's open unless the user chose. Side by side, all
         // are, in full: the column has the room, and nothing folds.
         let wide = self.columns().is_some();
-        let groups = (!self.toasts.is_empty()).then(|| {
+        let t = words::words();
+        // Listed while turned on, even with none waiting (it says so, as Windows' centre does).
+        let groups = self.config.calendar.notifications.then(|| {
             super::notifications::grouped(&self.toasts)
                 .into_iter()
                 .enumerate()
@@ -571,11 +584,12 @@ impl View {
                             .map(|t| scene::Toast {
                                 index: self.toasts.iter().position(|x| x.id == t.id).unwrap_or(0),
                                 title: if t.title.is_empty() { t.app.clone() } else { t.title.clone() },
+                                when: arrived(t.at),
                                 body: t.body.clone(),
                                 avatar: t.rich.avatar.as_ref().map(|p| (p.key.clone(), p.bytes.clone())),
                                 picture: t.rich.picture.as_ref().map(|p| (p.key.clone(), p.bytes.clone())),
                                 buttons: t.rich.buttons.iter().map(|a| a.label.clone()).collect(),
-                                reply: t.rich.reply.as_ref().map(|r| if r.placeholder.is_empty() { "Reply".to_string() } else { r.placeholder.clone() }),
+                                reply: t.rich.reply.as_ref().map(|r| if r.placeholder.is_empty() { words::words().reply.to_string() } else { r.placeholder.clone() }),
                                 menu: t.rich.menu.iter().map(|a| a.label.clone()).collect(),
                                 draft: self.draft.as_ref().filter(|(id, _)| *id == t.id).map(|(_, text)| text.clone()),
                                 menu_open: self.menu_for == Some(t.id),
@@ -639,19 +653,20 @@ impl View {
                 .map(|e| (*e).clone())
                 .collect();
             hero = next.cloned();
-            list_title = "Coming up".to_string();
-            empty = "Nothing else in the next 7 days".to_string();
+            list_title = t.coming_up.to_string();
+            // "Nothing else" only after a next event.
+            empty = if next.is_some() { t.nothing_else } else { t.nothing }.to_string();
         } else {
             rows = model::on_day(&self.events, &self.spans, self.selected).into_iter().cloned().collect();
             list_title = capitalised(&locale::day_title(self.selected));
-            empty = "No events".to_string();
+            empty = t.no_events.to_string();
         }
         let hero_view = hero.as_ref().map(|e| scene::Hero {
-            caption: soon(e, now).to_uppercase(),
+            caption: soon(e, now),
             title: e.title.clone(),
             when: join_parts(&[span_words(e), e.location.clone()]),
             color: e.color,
-            joinable: e.join.is_some(),
+            joinable: join_now(e, now),
         });
         let row_views = rows
             .iter()
@@ -660,7 +675,7 @@ impl View {
                 title: e.title.clone(),
                 color: e.color,
                 right: if self.selected == today { String::new() } else { duration_words(e) },
-                joinable: e.join.is_some(),
+                joinable: join_now(e, now),
             })
             .collect();
         self.hero = hero;
@@ -668,8 +683,8 @@ impl View {
 
         let focus = super::schedule::focus_end();
         let focus_label = match focus {
-            Some(end) => format!("Focus · {} min left", ((end - now) + 59) / 60),
-            None => format!("Focus {} min", self.config.calendar.focus_minutes),
+            Some(end) => (t.focus_stop)(((end - now) + 59) / 60),
+            None => (t.focus)(self.config.calendar.focus_minutes),
         };
         let clocks = self
             .clocks
@@ -717,7 +732,11 @@ impl View {
             notice,
             focus: self.focus,
             pressed: self.pressed,
-            flash: self.flash.as_ref().filter(|(_, at)| at.elapsed() < FLASH_FOR).map(|(text, _)| text.clone()),
+            flash: self.flash.as_ref().filter(|(_, at, _)| at.elapsed() < FLASH_FOR).map(|(text, _, top)| (text.clone(), *top)),
+            grid: self.grid(),
+            rows_max: self.config.calendar.rows.max(1) as usize,
+            week_numbers: if self.config.calendar.week_numbers && self.grid() != scene::Grid::None { week_numbers(&days) } else { Vec::new() },
+            notifications_denied: super::notifications::denied(),
         }
     }
 
@@ -730,7 +749,16 @@ impl View {
 
     /// The month shows, not the week: opened, or always side by side (the calendar has the room).
     fn month_shown(&self) -> bool {
-        self.month_open || self.columns().is_some()
+        (self.month_open || self.columns().is_some()) && self.grid() != scene::Grid::None
+    }
+
+    /// The days' grid, as Settings' Layout has it.
+    fn grid(&self) -> scene::Grid {
+        match self.config.calendar.layout {
+            crate::config::CalendarLayout::Comfortable => scene::Grid::Comfortable,
+            crate::config::CalendarLayout::Compact => scene::Grid::Compact,
+            crate::config::CalendarLayout::AgendaOnly => scene::Grid::None,
+        }
     }
 
     /// Lay out for what there is now, and put the panel in its corner.
@@ -752,6 +780,13 @@ impl View {
     /// Lay out again (something came, went or was picked) and show it.
     fn relayout(&mut self) {
         self.place();
+        if let Some(at) = self.refocus.take() {
+            let order = self.tab_order();
+            if !order.is_empty() {
+                self.focus = Some(order[at.min(order.len() - 1)].1);
+                self.place();
+            }
+        }
         self.show();
     }
 
@@ -981,6 +1016,8 @@ impl View {
                 self.toasts.retain(|t| !ids.contains(&t.id));
                 super::notifications::remove(ids);
                 self.hover = None;
+                // What moved under the pointer lights at once (the next one's X, to go on).
+                self.later();
             }
             Hit::Toast(i) => {
                 let toast = self.toasts.get(i)?.clone();
@@ -1034,17 +1071,27 @@ impl View {
                 self.toasts.retain(|t| t.id != id);
                 super::notifications::remove(vec![id]);
                 self.hover = None;
+                self.later();
             }
             Hit::ClearAll => {
+                let n = self.toasts.len();
                 super::notifications::clear();
                 self.toasts.clear();
                 self.hover = None;
+                self.say(&(words::words().cleared)(n), true);
+            }
+            Hit::Allow => {
+                return Some(Box::new(|| {
+                    close();
+                    crate::win::shell_open("ms-settings:privacy-notifications", None);
+                }))
             }
             Hit::Quiet => {
                 let was = super::focus::active();
                 let on = super::focus::toggle();
                 if on == was {
-                    self.say(if was { "Windows would not turn off Do not disturb" } else { "Windows would not turn on Do not disturb" });
+                    let t = words::words();
+                    self.say(if was { t.dnd_refused_off } else { t.dnd_refused_on }, self.scene.top.is_some());
                 }
                 self.quiet = super::focus::active();
                 crate::tray::wake_calendar();
@@ -1076,7 +1123,7 @@ impl View {
                 if super::schedule::focus_end().is_some() {
                     super::schedule::stop_focus();
                 } else if !super::schedule::start_focus(self.config.calendar.focus_minutes) && !super::focus::active() {
-                    self.say("The timer runs, but Windows would not silence notifications");
+                    self.say(words::words().timer_not_quiet, false);
                 }
                 self.quiet = super::focus::active();
                 // The clock and the timer follow.
@@ -1198,19 +1245,29 @@ impl View {
             return None;
         }
         if let Some(focus) = self.focus {
+            // After the action, the ring goes to what then stands in the same place (the next
+            // notification after a dismissal), not back to the top.
+            let at = self.tab_order().iter().position(|(_, h)| *h == focus);
             match key {
                 VK_RETURN | VK_SPACE => {
                     self.focus = None;
+                    self.refocus = at;
                     return self.activate(focus);
                 }
                 VK_DELETE => {
                     if let Some(i) = scene::toast_of(focus) {
                         self.focus = None;
+                        self.refocus = at;
                         return self.activate(Hit::Dismiss(i));
                     }
                     return None;
                 }
                 _ => {}
+            }
+            // The arrows move the day only from a day (on a notification, the list would change
+            // under it).
+            if !matches!(focus, Hit::Day(_)) {
+                return None;
             }
         }
         let day = match key {
@@ -1227,6 +1284,9 @@ impl View {
             _ => return None,
         };
         self.select(day);
+        if self.focus.is_some() {
+            self.focus = Some(Hit::Day(day));
+        }
         self.relayout();
         Some(Box::new(keep_rect))
     }
@@ -1238,8 +1298,9 @@ impl View {
             self.center_scroll = (self.center_scroll - notches * SCROLL_STEP).clamp(0.0, max);
         } else if let Some((_, max)) = self.scene.list_view.filter(|(a, _)| a.contains(x, y)) {
             self.list_scroll = (self.list_scroll - notches * SCROLL_STEP).clamp(0.0, max);
-        } else if self.month_shown() && self.scene.main.contains(x, y) && delta != 0 {
-            // Over the month, as in the shell's calendar: a notch is a month.
+        } else if self.month_shown() && delta != 0 && matches!(self.scene.hit(x, y), Some(Hit::Day(_) | Hit::Prev | Hit::Next)) {
+            // Over the month, as in the shell's calendar: a notch is a month (not over the rest of
+            // the card, an event's details least of all).
             self.show_month(if delta > 0 { -1 } else { 1 });
         } else if !self.month_shown() && delta != 0 && matches!(self.scene.hit(x, y), Some(Hit::Day(_))) {
             // Over the week: a notch is a week.
@@ -1251,9 +1312,9 @@ impl View {
         self.later();
     }
 
-    /// Say `text` for a moment, over the calendar's foot.
-    fn say(&mut self, text: &str) {
-        self.flash = Some((text.to_string(), Instant::now()));
+    /// Say `text` for a moment, in the notification card (`top`) or the calendar, by what was pressed.
+    fn say(&mut self, text: &str, top: bool) {
+        self.flash = Some((text.to_string(), Instant::now(), top));
         unsafe { SetTimer(Some(self.hwnd), FLASH_TIMER, FLASH_FOR.as_millis() as u32, None) };
     }
 
@@ -1276,46 +1337,85 @@ impl View {
     /// Tab: the next target the keyboard can take (Shift+Tab: the one before), in the order the
     /// panel is laid out.
     fn move_focus(&mut self, back: bool) {
-        let wide = self.columns().is_some();
-        let mut order: Vec<Hit> = Vec::new();
-        for (_, hit) in &self.scene.hits {
-            // A group's line does nothing side by side.
-            if !matches!(hit, Hit::Draft(_)) && !(wide && matches!(hit, Hit::Group(_))) && order.last() != Some(hit) && !order.contains(hit) {
-                order.push(*hit);
-            }
-        }
+        let order = self.tab_order();
         if order.is_empty() {
             return;
         }
-        let at = self.focus.and_then(|f| order.iter().position(|h| *h == f));
+        let at = self.focus.and_then(|f| order.iter().position(|(_, h)| *h == f));
         let next = match (at, back) {
             (None, false) => 0,
             (None, true) => order.len() - 1,
             (Some(i), false) => (i + 1) % order.len(),
             (Some(i), true) => (i + order.len() - 1) % order.len(),
         };
-        self.focus = Some(order[next]);
+        self.focus = Some(order[next].1);
+        self.reveal_focus(order[next].0);
     }
+
+    /// Every target the keyboard can take, in the order the panel is laid out: out of sight too
+    /// (it scrolls into view), each once.
+    fn tab_order(&self) -> Vec<(R, Hit)> {
+        let mut order: Vec<(R, Hit)> = Vec::new();
+        for &(r, hit) in &self.scene.order {
+            if !matches!(hit, Hit::Draft(_)) && !order.iter().any(|(_, h)| *h == hit) {
+                order.push((r, hit));
+            }
+        }
+        order
+    }
+
+    /// Scroll the list holding the focused target (at `r`, unscrolled place as drawn) so it shows.
+    fn reveal_focus(&mut self, r: R) {
+        for (view, scroll) in [(self.scene.center_view, &mut self.center_scroll), (self.scene.list_view, &mut self.list_scroll)] {
+            let Some((area, max)) = view else { continue };
+            if r.x < area.x || r.right() > area.right() + 0.5 {
+                continue;
+            }
+            if r.bottom() > area.bottom() {
+                *scroll = (*scroll + r.bottom() - area.bottom() + 4.0).clamp(0.0, max);
+            } else if r.y < area.y {
+                *scroll = (*scroll - (area.y - r.y) - 4.0).clamp(0.0, max);
+            }
+        }
+    }
+}
+
+/// Whether to offer Join now: from shortly before the meeting to its end (days ahead, a list of
+/// Join buttons was noise, and one away from the wrong meeting); its details always offer it.
+fn join_now(event: &Event, now: i64) -> bool {
+    const BEFORE: i64 = 10 * 60;
+    event.join.is_some() && matches!(event.when, When::At { start, end } if now >= start - BEFORE && now < end)
+}
+
+/// Each grid row's ISO week number (from its Monday, or its first day if none falls in it).
+fn week_numbers(days: &[i32]) -> Vec<u32> {
+    days.chunks(7)
+        .filter_map(|row| {
+            let monday = row.iter().copied().find(|d| time::weekday(*d) == 0).or(row.first().copied())?;
+            // The ISO week is the one of its Thursday.
+            let thursday = monday - time::weekday(monday) as i32 + 3;
+            let (year, _, _) = time::civil_from_days(thursday);
+            Some(((thursday - time::days_from_civil(year, 1, 1)) / 7 + 1) as u32)
+        })
+        .collect()
 }
 
 /// "Next · in 6 h 35", "Now · until 21:03", "Next · Monday".
 fn soon(event: &Event, now: i64) -> String {
+    let t = words::words();
     match event.when {
-        When::At { start, end } if start <= now => format!("Now · until {}", locale::clock(time::second_of_day(Local.to_local(end)))),
+        When::At { start, end } if start <= now => (t.now_until)(&locale::clock(time::second_of_day(Local.to_local(end)))),
         When::At { start, .. } => {
             let minutes = (start - now + 59) / 60;
             let day = time::day_of(Local.to_local(start));
             if day == time::today() || minutes < 12 * 60 {
-                match minutes {
-                    0..=59 => format!("Next · in {minutes} min"),
-                    _ => format!("Next · in {} h {:02}", minutes / 60, minutes % 60),
-                }
+                (t.next_in)(minutes)
             } else {
-                format!("Next · {}", capitalised(&locale::format(day, "dddd")))
+                (t.next_on)(&capitalised(&locale::format(day, "dddd")))
             }
         }
-        When::AllDay { first, .. } if first <= time::today() => "Today · all day".into(),
-        When::AllDay { first, .. } => format!("Next · {}", capitalised(&locale::format(first, "dddd"))),
+        When::AllDay { first, .. } if first <= time::today() => t.today_all_day.into(),
+        When::AllDay { first, .. } => (t.next_on)(&capitalised(&locale::format(first, "dddd"))),
     }
 }
 
@@ -1323,7 +1423,7 @@ fn soon(event: &Event, now: i64) -> String {
 fn span_words(event: &Event) -> String {
     match event.when {
         When::AllDay { first, end } if end - first > 1 => format!("{} – {}", locale::format(first, "d MMM"), locale::format(end - 1, "d MMM")),
-        When::AllDay { .. } => "All day".into(),
+        When::AllDay { .. } => words::words().all_day.into(),
         When::At { start, end } => {
             let (s, e) = (Local.to_local(start), Local.to_local(end));
             let first = locale::clock(time::second_of_day(s));
@@ -1335,7 +1435,7 @@ fn span_words(event: &Event) -> String {
 /// A row's day and time in the week's list: "Mon 09:15", "Tue".
 fn week_label(event: &Event, today: i32) -> String {
     let (first, _) = event.days(&Local);
-    let day = if first <= today { "Today".to_string() } else { capitalised(&locale::format(first, "ddd")).trim_end_matches('.').to_string() };
+    let day = if first <= today { words::words().today.to_string() } else { capitalised(&locale::format(first, "ddd")).trim_end_matches('.').to_string() };
     match event.when {
         When::At { start, .. } => format!("{day} {}", locale::clock(time::second_of_day(Local.to_local(start)))),
         When::AllDay { .. } => day,
@@ -1345,7 +1445,7 @@ fn week_label(event: &Event, today: i32) -> String {
 /// A row's time on its day: "09:15", "All day".
 fn day_label(event: &Event, day: i32) -> String {
     match event.when {
-        When::AllDay { .. } => "All day".into(),
+        When::AllDay { .. } => words::words().all_day.into(),
         When::At { start, .. } => {
             let s = Local.to_local(start);
             if time::day_of(s) == day { locale::clock(time::second_of_day(s)) } else { "…".into() }
@@ -1387,22 +1487,22 @@ fn detail_view(event: &Event, setup: &Setup, now: i64, day: i32) -> scene::Detai
     }
     let mut people = people.join(", ");
     if !d.response.is_empty() {
-        people = join_parts(&[people, format!("you: {}", d.response.to_lowercase())]);
+        people = join_parts(&[people, (words::words().you)(&d.response.to_lowercase())]);
     }
     let source = super::status(setup).calendars.iter().find(|c| c.key == event.calendar).map_or_else(
         || match event.source {
             Source::Google => "Google".to_string(),
             Source::Microsoft => "Outlook".to_string(),
-            Source::Link(i) => setup.links.get(i).map_or_else(|| "Calendar".into(), |l| l.name.clone()),
+            Source::Link(i) => setup.links.get(i).map_or_else(|| words::words().calendar.into(), |l| l.name.clone()),
         },
         |c| c.name.clone(),
     );
     let open = event.link.as_ref().map(|link| match event.source {
-        Source::Google => "Open in Google Calendar".to_string(),
-        Source::Microsoft => "Open in Outlook".to_string(),
-        Source::Link(_) if link.contains("calendar.google.com") => "Open in Google Calendar".to_string(),
-        Source::Link(_) if link.contains("outlook.") => "Open in Outlook".to_string(),
-        Source::Link(_) => "Open".to_string(),
+        Source::Google => words::words().open_google.to_string(),
+        Source::Microsoft => words::words().open_outlook.to_string(),
+        Source::Link(_) if link.contains("calendar.google.com") => words::words().open_google.to_string(),
+        Source::Link(_) if link.contains("outlook.") => words::words().open_outlook.to_string(),
+        Source::Link(_) => words::words().open.to_string(),
     });
     let (first, _) = event.days(&Local);
     scene::Detail {
@@ -1418,7 +1518,14 @@ fn detail_view(event: &Event, setup: &Setup, now: i64, day: i32) -> scene::Detai
         source,
         open,
         joinable: event.join.is_some(),
+        directions: !event.location.is_empty() && !online(&event.location),
     }
+}
+
+/// Whether a location is an online meeting's (an address, Teams, Zoom, Meet, Webex), not a place.
+fn online(location: &str) -> bool {
+    let l = location.to_ascii_lowercase();
+    ["http://", "https://", "www.", "teams", "zoom", "meet.google", "google meet", "webex", "skype"].iter().any(|w| l.contains(w))
 }
 
 /// When a notification arrived, in a few words.
@@ -1427,8 +1534,8 @@ fn arrived(at: i64) -> String {
     let minutes = (now - at).max(0) / 60;
     let wall = Local.to_local(at);
     match minutes {
-        0 => "now".into(),
-        1..=59 => format!("{minutes} min"),
+        0 => words::words().now.into(),
+        1..=59 => (words::words().minutes)(minutes),
         _ if time::day_of(wall) == time::day_of(Local.to_local(now)) => locale::clock(time::second_of_day(wall)),
         _ => capitalised(&locale::format(time::day_of(wall), "ddd d")),
     }
@@ -1464,6 +1571,8 @@ fn draw(pen: &Pen, scene: &Scene, p: &Palette, area: Option<R>) {
         Fill::Hover => p.hover,
         Fill::Pressed => p.text.alpha(0.12),
         Fill::Accent => p.accent,
+        Fill::AccentHover => p.accent.alpha(0.85),
+        Fill::AccentPressed => p.accent.alpha(0.7),
         Fill::Rule => p.text.alpha(0.08),
         Fill::Mark => p.text.alpha(0.5),
         Fill::Tip => p.tip,
@@ -1659,6 +1768,11 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESUL
             *super::OPEN_RECT.lock().unwrap_or_else(|e| e.into_inner()) = None;
             CLOSED_AT.with(|c| c.set(Some(Instant::now())));
             let top = VIEW.with(|cell| cell.borrow_mut().take()).map(|v| {
+                // Drafts of notifications still waiting, for the next open.
+                let mut drafts = v.stash.clone();
+                drafts.extend(v.draft.clone().filter(|(_, text)| !text.is_empty()));
+                drafts.retain(|(id, _)| v.toasts.iter().any(|t| t.id == *id));
+                DRAFTS.with(|d| *d.borrow_mut() = drafts);
                 SPARE_GFX.with(|s| *s.borrow_mut() = Some(v.gfx.into_inner()));
                 v.top_hwnd
             });
@@ -1706,5 +1820,53 @@ fn refresh_if_done() {
     let fetched = WAS_FETCHING.with(|w| w.replace(now)) && !now;
     if fetched || TOASTS.with(|t| t.replace(toasts)) != toasts {
         refresh();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn week_numbers_are_iso_from_each_row_s_monday() {
+        let monday = time::days_from_civil(2025, 12, 29);
+        assert_eq!(week_numbers(&(monday..monday + 14).collect::<Vec<_>>()), vec![1, 2], "the week of 1 January 2026 is its first");
+        let row = time::days_from_civil(2026, 11, 16);
+        assert_eq!(week_numbers(&(row..row + 7).collect::<Vec<_>>()), vec![47]);
+        // A week starting on Sunday counts from the Monday in it.
+        assert_eq!(week_numbers(&(row - 1..row + 6).collect::<Vec<_>>()), vec![47]);
+    }
+
+    fn meeting(start: i64, end: i64, join: Option<&str>) -> Event {
+        Event {
+            when: When::At { start, end },
+            title: "Sync".into(),
+            location: String::new(),
+            link: None,
+            join: join.map(str::to_string),
+            source: Source::Google,
+            color: [0; 3],
+            calendar: String::new(),
+            details: Default::default(),
+        }
+    }
+
+    #[test]
+    fn join_is_offered_from_ten_minutes_before_to_the_end() {
+        let start = 1_000_000;
+        let e = meeting(start, start + 1800, Some("https://meet.google.com/x"));
+        assert!(!join_now(&e, start - 601));
+        assert!(join_now(&e, start - 600));
+        assert!(join_now(&e, start + 1799));
+        assert!(!join_now(&e, start + 1800));
+        assert!(!join_now(&meeting(start, start + 1800, None), start));
+    }
+
+    #[test]
+    fn online_meetings_get_no_directions() {
+        assert!(online("Microsoft Teams Meeting"));
+        assert!(online("https://zoom.us/j/1"));
+        assert!(!online("Interference, Toulouse"));
+        assert!(!online("Room 4.12"));
     }
 }

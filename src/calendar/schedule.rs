@@ -100,7 +100,7 @@ fn quiet_until(events: &[Event], now: i64, in_meetings: bool, in_call: bool) -> 
 /// The text after the time: the focus time left, if a focus timer runs. Meetings stay off the
 /// clock: the time is the time.
 fn focus_left(now: i64, end: i64) -> String {
-    format!("Focus {} min", ((end - now) + 59) / 60)
+    (super::view::words::words().focus_left)(((end - now) + 59) / 60)
 }
 
 /// The clock's time and date patterns, from the `[clock]` settings and the locale's own formats.
@@ -227,7 +227,8 @@ pub fn tick(config: &Config) -> Duration {
 
         // The clock.
         let top = s.focus.map_or_else(String::new, |(end, _, _)| focus_left(now, end));
-        let unread = if config.calendar.enabled && config.clock.unread { super::notifications::unseen() } else { 0 };
+        // Only with the notification list on: a badge pointing at nothing helps no one.
+        let unread = if config.calendar.enabled && config.calendar.notifications && config.clock.unread { super::notifications::unseen() } else { 0 };
         if !top.is_empty() {
             // The countdown moves with the minute.
             next = next.min(now - now % 60 + 60);
@@ -301,8 +302,8 @@ mod tests {
     #[test]
     fn the_focus_time_left_rounds_up_to_the_minute() {
         let now = 1_000_000;
-        assert_eq!(focus_left(now, now + 18 * 60), "Focus 18 min");
-        assert_eq!(focus_left(now, now + 17 * 60 + 1), "Focus 18 min");
+        assert_eq!(focus_left(now, now + 18 * 60), "Focus · 18 min left");
+        assert_eq!(focus_left(now, now + 17 * 60 + 1), "Focus · 18 min left");
     }
 
     fn meeting(start: i64, end: i64) -> Event {

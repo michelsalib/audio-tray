@@ -119,6 +119,12 @@ impl Flyout {
     /// Run the motion, calling `frame(offset in px, alpha 0..=255)` once per compositor frame.
     pub(crate) fn run(self, slide_px: f32, mut frame: impl FnMut(i32, u8)) {
         use windows::Win32::Graphics::Dwm::DwmFlush;
+        if !animations_on() {
+            // Windows' "Animation effects" off: straight to where it ends.
+            let (offset, alpha) = self.at(1.0);
+            frame((offset * slide_px).round() as i32, (alpha * 255.0).round() as u8);
+            return;
+        }
         let start = std::time::Instant::now();
         let total = self.duration().as_secs_f32();
         loop {
@@ -134,6 +140,14 @@ impl Flyout {
             }
         }
     }
+}
+
+/// Whether Windows animates (Settings, Accessibility, Visual effects, Animation effects).
+pub(crate) fn animations_on() -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::{SystemParametersInfoW, SPI_GETCLIENTAREAANIMATION, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS};
+    let mut on = windows::core::BOOL(1);
+    let asked = unsafe { SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, Some(&mut on as *mut _ as *mut _), SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0)) };
+    asked.is_err() || on.as_bool()
 }
 
 /// Register `class` (re-registering is a no-op) and create a `WS_POPUP` window of it. The class

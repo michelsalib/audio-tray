@@ -1413,7 +1413,7 @@ fn calendar_steps(col: &mut Column, model: &Model) {
     let s = &model.calendar;
     let hint = |button| model.hint.filter(|(b, _, _)| *b == button).map(|(_, h, tone)| (h.to_string(), tone));
     let mut body = col.group();
-    let what = plain("The clock opens this calendar; Windows' notifications stay on the bell");
+    let what = plain("The clock opens this calendar, with Windows' notifications beside it");
     col.row(&mut body, None, "Opens from the taskbar clock", what, !c.enabled, Control::Toggle(c.enabled, Toggle::Calendar));
     col.end_group(body);
 
@@ -1425,8 +1425,8 @@ fn calendar_steps(col: &mut Column, model: &Model) {
     col.row(&mut body, None, "Day of the week", plain("Before the date"), false, Control::Toggle(k.weekday, Toggle::ClockWeekday));
     col.row(&mut body, None, "One line", plain("The date after the time"), false, Control::Toggle(k.one_line, Toggle::ClockOneLine));
     col.row(&mut body, None, "Hide the date", None, false, Control::Toggle(k.hide_date, Toggle::ClockHideDate));
-    let unread = plain("Windows' notifications waiting, after the date");
-    col.row(&mut body, None, "Unread count", unread, !c.enabled, Control::Toggle(k.unread, Toggle::ClockUnread));
+    let unread = plain("New notifications since you last opened it, before the time");
+    col.row(&mut body, None, "Unread count", unread, !c.enabled || !c.notifications, Control::Toggle(k.unread, Toggle::ClockUnread));
     col.end_group(body);
     col.laid.push(R::new(col.x + 2.0, col.y - 4.0, col.w, 18.0), Kind::Text("Your own patterns: time_pattern and date_pattern under [clock] in config.toml".into()));
     col.y += 20.0;

@@ -991,10 +991,6 @@ pub struct ClockText {
 
 /// Tell the loaded TAP how the clock reads. `false` when no TAP took it.
 pub fn send_clock(text: &ClockText) -> bool {
-    use windows::Win32::Foundation::{LPARAM, WPARAM};
-    use windows::Win32::System::DataExchange::COPYDATASTRUCT;
-    use windows::Win32::UI::WindowsAndMessaging::{SendMessageTimeoutW, SMTO_ABORTIFHUNG, WM_COPYDATA};
-
     let flag = |on: bool| u8::from(on).to_string();
     let data = tap_proto::encode_init([
         ("time", text.time.clone()),
@@ -1006,7 +1002,20 @@ pub fn send_clock(text: &ClockText) -> bool {
         ("badge_width", text.badge_image.as_ref().map(|b| b.1.to_string()).unwrap_or_default()),
         ("badge_scale", text.badge_image.as_ref().map(|b| (b.2 as f32 / 96.0).to_string()).unwrap_or_default()),
     ]);
-    let payload = crate::win::wide(&data);
+    send_clock_data(&data)
+}
+
+/// Hand the clock back to the shell: the TAP stops writing it and undoes what it changed.
+pub fn release_clock() -> bool {
+    send_clock_data(&tap_proto::encode_init([("release", "1".to_string())]))
+}
+
+fn send_clock_data(data: &str) -> bool {
+    use windows::Win32::Foundation::{LPARAM, WPARAM};
+    use windows::Win32::System::DataExchange::COPYDATASTRUCT;
+    use windows::Win32::UI::WindowsAndMessaging::{SendMessageTimeoutW, SMTO_ABORTIFHUNG, WM_COPYDATA};
+
+    let payload = crate::win::wide(data);
     let copy = COPYDATASTRUCT {
         dwData: tap_proto::CLOCK_MAGIC,
         cbData: (payload.len() * 2) as u32,

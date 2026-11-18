@@ -19,6 +19,8 @@ use crate::taskbar::ClockText;
 const REFRESH_EVERY: i64 = 15 * 60;
 /// Events longer than this are not meetings (an all-morning block, a trip).
 const MEETING_MAX: i64 = 4 * 3600;
+/// How much later a quiet time must end before it is pushed back.
+const QUIET_SLACK: i64 = 10 * 60;
 
 #[derive(Default)]
 struct State {
@@ -153,7 +155,8 @@ pub fn tick(config: &Config) -> Duration {
         };
         match quiet_until {
             Some(until) if s.focus.is_none() => {
-                if focus::ours().is_none_or(|(why, end)| why == Why::Quiet && end < until) {
+                // A call's end moves with every tick: extended only when it gained a while.
+                if focus::ours().is_none_or(|(why, end)| why == Why::Quiet && end + QUIET_SLACK < until) {
                     focus::start(Why::Quiet, until);
                 }
             }
@@ -178,9 +181,18 @@ pub fn tick(config: &Config) -> Duration {
         let (time_pattern, date_pattern) = patterns(&config.clock);
         let badge_image = if unread > 0 { super::view::badge(unread as u32) } else { None };
         let text = ClockText { time: time_pattern, date: date_pattern, one_line: config.clock.one_line, top, badge: unread as u32, badge_image };
-        // Nothing to say and nothing said: the shell's clock stays the shell's.
-        let wanted = config.clock.styled() || !text.top.is_empty() || text.badge > 0 || s.sent.is_some();
-        if wanted && s.sent.as_ref() != Some(&text) {
+        // Nothing to say: the shell's clock is the shell's (handed back if the TAP had it).
+        let wanted = config.clock.styled() || !text.top.is_empty() || text.badge > 0;
+        if !wanted {
+            if s.sent.is_some() {
+                if crate::taskbar::release_clock() {
+                    println!("calendar: the clock is the shell's again");
+                    s.sent = None;
+                } else {
+                    next = next.min(now + 5);
+                }
+            }
+        } else if s.sent.as_ref() != Some(&text) {
             if crate::taskbar::send_clock(&text) {
                 println!("calendar: the clock now reads {:?}, {} unread", text.top, text.badge);
                 s.sent = Some(text);

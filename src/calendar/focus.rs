@@ -41,8 +41,48 @@ fn manager() -> Option<FocusSessionManager> {
     FocusSessionManager::GetDefault().ok()
 }
 
+/// The latest end Windows takes: the last second of 9999 (a manual session runs "until switched
+/// off", `i64::MAX`, which would overflow).
+const LATEST: i64 = 253_402_300_799;
+
 fn date_time(secs: i64) -> DateTime {
-    DateTime { UniversalTime: (secs + 11_644_473_600) * 10_000_000 }
+    DateTime { UniversalTime: super::time::to_filetime(secs.clamp(0, LATEST)) }
+}
+
+/// A file that says Do not disturb is Audio Tray's: it outlives a crash, so the next start can
+/// end what this one left on.
+fn marker() -> Option<std::path::PathBuf> {
+    Some(std::path::PathBuf::from(std::env::var_os("LOCALAPPDATA")?).join("audio-tray").join("dnd-ours"))
+}
+
+fn mark(ours: bool) {
+    let Some(path) = marker() else { return };
+    if ours {
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(&path, b"");
+    } else {
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+/// At start: Do not disturb a previous run set and never ended (it quit or crashed) is ended.
+pub fn recover() {
+    if marker().is_some_and(|p| p.exists()) {
+        if dnd::on() {
+            println!("calendar: ending the Do not disturb a previous run left on");
+            dnd::set(false);
+        }
+        mark(false);
+    }
+}
+
+/// At exit: end whatever Audio Tray holds, whyever it was started.
+pub fn release() {
+    if let Some((why, ..)) = OURS.with(Cell::get) {
+        stop(why);
+    }
 }
 
 fn session_active() -> bool {
@@ -65,6 +105,9 @@ pub fn ours() -> Option<(Why, i64)> {
         if running && how == How::Dnd {
             dnd::set(false);
         }
+        if how == How::Dnd {
+            mark(false);
+        }
         OURS.with(|o| o.set(None));
         return None;
     }
@@ -74,9 +117,16 @@ pub fn ours() -> Option<(Why, i64)> {
 /// Keep things quiet until `until` (seconds since the epoch), unless they already are and not by
 /// Audio Tray. `false` when Windows refused both ways.
 pub fn start(why: Why, until: i64) -> bool {
-    if active() && ours().is_none() {
+    let held = ours();
+    if active() && held.is_none() {
         // The user's own session or Do not disturb already keeps things quiet.
         return false;
+    }
+    if let Some((_, _, how)) = held.and(OURS.with(Cell::get)) {
+        // Already quiet by Audio Tray: the new reason and end take over, the way stays. A session
+        // that ends sooner is started again then, by the next tick.
+        OURS.with(|o| o.set(Some((why, until, how))));
+        return true;
     }
     let session = manager().map(|m| m.TryStartFocusSession2(date_time(until)));
     let how = match session {
@@ -88,6 +138,7 @@ pub fn start(why: Why, until: i64) -> bool {
             if !dnd::set(true) {
                 return false;
             }
+            mark(true);
             How::Dnd
         }
     };
@@ -109,6 +160,7 @@ pub fn stop(why: Why) {
         }
         How::Dnd => {
             dnd::set(false);
+            mark(false);
         }
     }
     OURS.with(|o| o.set(None));
@@ -126,10 +178,20 @@ pub fn toggle() -> bool {
         if dnd::on() {
             dnd::set(false);
         }
+        mark(false);
         OURS.with(|o| o.set(None));
         return false;
     }
     start(Why::Manual, i64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn a_session_until_switched_off_ends_in_9999_not_in_an_overflow() {
+        assert_eq!(super::date_time(i64::MAX).UniversalTime, crate::calendar::time::to_filetime(super::LATEST));
+        assert_eq!(super::date_time(0).UniversalTime, 116_444_736_000_000_000);
+    }
 }
 
 /// Windows' Do not disturb, as its Quick Settings toggle sets it: the shell's

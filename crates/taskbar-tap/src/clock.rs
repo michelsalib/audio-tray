@@ -127,7 +127,7 @@ pub struct Text {
     date: String,
     /// The date after the time, on one line.
     one_line: bool,
-    /// After the time (the next meeting, the focus time left).
+    /// After the time: the focus time left (never meeting info).
     top: String,
     /// Windows' unread notifications (0: none).
     badge: u32,
@@ -140,9 +140,13 @@ pub struct Text {
 
 /// The app's latest word; `None` when it never styled the clock or has gone.
 static TEXT: Mutex<Option<Text>> = Mutex::new(None);
-/// The clock's width held (DIPs): the widest drawn since its text last changed shape; negative
-/// when it is to be measured afresh.
-static HELD_WIDTH: Mutex<f64> = Mutex::new(0.0);
+/// The app handed the clock back: the next tick undoes the TAP's changes, then the timer stops.
+static RELEASING: AtomicBool = AtomicBool::new(false);
+/// Each clock's width held (stack handle, DIPs): the widest it has drawn since the text last
+/// changed shape. Empty: measured afresh. Per clock, as each taskbar's clock has its own width.
+static HELD: Mutex<Vec<(u64, f64)>> = Mutex::new(Vec::new());
+/// Date blocks the TAP hid (a hidden date, one line), shown again when it lets go.
+static HIDDEN: Mutex<Vec<u64>> = Mutex::new(Vec::new());
 
 /// Control-window timer that updates the text, at each minute (each second with seconds shown).
 pub const TEXT_TIMER: usize = 3;
@@ -150,6 +154,15 @@ pub const TEXT_TIMER: usize = 3;
 /// The app's new text settings (init-data encoded).
 pub fn set_text(data: &str) {
     let flag = |key: &str| tap_proto::init_value(data, key).as_deref() == Some("1");
+    if flag("release") {
+        // The app has nothing to show: the clock goes back to the shell at the next tick.
+        if crate::lock(&TEXT).take().is_some() {
+            logf!("clock: handed back to the shell");
+            RELEASING.store(true, Ordering::SeqCst);
+            crate::lifecycle::arm_clock_timer(1);
+        }
+        return;
+    }
     let value = |key: &str| tap_proto::init_value(data, key).unwrap_or_default();
     let text = Text {
         time: value("time"),
@@ -165,7 +178,7 @@ pub fn set_text(data: &str) {
     if held.as_ref() != Some(&text) {
         logf!("clock: text now {text:?}");
         // A new shape: the width is measured afresh.
-        *crate::lock(&HELD_WIDTH) = -1.0;
+        crate::lock(&HELD).clear();
         *held = Some(text);
     }
     drop(held);
@@ -192,12 +205,16 @@ pub fn release_text() {
 /// # Safety
 /// XAML UI thread only.
 pub unsafe fn restore(diagnostics: &xamlom::IXamlDiagnostics) {
-    *crate::lock(&HELD_WIDTH) = 0.0;
+    crate::lock(&HELD).clear();
     for stack in tree::find_by_name(STACK) {
         set_min_width(diagnostics, stack, 0.0);
         show_badge(diagnostics, stack, None);
     }
     crate::lock(&BADGED).clear();
+    // The shell's bindings rewrite the date's text, never its visibility.
+    for block in std::mem::take(&mut *crate::lock(&HIDDEN)) {
+        crate::decorate::set_visible(diagnostics, block, true);
+    }
 }
 
 /// The room between the badge and the text, in DIPs.
@@ -250,7 +267,7 @@ unsafe fn show_badge(diagnostics: &xamlom::IXamlDiagnostics, stack: u64, image: 
         badged.push((stack, key));
     }
     // The width changes with the badge: measured afresh.
-    *crate::lock(&HELD_WIDTH) = -1.0;
+    crate::lock(&HELD).retain(|(h, _)| *h != stack);
 }
 
 /// `C:\a b\c.png` as `file:///C:/a%20b/c.png`, quoted for an XAML attribute.
@@ -353,7 +370,14 @@ pub unsafe fn tick() -> Option<u32> {
     // No quiet gate: setting text on elements that exist is no structural change (like the hover
     // plates' opacity), and while music plays the tree is seldom quiet: waiting for it left the
     // shell's text up for long stretches.
-    let text = crate::lock(&TEXT).clone()?;
+    let Some(text) = crate::lock(&TEXT).clone() else {
+        if RELEASING.swap(false, Ordering::SeqCst) {
+            if let Some(diagnostics) = crate::diagnostics() {
+                restore(&diagnostics);
+            }
+        }
+        return None;
+    };
     let Some(diagnostics) = crate::diagnostics() else { return Some(1000) };
     let st = now();
     let dot = accent_dot(crate::strip_state().and_then(|s| s.accent));
@@ -364,32 +388,43 @@ pub unsafe fn tick() -> Option<u32> {
         }
     }
     for block in tree::find_by_name(DATE) {
+        // Visibility is written only when it changes: a write each frame costs Explorer for nothing.
+        let hidden = crate::lock(&HIDDEN).contains(&block);
         match &date {
             Some(date) => {
-                crate::decorate::set_visible(&diagnostics, block, true);
+                if hidden {
+                    crate::decorate::set_visible(&diagnostics, block, true);
+                    crate::lock(&HIDDEN).retain(|b| *b != block);
+                }
                 if crate::decorate::text_of(&diagnostics, block).as_deref() != Some(date.as_str()) {
                     crate::decorate::set_text(&diagnostics, block, date);
                 }
             }
-            None => {
+            None if !hidden => {
                 crate::decorate::set_visible(&diagnostics, block, false);
+                crate::lock(&HIDDEN).push(block);
             }
+            None => {}
         }
     }
-    // Hold the width at the widest drawn, so the shell's own (shorter) text, shown for a moment
-    // after each minute, does not move the taskbar.
+    // Hold each clock's width at the widest it drew, so the shell's own (shorter) text, shown for a
+    // moment after each minute, does not move the taskbar.
     let badge = (text.badge > 0 && !text.badge_image.is_empty()).then_some((text.badge_image.as_str(), text.badge_width, text.badge_scale));
     for stack in tree::find_by_name(STACK) {
         show_badge(&diagnostics, stack, badge);
         let width = crate::decorate::actual_width(&diagnostics, stack).unwrap_or(0.0);
-        let mut held = crate::lock(&HELD_WIDTH);
-        if *held < 0.0 {
-            // A new shape: start from what it measures now.
-            *held = 0.0;
-            set_min_width(&diagnostics, stack, 0.0);
-        } else if width > *held + 0.5 {
-            *held = width;
-            set_min_width(&diagnostics, stack, width);
+        let mut held = crate::lock(&HELD);
+        match held.iter_mut().find(|(h, _)| *h == stack) {
+            None => {
+                // A new shape: start from what it measures now.
+                held.push((stack, 0.0));
+                set_min_width(&diagnostics, stack, 0.0);
+            }
+            Some((_, w)) if width > *w + 0.5 => {
+                *w = width;
+                set_min_width(&diagnostics, stack, width);
+            }
+            Some(_) => {}
         }
     }
     // A burst of looks asked for (the pointer over the clock): one frame at a time until spent.
@@ -406,11 +441,15 @@ static BURST: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new
 /// The pointer entered or left the clock: the shell may redraw its text then, so look every frame
 /// for about a second.
 pub fn watch_closely() {
-    if crate::lock(&TEXT).is_some() {
-        BURST.store(60, Ordering::SeqCst);
+    // Not re-armed while one runs: sweeping across the clock would keep Explorer at 60 Hz.
+    if crate::lock(&TEXT).is_some() && BURST.load(Ordering::SeqCst) == 0 {
+        BURST.store(BURST_FRAMES, Ordering::SeqCst);
         crate::lifecycle::arm_clock_timer(16);
     }
 }
+
+/// About half a second of frames: the shell redraws its text within that of a hover.
+const BURST_FRAMES: u32 = 30;
 
 /// When to look next (ms), `into` ms into the minute. The shell rewrites its text about half a
 /// second after each minute (measured: 0.5 to 0.7 s): through the first 1.5 s the TAP looks every

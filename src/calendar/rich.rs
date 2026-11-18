@@ -329,7 +329,9 @@ fn picture(src: &str, base: &Base) -> Option<Picture> {
 fn fetch(src: &str, base: &Base) -> Option<Vec<u8>> {
     let lower = src.to_ascii_lowercase();
     if lower.starts_with("https://") || lower.starts_with("http://") {
-        let mut response = super::oauth::agent().get(src).call().ok()?;
+        // Short: a slow picture host must not hold up the list.
+        let request = super::oauth::agent().get(src).config().timeout_global(Some(std::time::Duration::from_secs(5))).build();
+        let mut response = request.call().ok()?;
         if response.status() != 200 {
             return None;
         }
@@ -353,8 +355,18 @@ fn fetch(src: &str, base: &Base) -> Option<Vec<u8>> {
         src.to_string()
     };
     let path = path.replace('/', r"\");
+    if !on_a_local_drive(&path) {
+        // `\\server\share`: looking would sign in to that server, as the user.
+        return None;
+    }
     let size = std::fs::metadata(&path).ok()?.len();
     (size <= PICTURE_MAX).then(|| std::fs::read(&path).ok()).flatten()
+}
+
+/// `C:\…`: a path on a drive letter, never a share (`\\server\…`, `\\?\UNC\…`) or a device.
+fn on_a_local_drive(path: &str) -> bool {
+    let b = path.as_bytes();
+    b.len() > 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && b[2] == b'\\'
 }
 
 fn strip_scheme<'a>(src: &'a str, scheme: &str) -> Option<&'a str> {
@@ -480,6 +492,15 @@ fn activate(aumid: &str, clsid: u128, arguments: &str, kind: Kind, inputs: &[(St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pictures_are_read_from_local_drives_only() {
+        assert!(on_a_local_drive(r"C:\Users\a\b.png"));
+        assert!(!on_a_local_drive(r"\\server\share\b.png"));
+        assert!(!on_a_local_drive(r"\\?\UNC\server\share\b.png"));
+        assert!(!on_a_local_drive(r"\\.\pipe\x"));
+        assert!(!on_a_local_drive("b.png"));
+    }
 
     const WHATSAPP: &str = r#"<toast launch="action=Click&amp;key=1"><visual><binding template="ToastGeneric"><text>Pierre</text><text>Plouf</text><image src="https://x/a.jpg?s=96&amp;t=1" placement="appLogoOverride" hint-crop="circle" /></binding></visual><audio src="ms-appx:///Sounds/a.m4a" /><actions><input id="quickReplyInputBoxId" type="text" placeHolderContent="Saisir une réponse" /><action content="Envoyer" arguments="action=Reply&amp;k=1" activationType="background" hint-inputId="quickReplyInputBoxId" /><action content="Mode silencieux" arguments="action=Mute" activationType="background" placement="contextMenu" /><action content="Snooze" arguments="snooze" activationType="system" /></actions></toast>"#;
 

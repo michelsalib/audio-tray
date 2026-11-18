@@ -267,7 +267,8 @@ fn stamp(value: &str, params: &[(String, String)]) -> Option<Stamp> {
         return Some(Stamp::Date(day));
     }
     let clock = value.get(9..15)?;
-    let secs = day as i64 * DAY + digits(&clock[0..2])? * 3600 + digits(&clock[2..4])? * 60 + digits(&clock[4..6])?;
+    let part = |r: std::ops::Range<usize>| clock.get(r).and_then(digits);
+    let secs = day as i64 * DAY + part(0..2)? * 3600 + part(2..4)? * 60 + part(4..6)?;
     let utc_zone = params.iter().any(|(k, v)| k == "TZID" && matches!(v.as_str(), "UTC" | "Etc/UTC" | "GMT" | "Etc/GMT" | "Z"));
     Some(if value.ends_with('Z') || utc_zone { Stamp::Utc(secs) } else { Stamp::Wall(secs) })
 }
@@ -288,7 +289,7 @@ fn duration(value: &str) -> Option<i64> {
             unit => {
                 let n: i64 = number.parse().ok()?;
                 number.clear();
-                total += n * match unit {
+                let unit = match unit {
                     'W' => 7 * DAY,
                     'D' => DAY,
                     'H' => 3600,
@@ -296,6 +297,8 @@ fn duration(value: &str) -> Option<i64> {
                     'S' => 1,
                     _ => return None,
                 };
+                // A feed's nonsense (`P99999999999999W`) is no duration, not an overflow.
+                total = total.checked_add(n.checked_mul(unit)?)?;
             }
         }
     }
@@ -356,7 +359,8 @@ impl Rule {
                         _ => return None,
                     })
                 }
-                "INTERVAL" => rule.interval = value.parse::<i32>().ok()?.max(1),
+                // Capped: a series every thousand periods is as rare as never, and the sums stay small.
+                "INTERVAL" => rule.interval = value.parse::<i32>().ok()?.clamp(1, 1000),
                 "COUNT" => rule.count = value.parse().ok(),
                 "UNTIL" => rule.until = stamp(value, &[]),
                 "BYDAY" => rule.by_day = value.split(',').filter_map(by_day).collect(),
@@ -507,7 +511,7 @@ impl Rule {
 fn by_day(text: &str) -> Option<(i32, u32)> {
     let text = text.trim();
     let split = text.len().checked_sub(2)?;
-    let (ordinal, code) = text.split_at(split);
+    let (ordinal, code) = (text.get(..split)?, text.get(split..)?);
     let ordinal = if ordinal.is_empty() { 0 } else { ordinal.trim_start_matches('+').parse().ok()? };
     Some((ordinal, weekday_code(code)?))
 }
@@ -653,5 +657,25 @@ mod tests {
         assert_eq!(duration("P1D"), Some(DAY));
         assert_eq!(duration("P2W"), Some(14 * DAY));
         assert_eq!(duration("-PT15M"), Some(-900));
+    }
+
+    #[test]
+    fn a_hostile_feed_is_read_as_far_as_it_makes_sense_and_never_panics() {
+        assert_eq!(stamp("20261113Té90000", &[]), None, "a split character in the time");
+        assert_eq!(stamp("20261113T0900", &[]), None, "a truncated time");
+        assert_eq!(by_day("é1"), None);
+        assert_eq!(by_day("1é"), None);
+        assert_eq!(duration("P99999999999999W"), None);
+        assert_eq!(duration("PT9223372036854775807H"), None);
+        let text = feed(
+            "BEGIN:VEVENT\r\nUID:a\r\nSUMMARY:Huge\r\nDTSTART:20261113T090000Z\r\nDURATION:PT1H\r\nRRULE:FREQ=YEARLY;INTERVAL=2147483647\r\nEND:VEVENT\r\n\
+             BEGIN:VEVENT\r\nUID:b\r\nSUMMARY:Never\r\nDTSTART:20261113T090000Z\r\nDURATION:PT1H\r\nRRULE:FREQ=MONTHLY;BYMONTHDAY=40;INTERVAL=999999\r\nEND:VEVENT\r\n\
+             BEGIN:VEVENT\r\nUID:c\r\nSUMMARY:Cut\r\nDTSTART:2026\r\nEND:VEVENT\r\n\
+             BEGIN:VEVENT\r\nUID:d\r\nSUMMARY:Odd days\r\nDTSTART:20261113T090000Z\r\nDURATION:PT1H\r\nRRULE:FREQ=WEEKLY;BYDAY=é1,MO\r\nEND:VEVENT\r\n",
+        );
+        let zone = Fixed(0);
+        let items = parse(&text, (day(2026, 11, 9), day(2026, 11, 23)), &zone);
+        assert!(items.iter().any(|i| i.title == "Huge"), "its first occurrence stays");
+        assert!(items.iter().any(|i| i.title == "Odd days"), "the readable weekday stays");
     }
 }

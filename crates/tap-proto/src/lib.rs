@@ -82,6 +82,7 @@ pub const HANDOVER_DECLINED: isize = 2;
 /// `date` (`GetTimeFormatEx`/`GetDateFormatEx` patterns, empty for the locale's, `date=-` to hide
 /// it), `oneline`, `top` (text after the time), `badge` (the unread count) and `badge_image`,
 /// `badge_width`, `badge_scale` (the app-drawn badge PNG, its width in DIPs, its pixels per DIP).
+/// `release=1` alone hands the clock back to the shell (the TAP undoes its changes and stops).
 pub const CLOCK_MAGIC: usize = 0x4154_4331;
 
 /// Plane-15 PUA markers (Segoe Fluent owns the BMP PUA) for earbuds the TAP draws as vectors.

@@ -4,9 +4,9 @@
 //!
 //! **Threads.** Everything here is called on the tray thread except the work: a fetch and a
 //! sign-in each run on a thread of their own and post [`WM_CALENDAR`] to the tray when they are
-//! done; [`changed`] then repaints the calendar and Settings from [`STATE`]. Nothing polls: events
-//! are fetched when the calendar opens (from the cache at once, refreshed when stale) and when its
-//! month moves out of what was fetched.
+//! done; [`changed`] then repaints the calendar and Settings from [`STATE`]. Events are fetched when
+//! the calendar opens (from the cache at once, refreshed when stale), when its month moves out of
+//! what was fetched, and every quarter hour in the background ([`schedule`]) for reminders.
 
 pub mod focus;
 mod ics;
@@ -205,6 +205,22 @@ pub fn fetch(setup: &Setup, days: (i32, i32), force: bool) {
 
 fn spawn_fetch(setup: Setup, days: (i32, i32)) {
     std::thread::spawn(move || {
+        // A panic (a feed nobody foresaw) must not leave `fetching` set, or nothing is fetched
+        // again until a restart.
+        struct Done;
+        impl Drop for Done {
+            fn drop(&mut self) {
+                if std::thread::panicking() {
+                    eprintln!("calendar: the fetch panicked");
+                    let mut state = state();
+                    state.fetching = false;
+                    state.again = None;
+                    drop(state);
+                    notify();
+                }
+            }
+        }
+        let _done = Done;
         let (mut setup, mut days) = (setup, days);
         loop {
             let Fetched { events, problems, done, calendars } = fetch_all(&setup, days);
@@ -241,7 +257,6 @@ fn spawn_fetch(setup: Setup, days: (i32, i32)) {
     });
 }
 
-/// Every source's events on `days`, the problems met, and which sources answered.
 /// What a fetch brings back: the events, the problems met, which sources answered, and their
 /// calendars.
 struct Fetched {

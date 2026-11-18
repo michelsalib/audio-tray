@@ -307,10 +307,38 @@ struct Ink2 {
     items: Vec<(R, Draw)>,
     hits: Vec<(R, Hit)>,
     hover: Option<Hit>,
+    /// The scrolled area drawing is clipped to: targets are clipped the same, so what scrolled
+    /// out of sight takes no clicks (and none over the header above it).
+    /// Nested (the reply box clips inside the list): each entry is already cut to the one under it.
+    clips: Vec<R>,
+}
+
+/// Where `a` and `b` overlap, if they do.
+fn overlap(a: R, b: R) -> Option<R> {
+    let (x0, y0) = (a.x.max(b.x), a.y.max(b.y));
+    let (x1, y1) = (a.right().min(b.right()), a.bottom().min(b.bottom()));
+    (x1 > x0 && y1 > y0).then(|| R::new(x0, y0, x1 - x0, y1 - y0))
 }
 
 impl Ink2 {
+    fn new(hover: Option<Hit>) -> Self {
+        Ink2 { items: Vec::new(), hits: Vec::new(), hover, clips: Vec::new() }
+    }
+
     fn draw(&mut self, r: R, d: Draw) {
+        match d {
+            Draw::Clip => {
+                let cut = match self.clips.last() {
+                    Some(&c) => overlap(r, c).unwrap_or(R::new(r.x, r.y, 0.0, 0.0)),
+                    None => r,
+                };
+                self.clips.push(cut);
+            }
+            Draw::Unclip => {
+                self.clips.pop();
+            }
+            _ => {}
+        }
         self.items.push((r, d));
     }
 
@@ -323,6 +351,13 @@ impl Ink2 {
     }
 
     fn hit(&mut self, r: R, hit: Hit) {
+        let r = match self.clips.last() {
+            Some(&c) => match overlap(r, c) {
+                Some(cut) => cut,
+                None => return,
+            },
+            None => r,
+        };
         self.hits.push((r, hit));
     }
 
@@ -404,7 +439,7 @@ fn main_height(input: &Input, rows: usize) -> f32 {
 }
 
 pub fn build(input: &Input) -> Scene {
-    let mut ink = Ink2 { items: Vec::new(), hits: Vec::new(), hover: input.hover };
+    let mut ink = Ink2::new(input.hover);
 
     // How many list rows fit, and how tall the notification centre may be.
     let mut rows = input.rows.len().clamp(1, 5);
@@ -530,9 +565,7 @@ fn center_summary(ink: &mut Ink2, card: R, input: &Input, groups: &[Group]) {
     ink.plate(R::new(card.x + 4.0, card.y + 4.0, card.w - 8.0, card.h - 8.0), Hit::Center, 6.0);
     let y = card.y + (card.h - 20.0) / 2.0;
     ink.text(R::new(card.x + PAD, y, 110.0, 20.0), "Notifications", Font::Strong, Ink::Text, Align::Left);
-    let chip = R::new(card.x + PAD + 104.0, y + 1.0, 24.0, 18.0);
-    ink.draw(chip, Draw::Rect { fill: Fill::Accent, radius: 9.0 });
-    ink.text(chip, input.unread.to_string(), Font::CaptionStrong, Ink::OnAccent, Align::Center);
+    let chip = count_chip(ink, card.x + PAD + 104.0, y + 1.0, input.unread);
     let mut x = chip.right() + 10.0;
     for group in groups.iter().take(5) {
         if let Some((key, bytes)) = &group.logo {
@@ -626,18 +659,26 @@ fn notification(ink: &mut Ink2, r: R, toast: &Toast) {
     }
 }
 
+/// The unread count in an accent chip at `(x, y)`, as wide as its number (99+ at most).
+fn count_chip(ink: &mut Ink2, x: f32, y: f32, unread: usize) -> R {
+    let label = if unread > 99 { "99+".to_string() } else { unread.to_string() };
+    let chip = R::new(x, y, (label.chars().count() as f32 * 7.0 + 10.0).max(24.0), 18.0);
+    ink.draw(chip, Draw::Rect { fill: Fill::Accent, radius: 9.0 });
+    ink.text(chip, label, Font::CaptionStrong, Ink::OnAccent, Align::Center);
+    chip
+}
+
 /// The notification centre open: its header, then each app's group. Returns its scrolling area.
 fn center(ink: &mut Ink2, card: R, input: &Input, groups: &[Group]) -> (R, f32) {
     let x = card.x + 8.0;
     let w = card.w - 16.0;
     let head = R::new(x, card.y + 10.0, w, 32.0);
     ink.text(R::new(head.x + 8.0, head.y, 110.0, head.h), "Notifications", Font::Strong, Ink::Text, Align::Left);
-    let chip = R::new(head.x + 112.0, head.y + 7.0, 24.0, 18.0);
-    ink.draw(chip, Draw::Rect { fill: Fill::Accent, radius: 9.0 });
-    ink.text(chip, input.unread.to_string(), Font::CaptionStrong, Ink::OnAccent, Align::Center);
+    count_chip(ink, head.x + 112.0, head.y + 7.0, input.unread);
+    // A text link, tinted under the pointer like the calendar's.
     let clear = R::new(head.right() - 80.0, head.y + 2.0, 80.0, 28.0);
-    ink.draw(clear, Draw::Rect { fill: if ink.lit(Hit::ClearAll) { Fill::Hover } else { Fill::Raised }, radius: 4.0 });
-    ink.text(clear, "Clear all", Font::Caption, Ink::Text, Align::Center);
+    let lit = ink.lit(Hit::ClearAll);
+    ink.text(clear, "Clear all", Font::Caption, if lit { Ink::Accent } else { Ink::Text }, Align::Center);
     ink.hit(clear, Hit::ClearAll);
     ink.icon_button(R::new(clear.x - 40.0, head.y, 32.0, 32.0), '\u{E708}', Hit::Quiet, input.quiet);
     // The whole panel for the notifications, or back.

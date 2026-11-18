@@ -146,14 +146,9 @@ pub fn close() {
     if open == 0 || CLOSING.with(|c| c.replace(true)) {
         return;
     }
-    let top = with_view(|v| {
-        v.animate(crate::win::Flyout::Close);
-        v.top_hwnd
-    });
+    with_view(|v| v.animate(crate::win::Flyout::Close));
+    // Its WM_DESTROY takes the notification card along.
     let _ = unsafe { DestroyWindow(HWND(open as *mut _)) };
-    if let Some(top) = top {
-        let _ = unsafe { DestroyWindow(top) };
-    }
     CLOSING.with(|c| c.set(false));
 }
 
@@ -236,11 +231,20 @@ fn create(config: &Config) -> Result<()> {
     let mut cursor = POINT::default();
     let _ = unsafe { GetCursorPos(&mut cursor) };
     let (scale, rect, work) = monitor(cursor);
+    // First what can fail without windows to clean up after.
+    let gfx = Gfx::new()?;
     let style = WINDOW_EX_STYLE(WS_EX_LAYERED.0 | WS_EX_TOOLWINDOW.0 | WS_EX_TOPMOST.0);
     let hwnd = crate::win::create_popup(CLASS, w!("Calendar"), Some(wndproc), style, (0, 0, 1, 1)).context("CreateWindowExW")?;
     // Never activated: a click on it must not deactivate the calendar's window, which closes on that.
     let top_style = WINDOW_EX_STYLE(style.0 | WS_EX_NOACTIVATE.0);
-    let top_hwnd = crate::win::create_popup(CLASS_TOP, w!("Notifications"), Some(top_proc), top_style, (0, 0, 1, 1)).context("CreateWindowExW")?;
+    let top_hwnd = crate::win::create_popup(CLASS_TOP, w!("Notifications"), Some(top_proc), top_style, (0, 0, 1, 1));
+    let top_hwnd = match top_hwnd {
+        Ok(top) => top,
+        Err(e) => {
+            let _ = unsafe { DestroyWindow(hwnd) };
+            return Err(e).context("CreateWindowExW (the notification card)");
+        }
+    };
     unsafe {
         crate::layered::style_panel(hwnd, crate::layered::CORNER_ROUND);
         crate::layered::style_panel(top_hwnd, crate::layered::CORNER_ROUND);
@@ -253,7 +257,7 @@ fn create(config: &Config) -> Result<()> {
     let mut view = View {
         hwnd,
         top_hwnd,
-        gfx: RefCell::new(Gfx::new()?),
+        gfx: RefCell::new(gfx),
         palette: Palette::current(),
         scale,
         edge: edge_of(&rect, &work),

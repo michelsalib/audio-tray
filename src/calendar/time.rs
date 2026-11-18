@@ -117,6 +117,19 @@ pub fn now() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64)
 }
 
+/// Seconds from 1601 (Windows' epoch) to 1970.
+const WINDOWS_EPOCH: i64 = 11_644_473_600;
+
+/// Seconds since the epoch as Windows time (100 ns ticks since 1601).
+pub fn to_filetime(secs: i64) -> i64 {
+    secs.saturating_add(WINDOWS_EPOCH).saturating_mul(10_000_000)
+}
+
+/// Windows time (100 ns ticks since 1601) as seconds since the epoch.
+pub fn from_filetime(ticks: i64) -> i64 {
+    ticks / 10_000_000 - WINDOWS_EPOCH
+}
+
 /// Today's day number on the local clock.
 pub fn today() -> i32 {
     day_of(Local.to_local(now()))

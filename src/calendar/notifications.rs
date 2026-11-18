@@ -221,7 +221,7 @@ fn read(listener: &UserNotificationListener) -> anyhow::Result<Vec<Toast>> {
             .as_ref()
             .and_then(|x| x.ExpirationTime().ok())
             .and_then(|t| t.Value().ok())
-            .is_some_and(|t| t.UniversalTime / 10_000_000 - 11_644_473_600 <= now);
+            .is_some_and(|t| super::time::from_filetime(t.UniversalTime) <= now);
         if expired {
             continue;
         }
@@ -234,7 +234,7 @@ fn read(listener: &UserNotificationListener) -> anyhow::Result<Vec<Toast>> {
             .and_then(|b| b.GetTextElements().ok())
             .map(|list| list.into_iter().filter_map(|t| t.Text().ok().map(|s| s.to_string())).collect())
             .unwrap_or_default();
-        let at = n.CreationTime().map_or(0, |t| t.UniversalTime / 10_000_000 - 11_644_473_600);
+        let at = n.CreationTime().map_or(0, |t| super::time::from_filetime(t.UniversalTime));
         let logo = logo_of(&aumid, info.as_ref());
         let id = n.Id().unwrap_or_default();
         infos.push((id, aumid.clone(), info));

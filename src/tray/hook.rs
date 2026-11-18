@@ -146,7 +146,40 @@ static CLOCK_PRESSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicB
 /// The TAP's word on whether the pointer is over the clock (it only says "over" while the calendar
 /// replaces the shell's).
 pub(super) fn set_clock_hover(over: bool) {
-    CLOCK_HOVER.store(over, std::sync::atomic::Ordering::Relaxed);
+    use std::sync::atomic::Ordering::Relaxed;
+    if over {
+        // Where it was over the clock: a click far from there is not on the clock, whatever a
+        // stale word (the TAP unloaded before saying "left") claims.
+        let mut pt = POINT::default();
+        let _ = unsafe { windows::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut pt) };
+        CLOCK_AT.store(pack(pt), Relaxed);
+    }
+    CLOCK_HOVER.store(over, Relaxed);
+}
+
+/// Whether clicks on the clock open the calendar (the calendar is on).
+static CLOCK_TAKEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Where the pointer was when the TAP said it was over the clock (x, y packed).
+static CLOCK_AT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// The clock's button is about this wide: a press further than this from where the pointer
+/// entered it is elsewhere.
+const CLOCK_REACH: i32 = 160;
+
+fn pack(pt: POINT) -> u64 {
+    ((pt.x as u32 as u64) << 32) | pt.y as u32 as u64
+}
+
+fn unpack(v: u64) -> POINT {
+    POINT { x: (v >> 32) as u32 as i32, y: v as u32 as i32 }
+}
+
+/// The calendar on or off: off, the clock's clicks are the shell's whatever the TAP says.
+pub(super) fn set_clock_taken(on: bool) {
+    use std::sync::atomic::Ordering::Relaxed;
+    CLOCK_TAKEN.store(on, Relaxed);
+    if !on {
+        CLOCK_HOVER.store(false, Relaxed);
+    }
 }
 
 /// Whether a left button event is a click on the clock to take: a press while over it (and over a
@@ -156,7 +189,11 @@ fn clock_click(down: bool, pt: POINT) -> bool {
     if !down {
         return CLOCK_PRESSED.swap(false, Relaxed);
     }
-    if !CLOCK_HOVER.load(Relaxed) {
+    if !CLOCK_TAKEN.load(Relaxed) || !CLOCK_HOVER.load(Relaxed) {
+        return false;
+    }
+    let at = unpack(CLOCK_AT.load(Relaxed));
+    if (pt.x - at.x).abs() > CLOCK_REACH || (pt.y - at.y).abs() > CLOCK_REACH {
         return false;
     }
     let hwnd = unsafe { WindowFromPoint(pt) };

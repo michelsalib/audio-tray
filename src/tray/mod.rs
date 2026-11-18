@@ -330,10 +330,12 @@ pub fn run(backend: WasapiBackend, settings: bool) -> Result<()> {
         })
     });
     with_tray(Tray::refresh);
+    crate::calendar::focus::recover();
     if with_tray(|tray| tray.config.calendar.enabled).unwrap_or(false) {
         crate::calendar::notifications::start();
     }
     crate::calendar::set_shortcut(with_tray(|tray| tray.config.calendar.enabled && tray.config.calendar.shortcut).unwrap_or(false));
+    hook::set_clock_taken(with_tray(|tray| tray.config.calendar.enabled).unwrap_or(false));
     reschedule();
     if settings {
         post(crate::settings::WM_OPEN_SETTINGS, 0, 0);
@@ -345,6 +347,8 @@ pub fn run(backend: WasapiBackend, settings: bool) -> Result<()> {
     crate::integrations::stop();
 
     crate::calendar::close();
+    // Do not disturb Audio Tray set ends with it.
+    crate::calendar::focus::release();
     crate::settings::destroy();
     crate::pill::destroy();
     // The progress bar sits on *another app's* button, so it has to come off here, while this
@@ -542,6 +546,13 @@ fn click_allowed(what: &dyn std::fmt::Debug) -> bool {
 /// A gesture on the injected strip, relayed by the TAP.
 fn on_action(action: Action) {
     if action == Action::OpenCalendar {
+        // One click can arrive twice (the mouse hook and the TAP's tap handler, for touch or pen):
+        // opening toggles, so the second would close what the first opened.
+        let now = std::time::Instant::now();
+        let echo = LAST_OPEN.with(|last| last.replace(Some(now))).is_some_and(|at| now - at < std::time::Duration::from_millis(300));
+        if echo {
+            return;
+        }
         // The clock's click never reaches the audio panel (the hook takes it, or the shell's own
         // calendar would open), so it is not the click that closed it: the panel gives way and the
         // calendar opens once it has ([`open_flyout`]).
@@ -680,6 +691,8 @@ fn open_flyout(anchor: Option<flyout::Anchor>) {
 thread_local! {
     /// The calendar is to open as soon as the audio panel has closed.
     static CALENDAR_NEXT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// When the clock last asked for the calendar, to drop the same click's echo.
+    static LAST_OPEN: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) };
 }
 
 /// Have the calendar look again now (the focus timer started, a setting changed).
@@ -762,7 +775,7 @@ impl Tray {
         // The strip and the tile need a fresh injection.
         let drawn = |c: &Config| {
             let s = &c.strip;
-            (s.enabled, s.next_to_wifi, s.hide_windows_volume, s.hide_windows_mic, s.hide_windows_language, c.music.enabled, c.music.tile_style, c.calendar.enabled)
+            (s.enabled, s.next_to_wifi, s.hide_windows_volume, s.hide_windows_mic, s.hide_windows_language, c.music.enabled, c.music.tile_style, c.calendar.enabled, c.injects())
         };
         if drawn(&before) != drawn(c) {
             self.apply_taskbar();
@@ -774,6 +787,7 @@ impl Tray {
             crate::calendar::notifications::start();
         }
         crate::calendar::set_shortcut(self.config.calendar.enabled && self.config.calendar.shortcut);
+        hook::set_clock_taken(self.config.calendar.enabled);
         if before.calendar != self.config.calendar || before.clock != self.config.clock {
             post(WM_TIMER, CALENDAR_TIMER, 0);
         }
@@ -813,6 +827,8 @@ impl Tray {
     /// progress bar and state file follow the tile.
     fn apply_taskbar(&mut self) {
         taskbar::revert(0);
+        // The TAP that said the pointer was over the clock goes: its word with it.
+        hook::set_clock_hover(false);
         self.strip = None;
         crate::calendar::schedule::forget_clock();
         if self.config.injects() {

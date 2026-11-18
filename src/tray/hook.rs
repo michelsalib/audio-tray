@@ -243,8 +243,8 @@ fn clock_click(down: bool, pt: POINT) -> bool {
 /// Whether the calendar is open and `pt` is outside it: the click that closes it, as a menu's would.
 /// The calendar closes on losing the foreground too, but Windows may never have given it that.
 fn outside_calendar(pt: POINT) -> bool {
-    let open = *crate::calendar::OPEN_RECT.lock().unwrap_or_else(|e| e.into_inner());
-    open.is_some_and(|r| pt.x < r.left || pt.x >= r.right || pt.y < r.top || pt.y >= r.bottom)
+    let open = *crate::calendar::OPEN_CARDS.lock().unwrap_or_else(|e| e.into_inner());
+    open.is_some_and(|cards| !cards.iter().any(|r| pt.x >= r.left && pt.x < r.right && pt.y >= r.top && pt.y < r.bottom))
 }
 
 /// A [`super::WM_ICON_RECT_CHECK`] is on its way: one is enough however fast the wheel turns.

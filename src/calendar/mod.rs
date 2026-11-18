@@ -39,9 +39,10 @@ pub const CLOSE: usize = 1;
 /// [`WM_CALENDAR`]'s `wParam`: Windows' notifications changed.
 pub const NOTIFICATIONS: usize = 2;
 
-/// The open calendar's screen rectangle, for the mouse hook: a click outside it closes it even
-/// when Windows kept the foreground from it.
-pub static OPEN_RECT: Mutex<Option<windows::Win32::Foundation::RECT>> = Mutex::new(None);
+/// The open calendar's cards on screen (the calendar, then the notifications or an empty
+/// rectangle), for the mouse hook: a click outside both closes it even when Windows kept the
+/// foreground from it. The gap between or above the cards is outside.
+pub static OPEN_CARDS: Mutex<Option<[windows::Win32::Foundation::RECT; 2]>> = Mutex::new(None);
 
 /// A cache this old is fetched again when the calendar opens.
 const STALE_AFTER: i64 = 5 * 60;

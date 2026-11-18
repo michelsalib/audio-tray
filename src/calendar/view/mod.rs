@@ -499,13 +499,9 @@ fn empty_input() -> scene::Input {
     }
 }
 
-/// Tell the mouse hook where the panel is: a click outside it closes it.
+/// Tell the mouse hook where the panel's cards are: a click outside them closes it.
 fn keep_rect() {
-    let rect = with_view(|v| {
-        let (x, y) = v.origin;
-        RECT { left: x, top: y, right: x + v.px(v.scene.w), bottom: y + v.px(v.scene.h) }
-    });
-    *super::OPEN_RECT.lock().unwrap_or_else(|e| e.into_inner()) = rect;
+    with_view(|v| v.keep_cards());
 }
 
 impl View {
@@ -775,6 +771,18 @@ impl View {
         };
         // Never above the screen's top, whatever did not fit.
         self.origin.1 = self.origin.1.max(work.top + m);
+        // The open panel's cards follow every layout (a card shrinks as its last notification goes).
+        if OPEN.with(Cell::get) == self.hwnd.0 as isize && !self.hwnd.is_invalid() {
+            self.keep_cards();
+        }
+    }
+
+    /// Each card's screen rectangle to the mouse hook ([`super::OPEN_CARDS`]).
+    fn keep_cards(&self) {
+        let (x, y) = self.origin;
+        let on_screen = |card: R| RECT { left: x + self.px(card.x), top: y + self.px(card.y), right: x + self.px(card.right()), bottom: y + self.px(card.bottom()) };
+        let cards = [on_screen(self.scene.main), self.scene.top.map(on_screen).unwrap_or_default()];
+        *super::OPEN_CARDS.lock().unwrap_or_else(|e| e.into_inner()) = Some(cards);
     }
 
     /// Lay out again (something came, went or was picked) and show it.
@@ -1765,7 +1773,7 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESUL
         WM_DESTROY if OPEN.with(Cell::get) == hwnd.0 as isize => {
             OPEN.with(|o| o.set(0));
             super::notifications::set_watching(false);
-            *super::OPEN_RECT.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            *super::OPEN_CARDS.lock().unwrap_or_else(|e| e.into_inner()) = None;
             CLOSED_AT.with(|c| c.set(Some(Instant::now())));
             let top = VIEW.with(|cell| cell.borrow_mut().take()).map(|v| {
                 // Drafts of notifications still waiting, for the next open.

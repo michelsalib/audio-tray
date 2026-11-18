@@ -890,13 +890,19 @@ fn calendar(ink: &mut Ink2, card: R, input: &Input, rows: usize, hero: bool) -> 
     let lit = ink.lit(Hit::Today);
     ink.text(R::new(x, y, 200.0, 16.0), input.weekday.clone(), Font::Caption, if lit { Ink::Accent } else { Ink::Text2 }, Align::Left);
     ink.text(R::new(x, y + 16.0, 220.0, 28.0), input.date.clone(), Font::Big, if lit { Ink::Accent } else { Ink::Text }, Align::Left);
-    // Expand to the month, reduce to the week: the same pair as the notification centre's.
+    // Expand to the month, reduce to the week: the same pair as the notification centre's. Side by
+    // side the month always shows, so there is no switch.
     let toggle = R::new(card.right() - PAD - 32.0, y + 10.0, 32.0, 32.0);
-    ink.icon_button(toggle, if input.month_open { '\u{E73F}' } else { '\u{E740}' }, Hit::Month, false);
+    let edge = if input.columns.is_some() {
+        card.right() - PAD + 12.0
+    } else {
+        ink.icon_button(toggle, if input.month_open { '\u{E73F}' } else { '\u{E740}' }, Hit::Month, false);
+        toggle.x
+    };
     if !input.clocks.is_empty() {
         // As wide as its text (about 6.5 DIPs a character at 12), right against the switch.
-        let tw = (input.clocks.chars().count() as f32 * 6.5 + 4.0).min(toggle.x - x - 150.0).max(40.0);
-        let r = R::new(toggle.x - 12.0 - tw, y + 18.0, tw, 20.0);
+        let tw = (input.clocks.chars().count() as f32 * 6.5 + 4.0).min(edge - x - 150.0).max(40.0);
+        let r = R::new(edge - 12.0 - tw, y + 18.0, tw, 20.0);
         ink.hit(r, Hit::Clocks);
         let tint = if ink.lit(Hit::Clocks) { Ink::Accent } else { Ink::Text2 };
         ink.text(r, input.clocks.clone(), Font::Caption, tint, Align::Right);
@@ -1272,7 +1278,7 @@ mod tests {
         // More events than stacked, and no way to expand what is shown already.
         let (area, _) = s.list_view.unwrap();
         assert!(area.h > 5.0 * ROW_H);
-        assert!(!s.hits.iter().any(|(_, h)| *h == Hit::Expand));
+        assert!(!s.hits.iter().any(|(_, h)| matches!(h, Hit::Expand | Hit::Month)));
         // Each card's targets are its own.
         let day = s.hits.iter().find(|(_, h)| *h == Hit::Day(110)).unwrap().0;
         assert!(main.contains(day.x, day.y));

@@ -495,7 +495,7 @@ impl View {
         });
 
         // The week of the selected day, or the month shown.
-        let days: Vec<i32> = if self.month_open {
+        let days: Vec<i32> = if self.month_shown() {
             let start = self.week_start(time::days_from_civil(self.month.0, self.month.1, 1));
             (0..42).map(|i| start + i).collect()
         } else {
@@ -512,7 +512,7 @@ impl View {
                     label: d.to_string(),
                     today: day == today,
                     selected: day == self.selected,
-                    dim: self.month_open && m != self.month.1,
+                    dim: self.month_shown() && m != self.month.1,
                     busy: busy(day),
                 }
             })
@@ -604,7 +604,7 @@ impl View {
             weekday: capitalised(&locale::format(today, "dddd")),
             date: locale::format(today, "d MMMM"),
             clocks,
-            month_open: self.month_open,
+            month_open: self.month_shown(),
             month_title: capitalised(&locale::month_title(self.month.0, self.month.1)),
             heads: std::array::from_fn(|i| self.weekdays[(self.first_weekday as usize + i) % 7].clone()),
             days: cells,
@@ -631,6 +631,11 @@ impl View {
     fn columns(&self) -> Option<scene::Columns> {
         let width = (self.work.right - self.work.left) as f32 / self.scale - 2.0 * MARGIN;
         (width >= 2.0 * scene::W + scene::GAP).then_some(scene::Columns { calendar_left: self.edge == Edge::Left, from_top: self.edge == Edge::Top })
+    }
+
+    /// The month shows, not the week: opened, or always side by side (the calendar has the room).
+    fn month_shown(&self) -> bool {
+        self.month_open || self.columns().is_some()
     }
 
     /// Lay out for what there is now, and put the panel in its corner.
@@ -1080,10 +1085,10 @@ impl View {
             self.center_scroll = (self.center_scroll - notches * SCROLL_STEP).clamp(0.0, max);
         } else if let Some((_, max)) = self.scene.list_view.filter(|(a, _)| a.contains(x, y)) {
             self.list_scroll = (self.list_scroll - notches * SCROLL_STEP).clamp(0.0, max);
-        } else if self.month_open && self.scene.main.contains(x, y) && delta != 0 {
+        } else if self.month_shown() && self.scene.main.contains(x, y) && delta != 0 {
             // Over the month, as in the shell's calendar: a notch is a month.
             self.show_month(if delta > 0 { -1 } else { 1 });
-        } else if !self.month_open && delta != 0 && matches!(self.scene.hit(x, y), Some(Hit::Day(_))) {
+        } else if !self.month_shown() && delta != 0 && matches!(self.scene.hit(x, y), Some(Hit::Day(_))) {
             // Over the week: a notch is a week.
             self.select(self.selected + if delta > 0 { -7 } else { 7 });
         } else {

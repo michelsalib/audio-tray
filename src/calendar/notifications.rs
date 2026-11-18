@@ -46,6 +46,10 @@ enum Ask {
 /// How often the list is read again while any are waiting: the store on disk does not always say
 /// when one goes (a dismissal in Windows' own centre).
 const RECHECK: Duration = Duration::from_secs(60);
+/// …once Windows has been heard saying what changed: a slow safety net only.
+const RECHECK_HEARD: Duration = Duration::from_secs(300);
+/// Windows has sent a change event (it does not always, to an unpackaged app).
+static HEARD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// …and while the calendar is open, so what it lists follows what arrives.
 const RECHECK_OPEN: Duration = Duration::from_secs(3);
 /// Windows writes its store in bursts: one read once it has settled.
@@ -61,7 +65,15 @@ pub fn set_watching(on: bool) {
     WATCHING.store(on, std::sync::atomic::Ordering::SeqCst);
     if on {
         // Looked at: the clock's badge clears, as Windows' does.
-        see(&list());
+        // Their ids only, taken first: [`unseen`] locks the seen list before this one.
+        let ids: Vec<u32> = TOASTS.lock().unwrap_or_else(|e| e.into_inner()).iter().flatten().map(|t| t.id).collect();
+        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        for id in ids {
+            if !seen.contains(&id) {
+                seen.push(id);
+            }
+        }
+        drop(seen);
         held_changed();
         refresh();
     }
@@ -228,6 +240,7 @@ fn run(wake: windows::Win32::Foundation::HANDLE) {
     };
     // The listener's own word on changes, where Windows sends it to an unpackaged app.
     let handler = TypedEventHandler::new(move |_, _| {
+        HEARD.store(true, std::sync::atomic::Ordering::SeqCst);
         refresh();
         Ok(())
     });
@@ -250,7 +263,7 @@ fn run(wake: windows::Win32::Foundation::HANDLE) {
         let timeout = if WATCHING.load(std::sync::atomic::Ordering::SeqCst) {
             RECHECK_OPEN.as_millis() as u32
         } else if waiting {
-            RECHECK.as_millis() as u32
+            if HEARD.load(std::sync::atomic::Ordering::SeqCst) { RECHECK_HEARD.as_millis() as u32 } else { RECHECK.as_millis() as u32 }
         } else {
             INFINITE
         };

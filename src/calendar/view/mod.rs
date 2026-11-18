@@ -134,6 +134,11 @@ struct View {
     weekdays: [String; 7],
     /// The shown calendars' events, in their chosen colours.
     events: Vec<Event>,
+    /// When the world clocks were read: their times move on from there while the panel is open.
+    clocks_at: i64,
+    /// Each event's first and last local day, worked out once per reload (a time-zone sum each:
+    /// asked for every day of the month on every frame, they cost).
+    spans: Vec<(i32, i32)>,
     /// What the hero and the list show, to open on a click.
     hero: Option<Event>,
     rows: Vec<Event>,
@@ -302,17 +307,8 @@ fn edge_of(rect: &RECT, work: &RECT) -> Edge {
     }
 }
 
-/// The panel made, its windows hidden, nothing read yet.
-fn make(config: &Config) -> Result<View> {
-    let mut cursor = POINT::default();
-    let _ = unsafe { GetCursorPos(&mut cursor) };
-    let (scale, rect, work) = monitor(cursor);
-    // First what can fail without windows to clean up after. The last panel's, if any: its
-    // pictures are decoded already.
-    let gfx = match SPARE_GFX.with(|s| s.borrow_mut().take()) {
-        Some(gfx) => gfx,
-        None => Gfx::new()?,
-    };
+/// The calendar's window and the notification card's, hidden.
+fn windows() -> Result<(HWND, HWND)> {
     let style = WINDOW_EX_STYLE(WS_EX_LAYERED.0 | WS_EX_TOOLWINDOW.0 | WS_EX_TOPMOST.0);
     let hwnd = crate::win::create_popup(CLASS, w!("Calendar"), Some(wndproc), style, (0, 0, 1, 1)).context("CreateWindowExW")?;
     // Never activated: a click on it must not deactivate the calendar's window, which closes on that.
@@ -329,6 +325,22 @@ fn make(config: &Config) -> Result<View> {
         crate::layered::style_panel(hwnd, crate::layered::CORNER_ROUND);
         crate::layered::style_panel(top_hwnd, crate::layered::CORNER_ROUND);
     }
+    Ok((hwnd, top_hwnd))
+}
+
+/// The panel made, its windows hidden, nothing read yet; `windowless` (drawn ahead, never shown):
+/// without windows, and without asking Windows about Do not disturb.
+fn make(config: &Config, windowless: bool) -> Result<View> {
+    let mut cursor = POINT::default();
+    let _ = unsafe { GetCursorPos(&mut cursor) };
+    let (scale, rect, work) = monitor(cursor);
+    // First what can fail without windows to clean up after. The last panel's, if any: its
+    // pictures are decoded already.
+    let gfx = match SPARE_GFX.with(|s| s.borrow_mut().take()) {
+        Some(gfx) => gfx,
+        None => Gfx::new()?,
+    };
+    let (hwnd, top_hwnd) = if windowless { (HWND::default(), HWND::default()) } else { windows()? };
     let today = time::today();
     let (ty, tm, _) = time::civil_from_days(today);
     let setup = config.calendar.setup();
@@ -340,7 +352,7 @@ fn make(config: &Config) -> Result<View> {
         gfx: RefCell::new(gfx),
         shown: RefCell::new([Sent::new(), Sent::new()]),
         last: RefCell::new(None),
-        quiet: super::focus::active(),
+        quiet: !windowless && super::focus::active(),
         palette: Palette::current(),
         scale,
         edge: edge_of(&rect, &work),
@@ -357,6 +369,8 @@ fn make(config: &Config) -> Result<View> {
         first_weekday,
         weekdays: locale::weekday_names(),
         events: Vec::new(),
+        spans: Vec::new(),
+        clocks_at: 0,
         hero: None,
         rows: Vec::new(),
         detail: None,
@@ -382,22 +396,34 @@ fn make(config: &Config) -> Result<View> {
 /// Before an open: the panel drawn once, hidden, so that its pictures are decoded and its text laid
 /// out when it opens (a first open drew everything from nothing, ~40 ms more). Tray thread.
 pub fn prewarm(config: &Config) {
+    thread_local! {
+        /// The pictures and logos drawn ahead so far.
+        static WARMED: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    }
     if OPEN.with(Cell::get) != 0 {
         return;
     }
-    let Ok(mut view) = make(config) else { return };
+    // Only for pictures not drawn yet (or fonts never loaded): a notification gone, or one with
+    // nothing new to decode, needs no frame.
+    let keys: Vec<String> = super::notifications::list()
+        .iter()
+        .flat_map(|t| [Some(t.aumid.clone()), t.rich.avatar.as_ref().map(|p| p.key.clone()), t.rich.picture.as_ref().map(|p| p.key.clone())])
+        .flatten()
+        .collect();
+    let warm = SPARE_GFX.with(|s| s.borrow().is_some());
+    if warm && WARMED.with(|w| keys.iter().all(|k| w.borrow().contains(k))) {
+        return;
+    }
+    let Ok(mut view) = make(config, true) else { return };
     view.reload();
     view.place();
     view.draw_frame();
     SPARE_GFX.with(|s| *s.borrow_mut() = Some(view.gfx.into_inner()));
-    unsafe {
-        let _ = DestroyWindow(view.top_hwnd);
-        let _ = DestroyWindow(view.hwnd);
-    }
+    WARMED.with(|w| *w.borrow_mut() = keys);
 }
 
 fn create(config: &Config) -> Result<()> {
-    let mut view = make(config)?;
+    let mut view = make(config, false)?;
     let hwnd = view.hwnd;
     super::notifications::set_watching(true);
     view.reload();
@@ -491,6 +517,7 @@ impl View {
                 e
             })
             .collect();
+        self.spans = self.events.iter().map(|e| e.days(&Local)).collect();
         let toasts = if calendar.notifications { super::notifications::list() } else { Vec::new() };
         if toasts.iter().map(|t| t.id).ne(self.toasts.iter().map(|t| t.id)) {
             // Targets name a notification by its place, which has moved: a held press or the
@@ -504,6 +531,7 @@ impl View {
         }
         self.toasts = toasts;
         self.clocks = if calendar.world_clocks { super::zones::clocks() } else { Vec::new() };
+        self.clocks_at = time::now();
     }
 
     fn fetch(&self) {
@@ -569,7 +597,7 @@ impl View {
             let start = self.week_start(self.selected);
             (0..7).map(|i| start + i).collect()
         };
-        let busy = |day: i32| self.events.iter().filter(|e| e.on_day(day, &zone)).count().min(2) as u8;
+        let busy = |day: i32| self.spans.iter().filter(|(first, last)| *first <= day && day <= *last).count().min(2) as u8;
         let cells = days
             .iter()
             .map(|&day| {
@@ -614,7 +642,7 @@ impl View {
             list_title = "Coming up".to_string();
             empty = "Nothing else in the next 7 days".to_string();
         } else {
-            rows = model::on_day(&self.events, self.selected, &zone).into_iter().cloned().collect();
+            rows = model::on_day(&self.events, &self.spans, self.selected).into_iter().cloned().collect();
             list_title = capitalised(&locale::day_title(self.selected));
             empty = "No events".to_string();
         }
@@ -647,7 +675,7 @@ impl View {
             .clocks
             .iter()
             .take(2)
-            .map(|c| format!("{} {}", c.name, locale::clock(time::second_of_day(c.wall))))
+            .map(|c| format!("{} {}", c.name, locale::clock(time::second_of_day(c.wall + now - self.clocks_at))))
             .collect::<Vec<_>>()
             .join(" · ");
         let detail = self.detail.as_ref().map(|e| detail_view(e, &self.setup, now, self.selected));

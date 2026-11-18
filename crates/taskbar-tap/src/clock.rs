@@ -33,8 +33,9 @@ const DATE: &str = "DateInnerTextBlock";
 const STACK: &str = "DateTimeStackPanel";
 
 /// Text blocks that call back when their text changes ([`watch`]): never detached (the TAP stays
-/// loaded), the callback checks there is text to put back.
-static WATCHED: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+/// loaded), the callback checks there is text to put back. By handle and element: a handle can be
+/// reused by a rebuilt taskbar's new block, which needs a callback of its own.
+static WATCHED: Mutex<Vec<(u64, usize)>> = Mutex::new(Vec::new());
 /// A text change has called back (said once, as proof it works).
 static CALLED: AtomicBool = AtomicBool::new(false);
 /// A block would not be watched (said once).
@@ -69,11 +70,14 @@ impl IDependencyPropertyChangedCallback_Impl for TextChanged_Impl {
 /// XAML UI thread only.
 unsafe fn watch(diagnostics: &xamlom::IXamlDiagnostics, block: u64) -> bool {
     use windows_core::Interface;
-    if crate::lock(&WATCHED).contains(&block) {
+    // A handle whose element is gone (its removal never announced) has nothing to watch: it
+    // must not hold the clock to looking every frame.
+    let Some(object) = crate::decorate::element::<crate::winrt::IDependencyObject2>(diagnostics, block) else { return true };
+    let identity = object.as_raw() as usize;
+    if crate::lock(&WATCHED).contains(&(block, identity)) {
         return true;
     }
     let Some(statics) = crate::decorate::factory::<crate::winrt::ITextBlockStatics>("Windows.UI.Xaml.Controls.TextBlock") else { return false };
-    let Some(object) = crate::decorate::element::<crate::winrt::IDependencyObject2>(diagnostics, block) else { return false };
     let mut dp: *mut core::ffi::c_void = core::ptr::null_mut();
     if statics.get_TextProperty(&mut dp).is_err() || dp.is_null() {
         return false;
@@ -87,8 +91,8 @@ unsafe fn watch(diagnostics: &xamlom::IXamlDiagnostics, block: u64) -> bool {
         let mut watched = crate::lock(&WATCHED);
         // Blocks gone (a taskbar rebuilt) are forgotten.
         let alive = tree::find_by_name(TIME).into_iter().chain(tree::find_by_name(DATE)).collect::<Vec<_>>();
-        watched.retain(|b| alive.contains(b));
-        watched.push(block);
+        watched.retain(|(b, _)| alive.contains(b) && *b != block);
+        watched.push((block, identity));
     } else if !REFUSED.swap(true, Ordering::SeqCst) {
         logf!("clock: a text block would not report its changes; looking every frame after each minute");
     }
@@ -281,6 +285,15 @@ pub unsafe fn restore(diagnostics: &xamlom::IXamlDiagnostics) {
     for block in std::mem::take(&mut *crate::lock(&HIDDEN)) {
         crate::decorate::set_visible(diagnostics, block, true);
     }
+    // The shell's own text at once (its locale's time and date), not the TAP's badge or dot until
+    // the shell next writes.
+    let st = now();
+    for block in tree::find_by_name(TIME) {
+        crate::decorate::set_text(diagnostics, block, &format_time(&st, ""));
+    }
+    for block in tree::find_by_name(DATE) {
+        crate::decorate::set_text(diagnostics, block, &format_date(&st, ""));
+    }
 }
 
 /// The room between the badge and the text, in DIPs.
@@ -437,10 +450,11 @@ pub unsafe fn tick() -> Option<u32> {
     // plates' opacity), and while music plays the tree is seldom quiet: waiting for it left the
     // shell's text up for long stretches.
     let Some(text) = crate::lock(&TEXT).clone() else {
-        if RELEASING.swap(false, Ordering::SeqCst) {
-            if let Some(diagnostics) = crate::diagnostics() {
-                restore(&diagnostics);
-            }
+        if RELEASING.load(Ordering::SeqCst) {
+            // Undone when XAML can be reached; tried again until then.
+            let Some(diagnostics) = crate::diagnostics() else { return Some(1000) };
+            RELEASING.store(false, Ordering::SeqCst);
+            restore(&diagnostics);
         }
         return None;
     };

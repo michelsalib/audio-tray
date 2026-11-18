@@ -99,6 +99,11 @@ const WM_ICON_RECT_CHECK: u32 = WM_APP + 41;
 const NOTICE_TIMER: usize = 0x4E54;
 /// The receiver window's timer for the calendar's next moment ([`crate::calendar::schedule`]).
 const CALENDAR_TIMER: usize = 0x4341;
+/// The receiver window's timer for drawing the closed panel ahead ([`crate::calendar::prewarm`]),
+/// once a burst of notifications has settled.
+const PREWARM_TIMER: usize = 0x5057;
+/// How long a burst has to settle.
+const PREWARM_AFTER_MS: u32 = 2000;
 
 /// Re-registration checks after a restart, and the first gap (doubling): ~1 min in all.
 const ICON_CHECKS: usize = 6;
@@ -333,6 +338,8 @@ pub fn run(backend: WasapiBackend, settings: bool) -> Result<()> {
     crate::calendar::focus::recover();
     if with_tray(|tray| tray.config.calendar.enabled).unwrap_or(false) {
         crate::calendar::notifications::start();
+        // The first open finds its fonts loaded and its pictures decoded.
+        prewarm_later(10_000);
     }
     crate::calendar::set_shortcut(with_tray(|tray| tray.config.calendar.enabled && tray.config.calendar.shortcut).unwrap_or(false));
     hook::set_clock_taken(with_tray(|tray| tray.config.calendar.enabled).unwrap_or(false));
@@ -408,7 +415,7 @@ fn is_ours(msg: u32, wparam: usize) -> bool {
             | crate::settings::WM_SETTINGS
             | crate::settings::WM_OPEN_SETTINGS
             | crate::calendar::WM_CALENDAR
-    ) || (msg == WM_TIMER && (wparam == crate::osd::TIMER_ID || wparam == NOTICE_TIMER || wparam == CALENDAR_TIMER))
+    ) || (msg == WM_TIMER && (wparam == crate::osd::TIMER_ID || wparam == NOTICE_TIMER || wparam == CALENDAR_TIMER || wparam == PREWARM_TIMER))
 }
 
 /// Handle queued messages, oldest first, unless a handler further up the stack already is.
@@ -475,10 +482,8 @@ fn handle(msg: Queued) {
         }
         crate::calendar::WM_CALENDAR if msg.wparam == crate::calendar::NOTIFICATIONS => {
             crate::calendar::notifications_changed();
-            // New pictures are decoded now, not when the panel opens.
-            if let Some(config) = with_tray(|tray| tray.config.clone()).filter(|c| c.calendar.enabled) {
-                crate::calendar::prewarm(&config);
-            }
+            // New pictures decoded before the panel opens, once the burst has settled.
+            prewarm_later(PREWARM_AFTER_MS);
             reschedule();
         }
         crate::calendar::WM_CALENDAR => {
@@ -486,6 +491,14 @@ fn handle(msg: Queued) {
             reschedule();
         }
         WM_TIMER if msg.wparam == CALENDAR_TIMER => reschedule(),
+        WM_TIMER if msg.wparam == PREWARM_TIMER => {
+            if let Some(window) = taskbar::receiver() {
+                let _ = unsafe { KillTimer(Some(window), PREWARM_TIMER) };
+            }
+            if let Some(config) = with_tray(|tray| tray.config.clone()).filter(|c| c.calendar.enabled) {
+                crate::calendar::prewarm(&config);
+            }
+        }
         WM_TIMER if msg.wparam == NOTICE_TIMER => {
             with_tray(Tray::expire_notices);
         }
@@ -706,6 +719,13 @@ thread_local! {
 }
 
 /// Have the calendar look again now (the focus timer started, a setting changed).
+/// Draw the closed panel ahead in `ms` (a call meanwhile pushes it back).
+fn prewarm_later(ms: u32) {
+    if let Some(window) = taskbar::receiver() {
+        unsafe { SetTimer(Some(window), PREWARM_TIMER, ms, None) };
+    }
+}
+
 pub(crate) fn wake_calendar() {
     post(WM_TIMER, CALENDAR_TIMER, 0);
 }

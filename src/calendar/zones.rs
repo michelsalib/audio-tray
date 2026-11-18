@@ -36,8 +36,21 @@ fn reg_dword(key: &str, name: &str) -> Option<u32> {
     found.is_ok().then_some(value)
 }
 
-/// The time zone Windows names `key` (`Pacific Standard Time`).
+/// The time zone Windows names `key` (`Pacific Standard Time`): looked up once (each lookup reads
+/// the registry through every zone up to it).
 fn zone(key: &str) -> Option<DYNAMIC_TIME_ZONE_INFORMATION> {
+    thread_local! {
+        static FOUND: std::cell::RefCell<Vec<(String, DYNAMIC_TIME_ZONE_INFORMATION)>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    if let Some(info) = FOUND.with(|f| f.borrow().iter().find(|(k, _)| k == key).map(|(_, info)| *info)) {
+        return Some(info);
+    }
+    let info = find_zone(key)?;
+    FOUND.with(|f| f.borrow_mut().push((key.to_string(), info)));
+    Some(info)
+}
+
+fn find_zone(key: &str) -> Option<DYNAMIC_TIME_ZONE_INFORMATION> {
     for i in 0..512 {
         let mut info = DYNAMIC_TIME_ZONE_INFORMATION::default();
         if unsafe { EnumDynamicTimeZoneInformation(i, &mut info) } != 0 {
@@ -63,7 +76,7 @@ pub fn clocks() -> Vec<WorldClock> {
             }
             let info = zone(&reg_string(&key, "TzRegKeyName")?)?;
             let name = reg_string(&key, "DisplayName").filter(|n| !n.is_empty()).unwrap_or_else(|| String::from_utf16_lossy(&info.TimeZoneKeyName).trim_end_matches('\0').to_string());
-            let utc = to_systemtime(now);
+            let utc = time::to_systemtime(now);
             let mut local = Default::default();
             unsafe { SystemTimeToTzSpecificLocalTimeEx(Some(&info), &utc, &mut local) }.ok()?;
             let wall = time::days_from_civil(local.wYear as i32, local.wMonth as u32, local.wDay as u32) as i64 * time::DAY
@@ -73,22 +86,6 @@ pub fn clocks() -> Vec<WorldClock> {
             Some(WorldClock { name, wall, offset: wall - here })
         })
         .collect()
-}
-
-fn to_systemtime(secs: i64) -> windows::Win32::Foundation::SYSTEMTIME {
-    let day = time::day_of(secs);
-    let (y, m, d) = time::civil_from_days(day);
-    let s = time::second_of_day(secs);
-    windows::Win32::Foundation::SYSTEMTIME {
-        wYear: y as u16,
-        wMonth: m as u16,
-        wDayOfWeek: ((time::weekday(day) + 1) % 7) as u16,
-        wDay: d as u16,
-        wHour: (s / 3600) as u16,
-        wMinute: (s / 60 % 60) as u16,
-        wSecond: (s % 60) as u16,
-        wMilliseconds: 0,
-    }
 }
 
 /// Windows' own page for them: Date and time's Additional clocks tab.

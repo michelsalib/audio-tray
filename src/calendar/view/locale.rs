@@ -10,17 +10,7 @@ use windows::Win32::Globalization::{
 use crate::calendar::time;
 
 fn system_time(day: i32, secs: i64) -> SYSTEMTIME {
-    let (y, m, d) = time::civil_from_days(day);
-    SYSTEMTIME {
-        wYear: y as u16,
-        wMonth: m as u16,
-        wDayOfWeek: ((time::weekday(day) + 1) % 7) as u16,
-        wDay: d as u16,
-        wHour: (secs / 3600) as u16,
-        wMinute: (secs / 60 % 60) as u16,
-        wSecond: 0,
-        wMilliseconds: 0,
-    }
+    time::to_systemtime(day as i64 * time::DAY + secs)
 }
 
 fn date(day: i32, flags: ENUM_DATE_FORMATS_FLAGS) -> String {

@@ -89,7 +89,8 @@ impl Zone for Local {
     }
 }
 
-fn to_systemtime(secs: i64) -> windows::Win32::Foundation::SYSTEMTIME {
+/// Seconds since the epoch (UTC or wall) as a `SYSTEMTIME`, its year kept within what Windows takes.
+pub fn to_systemtime(secs: i64) -> windows::Win32::Foundation::SYSTEMTIME {
     let day = day_of(secs);
     let (y, m, d) = civil_from_days(day);
     let s = second_of_day(secs);

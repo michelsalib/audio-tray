@@ -361,7 +361,7 @@ static DOWNLOADING: Mutex<Vec<String>> = Mutex::new(Vec::new());
 type Bytes = Arc<Vec<u8>>;
 /// No picture bigger than this is kept.
 const PICTURE_MAX: u64 = 4 * 1024 * 1024;
-/// Nor more than this in all: the oldest go first.
+/// Nor more than this in all: past it, a new one is not kept.
 const PICTURES_MAX: usize = 32 * 1024 * 1024;
 
 fn picture(src: &str, base: &Base) -> Option<Picture> {
@@ -388,16 +388,15 @@ fn picture(src: &str, base: &Base) -> Option<Picture> {
     bytes.map(|bytes| Picture { key: src.to_string(), bytes })
 }
 
-/// Cache a picture's bytes (or that there is none), within [`PICTURES_MAX`].
+/// Cache a picture's bytes (or that there is none), within [`PICTURES_MAX`]. One that does not fit
+/// is kept as none: evicting another listed one would only fetch it again, and evict this one, on
+/// and on. Pictures no longer listed go at each read ([`for_toasts`]).
 fn keep(src: &str, bytes: Option<Vec<u8>>) -> Option<Bytes> {
-    let bytes = bytes.filter(|b| !b.is_empty()).map(Arc::new);
     let mut held = PICTURES.lock().unwrap_or_else(|e| e.into_inner());
     held.retain(|(s, _)| s != src);
+    let size: usize = held.iter().filter_map(|(_, b)| b.as_ref()).map(|b| b.len()).sum();
+    let bytes = bytes.filter(|b| !b.is_empty() && size + b.len() <= PICTURES_MAX).map(Arc::new);
     held.push((src.to_string(), bytes.clone()));
-    let size = |held: &[(String, Option<Bytes>)]| held.iter().filter_map(|(_, b)| b.as_ref()).map(|b| b.len()).sum::<usize>();
-    while held.len() > 1 && size(&held) > PICTURES_MAX {
-        held.remove(0);
-    }
     bytes
 }
 

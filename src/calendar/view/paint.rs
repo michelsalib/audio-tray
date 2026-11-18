@@ -132,7 +132,7 @@ pub struct Gfx {
     surface: Option<((u32, u32), IWICBitmap, ID2D1RenderTarget)>,
     /// The last frame, premultiplied BGRA.
     pub pixels: Vec<u8>,
-    /// Images drawn for this surface, by key and pixel size, oldest first.
+    /// Images drawn for this surface, by key and pixel size, least recently drawn first.
     images: std::cell::RefCell<Vec<(String, u32, Option<ID2D1Bitmap>)>>,
     /// The size of the last frame (the surface can be taller).
     drawn: (u32, u32),
@@ -235,11 +235,17 @@ impl Gfx {
             // In parts only over a frame of the same size, whose other pixels stand.
             let areas = areas.filter(|_| fits && self.drawn == size);
             let full = areas.is_none();
-            if full {
-                // What the last full frame did not draw goes.
+            {
                 let mut layouts = self.layouts.borrow_mut();
-                let now = std::mem::take(&mut layouts.now);
-                layouts.before = if now.len() > LAYOUTS_MAX { Default::default() } else { now };
+                if full {
+                    // What the last full frame did not draw goes.
+                    let now = std::mem::take(&mut layouts.now);
+                    layouts.before = if now.len() > LAYOUTS_MAX { Default::default() } else { now };
+                } else if layouts.now.len() > LAYOUTS_MAX {
+                    // Parts only add (a long reply typed in): bounded all the same.
+                    layouts.now.clear();
+                    layouts.before.clear();
+                }
             }
             let (_, bitmap, target) = self.surface.as_ref().context("no surface")?;
             target.SetDpi(96.0 * scale, 96.0 * scale);
@@ -420,8 +426,16 @@ impl Pen<'_> {
 
     /// The bitmap for `key` at `px`, made once.
     fn cached(&self, key: &str, px: u32, make: impl FnOnce() -> Option<(Vec<u8>, u32, u32)>) -> Option<ID2D1Bitmap> {
-        if let Some(b) = self.gfx.images.borrow().iter().find(|(k, p, _)| k == key && *p == px).map(|(_, _, b)| b.clone()) {
-            return b;
+        {
+            // Least recently drawn goes first: one used now moves to the back, so a frame never
+            // evicts what it is drawing.
+            let mut images = self.gfx.images.borrow_mut();
+            if let Some(at) = images.iter().position(|(k, p, _)| k == key && *p == px) {
+                let entry = images.remove(at);
+                let bitmap = entry.2.clone();
+                images.push(entry);
+                return bitmap;
+            }
         }
         let made = make().and_then(|(rgba, w, h)| self.bitmap(&rgba, w, h));
         let mut images = self.gfx.images.borrow_mut();

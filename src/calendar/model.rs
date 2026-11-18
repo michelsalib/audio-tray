@@ -72,11 +72,6 @@ impl Event {
         }
     }
 
-    pub fn on_day(&self, day: i32, zone: &dyn Zone) -> bool {
-        let (first, last) = self.days(zone);
-        first <= day && day <= last
-    }
-
     /// All-day events first, then by start, then by title.
     pub fn order(&self) -> (u8, i64) {
         match self.when {
@@ -86,9 +81,10 @@ impl Event {
     }
 }
 
-/// The events on `day`, in the order the agenda lists them.
-pub fn on_day<'a>(events: &'a [Event], day: i32, zone: &dyn Zone) -> Vec<&'a Event> {
-    let mut list: Vec<&Event> = events.iter().filter(|e| e.on_day(day, zone)).collect();
+/// The events on `day`, in the order the agenda lists them, each event's days given in `spans`
+/// (from [`Event::days`], worked out once: a time-zone sum each).
+pub fn on_day<'a>(events: &'a [Event], spans: &[(i32, i32)], day: i32) -> Vec<&'a Event> {
+    let mut list: Vec<&Event> = events.iter().zip(spans).filter(|(_, (first, last))| *first <= day && day <= *last).map(|(e, _)| e).collect();
     list.sort_by(|a, b| a.order().cmp(&b.order()).then_with(|| a.title.cmp(&b.title)));
     list
 }
@@ -119,8 +115,7 @@ mod tests {
         let zone = Fixed(3600);
         // 23:30 UTC is 00:30 the next day at UTC+1.
         let late = Event { when: When::At { start: day as i64 * DAY + 23 * 3600 + 1800, end: day as i64 * DAY + 24 * 3600 + 1800 }, ..timed(day, 0, 1) };
-        assert!(!late.on_day(day, &zone));
-        assert!(late.on_day(day + 1, &zone));
+        assert_eq!(late.days(&zone), (day + 1, day + 1));
         let to_midnight = timed(day, 22, 23); // 23:00 to 00:00 local
         assert_eq!(to_midnight.days(&zone), (day, day));
     }
@@ -131,9 +126,10 @@ mod tests {
         let zone = Fixed(0);
         let trip = Event { when: When::AllDay { first: day, end: day + 3 }, title: "Trip".into(), ..timed(day, 0, 1) };
         let events = vec![timed(day, 9, 10), trip.clone(), timed(day, 8, 9)];
-        let list = on_day(&events, day, &zone);
+        let spans: Vec<(i32, i32)> = events.iter().map(|e| e.days(&zone)).collect();
+        let list = on_day(&events, &spans, day);
         assert_eq!(list[0].title, "Trip");
         assert_eq!(list[1].title, "8h");
-        assert!(trip.on_day(day + 2, &zone) && !trip.on_day(day + 3, &zone));
+        assert_eq!(trip.days(&zone), (day, day + 2));
     }
 }

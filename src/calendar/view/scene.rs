@@ -378,6 +378,9 @@ impl Ink2 {
             Draw::Unclip => {
                 self.clips.pop();
             }
+            // Scrolled out of sight: not drawn (a long list would lay out, and decode the
+            // pictures of, every notification on each frame).
+            _ if self.clips.last().is_some_and(|&c| overlap(r, c).is_none()) => return,
             _ => {}
         }
         self.items.push((r, d));
@@ -1200,6 +1203,8 @@ mod tests {
         assert_eq!(s.hit(clear.x + 2.0, clear.y + 2.0), Some(Hit::ClearAll));
         // No notification target reaches past its card.
         assert!(s.hits.iter().filter(|(_, h)| toast_of(*h).is_some()).all(|(r, _)| r.y >= top.y && r.bottom() <= top.bottom()));
+        // Nor is any drawn there: out of sight is out of the frame's work.
+        assert!(s.items.iter().filter(|(_, d)| !matches!(d, Draw::Clip | Draw::Unclip)).all(|(r, _)| overlap(*r, top).is_some() || overlap(*r, s.main).is_some()));
         // And the list says it scrolls.
         assert!(s.items.iter().any(|(r, d)| matches!(d, Draw::Rect { fill: Fill::Mark, .. }) && r.w == 3.0));
     }

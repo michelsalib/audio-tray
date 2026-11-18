@@ -62,6 +62,8 @@ const FLASH_FOR: std::time::Duration = std::time::Duration::from_secs(4);
 /// disturb switched elsewhere follow.
 const REFRESH_TIMER: usize = 3;
 const REFRESH_MS: u32 = 30_000;
+/// A frame once input has settled ([`View::later`]).
+const FRAME_TIMER: usize = 4;
 /// How far ahead the next event is looked for.
 const AHEAD: i64 = 7 * DAY;
 
@@ -84,13 +86,17 @@ enum Edge {
     Right,
 }
 
+/// What a window was last sent: where (screen x, y, and size in pixels; a width of -1 or 0 for
+/// nothing known) and its pixels, row after row.
+type Sent = ((i32, i32, i32, i32), Vec<u8>);
+
 struct View {
     /// The calendar's window (input, capture) and the notification centre's.
     hwnd: HWND,
     top_hwnd: HWND,
     gfx: RefCell<Gfx>,
-    /// What each window (main, top) last showed, to skip sending the same again (0: unknown).
-    shown: Cell<[u64; 2]>,
+    /// What each window (main, top) last showed, to skip sending the same again.
+    shown: RefCell<[Sent; 2]>,
     palette: Palette,
     scale: f32,
     edge: Edge,
@@ -307,7 +313,7 @@ fn create(config: &Config) -> Result<()> {
         hwnd,
         top_hwnd,
         gfx: RefCell::new(gfx),
-        shown: Cell::new([0; 2]),
+        shown: RefCell::new(Default::default()),
         palette: Palette::current(),
         scale,
         edge: edge_of(&rect, &work),
@@ -656,7 +662,7 @@ impl View {
 
     /// Lay out again (something came, went or was picked) and show it.
     fn relayout(&mut self) {
-        let had_top = self.scene.top.is_some();
+        let had_top = unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(self.top_hwnd) }.as_bool();
         self.place();
         let has_top = self.scene.top.is_some();
         if had_top != has_top {
@@ -683,7 +689,6 @@ impl View {
 
     /// Each card's part of the frame to its window, `offset` from its place.
     fn present(&self, (dx, dy): (i32, i32), alpha: u8) {
-        use std::hash::{Hash, Hasher};
         let gfx = self.gfx.borrow();
         let full_w = self.px(self.scene.w).max(0);
         let row = full_w as usize * 4;
@@ -698,22 +703,29 @@ impl View {
             &gfx.pixels[start..start + w as usize * 4]
         };
         let (x, y) = (self.origin.0 + dx, self.origin.1 + dy);
-        // A card that looks and sits as it did is not sent again (a hover changes one card at most).
+        // A card that looks and sits as it did is not sent again (a hover changes one card at most):
+        // compared with a copy of what was sent, a memory compare, where a hash cost ~13 ms a frame.
         let still = dx == 0 && dy == 0 && alpha == 255;
-        let mut shown = self.shown.get();
+        let mut shown = self.shown.borrow_mut();
         let mut show = |slot: usize, hwnd: HWND, card: R| {
             let (x0, y0, w, h) = cut(card);
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            (w, h, x + x0, y + y0).hash(&mut hasher);
-            for r in 0..h {
-                line(x0, y0, w, r).hash(&mut hasher);
-            }
-            let look = if still { hasher.finish() } else { 0 };
-            if look != 0 && shown[slot] == look {
+            let span = w as usize * 4;
+            let sent = &mut shown[slot];
+            let place = (x + x0, y + y0, w, h);
+            let same = still && sent.0 == place && (0..h).all(|r| sent.1[r as usize * span..][..span] == *line(x0, y0, w, r));
+            if same {
                 return;
             }
-            shown[slot] = look;
-            let span = w as usize * 4;
+            if still {
+                sent.0 = place;
+                sent.1.clear();
+                for r in 0..h {
+                    sent.1.extend_from_slice(line(x0, y0, w, r));
+                }
+            } else {
+                // Moving: the next still frame is sent whatever it holds.
+                sent.0 = (0, 0, -1, 0);
+            }
             crate::layered::present_with(hwnd, w, h, x + x0, y + y0, alpha, |dst| {
                 for (r, out) in dst.chunks_exact_mut(span.max(1)).enumerate().take(h as usize) {
                     out.copy_from_slice(line(x0, y0, w, r as i32));
@@ -725,7 +737,22 @@ impl View {
             show(1, self.top_hwnd, top);
         }
         show(0, self.hwnd, self.scene.main);
-        self.shown.set(shown);
+    }
+
+    /// Lay out and draw once input has settled: a wheel's burst or a sweep across targets makes
+    /// one frame, not one each (WM_TIMER comes only when no other message waits).
+    fn later(&self) {
+        unsafe { SetTimer(Some(self.hwnd), FRAME_TIMER, 1, None) };
+    }
+
+    /// Lay out, take the hover from where the pointer is now (what scrolled under it), and show it.
+    fn settle(&mut self) {
+        self.place();
+        let mut point = cursor();
+        let _ = unsafe { ScreenToClient(self.hwnd, &mut point) };
+        let hover = self.hit(point.x, point.y);
+        self.note_hover(hover);
+        self.relayout();
     }
 
     /// Slide in or out from the taskbar's edge, on the last frame drawn.
@@ -770,19 +797,28 @@ impl View {
         self.scene.hit(x, y)
     }
 
+    /// The pointer is over `hover` now: shown at the next frame ([`View::later`]).
     fn set_hover(&mut self, hover: Option<Hit>) {
-        if self.hover != hover {
-            self.hover = hover;
-            // A tooltip waits for the pointer to rest.
-            self.show_tip = None;
-            unsafe {
-                let _ = KillTimer(Some(self.hwnd), TIP_TIMER);
-                if hover.is_some() {
-                    SetTimer(Some(self.hwnd), TIP_TIMER, TIP_DELAY_MS, None);
-                }
-            }
-            self.relayout();
+        if self.note_hover(hover) {
+            self.later();
         }
+    }
+
+    /// Take `hover` without drawing; `true` if it changed.
+    fn note_hover(&mut self, hover: Option<Hit>) -> bool {
+        if self.hover == hover {
+            return false;
+        }
+        self.hover = hover;
+        // A tooltip waits for the pointer to rest.
+        self.show_tip = None;
+        unsafe {
+            let _ = KillTimer(Some(self.hwnd), TIP_TIMER);
+            if hover.is_some() {
+                SetTimer(Some(self.hwnd), TIP_TIMER, TIP_DELAY_MS, None);
+            }
+        }
+        true
     }
 
     /// The key of notification group `g`.
@@ -1094,10 +1130,8 @@ impl View {
         } else {
             return;
         }
-        self.relayout();
-        // What scrolled under the pointer is what it is over now.
-        let hit = self.hit(cx, cy);
-        self.set_hover(hit);
+        // One frame for the burst; what scrolled under the pointer is hovered then.
+        self.later();
     }
 
     /// Say `text` for a moment, over the calendar's foot.
@@ -1457,6 +1491,10 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESUL
                 v.flash = None;
                 v.relayout();
             });
+        }
+        WM_TIMER if wparam.0 == FRAME_TIMER => {
+            let _ = unsafe { KillTimer(Some(hwnd), FRAME_TIMER) };
+            with_view(View::settle);
         }
         WM_TIMER if wparam.0 == REFRESH_TIMER => {
             with_view(View::relayout);

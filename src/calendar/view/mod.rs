@@ -456,7 +456,8 @@ impl View {
         let zone = Local;
         let today = self.today;
 
-        // Notifications, by app; the newest app's open unless the user chose (side by side, all are).
+        // Notifications, by app; the newest app's open unless the user chose. Side by side, all
+        // are, in full: the column has the room, and nothing folds.
         let wide = self.columns().is_some();
         let groups = (!self.toasts.is_empty()).then(|| {
             super::notifications::grouped(&self.toasts)
@@ -465,7 +466,7 @@ impl View {
                 .map(|(g, (key, list))| {
                     let open = match &self.open_groups {
                         Some(open) => open.contains(&key),
-                        None => wide || g == 0,
+                        None => g == 0,
                     };
                     scene::Group {
                         name: list.first().map_or_else(String::new, |t| t.app.clone()),
@@ -486,8 +487,8 @@ impl View {
                             })
                             .collect(),
                         when: list.first().map_or_else(String::new, |t| arrived(t.at)),
-                        all: self.center_full || self.full_groups.contains(&key),
-                        open: open || self.center_full,
+                        all: self.center_full || wide || self.full_groups.contains(&key),
+                        open: open || self.center_full || wide,
                     }
                 })
                 .collect()
@@ -804,6 +805,8 @@ impl View {
                 self.center_scroll = 0.0;
             }
             Hit::Calendar => self.center_full = false,
+            // Side by side, every group shows in full: its line only lights its clear button.
+            Hit::Group(_) if self.columns().is_some() => {}
             Hit::Group(g) => {
                 let key = self.group_key(g)?;
                 let groups = super::notifications::grouped(&self.toasts);
@@ -1117,9 +1120,11 @@ impl View {
     /// Tab: the next target the keyboard can take (Shift+Tab: the one before), in the order the
     /// panel is laid out.
     fn move_focus(&mut self, back: bool) {
+        let wide = self.columns().is_some();
         let mut order: Vec<Hit> = Vec::new();
         for (_, hit) in &self.scene.hits {
-            if !matches!(hit, Hit::Draft(_)) && order.last() != Some(hit) && !order.contains(hit) {
+            // A group's line does nothing side by side.
+            if !matches!(hit, Hit::Draft(_)) && !(wide && matches!(hit, Hit::Group(_))) && order.last() != Some(hit) && !order.contains(hit) {
                 order.push(*hit);
             }
         }

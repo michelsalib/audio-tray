@@ -842,6 +842,9 @@ fn center(ink: &mut Ink2, card: R, input: &Input, groups: &[Group]) -> (R, f32) 
             let x_r = R::new(line.right() - 30.0, line.y + (line.h - 24.0) / 2.0, 24.0, 24.0);
             ink.plate(x_r, Hit::DismissGroup(g), 4.0);
             ink.glyph(x_r, '\u{E711}', Font::IconSmall, Ink::Text2);
+        } else if input.columns.is_some() {
+            // Side by side nothing folds: its time only.
+            ink.text(R::new(line.right() - 80.0, line.y, 72.0, line.h), group.when.clone(), Font::Caption, Ink::Text3, Align::Right);
         } else if group.open {
             // Its time, and the chevron saying the line folds it.
             ink.text(R::new(line.right() - 100.0, line.y, 72.0, line.h), group.when.clone(), Font::Caption, Ink::Text3, Align::Right);

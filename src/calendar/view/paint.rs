@@ -6,12 +6,12 @@ use anyhow::{Context, Result};
 use windows::core::{w, PCWSTR};
 use windows::Win32::Graphics::Direct2D::Common::{D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT, D2D_RECT_F, D2D_SIZE_U};
 use windows::Win32::Graphics::Direct2D::{
-    D2D1CreateFactory, ID2D1Bitmap, ID2D1Factory, ID2D1RenderTarget, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, D2D1_BITMAP_PROPERTIES, ID2D1SolidColorBrush, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+    D2D1CreateFactory, ID2D1Bitmap, ID2D1Factory, ID2D1RenderTarget, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, D2D1_BITMAP_PROPERTIES, ID2D1SolidColorBrush, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1_ANTIALIAS_MODE_ALIASED,
     D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_RENDER_TARGET_PROPERTIES,
     D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1_ROUNDED_RECT, D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE,
 };
 use windows::Win32::Graphics::DirectWrite::{
-    DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat, DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL,
+    DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat, IDWriteTextLayout, DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL,
     DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_WEIGHT_SEMI_BOLD,
     DWRITE_PARAGRAPH_ALIGNMENT_CENTER, DWRITE_PARAGRAPH_ALIGNMENT_NEAR, DWRITE_TEXT_ALIGNMENT, DWRITE_TEXT_ALIGNMENT_CENTER,
     DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_TEXT_ALIGNMENT_TRAILING, DWRITE_TRIMMING, DWRITE_TRIMMING_GRANULARITY_CHARACTER,
@@ -136,7 +136,23 @@ pub struct Gfx {
     images: std::cell::RefCell<Vec<(String, u32, Option<ID2D1Bitmap>)>>,
     /// The size of the last frame (the surface can be taller).
     drawn: (u32, u32),
+    /// Text laid out, kept while drawn ([`Layouts`]).
+    layouts: std::cell::RefCell<Layouts>,
 }
+
+/// A text's layout by what makes it: the text, its font, its box's size (bits) and alignment.
+type LayoutKey = (String, u8, u32, u32, u8);
+
+/// Layouts made or used since the last full frame, and those of the frame before: one not used
+/// for a whole frame goes. A scroll or a hover lays out nothing anew.
+#[derive(Default)]
+struct Layouts {
+    now: std::collections::HashMap<LayoutKey, IDWriteTextLayout>,
+    before: std::collections::HashMap<LayoutKey, IDWriteTextLayout>,
+}
+
+/// Layouts kept at most: past it, a full frame forgets what it did not draw.
+const LAYOUTS_MAX: usize = 4000;
 
 /// Images kept decoded at most (logos, photos and pictures of the notifications listed).
 const IMAGES_MAX: usize = 64;
@@ -147,7 +163,7 @@ impl Gfx {
             let factory: ID2D1Factory = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None).context("D2D1CreateFactory")?;
             let dwrite: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED).context("DWriteCreateFactory")?;
             let wic: IWICImagingFactory = CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER).context("WIC")?;
-            let mut gfx = Gfx { factory, dwrite, wic, formats: Vec::new(), surface: None, pixels: Vec::new(), images: Default::default(), drawn: (0, 0) };
+            let mut gfx = Gfx { factory, dwrite, wic, formats: Vec::new(), surface: None, pixels: Vec::new(), images: Default::default(), drawn: (0, 0), layouts: Default::default() };
             let text = w!("Segoe UI Variable Text");
             let icons = w!("Segoe Fluent Icons");
             gfx.formats = vec![
@@ -187,6 +203,19 @@ impl Gfx {
 
     /// Draw a frame of `size` pixels at `scale` pixels per DIP into [`Gfx::pixels`].
     pub fn frame(&mut self, size: (u32, u32), scale: f32, draw: impl FnOnce(&Pen)) -> Result<()> {
+        let mut draw = Some(draw);
+        self.frame_in(size, scale, None, |pen, _| {
+            if let Some(draw) = draw.take() {
+                draw(pen);
+            }
+        })
+        .map(|_| ())
+    }
+
+    /// Draw a frame of `size` pixels, only in `areas` (DIPs) where given and the last frame was the
+    /// same size: `draw` is called for each area (`None`: the whole frame), clipped to it, and
+    /// should skip what lies outside it. Returns whether the whole frame was drawn.
+    pub fn frame_in(&mut self, size: (u32, u32), scale: f32, areas: Option<&[R]>, mut draw: impl FnMut(&Pen, Option<R>)) -> Result<bool> {
         unsafe {
             // The surface only grows (same width): a panel growing or shrinking keeps its target,
             // and so its decoded pictures. Only the top `size.1` rows are read back.
@@ -203,27 +232,57 @@ impl Gfx {
                 self.surface = Some((size, bitmap, target));
                 self.images.borrow_mut().clear();
             }
+            // In parts only over a frame of the same size, whose other pixels stand.
+            let areas = areas.filter(|_| fits && self.drawn == size);
+            let full = areas.is_none();
+            if full {
+                // What the last full frame did not draw goes.
+                let mut layouts = self.layouts.borrow_mut();
+                let now = std::mem::take(&mut layouts.now);
+                layouts.before = if now.len() > LAYOUTS_MAX { Default::default() } else { now };
+            }
             let (_, bitmap, target) = self.surface.as_ref().context("no surface")?;
             target.SetDpi(96.0 * scale, 96.0 * scale);
+            let brush = target.CreateSolidColorBrush(&D2D1_COLOR_F::default(), None).context("CreateSolidColorBrush")?;
             target.BeginDraw();
-            draw(&Pen { gfx: self, target: target.clone(), scale });
+            let pen = Pen { gfx: self, target: target.clone(), scale, brush };
+            // The rows drawn, to read back (pixels).
+            let mut rows = (0u32, size.1);
+            match areas {
+                None => draw(&pen, None),
+                Some(areas) => {
+                    rows = (size.1, 0);
+                    for &area in areas {
+                        target.PushAxisAlignedClip(&rect(area), D2D1_ANTIALIAS_MODE_ALIASED);
+                        draw(&pen, Some(area));
+                        target.PopAxisAlignedClip();
+                        let top = ((area.y * scale).floor().max(0.0) as u32).min(size.1);
+                        let bottom = ((area.bottom() * scale).ceil().max(0.0) as u32 + 1).min(size.1);
+                        rows = (rows.0.min(top), rows.1.max(bottom));
+                    }
+                }
+            }
+            drop(pen);
             target.EndDraw(None, None).context("EndDraw")?;
             self.drawn = size;
 
-            let rect = WICRect { X: 0, Y: 0, Width: size.0 as i32, Height: size.1.max(1) as i32 };
-            let lock = bitmap.Lock(&rect, WICBitmapLockRead.0 as u32).context("Lock")?;
-            let stride = lock.GetStride()? as usize;
-            let mut len = 0u32;
-            let mut data = std::ptr::null_mut();
-            lock.GetDataPointer(&mut len, &mut data)?;
-            let src = std::slice::from_raw_parts(data, len as usize);
             let row = size.0 as usize * 4;
             self.pixels.resize(row * size.1 as usize, 0);
-            for (y, out) in self.pixels.chunks_exact_mut(row).enumerate() {
-                out.copy_from_slice(&src[y * stride..y * stride + row]);
+            if rows.0 < rows.1 {
+                let rect = WICRect { X: 0, Y: rows.0 as i32, Width: size.0 as i32, Height: (rows.1 - rows.0) as i32 };
+                let lock = bitmap.Lock(&rect, WICBitmapLockRead.0 as u32).context("Lock")?;
+                let stride = lock.GetStride()? as usize;
+                let mut len = 0u32;
+                let mut data = std::ptr::null_mut();
+                lock.GetDataPointer(&mut len, &mut data)?;
+                let src = std::slice::from_raw_parts(data, len as usize);
+                let out = &mut self.pixels[rows.0 as usize * row..rows.1 as usize * row];
+                for (y, out) in out.chunks_exact_mut(row).enumerate() {
+                    out.copy_from_slice(&src[y * stride..y * stride + row]);
+                }
             }
+            Ok(full)
         }
-        Ok(())
     }
 
     /// The last frame, as a PNG file.
@@ -257,6 +316,8 @@ pub struct Pen<'a> {
     target: ID2D1RenderTarget,
     /// Pixels per DIP.
     scale: f32,
+    /// One brush for the frame, coloured for each use.
+    brush: ID2D1SolidColorBrush,
 }
 
 fn rect(r: R) -> D2D_RECT_F {
@@ -264,8 +325,9 @@ fn rect(r: R) -> D2D_RECT_F {
 }
 
 impl Pen<'_> {
-    fn brush(&self, c: Color) -> Option<ID2D1SolidColorBrush> {
-        unsafe { self.target.CreateSolidColorBrush(&D2D1_COLOR_F { r: c.0, g: c.1, b: c.2, a: c.3 }, None) }.ok()
+    fn brush(&self, c: Color) -> Option<&ID2D1SolidColorBrush> {
+        unsafe { self.brush.SetColor(&D2D1_COLOR_F { r: c.0, g: c.1, b: c.2, a: c.3 }) };
+        Some(&self.brush)
     }
 
     /// Fill everything with `c`, alpha included (the panel is translucent).
@@ -276,7 +338,7 @@ impl Pen<'_> {
     pub fn fill(&self, r: R, radius: f32, c: Color) {
         if let Some(brush) = self.brush(c) {
             let rounded = D2D1_ROUNDED_RECT { rect: rect(r), radiusX: radius, radiusY: radius };
-            unsafe { self.target.FillRoundedRectangle(&rounded, &brush) };
+            unsafe { self.target.FillRoundedRectangle(&rounded, brush) };
         }
     }
 
@@ -285,7 +347,7 @@ impl Pen<'_> {
             let half = width / 2.0;
             let inner = R::new(r.x + half, r.y + half, r.w - width, r.h - width);
             let rounded = D2D1_ROUNDED_RECT { rect: rect(inner), radiusX: radius, radiusY: radius };
-            unsafe { self.target.DrawRoundedRectangle(&rounded, &brush, width, None) };
+            unsafe { self.target.DrawRoundedRectangle(&rounded, brush, width, None) };
         }
     }
 
@@ -293,20 +355,34 @@ impl Pen<'_> {
         if text.is_empty() || r.w <= 0.0 {
             return;
         }
-        let wide: Vec<u16> = text.encode_utf16().collect();
+        let Some(layout) = self.layout(text, font, r, align) else { return };
         let Some(brush) = self.brush(c) else { return };
-        unsafe {
-            let Ok(layout) = self.gfx.dwrite.CreateTextLayout(&wide, &self.gfx.formats[font as usize], r.w, r.h) else {
-                return;
-            };
-            let a: DWRITE_TEXT_ALIGNMENT = match align {
-                Align::Left => DWRITE_TEXT_ALIGNMENT_LEADING,
-                Align::Center => DWRITE_TEXT_ALIGNMENT_CENTER,
-                Align::Right => DWRITE_TEXT_ALIGNMENT_TRAILING,
-            };
-            let _ = layout.SetTextAlignment(a);
-            self.target.DrawTextLayout(Vector2 { X: r.x, Y: r.y }, &layout, &brush, D2D1_DRAW_TEXT_OPTIONS_CLIP);
+        unsafe { self.target.DrawTextLayout(Vector2 { X: r.x, Y: r.y }, &layout, brush, D2D1_DRAW_TEXT_OPTIONS_CLIP) };
+    }
+
+    /// `text` laid out in a box of `r`'s size: made once, then kept while it is drawn.
+    fn layout(&self, text: &str, font: Font, r: R, align: Align) -> Option<IDWriteTextLayout> {
+        let key: LayoutKey = (text.to_string(), font as u8, r.w.to_bits(), r.h.to_bits(), align as u8);
+        let mut layouts = self.gfx.layouts.borrow_mut();
+        if let Some(layout) = layouts.now.get(&key) {
+            return Some(layout.clone());
         }
+        let layout = match layouts.before.remove(&key) {
+            Some(layout) => layout,
+            None => unsafe {
+                let wide: Vec<u16> = text.encode_utf16().collect();
+                let layout = self.gfx.dwrite.CreateTextLayout(&wide, &self.gfx.formats[font as usize], r.w, r.h).ok()?;
+                let a: DWRITE_TEXT_ALIGNMENT = match align {
+                    Align::Left => DWRITE_TEXT_ALIGNMENT_LEADING,
+                    Align::Center => DWRITE_TEXT_ALIGNMENT_CENTER,
+                    Align::Right => DWRITE_TEXT_ALIGNMENT_TRAILING,
+                };
+                let _ = layout.SetTextAlignment(a);
+                layout
+            },
+        };
+        layouts.now.insert(key, layout.clone());
+        Some(layout)
     }
 
     pub fn glyph(&self, glyph: char, font: Font, r: R, c: Color) {

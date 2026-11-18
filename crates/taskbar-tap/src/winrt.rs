@@ -39,14 +39,42 @@ pub unsafe trait IDependencyObject: IUnknown {
     pub fn ClearValue(&self, dp: *mut c_void) -> HRESULT;
     pub fn ReadLocalValue(&self, dp: *mut c_void, value: *mut *mut c_void) -> HRESULT;
     pub fn GetAnimationBaseValue(&self, dp: *mut c_void, value: *mut *mut c_void) -> HRESULT;
-    pub fn RegisterPropertyChangedCallback(
-        &self,
-        dp: *mut c_void,
-        callback: *mut c_void,
-        token: *mut i64,
-    ) -> HRESULT;
-    pub fn UnregisterPropertyChangedCallback(&self, dp: *mut c_void, token: i64) -> HRESULT;
     pub fn get_Dispatcher(&self, value: *mut *mut c_void) -> HRESULT;
+}
+
+/// `Windows.UI.Xaml.IDependencyObject2`: a property's changes, followed.
+#[interface("29fed85d-3d22-43a1-add0-17027c08b212")]
+pub unsafe trait IDependencyObject2: IUnknown {
+    pub fn GetIids(&self, count: *mut u32, iids: *mut *mut windows_core::GUID) -> HRESULT;
+    pub fn GetRuntimeClassName(&self, name: *mut *mut c_void) -> HRESULT;
+    pub fn GetTrustLevel(&self, level: *mut i32) -> HRESULT;
+    pub fn RegisterPropertyChangedCallback(&self, dp: *mut c_void, callback: *mut c_void, token: *mut i64) -> HRESULT;
+    pub fn UnregisterPropertyChangedCallback(&self, dp: *mut c_void, token: i64) -> HRESULT;
+}
+
+/// `Windows.UI.Xaml.DependencyPropertyChangedCallback`.
+#[interface("45883d16-27bf-4bc1-ac26-94c1601f3a49")]
+pub unsafe trait IDependencyPropertyChangedCallback: IUnknown {
+    pub fn Invoke(&self, sender: *mut c_void, dp: *mut c_void) -> HRESULT;
+}
+
+/// `Windows.UI.Xaml.Controls.ITextBlockStatics`: `TextProperty` is its eleventh property.
+#[interface("193ec042-a847-4552-b4e8-db36655b840a")]
+pub unsafe trait ITextBlockStatics: IUnknown {
+    pub fn GetIids(&self, count: *mut u32, iids: *mut *mut windows_core::GUID) -> HRESULT;
+    pub fn GetRuntimeClassName(&self, name: *mut *mut c_void) -> HRESULT;
+    pub fn GetTrustLevel(&self, level: *mut i32) -> HRESULT;
+    pub fn get_FontSizeProperty(&self, value: *mut *mut c_void) -> HRESULT;
+    pub fn get_FontFamilyProperty(&self, value: *mut *mut c_void) -> HRESULT;
+    pub fn get_FontWeightProperty(&self, value: *mut *mut c_void) -> HRESULT;
+    pub fn get_FontStyleProperty(&self, value: *mut *mut c_void) -> HRESULT;
+    pub fn get_FontStretchProperty(&self, value: *mut *mut c_void) -> HRESULT;
+    pub fn get_CharacterSpacingProperty(&self, value: *mut *mut c_void) -> HRESULT;
+    pub fn get_ForegroundProperty(&self, value: *mut *mut c_void) -> HRESULT;
+    pub fn get_TextWrappingProperty(&self, value: *mut *mut c_void) -> HRESULT;
+    pub fn get_TextTrimmingProperty(&self, value: *mut *mut c_void) -> HRESULT;
+    pub fn get_TextAlignmentProperty(&self, value: *mut *mut c_void) -> HRESULT;
+    pub fn get_TextProperty(&self, value: *mut *mut c_void) -> HRESULT;
 }
 
 /// `Windows.UI.Xaml.Media.IVisualTreeHelperStatics` (the `Find*` slots are unused).

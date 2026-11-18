@@ -9,9 +9,10 @@
 //! **Text** (`tap_proto::CLOCK_MAGIC`): once the app styles the clock, the TAP writes the shell's
 //! two text blocks. Nothing can be added beside them (`Panel.Children` refuses writes, and the
 //! shell resets the clock's slot when its content is replaced), and the shell rewrites them every
-//! minute through compiled bindings: the TAP watches every frame through the 1.5 s after each minute and
-//! puts its text back within one, and holds the clock's width at the widest it has drawn so the taskbar does
-//! not shift meanwhile. The unread count is a badge the app draws (an accent pill with the count, a
+//! minute through compiled bindings: each text block calls back when its text changes ([`watch`]),
+//! and the TAP puts its text back at once (where a block could not be watched, it looks every frame
+//! through the 1.5 s after each minute instead). It holds the clock's width at the widest it has
+//! drawn so the taskbar does not shift meanwhile. The unread count is a badge the app draws (an accent pill with the count, a
 //! PNG at the taskbar's scale), painted as the clock stack's background left of the two lines
 //! ([`show_badge`]); without one, an emoji dot near the accent and the count go before the time.
 
@@ -19,6 +20,8 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use crate::log::logf;
+use crate::winrt::{IDependencyPropertyChangedCallback, IDependencyPropertyChangedCallback_Impl};
+use windows_core::implement;
 use crate::{tree, xamlom};
 
 /// The clock's content, the same on the main and the secondary taskbars.
@@ -28,6 +31,69 @@ const SECTION: &str = "NotificationCenterButton";
 const TIME: &str = "TimeInnerTextBlock";
 const DATE: &str = "DateInnerTextBlock";
 const STACK: &str = "DateTimeStackPanel";
+
+/// Text blocks that call back when their text changes ([`watch`]): never detached (the TAP stays
+/// loaded), the callback checks there is text to put back.
+static WATCHED: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+/// A text change has called back (said once, as proof it works).
+static CALLED: AtomicBool = AtomicBool::new(false);
+/// A block would not be watched (said once).
+static REFUSED: AtomicBool = AtomicBool::new(false);
+
+/// A clock's text changed (the shell's rewrite, or the TAP's own): look at once. The TAP's own
+/// write comes from inside [`tick`], whose next look then replaces this one.
+#[implement(IDependencyPropertyChangedCallback)]
+struct TextChanged(());
+
+impl IDependencyPropertyChangedCallback_Impl for TextChanged_Impl {
+    unsafe fn Invoke(&self, _sender: *mut core::ffi::c_void, _dp: *mut core::ffi::c_void) -> windows_core::HRESULT {
+        if std::panic::catch_unwind(|| {
+            if !CALLED.swap(true, Ordering::SeqCst) {
+                logf!("clock: text changes call back");
+            }
+            if crate::lock(&TEXT).is_some() {
+                crate::lifecycle::arm_clock_timer(1);
+            }
+        })
+        .is_err()
+        {
+            logf!("clock: text callback panicked");
+        }
+        windows_core::HRESULT(0)
+    }
+}
+
+/// Have `block`'s text changes call back ([`TextChanged`]); `false` if XAML would not.
+///
+/// # Safety
+/// XAML UI thread only.
+unsafe fn watch(diagnostics: &xamlom::IXamlDiagnostics, block: u64) -> bool {
+    use windows_core::Interface;
+    if crate::lock(&WATCHED).contains(&block) {
+        return true;
+    }
+    let Some(statics) = crate::decorate::factory::<crate::winrt::ITextBlockStatics>("Windows.UI.Xaml.Controls.TextBlock") else { return false };
+    let Some(object) = crate::decorate::element::<crate::winrt::IDependencyObject2>(diagnostics, block) else { return false };
+    let mut dp: *mut core::ffi::c_void = core::ptr::null_mut();
+    if statics.get_TextProperty(&mut dp).is_err() || dp.is_null() {
+        return false;
+    }
+    // Ours to release.
+    let dp = windows_core::IUnknown::from_raw(dp);
+    let callback: IDependencyPropertyChangedCallback = TextChanged(()).into();
+    let mut token = 0i64;
+    let ok = object.RegisterPropertyChangedCallback(dp.as_raw(), callback.as_raw(), &mut token).is_ok();
+    if ok {
+        let mut watched = crate::lock(&WATCHED);
+        // Blocks gone (a taskbar rebuilt) are forgotten.
+        let alive = tree::find_by_name(TIME).into_iter().chain(tree::find_by_name(DATE)).collect::<Vec<_>>();
+        watched.retain(|b| alive.contains(b));
+        watched.push(block);
+    } else if !REFUSED.swap(true, Ordering::SeqCst) {
+        logf!("clock: a text block would not report its changes; looking every frame after each minute");
+    }
+    ok
+}
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
 /// Elements that already have the handlers.
@@ -382,12 +448,16 @@ pub unsafe fn tick() -> Option<u32> {
     let st = now();
     let dot = accent_dot(crate::strip_state().and_then(|s| s.accent));
     let (time, date) = lines(&text, &st, dot);
+    // Every block calls back on a change: no looking out for the shell's rewrites.
+    let mut watched = true;
     for block in tree::find_by_name(TIME) {
+        watched &= watch(&diagnostics, block);
         if crate::decorate::text_of(&diagnostics, block).as_deref() != Some(time.as_str()) {
             crate::decorate::set_text(&diagnostics, block, &time);
         }
     }
     for block in tree::find_by_name(DATE) {
+        watched &= watch(&diagnostics, block);
         // Visibility is written only when it changes: a write each frame costs Explorer for nothing.
         let hidden = crate::lock(&HIDDEN).contains(&block);
         match &date {
@@ -428,11 +498,14 @@ pub unsafe fn tick() -> Option<u32> {
         }
     }
     // A burst of looks asked for (the pointer over the clock): one frame at a time until spent.
-    if BURST.load(Ordering::SeqCst) > 0 {
+    // Watched blocks say when the shell rewrites them: no burst needed.
+    if watched {
+        BURST.store(0, Ordering::SeqCst);
+    } else if BURST.load(Ordering::SeqCst) > 0 {
         BURST.fetch_sub(1, Ordering::SeqCst);
         return Some(16);
     }
-    Some(next_look(st.wSecond as u32 * 1000 + st.wMilliseconds as u32, text.time.contains('s')))
+    Some(next_look(st.wSecond as u32 * 1000 + st.wMilliseconds as u32, text.time.contains('s'), watched))
 }
 
 /// Frame-by-frame looks still due, after the pointer entered or left the clock.
@@ -451,22 +524,27 @@ pub fn watch_closely() {
 /// About half a second of frames: the shell redraws its text within that of a hover.
 const BURST_FRAMES: u32 = 30;
 
-/// When to look next (ms), `into` ms into the minute. The shell rewrites its text about half a
-/// second after each minute (measured: 0.5 to 0.7 s): through the first 1.5 s the TAP looks every
-/// frame, so its text is back within one. The shell also rewrites it at other moments, so outside
-/// that window it looks every 2 s (every second with seconds shown).
-fn next_look(into: u32, seconds: bool) -> u32 {
+/// When to look next (ms), `into` ms into the minute. With every block `watched`, the shell's
+/// rewrites call back, so only the TAP's own text is due: at the next second (seconds shown) or
+/// minute. Otherwise: the shell rewrites its text about half a second after each minute (measured:
+/// 0.5 to 0.7 s), so through the first 1.5 s the TAP looks every frame and its text is back within
+/// one; the shell also rewrites it at other moments, so outside that window it looks every 2 s.
+fn next_look(into: u32, seconds: bool, watched: bool) -> u32 {
     const WATCH: u32 = 1500;
     const FRAME: u32 = 16;
     const LOOK: u32 = 2000;
+    let next_minute = 60_000 - into.min(59_999) + 5;
+    if seconds {
+        return if !watched && into < WATCH { FRAME } else { 1000 - into % 1000 + 15 };
+    }
+    if watched {
+        return next_minute;
+    }
     if into < WATCH {
         return FRAME;
     }
-    if seconds {
-        return 1000 - into % 1000 + 15;
-    }
     // Never past the next minute's watch.
-    LOOK.min(60_000 - into.min(59_999) + 5)
+    LOOK.min(next_minute)
 }
 
 #[cfg(test)]
@@ -476,14 +554,23 @@ mod tests {
     #[test]
     fn the_clock_is_watched_every_frame_just_after_each_minute() {
         use super::next_look;
-        assert_eq!(next_look(0, false), 16);
-        assert_eq!(next_look(1499, false), 16);
-        assert_eq!(next_look(1500, false), 2000);
-        assert_eq!(next_look(30_000, false), 2000);
-        assert_eq!(next_look(59_000, false), 1005);
-        assert_eq!(next_look(59_990, false), 15);
-        assert_eq!(next_look(700, true), 16);
-        assert_eq!(next_look(5_200, true), 815);
+        assert_eq!(next_look(0, false, false), 16);
+        assert_eq!(next_look(1499, false, false), 16);
+        assert_eq!(next_look(1500, false, false), 2000);
+        assert_eq!(next_look(30_000, false, false), 2000);
+        assert_eq!(next_look(59_000, false, false), 1005);
+        assert_eq!(next_look(59_990, false, false), 15);
+        assert_eq!(next_look(700, true, false), 16);
+        assert_eq!(next_look(5_200, true, false), 815);
+    }
+
+    #[test]
+    fn a_watched_clock_is_looked_at_only_when_its_own_text_is_due() {
+        use super::next_look;
+        assert_eq!(next_look(0, false, true), 60_005);
+        assert_eq!(next_look(30_000, false, true), 30_005);
+        assert_eq!(next_look(59_990, false, true), 15);
+        assert_eq!(next_look(700, true, true), 315);
     }
 
     #[test]

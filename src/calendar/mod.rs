@@ -129,6 +129,11 @@ pub fn open(config: &crate::config::Config) {
     view::toggle(config);
 }
 
+/// Draw the panel once, hidden, ahead of its next open (see [`view::prewarm`]).
+pub fn prewarm(config: &crate::config::Config) {
+    view::prewarm(config);
+}
+
 /// Close the calendar if it is open (the app is quitting).
 pub fn close() {
     view::close();

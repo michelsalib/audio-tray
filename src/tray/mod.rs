@@ -474,6 +474,10 @@ fn handle(msg: Queued) {
         }
         crate::calendar::WM_CALENDAR if msg.wparam == crate::calendar::NOTIFICATIONS => {
             crate::calendar::notifications_changed();
+            // New pictures are decoded now, not when the panel opens.
+            if let Some(config) = with_tray(|tray| tray.config.clone()).filter(|c| c.calendar.enabled) {
+                crate::calendar::prewarm(&config);
+            }
             reschedule();
         }
         crate::calendar::WM_CALENDAR => {

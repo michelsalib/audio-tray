@@ -86,9 +86,21 @@ enum Edge {
     Right,
 }
 
-/// What a window was last sent: where (screen x, y, and size in pixels; a width of -1 or 0 for
-/// nothing known) and its pixels, row after row.
-type Sent = ((i32, i32, i32, i32), Vec<u8>);
+/// A frame drawn: its size in pixels, its cards, and the drawing.
+type Drawn = ((u32, u32), Vec<R>, Vec<(R, Draw)>);
+
+/// What a card's window shows: its pixels (held in its bitmap), where, and how faded.
+struct Sent {
+    canvas: crate::layered::Canvas,
+    at: (i32, i32),
+    alpha: u8,
+}
+
+impl Sent {
+    const fn new() -> Self {
+        Sent { canvas: crate::layered::Canvas::new(), at: (0, 0), alpha: 0 }
+    }
+}
 
 struct View {
     /// The calendar's window (input, capture) and the notification centre's.
@@ -97,6 +109,11 @@ struct View {
     gfx: RefCell<Gfx>,
     /// What each window (main, top) last showed, to skip sending the same again.
     shown: RefCell<[Sent; 2]>,
+    /// The last frame drawn: its size, its cards and their drawing, to redraw only what changed.
+    last: RefCell<Option<Drawn>>,
+    /// Windows keeps notifications quiet (asked of Windows on opening, each refresh and after a
+    /// switch: never per frame, each asking costs a WinRT call).
+    quiet: bool,
     palette: Palette,
     scale: f32,
     edge: Edge,
@@ -278,7 +295,8 @@ fn edge_of(rect: &RECT, work: &RECT) -> Edge {
     }
 }
 
-fn create(config: &Config) -> Result<()> {
+/// The panel made, its windows hidden, nothing read yet.
+fn make(config: &Config) -> Result<View> {
     let mut cursor = POINT::default();
     let _ = unsafe { GetCursorPos(&mut cursor) };
     let (scale, rect, work) = monitor(cursor);
@@ -309,11 +327,13 @@ fn create(config: &Config) -> Result<()> {
     let setup = config.calendar.setup();
     let first_weekday = config.calendar.first_weekday.map_or_else(locale::first_weekday, |d| d.min(6) as u32);
     let empty = scene::build(&empty_input());
-    let mut view = View {
+    let view = View {
         hwnd,
         top_hwnd,
         gfx: RefCell::new(gfx),
-        shown: RefCell::new(Default::default()),
+        shown: RefCell::new([Sent::new(), Sent::new()]),
+        last: RefCell::new(None),
+        quiet: super::focus::active(),
         palette: Palette::current(),
         scale,
         edge: edge_of(&rect, &work),
@@ -349,6 +369,29 @@ fn create(config: &Config) -> Result<()> {
         stash: Vec::new(),
         flash: None,
     };
+    Ok(view)
+}
+
+/// Before an open: the panel drawn once, hidden, so that its pictures are decoded and its text laid
+/// out when it opens (a first open drew everything from nothing, ~40 ms more). Tray thread.
+pub fn prewarm(config: &Config) {
+    if OPEN.with(Cell::get) != 0 {
+        return;
+    }
+    let Ok(mut view) = make(config) else { return };
+    view.reload();
+    view.place();
+    view.draw_frame();
+    SPARE_GFX.with(|s| *s.borrow_mut() = Some(view.gfx.into_inner()));
+    unsafe {
+        let _ = DestroyWindow(view.top_hwnd);
+        let _ = DestroyWindow(view.hwnd);
+    }
+}
+
+fn create(config: &Config) -> Result<()> {
+    let mut view = make(config)?;
+    let hwnd = view.hwnd;
     super::notifications::set_watching(true);
     view.reload();
     view.fetch();
@@ -605,7 +648,7 @@ impl View {
             columns: self.columns(),
             groups,
             unread: self.toasts.len(),
-            quiet: super::focus::active(),
+            quiet: self.quiet,
             center_scroll: self.center_scroll,
             weekday: capitalised(&locale::format(today, "dddd")),
             date: locale::format(today, "d MMMM"),
@@ -662,8 +705,13 @@ impl View {
 
     /// Lay out again (something came, went or was picked) and show it.
     fn relayout(&mut self) {
-        let had_top = unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(self.top_hwnd) }.as_bool();
         self.place();
+        self.show();
+    }
+
+    /// Show the scene laid out: the notification card's window shown or hidden to match, then drawn.
+    fn show(&self) {
+        let had_top = unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(self.top_hwnd) }.as_bool();
         let has_top = self.scene.top.is_some();
         if had_top != has_top {
             unsafe {
@@ -676,8 +724,23 @@ impl View {
     /// Draw the scene off screen.
     fn draw_frame(&self) {
         let size = (self.px(self.scene.w) as u32, self.px(self.scene.h) as u32);
-        if let Err(e) = self.gfx.borrow_mut().frame(size, self.scale, |pen| draw(pen, &self.scene, &self.palette)) {
-            eprintln!("calendar: could not draw ({e:#})");
+        // Only the cards whose drawing changed, when they sit where they did (a hover, a scroll
+        // changes one); everything when anything moved.
+        let mut last = self.last.borrow_mut();
+        let cards: Vec<R> = self.scene.top.into_iter().chain([self.scene.main]).collect();
+        let areas: Option<Vec<R>> = last.as_ref().filter(|(was_size, was_cards, _)| *was_size == size && *was_cards == cards).map(|(_, _, items)| {
+            cards.iter().copied().filter(|&card| !in_card(items, card).eq(in_card(&self.scene.items, card))).collect()
+        });
+        if areas.as_ref().is_some_and(Vec::is_empty) {
+            return;
+        }
+        let drawn = self.gfx.borrow_mut().frame_in(size, self.scale, areas.as_deref(), |pen, area| draw(pen, &self.scene, &self.palette, area));
+        match drawn {
+            Ok(_) => *last = Some((size, cards, self.scene.items.clone())),
+            Err(e) => {
+                *last = None;
+                eprintln!("calendar: could not draw ({e:#})");
+            }
         }
     }
 
@@ -703,34 +766,30 @@ impl View {
             &gfx.pixels[start..start + w as usize * 4]
         };
         let (x, y) = (self.origin.0 + dx, self.origin.1 + dy);
-        // A card that looks and sits as it did is not sent again (a hover changes one card at most):
-        // compared with a copy of what was sent, a memory compare, where a hash cost ~13 ms a frame.
-        let still = dx == 0 && dy == 0 && alpha == 255;
         let mut shown = self.shown.borrow_mut();
         let mut show = |slot: usize, hwnd: HWND, card: R| {
             let (x0, y0, w, h) = cut(card);
             let span = w as usize * 4;
             let sent = &mut shown[slot];
-            let place = (x + x0, y + y0, w, h);
-            let same = still && sent.0 == place && (0..h).all(|r| sent.1[r as usize * span..][..span] == *line(x0, y0, w, r));
-            if same {
-                return;
+            let at = (x + x0, y + y0);
+            // A card that looks as it did is not sent again (a hover changes one card at most, a
+            // slide none): compared with what its window holds, a memory compare.
+            let same = sent.canvas.size() == (w, h) && {
+                let held = sent.canvas.pixels();
+                (0..h).all(|r| held[r as usize * span..][..span] == *line(x0, y0, w, r))
+            };
+            if !same {
+                sent.canvas.present(hwnd, (w, h), at, alpha, |dst| {
+                    for (r, out) in dst.chunks_exact_mut(span.max(1)).enumerate().take(h as usize) {
+                        out.copy_from_slice(line(x0, y0, w, r as i32));
+                    }
+                });
+            } else if (sent.at, sent.alpha) != (at, alpha) {
+                // Only moved or faded (a slide): the window keeps its pixels.
+                crate::layered::Canvas::shift(hwnd, at.0, at.1, alpha);
             }
-            if still {
-                sent.0 = place;
-                sent.1.clear();
-                for r in 0..h {
-                    sent.1.extend_from_slice(line(x0, y0, w, r));
-                }
-            } else {
-                // Moving: the next still frame is sent whatever it holds.
-                sent.0 = (0, 0, -1, 0);
-            }
-            crate::layered::present_with(hwnd, w, h, x + x0, y + y0, alpha, |dst| {
-                for (r, out) in dst.chunks_exact_mut(span.max(1)).enumerate().take(h as usize) {
-                    out.copy_from_slice(line(x0, y0, w, r as i32));
-                }
-            });
+            sent.at = at;
+            sent.alpha = alpha;
         };
         // Growing upward, the notification card goes first, so the two never overlap for a frame.
         if let Some(top) = self.scene.top {
@@ -751,8 +810,11 @@ impl View {
         let mut point = cursor();
         let _ = unsafe { ScreenToClient(self.hwnd, &mut point) };
         let hover = self.hit(point.x, point.y);
-        self.note_hover(hover);
-        self.relayout();
+        // Laid out again only if the hover changed (it lights what it is over).
+        if self.note_hover(hover) {
+            self.place();
+        }
+        self.show();
     }
 
     /// Slide in or out from the taskbar's edge, on the last frame drawn.
@@ -932,6 +994,7 @@ impl View {
                 if !super::focus::toggle() && !was {
                     self.say("Windows would not turn on Do not disturb");
                 }
+                self.quiet = super::focus::active();
                 crate::tray::wake_calendar();
             }
             Hit::Today => {
@@ -963,6 +1026,7 @@ impl View {
                 } else if !super::schedule::start_focus(self.config.calendar.focus_minutes) && !super::focus::active() {
                     self.say("The timer runs, but Windows would not silence notifications");
                 }
+                self.quiet = super::focus::active();
                 // The clock and the timer follow.
                 crate::tray::wake_calendar();
             }
@@ -1323,7 +1387,17 @@ fn capitalised(text: &str) -> String {
 }
 
 /// Paint the scene.
-fn draw(pen: &Pen, scene: &Scene, p: &Palette) {
+/// The drawing that falls on `card`.
+fn in_card(items: &[(R, Draw)], card: R) -> impl Iterator<Item = &(R, Draw)> {
+    items.iter().filter(move |(r, _)| overlaps(*r, card))
+}
+
+fn overlaps(a: R, b: R) -> bool {
+    a.x < b.right() && b.x < a.right() && a.y < b.bottom() && b.y < a.bottom()
+}
+
+/// Draw `scene`, or only what falls in `area` (the frame is clipped to it).
+fn draw(pen: &Pen, scene: &Scene, p: &Palette, area: Option<R>) {
     pen.clear(Color(0.0, 0.0, 0.0, 0.0));
     let ink = |ink: Ink| match ink {
         Ink::Text => p.text,
@@ -1343,6 +1417,9 @@ fn draw(pen: &Pen, scene: &Scene, p: &Palette) {
         Fill::Rgb(rgb) => Color::rgb(rgb),
     };
     for (r, d) in &scene.items {
+        if area.is_some_and(|a| !overlaps(*r, a)) && !matches!(d, Draw::Clip | Draw::Unclip) {
+            continue;
+        }
         match d {
             Draw::Card => pen.fill(*r, 0.0, p.bg),
             Draw::Rect { fill: f, radius } => pen.fill(*r, *radius, fill(*f)),
@@ -1497,7 +1574,10 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESUL
             with_view(View::settle);
         }
         WM_TIMER if wparam.0 == REFRESH_TIMER => {
-            with_view(View::relayout);
+            with_view(|v| {
+                v.quiet = super::focus::active();
+                v.relayout();
+            });
         }
         WM_TIMER if wparam.0 == TIP_TIMER => {
             let _ = unsafe { KillTimer(Some(hwnd), TIP_TIMER) };
@@ -1519,7 +1599,8 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESUL
                 with_view(|v| v.set_hover(None));
             }
         }
-        WM_DESTROY => {
+        // The open panel's (not one drawn ahead, [`prewarm`]).
+        WM_DESTROY if OPEN.with(Cell::get) == hwnd.0 as isize => {
             OPEN.with(|o| o.set(0));
             super::notifications::set_watching(false);
             *super::OPEN_RECT.lock().unwrap_or_else(|e| e.into_inner()) = None;

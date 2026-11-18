@@ -980,13 +980,13 @@ pub struct ClockText {
     /// A `GetDateFormatEx` pattern; empty: the locale's short date; `-`: hidden.
     pub date: String,
     pub one_line: bool,
-    /// After the time (the next meeting, the focus time left).
+    /// After the time: the focus time left, never a meeting (the time stays the time).
     pub top: String,
-    /// Windows' unread notifications (0: none).
+    /// Notifications new since the panel was last opened (0: none).
     pub badge: u32,
     /// The badge drawn for it (`calendar::view::badge`): the PNG, its width in DIPs and the DPI it
     /// was drawn for. Without one, the TAP puts an emoji dot and the count before the time.
-    pub badge_image: Option<(String, u32, u32)>,
+    pub badge_image: Option<crate::calendar::Badge>,
 }
 
 /// Tell the loaded TAP how the clock reads. `false` when no TAP took it.

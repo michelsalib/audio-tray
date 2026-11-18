@@ -18,6 +18,8 @@ pub mod schedule;
 mod sources;
 pub mod time;
 mod view;
+
+pub use view::Badge;
 pub mod zones;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -525,6 +527,13 @@ mod tests {
         assert!(!super::app_link("search-ms:query=x"));
         assert!(!super::app_link("SHELL:startup"));
         assert!(!super::app_link("no scheme here"));
+    }
+
+    #[test]
+    fn a_month_s_fetch_covers_the_months_either_side_and_a_week_more() {
+        let (from, to) = super::days_around(2026, 1);
+        assert_eq!(from, super::time::days_from_civil(2025, 12, 1) - 7);
+        assert_eq!(to, super::time::days_from_civil(2026, 3, 1) + 7);
     }
 
     #[test]

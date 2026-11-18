@@ -12,9 +12,10 @@
 //! minute through compiled bindings: each text block calls back when its text changes ([`watch`]),
 //! and the TAP puts its text back at once (where a block could not be watched, it looks every frame
 //! through the 1.5 s after each minute instead). It holds the clock's width at the widest it has
-//! drawn so the taskbar does not shift meanwhile. The unread count is a badge the app draws (an accent pill with the count, a
-//! PNG at the taskbar's scale), painted as the clock stack's background left of the two lines
-//! ([`show_badge`]); without one, an emoji dot near the accent and the count go before the time.
+//! drawn so the taskbar does not shift meanwhile. The unread count is a badge the app draws (an
+//! accent pill with the count, a PNG at the taskbar's scale), painted as the clock stack's
+//! background left of the two lines ([`show_badge`]); without one, an emoji dot near the accent
+//! and the count go before the time.
 
 use core::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
@@ -590,6 +591,24 @@ mod tests {
     #[test]
     fn badge_paths_become_file_uris_fit_for_an_attribute() {
         assert_eq!(super::file_uri(r"C:\Users\a b\x&y.png"), "file:///C:/Users/a%20b/x&amp;y.png");
+        assert_eq!(super::file_uri(r#"C:\b%#\"q<.png"#), "file:///C:/b%25%23/&quot;q&lt;.png", "escaped for the address and the attribute");
+    }
+
+    #[test]
+    fn the_clock_lines_follow_the_text_asked_for() {
+        use super::{lines, Text};
+        let st = windows::Win32::Foundation::SYSTEMTIME { wYear: 2026, wMonth: 11, wDay: 18, wHour: 9, wMinute: 5, ..Default::default() };
+        let plain = Text { time: "HH:mm".into(), date: "dd/MM".into(), ..Default::default() };
+        assert_eq!(lines(&plain, &st, "x"), ("09:05".into(), Some("18/11".into())));
+        let one = Text { one_line: true, ..plain.clone() };
+        assert_eq!(lines(&one, &st, "x"), ("09:05   18/11".into(), None));
+        let hidden = Text { date: "-".into(), top: "Focus · 18 min left".into(), ..plain.clone() };
+        assert_eq!(lines(&hidden, &st, "x"), ("09:05 · Focus · 18 min left".into(), None));
+        // A count without its badge picture: the dot and the count go first.
+        let badged = Text { badge: 3, ..plain.clone() };
+        assert_eq!(lines(&badged, &st, "x").0, "x 3   09:05");
+        let pictured = Text { badge: 3, badge_image: r"C:\b.png".into(), ..plain };
+        assert_eq!(lines(&pictured, &st, "x").0, "09:05");
     }
 
     #[test]

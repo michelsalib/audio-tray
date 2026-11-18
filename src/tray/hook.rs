@@ -20,13 +20,14 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use crate::audio::Flow;
 use crate::taskbar::WM_TASKBAR_SCROLL;
 
-/// The hook thread; stopping it (on drop) unhooks.
-pub(super) struct WheelHook {
+/// The hooks' thread: the mouse's (the wheel over the strip, the clock's click, a click outside
+/// the calendar) and, while the shortcut is on, the keyboard's. Stopping it (on drop) unhooks both.
+pub(super) struct Hooks {
     thread: u32,
     join: Option<std::thread::JoinHandle<()>>,
 }
 
-impl WheelHook {
+impl Hooks {
     /// Install the hook on a fresh thread. `None` if it could not be installed.
     pub(super) fn spawn() -> Option<Self> {
         let (ready, started) = std::sync::mpsc::channel();
@@ -89,7 +90,7 @@ pub(super) fn want_keys(on: bool) {
     }
 }
 
-impl Drop for WheelHook {
+impl Drop for Hooks {
     fn drop(&mut self) {
         HOOK_THREAD.store(0, std::sync::atomic::Ordering::SeqCst);
         let _ = unsafe { PostThreadMessageW(self.thread, WM_QUIT, WPARAM(0), LPARAM(0)) };
@@ -343,7 +344,16 @@ fn mask_windows_key() {
 
 #[cfg(test)]
 mod tests {
-    use super::wheel_belongs_to_tray;
+    use super::{pack, unpack, wheel_belongs_to_tray};
+    use windows::Win32::Foundation::POINT;
+
+    #[test]
+    fn points_survive_packing_on_any_monitor() {
+        for (x, y) in [(0, 0), (1540, 1166), (-1920, -40), (i32::MAX, i32::MIN)] {
+            let back = unpack(pack(POINT { x, y }));
+            assert_eq!((back.x, back.y), (x, y));
+        }
+    }
 
     #[test]
     fn the_slot_counts_only_in_the_taskbar_or_our_popup() {

@@ -286,7 +286,7 @@ pub fn run(backend: WasapiBackend, settings: bool) -> Result<()> {
     let icon = build_tray(&backend, &config)?;
     TrayIconEvent::set_event_handler(Some(on_tray_event));
     let _notifications = notify::register()?;
-    let _wheel = hook::WheelHook::spawn();
+    let _wheel = hook::Hooks::spawn();
 
     let devices = backend.enumerate_flow(Flow::Output).map(|d| d.len()).unwrap_or(0);
     let gestures = if taskbar::buttons_up() {

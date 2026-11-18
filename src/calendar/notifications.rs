@@ -143,7 +143,8 @@ pub fn list() -> Vec<Toast> {
     TOASTS.lock().unwrap_or_else(|e| e.into_inner()).clone().unwrap_or_default()
 }
 
-/// How many notifications are waiting.
+/// How many notifications are waiting (the dev preview follows them).
+#[cfg(feature = "dev")]
 pub fn count() -> usize {
     TOASTS.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map_or(0, Vec::len)
 }

@@ -1683,7 +1683,7 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESUL
                 v.scene.on_card(sx, sy)
             });
             if inside == Some(false) {
-                // Under capture: a click outside the panel closes it.
+                // A click on the panel's windows but off both cards (the corner between them) closes it.
                 after = Some(Box::new(close));
             }
         }

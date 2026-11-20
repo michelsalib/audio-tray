@@ -79,6 +79,18 @@ thread_local! {
     static CLOSED_AT: Cell<Option<Instant>> = const { Cell::new(None) };
     /// The close animation is running.
     static CLOSING: Cell<bool> = const { Cell::new(false) };
+    /// The panel really has the foreground (`GetForegroundWindow` says so), so losing it is the
+    /// user going elsewhere. Without rights, `raise` borrows the foreground app's input queue: the
+    /// panel looks active while attached and is deactivated on detaching, with that app still in
+    /// front. Closing on that deactivation shut the panel as it opened.
+    static HELD: Cell<bool> = const { Cell::new(false) };
+    /// [`create`] is in `raise`: activations meanwhile are borrowed, not held.
+    static RAISING: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Whether `hwnd` is the foreground window, as the whole system sees it.
+fn foreground_is(hwnd: HWND) -> bool {
+    unsafe { windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow() == hwnd }
 }
 
 /// The screen edge the taskbar is on, where the panel opens from.
@@ -451,8 +463,15 @@ fn create(config: &Config) -> Result<()> {
     unsafe { SetTimer(Some(hwnd), REFRESH_TIMER, REFRESH_MS, None) };
     // The click that opened it was swallowed by our hook, so Windows has not lent us the
     // foreground: without it there are no keys (Escape) and no deactivation to close on.
-    if crate::music::player::raise(hwnd) == crate::music::player::Raise::Refused {
-        eprintln!("calendar: could not take the foreground");
+    // Its deactivations are not the user's until it is known to be in front (see [`HELD`]).
+    HELD.with(|h| h.set(false));
+    RAISING.with(|r| r.set(true));
+    let raised = crate::music::player::raise(hwnd);
+    RAISING.with(|r| r.set(false));
+    let held = foreground_is(hwnd);
+    HELD.with(|h| h.set(held));
+    if !held {
+        eprintln!("calendar: could not take the foreground ({raised:?}); a click outside closes it");
     }
     // No mouse capture: a click elsewhere goes where it was aimed (the audio icon opens its panel
     // at once), and the tray's mouse hook closes the calendar as it passes ([`keep_rect`]).
@@ -1724,10 +1743,23 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESUL
                 with_view(|v| v.type_char(c));
             }
         }
+        // Activated for real later (a click on it, with the input that grants it): from then on,
+        // leaving it closes it. Not while `raise` runs: borrowing a queue activates it for show.
+        WM_ACTIVATE if (wparam.0 & 0xFFFF) as u32 != WA_INACTIVE => {
+            if !RAISING.with(Cell::get) && foreground_is(hwnd) {
+                HELD.with(|h| h.set(true));
+            }
+            // On to `DefWindowProc`, which gives the panel the keyboard focus.
+            return None;
+        }
         WM_ACTIVATE if (wparam.0 & 0xFFFF) as u32 == WA_INACTIVE => {
             // Not to its own notification card (which never takes activation, but in case).
             let to = HWND(lparam.0 as *mut _);
-            if with_view(|v| v.top_hwnd != to).unwrap_or(true) {
+            if !HELD.with(Cell::get) {
+                // The deactivation of a borrowed activation (see [`HELD`]): the app it was borrowed
+                // from is still in front, and the user has not gone anywhere.
+                println!("calendar: deactivated without having had the foreground; staying open");
+            } else if with_view(|v| v.top_hwnd != to).unwrap_or(true) {
                 println!("calendar: closed, the foreground went to {:?} ({})", to.0, crate::win::class_name(to));
                 after = Some(Box::new(close));
             }

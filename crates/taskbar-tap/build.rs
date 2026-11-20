@@ -20,6 +20,13 @@ fn main() {
         return;
     }
 
+    // LNK4104 ("export of symbol 'DllGetClassObject' should be PRIVATE"): the COM entry points are
+    // listed in the export file rustc writes, which cannot mark them PRIVATE. That only keeps them
+    // out of the import library, which nothing links against: the DLL is loaded by path.
+    if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
+        println!("cargo:rustc-cdylib-link-arg=/IGNORE:4104");
+    }
+
     let (major, minor, patch) = triple(&version);
 
     let mut res = winresource::WindowsResource::new();

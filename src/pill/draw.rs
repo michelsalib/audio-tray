@@ -582,9 +582,17 @@ fn device_button(p: &mut Painter, flow: Flow, device: &Device, cx: f32, cy: f32,
         None => p.icon(device.icon, cx, cy, m.dev_px)?,
     }
     if device.recording {
-        p.circle(cx + r * 0.7, cy - r * 0.7, r * 0.28, LIVE_DOT)?;
+        recording_dot(p, cx, cy, r, if device.muted { Rgba::hex(0x5A5A5A, 1.0) } else { Rgba::hex(0x3A3A3A, 1.0) })?;
     }
     Ok(())
+}
+/// The red recording dot, wholly inside a button's disc (radius `r`, colour `disc`) at its upper
+/// right, ringed in the disc's colour to stand off the glyph. On the rim it hung half off the
+/// button.
+fn recording_dot(p: &mut Painter, cx: f32, cy: f32, r: f32, disc: Rgba) -> Result<()> {
+    let (dx, dy, dr) = (cx + r * 0.45, cy - r * 0.45, r * 0.25);
+    p.circle(dx, dy, dr + r * 0.1, disc)?;
+    p.circle(dx, dy, dr, LIVE_DOT)
 }
 /// Cover art, or a music (or `video`) glyph on a plain disc when there is none (or it will not decode).
 fn art(p: &mut Painter, cover: Option<&[u8]>, video: bool, x: f32, y: f32, size: f32, radius: Option<f32>) -> Result<()> {
@@ -810,7 +818,7 @@ fn paint_call(p: &mut Painter, frame: &Frame, call: &CallPill, layout: &CallLayo
         p.circle(cx, cy, r, if call.muted { Rgba::hex(0x5A5A5A, 1.0) } else { Rgba::hex(0x3A3A3A, 1.0) })?;
         p.text(&(if call.muted { GLYPH_MIC_OFF } else { GLYPH_MIC }).to_string(), m.dev_font, (cx - r, cy - r, 2.0 * r, 2.0 * r), WHITE)?;
         if !call.muted {
-            p.circle(cx + r * 0.7, cy - r * 0.7, r * 0.28, LIVE_DOT)?;
+            recording_dot(p, cx, cy, r, Rgba::hex(0x3A3A3A, 1.0))?;
         }
         Ok(())
     };

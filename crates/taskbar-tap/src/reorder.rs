@@ -25,7 +25,7 @@ use std::sync::Mutex;
 use crate::budget::Budget;
 use crate::log::logf;
 use crate::tree;
-use crate::winrt::{IFrameworkElement, IGridStatics, IUIElement, Thickness, GRID, VISIBILITY_COLLAPSED};
+use crate::winrt::{IFrameworkElement, IGridStatics, ISizeChangedEventHandler, ISizeChangedEventHandler_Impl, IUIElement, Thickness, GRID, VISIBILITY_COLLAPSED};
 use crate::xamlom::{IXamlDiagnostics, InstanceHandle};
 use windows::Win32::Foundation::S_OK;
 use windows_core::Interface;
@@ -333,7 +333,64 @@ unsafe fn shift_by_margins(diagnostics: &IXamlDiagnostics, frame: InstanceHandle
     if !before {
         logf!("reorder: notify icons drawn {stepped} epx right, {CONTROL_CENTRE} +{icons_width} (StackPanel)");
     }
+    // Every section whose width the margins count: followed as it resizes, not at the next sweep.
+    for &section in &children[icons..control_centre] {
+        follow(diagnostics, section);
+    }
     Outcome::InPlace
+}
+
+/// Sections whose `SizeChanged` re-plans the margins (never detached: the handler checks the move
+/// is still wanted and in place).
+static FOLLOWED: Mutex<Vec<InstanceHandle>> = Mutex::new(Vec::new());
+
+/// Re-plan the margins whenever `section` resizes (a privacy indicator such as location appearing,
+/// the language indicator changing, an icon added): inside the layout pass that resized it, so the
+/// frame is drawn with the margins already right. The sweep alone came back only after the tree
+/// had been quiet for a while, and the strip overlapped, then jumped, meanwhile. Margins are
+/// property values, which the event stream's mutation rule does not cover (as the clock's text).
+///
+/// # Safety
+/// XAML UI thread only.
+unsafe fn follow(diagnostics: &IXamlDiagnostics, section: InstanceHandle) {
+    use crate::winrt::IFrameworkElementEvents;
+    {
+        let mut followed = crate::lock(&FOLLOWED);
+        // Gone from the tree (a taskbar rebuilt): forgotten, its handle may come back.
+        followed.retain(|h| tree::type_of(*h).is_some());
+        if followed.contains(&section) {
+            return;
+        }
+        followed.push(section);
+    }
+    let Some(element) = crate::decorate::element::<IFrameworkElementEvents>(diagnostics, section) else { return };
+    let handler: ISizeChangedEventHandler = Resized.into();
+    let mut token = 0i64;
+    if element.add_SizeChanged(handler.as_raw(), &mut token) != S_OK {
+        logf!("reorder: 0x{section:x} would not report its size; the sweep keeps the margins up");
+    }
+}
+
+/// A followed section resized: the margins follow at once.
+#[windows_core::implement(ISizeChangedEventHandler)]
+struct Resized;
+
+impl ISizeChangedEventHandler_Impl for Resized_Impl {
+    unsafe fn Invoke(&self, _sender: *mut core::ffi::c_void, _args: *mut core::ffi::c_void) -> windows_core::HRESULT {
+        let replanned = std::panic::catch_unwind(|| {
+            if !ENABLED.load(Ordering::SeqCst) || !crate::live() || !BUDGET.allowed() || DONE_FOR.load(Ordering::SeqCst) == 0 {
+                return;
+            }
+            let (Some(diagnostics), Some(frame)) = (crate::diagnostics(), frame()) else { return };
+            if tree::type_of(frame).as_deref() == Some(STACK_PANEL) {
+                shift_by_margins(&diagnostics, frame);
+            }
+        });
+        if replanned.is_err() {
+            logf!("reorder: resize handler panicked");
+        }
+        windows_core::HRESULT(0)
+    }
 }
 
 /// Logs every tray section with its column — the map the reorder is planned from.
@@ -528,6 +585,7 @@ static REPORTED: AtomicBool = AtomicBool::new(false);
 
 /// Forget everything for a fresh start after a stand-down.
 pub fn forget() {
+    // The handlers stay attached (never detached) and check `DONE_FOR`.
     DONE_FOR.store(0, Ordering::SeqCst);
     REPORTED.store(false, Ordering::SeqCst);
     BUDGET.reset();

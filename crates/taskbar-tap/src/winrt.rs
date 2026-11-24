@@ -438,6 +438,63 @@ pub unsafe trait IFrameworkElement: IUnknown {
     pub fn put_Margin(&self, value: Thickness) -> HRESULT;
 }
 
+/// `Windows.UI.Xaml.SizeChangedEventHandler`.
+#[interface("1115b13c-25d2-480b-89dc-eb3dcbd6b7fa")]
+pub unsafe trait ISizeChangedEventHandler: IUnknown {
+    pub fn Invoke(&self, sender: *mut c_void, args: *mut c_void) -> HRESULT;
+}
+
+/// `IFrameworkElement` again (same IID), down to its `SizeChanged` event: the 42nd method after
+/// `IInspectable`'s (count against the SDK header, `windows.ui.xaml.h`, never by eye).
+#[interface("a391d09b-4a99-4b7c-9d8d-6fa5d01f6fbf")]
+pub unsafe trait IFrameworkElementEvents: IUnknown {
+    pub fn GetIids(&self, count: *mut u32, iids: *mut *mut windows_core::GUID) -> HRESULT;
+    pub fn GetRuntimeClassName(&self, name: *mut *mut c_void) -> HRESULT;
+    pub fn GetTrustLevel(&self, level: *mut i32) -> HRESULT;
+    pub fn _m01(&self) -> HRESULT;
+    pub fn _m02(&self) -> HRESULT;
+    pub fn _m03(&self) -> HRESULT;
+    pub fn _m04(&self) -> HRESULT;
+    pub fn _m05(&self) -> HRESULT;
+    pub fn _m06(&self) -> HRESULT;
+    pub fn _m07(&self) -> HRESULT;
+    pub fn _m08(&self) -> HRESULT;
+    pub fn _m09(&self) -> HRESULT;
+    pub fn _m10(&self) -> HRESULT;
+    pub fn _m11(&self) -> HRESULT;
+    pub fn _m12(&self) -> HRESULT;
+    pub fn _m13(&self) -> HRESULT;
+    pub fn _m14(&self) -> HRESULT;
+    pub fn _m15(&self) -> HRESULT;
+    pub fn _m16(&self) -> HRESULT;
+    pub fn _m17(&self) -> HRESULT;
+    pub fn _m18(&self) -> HRESULT;
+    pub fn _m19(&self) -> HRESULT;
+    pub fn _m20(&self) -> HRESULT;
+    pub fn _m21(&self) -> HRESULT;
+    pub fn _m22(&self) -> HRESULT;
+    pub fn _m23(&self) -> HRESULT;
+    pub fn _m24(&self) -> HRESULT;
+    pub fn _m25(&self) -> HRESULT;
+    pub fn _m26(&self) -> HRESULT;
+    pub fn _m27(&self) -> HRESULT;
+    pub fn _m28(&self) -> HRESULT;
+    pub fn _m29(&self) -> HRESULT;
+    pub fn _m30(&self) -> HRESULT;
+    pub fn _m31(&self) -> HRESULT;
+    pub fn _m32(&self) -> HRESULT;
+    pub fn _m33(&self) -> HRESULT;
+    pub fn _m34(&self) -> HRESULT;
+    pub fn _m35(&self) -> HRESULT;
+    pub fn _m36(&self) -> HRESULT;
+    pub fn _m37(&self) -> HRESULT;
+    pub fn _m38(&self) -> HRESULT;
+    pub fn _m39(&self) -> HRESULT;
+    pub fn _m40(&self) -> HRESULT;
+    pub fn _m41(&self) -> HRESULT;
+    pub fn add_SizeChanged(&self, handler: *mut c_void, token: *mut i64) -> HRESULT;
+}
+
 /// `Windows.UI.Xaml.HorizontalAlignment`.
 pub const HORIZONTAL_ALIGNMENT_LEFT: i32 = 0;
 
@@ -528,6 +585,98 @@ pub unsafe trait IPanel: IUnknown {
     pub fn get_Background(&self, value: *mut *mut c_void) -> HRESULT;
     pub fn put_Background(&self, value: *mut c_void) -> HRESULT;
 }
+
+/// `Windows.UI.Xaml.CornerRadius`: four `DOUBLE`s, top-left, top-right, bottom-right, bottom-left.
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug, PartialEq)]
+pub struct CornerRadius {
+    pub top_left: f64,
+    pub top_right: f64,
+    pub bottom_right: f64,
+    pub bottom_left: f64,
+}
+
+/// `Windows.UI.Xaml.Controls.IGrid2`: a grid's own rounded corners, for the clock's and the
+/// bell's hover plates.
+#[interface("f76efa41-380e-45db-be87-9e1326ba4b57")]
+pub unsafe trait IGrid2: IUnknown {
+    pub fn GetIids(&self, count: *mut u32, iids: *mut *mut windows_core::GUID) -> HRESULT;
+    pub fn GetRuntimeClassName(&self, name: *mut *mut c_void) -> HRESULT;
+    pub fn GetTrustLevel(&self, level: *mut i32) -> HRESULT;
+    pub fn get_BorderBrush(&self, value: *mut *mut c_void) -> HRESULT;
+    pub fn put_BorderBrush(&self, value: *mut c_void) -> HRESULT;
+    pub fn get_BorderThickness(&self, value: *mut Thickness) -> HRESULT;
+    pub fn put_BorderThickness(&self, value: Thickness) -> HRESULT;
+    pub fn get_CornerRadius(&self, value: *mut CornerRadius) -> HRESULT;
+    pub fn put_CornerRadius(&self, value: CornerRadius) -> HRESULT;
+}
+
+/// `Windows.UI.Xaml.Controls.IBorderStatics`: the shell's plate's `Background` property, watched
+/// so the clock's and the bell's plates take its brush as it changes (rest, pointer over).
+#[interface("b81d1639-e911-4fd7-a4c4-b9c7f008b7fc")]
+pub unsafe trait IBorderStatics: IUnknown {
+    pub fn GetIids(&self, count: *mut u32, iids: *mut *mut windows_core::GUID) -> HRESULT;
+    pub fn GetRuntimeClassName(&self, name: *mut *mut c_void) -> HRESULT;
+    pub fn GetTrustLevel(&self, level: *mut i32) -> HRESULT;
+    pub fn get_BorderBrushProperty(&self, value: *mut *mut c_void) -> HRESULT;
+    pub fn get_BorderThicknessProperty(&self, value: *mut *mut c_void) -> HRESULT;
+    pub fn get_BackgroundProperty(&self, value: *mut *mut c_void) -> HRESULT;
+}
+
+pub const BORDER: &str = "Windows.UI.Xaml.Controls.Border";
+
+/// `Windows.UI.Xaml.Controls.IBorder2`: how the shell's plate fills and fades.
+#[interface("a1efbd9d-cb8b-56b5-878d-3a7f43bc9730")]
+pub unsafe trait IBorder2: IUnknown {
+    pub fn GetIids(&self, count: *mut u32, iids: *mut *mut windows_core::GUID) -> HRESULT;
+    pub fn GetRuntimeClassName(&self, name: *mut *mut c_void) -> HRESULT;
+    pub fn GetTrustLevel(&self, level: *mut i32) -> HRESULT;
+    pub fn get_BackgroundSizing(&self, value: *mut i32) -> HRESULT;
+    pub fn put_BackgroundSizing(&self, value: i32) -> HRESULT;
+    pub fn get_BackgroundTransition(&self, value: *mut *mut c_void) -> HRESULT;
+    pub fn put_BackgroundTransition(&self, value: *mut c_void) -> HRESULT;
+}
+
+/// `Windows.UI.Xaml.Controls.IPanel2`: a grid's background fade, as the shell's plate's.
+#[interface("709133c7-38f3-5083-a4bb-06a548a1d231")]
+pub unsafe trait IPanel2: IUnknown {
+    pub fn GetIids(&self, count: *mut u32, iids: *mut *mut windows_core::GUID) -> HRESULT;
+    pub fn GetRuntimeClassName(&self, name: *mut *mut c_void) -> HRESULT;
+    pub fn GetTrustLevel(&self, level: *mut i32) -> HRESULT;
+    pub fn get_BackgroundTransition(&self, value: *mut *mut c_void) -> HRESULT;
+    pub fn put_BackgroundTransition(&self, value: *mut c_void) -> HRESULT;
+}
+
+/// `Windows.UI.Xaml.Controls.IGrid4`: a grid's background sizing, as the shell's plate's.
+#[interface("ed02d274-81f1-5ac2-a0c3-bbdaf5a3ffee")]
+pub unsafe trait IGrid4: IUnknown {
+    pub fn GetIids(&self, count: *mut u32, iids: *mut *mut windows_core::GUID) -> HRESULT;
+    pub fn GetRuntimeClassName(&self, name: *mut *mut c_void) -> HRESULT;
+    pub fn GetTrustLevel(&self, level: *mut i32) -> HRESULT;
+    pub fn get_BackgroundSizing(&self, value: *mut i32) -> HRESULT;
+    pub fn put_BackgroundSizing(&self, value: i32) -> HRESULT;
+}
+
+/// `Windows.UI.Xaml.Controls.IToolTipServiceStatics`: the clock's and the bell's tooltips are taken
+/// off while audio-tray's panel is open over them (and put back after), as the shell's flyouts do.
+#[interface("86e649f8-e245-48aa-a8c8-d1073ed76319")]
+pub unsafe trait IToolTipServiceStatics: IUnknown {
+    pub fn GetIids(&self, count: *mut u32, iids: *mut *mut windows_core::GUID) -> HRESULT;
+    pub fn GetRuntimeClassName(&self, name: *mut *mut c_void) -> HRESULT;
+    pub fn GetTrustLevel(&self, level: *mut i32) -> HRESULT;
+    pub fn _reserved_placement_property(&self) -> HRESULT;
+    pub fn _reserved_get_placement(&self) -> HRESULT;
+    pub fn _reserved_set_placement(&self) -> HRESULT;
+    pub fn _reserved_placement_target_property(&self) -> HRESULT;
+    pub fn _reserved_get_placement_target(&self) -> HRESULT;
+    pub fn _reserved_set_placement_target(&self) -> HRESULT;
+    pub fn _reserved_tooltip_property(&self) -> HRESULT;
+    /// `element` is an `IDependencyObject`.
+    pub fn GetToolTip(&self, element: *mut c_void, value: *mut *mut c_void) -> HRESULT;
+    pub fn SetToolTip(&self, element: *mut c_void, value: *mut c_void) -> HRESULT;
+}
+
+pub const TOOLTIP_SERVICE: &str = "Windows.UI.Xaml.Controls.ToolTipService";
 
 /// `Windows.UI.Xaml.Controls.IStackPanel2`: its `Padding` makes room for the badge.
 #[interface("36f23359-040e-48f7-9a98-f2664591959c")]

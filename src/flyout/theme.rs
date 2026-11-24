@@ -21,8 +21,10 @@ pub(super) const ICON_PX: f32 = 20.0; // leading icon glyph size
 pub(super) const TEXT_X: f32 = 48.0; // left inset of a row's label
 pub(super) const HEADER_X: f32 = 15.0; // left inset of a section-header label
 pub(super) const RIGHT_PAD: f32 = 16.0;
-pub(super) const MIN_W: f32 = 340.0; // panel minimum width
-pub(super) const MAX_W: f32 = 420.0; // cap on the panel width (driven by device-name length)
+pub(super) const MIN_W: f32 = PANEL_W; // every panel is as wide: this one, the calendar, the notifications
+pub(super) const MAX_W: f32 = PANEL_W; // long device names are cut with "…"
+/// Every panel's width (the calendar's and the notifications' cards take it too).
+pub(crate) const PANEL_W: f32 = 380.0;
 pub(super) const ROW_MARGIN: f32 = 4.0; // side margin of the row highlight/pill
 pub(super) const ROW_RADIUS: f32 = 4.0; // corner radius of the row highlight
 pub(super) const PILL_W: f32 = 3.0; // accent selection-indicator pill width
@@ -51,9 +53,9 @@ pub(super) const FOOTER_BTN_GAP: f32 = 4.0; // gap between two icon buttons
 pub(super) const FOOTER_CTA_A: f32 = 0.20; // accent disc under a call-to-action button (idle)
 pub(super) const FOOTER_CTA_HOVER_A: f32 = 0.34; // …and under the pointer
 pub(super) const FOOTER_GAP: f32 = 8.0; // minimum gap between the left item and the button
-pub(super) const DIVIDER_A: f32 = 0.14; // footer hairline (below ~0.1 it vanishes into the acrylic)
+pub(crate) const DIVIDER_A: f32 = 0.14; // footer hairline (below ~0.1 it vanishes into the acrylic)
 pub(super) const FOOTER_SHADE: [u8; 3] = [0x00, 0x00, 0x00]; // the strip sits a shade darker than the body
-pub(super) const FOOTER_SHADE_A: f32 = 0.18;
+pub(crate) const FOOTER_SHADE_A: f32 = 0.18;
 
 // Fluent glyphs painted directly (not from the built-in IconId set).
 const GLYPH_VOLUME: char = '\u{E767}';
@@ -61,14 +63,58 @@ const GLYPH_MUTE: char = '\u{E74F}';
 pub(super) const GLYPH_MIC: char = '\u{E720}';
 pub(super) const GLYPH_MIC_OFF: char = '\u{EC54}';
 pub(super) const GLYPH_SETTINGS: char = '\u{E713}';
-pub(super) const GLYPH_CANCEL: char = '\u{E711}';
+pub(super) const GLYPH_SOUND: char = '\u{E767}'; // Volume — the footer's link to Windows' sound settings
 pub(super) const GLYPH_UPDATE: char = '\u{E72C}'; // Refresh (circular arrow) — restart-to-update button
 
 // Colours (RGB); alpha applied at blend time.
 pub(crate) const RECORDING: [u8; 3] = [0xE8, 0x11, 0x23]; // the "an app is recording" dot
-pub(crate) const TINT: [u8; 3] = [0x2C, 0x2C, 0x2C]; // panel base (semi-transparent, acrylic shows through)
-pub(crate) const TINT_A: f32 = 0.82;
-pub(crate) const TEXT: [u8; 3] = [0xFF, 0xFF, 0xFF]; // primary text + glyphs
+pub(crate) const DARK_TINT: [u8; 3] = [0x2C, 0x2C, 0x2C]; // panel base (semi-transparent, acrylic shows through)
+pub(crate) const DARK_TINT_A: f32 = 0.82;
+/// The footer strip's darkening, the same on every panel: the calendar's light palette takes 0.04
+/// too ([`FOOTER_SHADE_A`] on the dark one).
+pub(super) fn footer_shade_a() -> f32 {
+    if light() { 0.04 } else { FOOTER_SHADE_A }
+}
+
+/// The light panel's base: the calendar's and the notifications' light ground too.
+pub(crate) const LIGHT_TINT: [u8; 3] = [0xEE, 0xEE, 0xEE];
+pub(crate) const LIGHT_TINT_A: f32 = 0.86;
+
+/// The panels follow Windows' light or dark mode (the system's, as the taskbar), as the calendar
+/// and the notifications do. Read when a panel shows ([`refresh_mode`]), not on every paint.
+static LIGHT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Read Windows' mode again (a panel is about to show).
+pub(crate) fn refresh_mode() {
+    let light = crate::win::hkcu_dword(w!(r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"), w!("SystemUsesLightTheme")) == Some(1);
+    #[cfg(feature = "dev")]
+    let light = std::env::var("AUDIO_TRAY_THEME").map_or(light, |t| t == "light");
+    LIGHT.store(light, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn light() -> bool {
+    LIGHT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Primary text and glyphs; also what hover and selection washes are made of (at a low alpha).
+pub(crate) fn text() -> [u8; 3] {
+    if light() { [0x00, 0x00, 0x00] } else { [0xFF, 0xFF, 0xFF] }
+}
+
+/// The panel's base, translucent over the acrylic.
+pub(crate) fn tint() -> [u8; 3] {
+    if light() { LIGHT_TINT } else { DARK_TINT }
+}
+
+pub(crate) fn tint_a() -> f32 {
+    if light() { LIGHT_TINT_A } else { DARK_TINT_A }
+}
+
+/// The accent a panel paints with: Windows' lighter shade on the dark panel, its darker on the
+/// light one (as the calendar's).
+pub(crate) fn panel_accent() -> [u8; 3] {
+    if light() { accent_shade(4).unwrap_or([0x00, 0x5F, 0xB8]) } else { accent_rgb() }
+}
 pub(super) const DARK_GLYPH: [u8; 3] = [0x12, 0x16, 0x1C]; // glyph colour on a solid accent disc
 pub(super) const HOVER_A: f32 = 0.06; // white overlay for hover
 pub(super) const SEL_A: f32 = 0.09; // white overlay for the selected row
@@ -93,7 +139,7 @@ pub(crate) fn recording_dot(cv: &mut Canvas, x: i32, y: i32, size: u32) {
     let disc = |cv: &mut Canvas, r: f32, col: [u8; 3]| {
         cv.fill_round_rect(Rect::new(cx - r, cy - r, cx + r, cy + r), r, col, 1.0);
     };
-    disc(cv, outer, TEXT);
+    disc(cv, outer, [0xFF, 0xFF, 0xFF]);
     disc(cv, r, RECORDING);
 }
 

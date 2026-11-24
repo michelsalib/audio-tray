@@ -25,7 +25,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use crate::audio::Flow;
 use crate::canvas::{measure, Canvas, Rect};
 use crate::flyout::theme::{
-    accent_rgb, endpoint_glyph, recording_dot, ui_font, TEXT, TINT, TINT_A, TRACK_H,
+    endpoint_glyph, panel_accent, recording_dot, text, tint, tint_a, ui_font, TRACK_H,
 };
 use crate::icons;
 
@@ -119,6 +119,8 @@ impl Osd {
     /// Show or refresh one endpoint's level and restart the hold. `anchor` is the tray icon's
     /// screen rect; without one the pointer is used.
     pub(crate) fn show(&mut self, flow: Flow, level: f32, muted: bool, anchor: Option<RECT>) {
+        // Windows' light or dark mode, as the panels.
+        crate::flyout::theme::refresh_mode();
         let at = match anchor {
             Some(slot) => POINT { x: (slot.left + slot.right) / 2, y: (slot.top + slot.bottom) / 2 },
             None => {
@@ -252,15 +254,15 @@ impl Osd {
     fn paint(&mut self) {
         let (scale, w, h) = (self.scale, self.width, self.height);
         let (flow, level, muted) = (self.flow, self.level, self.muted);
-        let accent = accent_rgb();
+        let accent = panel_accent();
         let style = crate::config::motion().volume;
         let cy = h as f32 / 2.0;
         let mut cv = Canvas::new(&mut self.buf, w, h);
         cv.clear();
-        cv.fill_round_rect(Rect::new(0.0, 0.0, w as f32, h as f32), RADIUS * scale, TINT, TINT_A);
+        cv.fill_round_rect(Rect::new(0.0, 0.0, w as f32, h as f32), RADIUS * scale, tint(), tint_a());
 
         let glyph = endpoint_glyph(flow, muted);
-        let glyph_col = if muted { MUTED_GLYPH } else { TEXT };
+        let glyph_col = if muted { MUTED_GLYPH } else { text() };
         let gpx = (GLYPH_PX * scale).round() as u32;
         if let Ok((rgba, gw, gh)) = icons::render_glyph(glyph, gpx, glyph_col) {
             let gx = (GLYPH_CX * scale).round() as i32 - gw as i32 / 2;
@@ -277,10 +279,10 @@ impl Osd {
         let x1 = w as f32 - TRACK_RIGHT * scale;
         if style == crate::config::MotionStyle::None {
             let th = TRACK_H * scale;
-            cv.fill_round_rect(Rect::new(x0, cy - th / 2.0, x1, cy + th / 2.0), th / 2.0, TEXT, TRACK_A);
+            cv.fill_round_rect(Rect::new(x0, cy - th / 2.0, x1, cy + th / 2.0), th / 2.0, text(), TRACK_A);
             let fx = x0 + (x1 - x0) * level;
             if fx > x0 {
-                let (col, alpha) = if muted { (TEXT, MUTED_FILL_A) } else { (accent, 1.0) };
+                let (col, alpha) = if muted { (text(), MUTED_FILL_A) } else { (accent, 1.0) };
                 cv.fill_round_rect(Rect::new(x0, cy - th / 2.0, fx, cy + th / 2.0), th / 2.0, col, alpha);
             }
         } else {
@@ -293,10 +295,10 @@ impl Osd {
         if let Some(font) = ui_font() {
             let vpx = VALUE_PX * scale;
             let shown = if style == crate::config::MotionStyle::None { level } else { self.motion.shown() };
-            let text = (shown * 100.0).round().to_string();
-            let vx = w as f32 - VALUE_RIGHT * scale - measure(font, vpx, &text);
+            let value = (shown * 100.0).round().to_string();
+            let vx = w as f32 - VALUE_RIGHT * scale - measure(font, vpx, &value);
             let alpha = if muted { MUTED_VALUE_A } else { 1.0 };
-            cv.draw_text(font, vpx, (vx, cy + vpx * 0.34), TEXT, alpha, &text);
+            cv.draw_text(font, vpx, (vx, cy + vpx * 0.34), text(), alpha, &value);
         }
     }
 

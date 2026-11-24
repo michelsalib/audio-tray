@@ -226,6 +226,12 @@ Reading the column needs `IGridStatics::GetColumn`, and it takes an
 `GetIInspectableFromHandle` calls through the wrong vtable and **hangs the
 shell** rather than returning an error — QI first.
 
+The same mistake the other way round **crashes** it: an event's `sender` (an
+`IInspectable*`) passed as `IPointerRoutedEventArgs::GetCurrentPoint`'s
+`relativeTo` (a `UIElement*`) killed Explorer with a fail-fast (0xc0000409) on
+the first hover (2026-11-22, measuring the clock's rect). The rect is now
+measured by the app with UI Automation, out of Explorer.
+
 Two caveats that are properties of the approach, not bugs:
 
 - This moves the **whole notification-area section**, so every notify icon

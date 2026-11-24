@@ -63,6 +63,21 @@ pub struct Rich {
     /// Buttons under the notification, and those of its menu.
     pub buttons: Vec<Action>,
     pub menu: Vec<Action>,
+    /// A reminder, an alarm or a call (the payload's `scenario`): its banner stays until it is
+    /// answered or dismissed, as Windows' does.
+    pub sticky: bool,
+    /// It asks for no sound (`<audio silent="true"/>`).
+    pub silent: bool,
+    /// It asks to stay long (`duration="long"`, about 25 s).
+    pub long: bool,
+    /// An incoming call (`scenario="incomingCall"`): its buttons answer and decline.
+    pub call: bool,
+    /// The conversation it belongs to (a chat's id, from its launch arguments' `tag`), its
+    /// banner shared with the others of it; empty: its own.
+    pub thread: String,
+    /// Windows' tag for it (the app's own name for this notification): Audio Tray's own say
+    /// what they are there (`audio-tray/battery/12`).
+    pub tag: String,
     /// The app's activator, when it has one: buttons and replies can reach it.
     pub activator: Option<u128>,
 }
@@ -72,6 +87,10 @@ pub struct Rich {
 struct Parts {
     launch: String,
     launch_kind: Kind,
+    sticky: bool,
+    silent: bool,
+    long: bool,
+    call: bool,
     avatar: Option<String>,
     picture: Option<String>,
     reply: Option<Reply>,
@@ -95,6 +114,40 @@ static MISSES: Mutex<Vec<(u32, u8)>> = Mutex::new(Vec::new());
 /// Reads that look for a notification missing from the store before it stays plain.
 const MISSES_MAX: u8 = 5;
 
+/// The conversation a notification's launch arguments name: their `tag` (WhatsApp's chat id,
+/// `action=Click&key=…&tag=120363…@g.us`), percent-decoded; empty without one.
+fn thread_of(launch: &str) -> String {
+    let query = launch.rsplit_once('?').map_or(launch, |(_, q)| q);
+    let Some(value) = query.split('&').find_map(|pair| pair.strip_prefix("tag=")) else { return String::new() };
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' if i + 2 < bytes.len() => {
+                match u8::from_str_radix(&value[i + 1..i + 3], 16) {
+                    Ok(b) => {
+                        out.push(b);
+                        i += 3;
+                        continue;
+                    }
+                    Err(_) => out.push(b'%'),
+                }
+            }
+            b'+' => out.push(b' '),
+            b => out.push(b),
+        }
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Whether notification `id`'s payload has been read from Windows' store (or given up on): until
+/// then its extras are not known (whether it wants a sound, whether it is a call).
+pub fn read_for(id: u32) -> bool {
+    READ.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|(r, _)| *r == id)
+}
+
 /// Each notification's extras, read once (what is no longer listed is forgotten).
 pub fn for_toasts(wanted: &[(u32, String, Option<windows::ApplicationModel::AppInfo>)]) -> Vec<Rich> {
     let mut read = READ.lock().unwrap_or_else(|e| e.into_inner());
@@ -110,7 +163,7 @@ pub fn for_toasts(wanted: &[(u32, String, Option<windows::ApplicationModel::AppI
         if read.iter().any(|(r, _)| r == id) {
             continue;
         }
-        let Some((_, xml)) = payloads.iter().find(|(p, _)| p == id) else {
+        let Some((_, xml, tag)) = payloads.iter().find(|(p, ..)| p == id) else {
             // Not in the store (yet): plain, and looked for again a few times.
             let tries = match misses.iter_mut().find(|(m, _)| m == id) {
                 Some((_, n)) => {
@@ -134,8 +187,15 @@ pub fn for_toasts(wanted: &[(u32, String, Option<windows::ApplicationModel::AppI
         // Without an activator, an action done in the background reaches nothing: not offered (a
         // reply typed and sent would vanish).
         let works = |action: &Action| activator.is_some() || action.kind != Kind::Background;
+        let thread = thread_of(&parts.launch);
         let rich = Rich {
             launch: parts.launch,
+            sticky: parts.sticky,
+            silent: parts.silent,
+            long: parts.long,
+            call: parts.call,
+            thread,
+            tag: tag.clone(),
             launch_kind: parts.launch_kind,
             avatar: None,
             picture: None,
@@ -163,24 +223,28 @@ pub fn for_toasts(wanted: &[(u32, String, Option<windows::ApplicationModel::AppI
     out
 }
 
-/// The payloads of notifications `ids`, from Windows' store.
-fn payloads(ids: &[u32]) -> anyhow::Result<Vec<(u32, String)>> {
+/// The payloads of notifications `ids`, from Windows' store, with each one's tag (empty where the
+/// store keeps none).
+fn payloads(ids: &[u32]) -> anyhow::Result<Vec<(u32, String, String)>> {
     use rusqlite::{types::ValueRef, Connection, OpenFlags};
     let path = std::path::PathBuf::from(std::env::var_os("LOCALAPPDATA").ok_or_else(|| anyhow::anyhow!("no LOCALAPPDATA"))?)
         .join(r"Microsoft\Windows\Notifications\wpndatabase.db");
     let db = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
     db.busy_timeout(std::time::Duration::from_millis(500))?;
-    let mut query = db.prepare("SELECT Payload FROM Notification WHERE Id = ?1")?;
+    let text = |v: ValueRef| match v {
+        ValueRef::Text(b) | ValueRef::Blob(b) => String::from_utf8_lossy(b).into_owned(),
+        _ => String::new(),
+    };
+    // The tag where this Windows keeps it; the payload alone otherwise.
+    let (mut query, tagged) = match db.prepare("SELECT Payload, Tag FROM Notification WHERE Id = ?1") {
+        Ok(q) => (q, true),
+        Err(_) => (db.prepare("SELECT Payload FROM Notification WHERE Id = ?1")?, false),
+    };
     let mut out = Vec::new();
     for &id in ids {
-        let payload = query.query_row([id], |row| {
-            Ok(match row.get_ref(0)? {
-                ValueRef::Text(b) | ValueRef::Blob(b) => String::from_utf8_lossy(b).into_owned(),
-                _ => String::new(),
-            })
-        });
-        if let Ok(xml) = payload {
-            out.push((id, xml));
+        let row = query.query_row([id], |row| Ok((text(row.get_ref(0)?), if tagged { text(row.get_ref(1)?) } else { String::new() })));
+        if let Ok((xml, tag)) = row {
+            out.push((id, xml, tag));
         }
     }
     Ok(out)
@@ -280,6 +344,7 @@ fn kind_of(value: Option<&str>) -> Kind {
 /// A toast payload's launch, pictures, reply box and buttons.
 fn parse(xml: &str) -> Parts {
     let mut parts = Parts::default();
+    let mut legacy = false;
     let mut inputs: Vec<(String, String)> = Vec::new();
     let mut sends: Vec<(String, Action)> = Vec::new();
     for (name, attrs) in tags(xml) {
@@ -288,12 +353,20 @@ fn parse(xml: &str) -> Parts {
             "toast" => {
                 parts.launch = get("launch").unwrap_or_default().to_string();
                 parts.launch_kind = kind_of(get("activationType"));
+                parts.sticky = matches!(get("scenario"), Some("reminder" | "alarm" | "incomingCall" | "urgent"));
+                parts.long = get("duration") == Some("long");
+                parts.call = get("scenario") == Some("incomingCall");
             }
+            "audio" => parts.silent = get("silent") == Some("true"),
+            // Windows' old templates (`ToastImageAndText01`..`04`): their one image is the sender's
+            // small icon beside the text, never a large picture.
+            "binding" => legacy = get("template").is_some_and(|t| t.starts_with("ToastImage")),
             "image" => {
                 let Some(src) = get("src").filter(|s| !s.is_empty()) else { continue };
                 match get("placement") {
                     Some("appLogoOverride") => parts.avatar = Some(src.to_string()),
                     Some("hero") => parts.picture = Some(src.to_string()),
+                    None if legacy && parts.avatar.is_none() => parts.avatar = Some(src.to_string()),
                     None | Some("inline") if parts.picture.is_none() => parts.picture = Some(src.to_string()),
                     _ => {}
                 }
@@ -348,9 +421,61 @@ impl Base {
             .and_then(|_| info?.Package().ok())
             .and_then(|p| p.InstalledPath().ok())
             .map(|s| s.to_string())
-            .filter(|s| !s.is_empty());
+            .filter(|s| !s.is_empty())
+            // Not always given to an unpackaged reader (WhatsApp's): Windows' package repository has it.
+            .or_else(|| package_folder(family.as_deref()?));
         Base { installed, family }
     }
+}
+
+/// The install folder of package family `family` (`Name_PublisherId`), from Windows' package
+/// repository: its main package (no resource id, `Name_Version_Arch__PublisherId`), the newest.
+fn package_folder(family: &str) -> Option<String> {
+    use windows::Win32::System::Registry::{RegCloseKey, RegEnumKeyExW, RegGetValueW, RegOpenKeyExW, HKEY, HKEY_CLASSES_ROOT, KEY_READ, RRF_RT_REG_SZ};
+    use windows::core::PWSTR;
+    let (name, publisher) = family.rsplit_once('_')?;
+    let repo = r"Local Settings\Software\Microsoft\Windows\CurrentVersion\AppModel\PackageRepository\Packages";
+    let wide = crate::win::wide(repo);
+    let mut key = HKEY::default();
+    if unsafe { RegOpenKeyExW(HKEY_CLASSES_ROOT, PCWSTR(wide.as_ptr()), None, KEY_READ, &mut key) }.is_err() {
+        return None;
+    }
+    let mut mains = Vec::new();
+    for index in 0u32.. {
+        let mut buf = [0u16; 256];
+        let mut len = buf.len() as u32;
+        if unsafe { RegEnumKeyExW(key, index, Some(PWSTR(buf.as_mut_ptr())), &mut len, None, None, None, None) }.is_err() {
+            break;
+        }
+        let full = String::from_utf16_lossy(&buf[..len as usize]);
+        if main_package_of(&full, name, publisher).is_some() {
+            mains.push(full);
+        }
+    }
+    let _ = unsafe { RegCloseKey(key) };
+    // The newest version first.
+    mains.sort_by_key(|full| std::cmp::Reverse(main_package_of(full, name, publisher)));
+    mains.into_iter().find_map(|full| {
+        let sub = crate::win::wide(&format!(r"{repo}\{full}"));
+        let value = crate::win::wide("Path");
+        let mut path = [0u16; 512];
+        let mut size = (path.len() * 2) as u32;
+        let read = unsafe { RegGetValueW(HKEY_CLASSES_ROOT, PCWSTR(sub.as_ptr()), PCWSTR(value.as_ptr()), RRF_RT_REG_SZ, None, Some(path.as_mut_ptr().cast()), Some(&mut size)) };
+        if read.is_err() {
+            return None;
+        }
+        let len = path.iter().position(|&c| c == 0).unwrap_or(path.len());
+        let folder = String::from_utf16_lossy(&path[..len]);
+        std::path::Path::new(&folder).join("AppxManifest.xml").exists().then_some(folder)
+    })
+}
+
+/// `full`'s version, when it is package `name`'s main package from `publisher`
+/// (`Name_Version_Arch__PublisherId`: no resource id).
+fn main_package_of(full: &str, name: &str, publisher: &str) -> Option<Vec<u32>> {
+    let rest = full.strip_prefix(name)?.strip_prefix('_')?.strip_suffix(publisher)?.strip_suffix("__")?;
+    let (version, _arch) = rest.split_once('_')?;
+    version.split('.').map(|p| p.parse().ok()).collect()
 }
 
 /// Pictures fetched so far, by address (`None`: there is none), for the listed notifications only.
@@ -486,21 +611,23 @@ fn activator(aumid: &str, base: &Base) -> Option<u128> {
     clsid
 }
 
-/// `HKCU\Software\Classes\AppUserModelId\<aumid>\CustomActivator`, where desktop apps register it.
+/// `Software\Classes\AppUserModelId\<aumid>\CustomActivator`, where desktop apps register it: the
+/// user's own, else the machine's (Outlook, Windows' own notifications).
 fn registry_activator(aumid: &str) -> Option<u128> {
-    use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_SZ};
+    use windows::Win32::System::Registry::{RegGetValueW, HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ};
     let key = crate::win::wide(&format!(r"Software\Classes\AppUserModelId\{aumid}"));
     let name = crate::win::wide("CustomActivator");
-    let mut buf = [0u16; 64];
-    let mut size = (buf.len() * 2) as u32;
-    let read = unsafe {
-        RegGetValueW(HKEY_CURRENT_USER, PCWSTR(key.as_ptr()), PCWSTR(name.as_ptr()), RRF_RT_REG_SZ, None, Some(buf.as_mut_ptr().cast()), Some(&mut size))
+    let read = |root: HKEY| -> Option<u128> {
+        let mut buf = [0u16; 64];
+        let mut size = (buf.len() * 2) as u32;
+        let read = unsafe { RegGetValueW(root, PCWSTR(key.as_ptr()), PCWSTR(name.as_ptr()), RRF_RT_REG_SZ, None, Some(buf.as_mut_ptr().cast()), Some(&mut size)) };
+        if read.is_err() {
+            return None;
+        }
+        let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+        parse_guid(&String::from_utf16_lossy(&buf[..len]))
     };
-    if read.is_err() {
-        return None;
-    }
-    let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
-    parse_guid(&String::from_utf16_lossy(&buf[..len]))
+    read(HKEY_CURRENT_USER).or_else(|| read(HKEY_LOCAL_MACHINE))
 }
 
 /// `{bebd6a5e-1b14-4a57-a195-c772d28b6d15}` (braces optional).
@@ -515,6 +642,14 @@ fn parse_guid(text: &str) -> Option<u128> {
 /// take a moment to start.
 pub fn invoke(id: u32, aumid: &str, activator: Option<u128>, arguments: &str, kind: Kind, inputs: Vec<(String, String)>) {
     let (aumid, arguments) = (aumid.to_string(), arguments.to_string());
+    // What a click carried, and where it went: an app opened without its link says which.
+    let shown: String = arguments.chars().take(160).collect();
+    let target = match (kind, activator) {
+        (Kind::Protocol, _) => "its address".to_string(),
+        (_, Some(clsid)) => format!("its activator {{{clsid:032x}}}"),
+        (_, None) => "no activator: the app only".to_string(),
+    };
+    println!("notifications: {id} ({aumid}): {kind:?} {shown:?} to {target}{}", if inputs.is_empty() { "" } else { ", with a reply" });
     let _ = std::thread::Builder::new().name("notification action".into()).spawn(move || {
         let done = match kind {
             // An app's own address only: a toast's text could name a program or a share.
@@ -559,9 +694,70 @@ fn activate(aumid: &str, clsid: u128, arguments: &str, kind: Kind, inputs: &[(St
     }
 }
 
+/// Dev: where app `aumid`'s buttons and replies go (its package folder, its activator).
+#[cfg(feature = "dev")]
+pub fn print_activator(aumid: &str) {
+    let family = aumid.split('!').next().unwrap_or(aumid);
+    let base = Base { installed: package_folder(family), family: Some(family.to_string()) };
+    println!("{aumid}: package {:?}, activator {:?}", base.installed, activator(aumid, &base).map(|c| format!("{c:032x}")));
+}
+
+/// Dev: the newest `count` notifications in Windows' store, as their apps sent them.
+#[cfg(feature = "dev")]
+pub fn print_latest(count: usize) -> anyhow::Result<()> {
+    use rusqlite::{types::ValueRef, Connection, OpenFlags};
+    let path = std::path::PathBuf::from(std::env::var_os("LOCALAPPDATA").ok_or_else(|| anyhow::anyhow!("no LOCALAPPDATA"))?)
+        .join(r"Microsoft\Windows\Notifications\wpndatabase.db");
+    let db = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
+    let columns: Vec<String> = db.prepare("PRAGMA table_info(Notification)")?.query_map([], |row| row.get::<_, String>(1))?.collect::<Result<_, _>>()?;
+    println!("columns: {}", columns.join(", "));
+    let mut query = db.prepare("SELECT Id, Payload FROM Notification ORDER BY Id DESC LIMIT ?1")?;
+    let rows = query.query_map([count as i64], |row| {
+        let payload = match row.get_ref(1)? {
+            ValueRef::Text(b) | ValueRef::Blob(b) => String::from_utf8_lossy(b).into_owned(),
+            _ => String::new(),
+        };
+        Ok((row.get::<_, i64>(0)?, payload))
+    })?;
+    for row in rows {
+        let (id, payload) = row?;
+        println!("{id}: {payload}\n");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_old_template_s_image_is_the_sender_s_icon_not_a_picture() {
+        let hp = r#"<toast><visual><binding template="ToastImageAndText04"><image id="1" src="file:///C:\HP\toast.png"/><text id="1">USB</text></binding></visual></toast>"#;
+        let parts = parse(hp);
+        assert_eq!(parts.avatar.as_deref(), Some(r"file:///C:\HP\toast.png"));
+        assert_eq!(parts.picture, None);
+        let generic = r#"<toast><visual><binding template="ToastGeneric"><text>A</text><image src="https://x/y.png"/></binding></visual></toast>"#;
+        assert_eq!(parse(generic).picture.as_deref(), Some("https://x/y.png"));
+    }
+
+    #[test]
+    fn a_chat_is_named_by_its_launch_tag() {
+        let launch = "action=Click&key=msg%3Afalse_120363422430301195%40g.us_ACCE&tag=120363422430301195%40g.us";
+        assert_eq!(thread_of(launch), "120363422430301195@g.us");
+        assert_eq!(thread_of("action=LaunchApp"), "");
+        // A trailing lone percent is kept as it is.
+        assert_eq!(thread_of("tag=a%4"), "a%4");
+    }
+
+    #[test]
+    fn a_family_finds_its_main_package_not_its_resource_packs() {
+        let (name, publisher) = ("5319275A.WhatsAppDesktop", "cv1g1gvanyjgm");
+        assert_eq!(main_package_of("5319275A.WhatsAppDesktop_2.2640.100.0_x64__cv1g1gvanyjgm", name, publisher), Some(vec![2, 2640, 100, 0]));
+        assert_eq!(main_package_of("5319275A.WhatsAppDesktop_2.2640.100.0_neutral_split.scale-150_cv1g1gvanyjgm", name, publisher), None);
+        assert_eq!(main_package_of("5319275A.WhatsAppDesktop_2.2640.100.0_neutral_~_cv1g1gvanyjgm", name, publisher), None);
+        assert_eq!(main_package_of("5319275A.WhatsAppDesktopBeta_1.0.0.0_x64__cv1g1gvanyjgm", name, publisher), None);
+        assert_eq!(main_package_of("Microsoft.MicrosoftEdge.Stable_157.0.4341.42_neutral__8wekyb3d8bbwe", "Microsoft.MicrosoftEdge.Stable", "8wekyb3d8bbwe"), Some(vec![157, 0, 4341, 42]));
+    }
 
     #[test]
     fn pictures_are_read_from_local_drives_only() {

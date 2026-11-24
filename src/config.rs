@@ -81,12 +81,31 @@ pub struct Calendar {
     pub hidden: Vec<String>,
     /// Colours chosen for calendars, by key: `#RRGGBB`.
     pub colors: std::collections::BTreeMap<String, String>,
-    /// Win+Alt+D opens this calendar.
+    /// Win+Alt+D opens this calendar, Win+N the notifications.
     pub shortcut: bool,
-    /// Windows' notifications listed above the month, with Clear all.
+    /// The bell beside the clock opens Audio Tray's notifications (Windows' own otherwise).
     pub notifications: bool,
+    /// Audio Tray shows every notification itself: Windows' banners are turned off (and given back
+    /// when this is off or the app quits), its own show above the bell, and its own notices
+    /// (batteries, audio devices, reminders) join Windows' list instead of the pill.
+    pub take_over: bool,
+    /// What a middle click on the bell does.
+    pub bell_middle_click: BellMiddleClick,
     /// Windows' additional clocks under the date.
     pub world_clocks: bool,
+}
+
+/// A middle click on the bell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BellMiddleClick {
+    /// Switch Do not disturb on or off.
+    #[default]
+    DoNotDisturb,
+    /// Clear every notification.
+    ClearAll,
+    /// Nothing: the click is Windows'.
+    Nothing,
 }
 
 /// How the calendar is laid out.
@@ -122,6 +141,8 @@ impl Default for Calendar {
             colors: Default::default(),
             shortcut: true,
             notifications: true,
+            take_over: false,
+            bell_middle_click: BellMiddleClick::DoNotDisturb,
             world_clocks: true,
         }
     }
@@ -574,11 +595,16 @@ pub struct Strip {
     /// Hide Windows' keyboard-layout indicator ("FRA"). Off by default: unlike the two above it is
     /// not replaced by anything; Win+Space still switches. Needs the TAP (buttons or music tile).
     pub hide_windows_language: bool,
-    /// What a left click on the output or input button does.
-    pub left_click: LeftClick,
-    /// Switching devices (a button's or the pill's click) stops once on the last device, muted,
-    /// before going back to the first.
-    pub mute_in_cycle: bool,
+    /// What a middle click on the output or input button does (a left click opens the panel).
+    pub middle_click: MiddleClick,
+    /// Win+Ctrl+V (Windows' shortcut for its sound output) opens the audio panel.
+    pub shortcut: bool,
+    /// Before 0.28: what a left click did (`"switch"`, `"mute"`, `"panel"`) and whether switching
+    /// stopped on a muted last device. Read once into [`Strip::middle_click`], never written back.
+    #[serde(default, skip_serializing)]
+    left_click: Option<String>,
+    #[serde(default, skip_serializing)]
+    mute_in_cycle: Option<bool>,
 }
 
 impl Default for Strip {
@@ -589,24 +615,39 @@ impl Default for Strip {
             hide_windows_volume: true,
             hide_windows_mic: true,
             hide_windows_language: false,
-            left_click: LeftClick::Switch,
-            mute_in_cycle: true,
+            middle_click: MiddleClick::SwitchMute,
+            shortcut: true,
+            left_click: None,
+            mute_in_cycle: None,
         }
     }
 }
 
-/// A left click on a taskbar audio button.
+impl Strip {
+    /// An older file's left-click choice as the middle click's (the left click opens the panel now).
+    fn migrate(&mut self) {
+        if self.left_click.is_none() && self.mute_in_cycle.is_none() {
+            return;
+        }
+        self.middle_click = match (self.left_click.take().as_deref(), self.mute_in_cycle.take()) {
+            (Some("mute"), _) => MiddleClick::Mute,
+            (_, Some(false)) => MiddleClick::Switch,
+            _ => MiddleClick::SwitchMute,
+        };
+    }
+}
+
+/// A middle click on a taskbar audio button. (A left click opens the panel, a right click too.)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum LeftClick {
-    /// Step that flow to its next device (with one muted stop before the wrap, unless
-    /// [`Strip::mute_in_cycle`] is off).
-    #[default]
-    Switch,
+#[serde(rename_all = "snake_case")]
+pub enum MiddleClick {
     /// Mute or unmute that flow's default device.
     Mute,
-    /// Open Audio Tray's panel, as a right click does.
-    Panel,
+    /// Step that flow to its next device, wrapping from the last to the first.
+    Switch,
+    /// The same, with one muted stop on the last device before the wrap.
+    #[default]
+    SwitchMute,
 }
 
 /// Following YouTube Music and drawing it into the taskbar. On by default: it does nothing
@@ -716,6 +757,8 @@ impl Config {
         if !has("music", "tile_style") && !config.music.tile.is_empty() {
             config.music.tile_style = TileStyle::Full;
         }
+        // The left click's choice became the middle click's (a left click opens the panel).
+        config.strip.migrate();
         Ok(config)
     }
 
@@ -785,6 +828,19 @@ this is not toml").unwrap();
         // Missing is plain defaults, with nothing renamed.
         assert!(Config::load_from(&path).icons.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_old_left_click_becomes_the_middle_click() {
+        let middle = |strip: &str| Config::parse(&format!("[strip]\nenabled = true\n{strip}")).unwrap().strip.middle_click;
+        assert_eq!(middle("left_click = \"switch\"\nmute_in_cycle = true"), MiddleClick::SwitchMute);
+        assert_eq!(middle("left_click = \"switch\"\nmute_in_cycle = false"), MiddleClick::Switch);
+        assert_eq!(middle("left_click = \"mute\"\nmute_in_cycle = true"), MiddleClick::Mute);
+        assert_eq!(middle("left_click = \"panel\""), MiddleClick::SwitchMute, "the panel is the left click's now");
+        assert_eq!(middle("middle_click = \"mute\""), MiddleClick::Mute);
+        // Written back without the old keys.
+        let text = toml::to_string_pretty(&Config::parse("[strip]\nleft_click = \"mute\"").unwrap()).unwrap();
+        assert!(text.contains("middle_click = \"mute\"") && !text.contains("left_click") && !text.contains("mute_in_cycle"));
     }
 
     #[test]

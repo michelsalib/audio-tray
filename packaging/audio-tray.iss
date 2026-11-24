@@ -95,6 +95,11 @@ Root: HKCU; Subkey: "Software\Classes\AppUserModelId\MichelSalib.AudioTray"; Fla
 ; (winget / CI) installs.
 Filename: "{app}\{#AppExeName}"; Description: "Launch {#AppName} now"; Flags: nowait postinstall skipifsilent
 
+[UninstallRun]
+; Windows' own notification banners, turned off app by app while Audio Tray showed every
+; notification (src/calendar/takeover.rs): given back as they were before the exe goes.
+Filename: "{app}\{#AppExeName}"; Parameters: "--give-back-banners"; Flags: runhidden waituntilterminated; RunOnceId: "GiveBackBanners"
+
 [UninstallDelete]
 ; TAPs set aside by `SetAsideLoadedTap` or the self-updater (`update::install_tap`).
 Type: files; Name: "{app}\audio_tray_tap.dll.old*"

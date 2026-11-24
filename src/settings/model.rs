@@ -5,6 +5,7 @@ use crate::audio::wasapi::WasapiBackend;
 use crate::audio::{DeviceId, Flow};
 use crate::config::Config;
 use crate::icons::IconId;
+use crate::lang::tr;
 use crate::win::Monitor;
 
 use super::layout::{Button, Page};
@@ -153,11 +154,11 @@ pub(super) fn paste_key(button: Button, text: &str) -> Result<(), &'static str> 
     let secret_like = (24..=64).contains(&text.len()) && text.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
     match button {
         Button::DiscordId if id_like => Ok(()),
-        Button::DiscordId if secret_like => Err("That is the secret: copy the client ID"),
-        Button::DiscordId => Err("Copy the client ID first, then paste"),
-        _ if id_like => Err("That is the ID: copy the client secret"),
+        Button::DiscordId if secret_like => Err(tr("That is the secret: copy the client ID", "C'est le secret : copiez l'ID client")),
+        Button::DiscordId => Err(tr("Copy the client ID first, then paste", "Copiez d'abord l'ID client, puis collez")),
+        _ if id_like => Err(tr("That is the ID: copy the client secret", "C'est l'ID : copiez le secret client")),
         _ if secret_like => Ok(()),
-        _ => Err("Copy the client secret first, then paste"),
+        _ => Err(tr("Copy the client secret first, then paste", "Copiez d'abord le secret client, puis collez")),
     }
 }
 
@@ -184,17 +185,17 @@ pub(super) fn paste_calendar(key: CalendarKey, text: &str) -> Result<String, &'s
     };
     match key {
         CalendarKey::GoogleId if google_id => Ok(text.to_string()),
-        CalendarKey::GoogleId if google_secret => Err("That is the secret: copy the client ID"),
-        CalendarKey::GoogleId => Err("Copy the client ID (…apps.googleusercontent.com) first"),
+        CalendarKey::GoogleId if google_secret => Err(tr("That is the secret: copy the client ID", "C'est le secret : copiez l'ID client")),
+        CalendarKey::GoogleId => Err(tr("Copy the client ID (…apps.googleusercontent.com) first", "Copiez d'abord l'ID client (…apps.googleusercontent.com)")),
         CalendarKey::GoogleSecret if google_secret => Ok(text.to_string()),
-        CalendarKey::GoogleSecret if google_id => Err("That is the ID: copy the client secret"),
-        CalendarKey::GoogleSecret => Err("Copy the client secret (GOCSPX-…) first"),
+        CalendarKey::GoogleSecret if google_id => Err(tr("That is the ID: copy the client secret", "C'est l'ID : copiez le secret client")),
+        CalendarKey::GoogleSecret => Err(tr("Copy the client secret (GOCSPX-…) first", "Copiez d'abord le secret client (GOCSPX-…)")),
         CalendarKey::MicrosoftId if guid => Ok(text.to_ascii_lowercase()),
-        CalendarKey::MicrosoftId => Err("Copy the Application (client) ID from its Overview first"),
+        CalendarKey::MicrosoftId => Err(tr("Copy the Application (client) ID from its Overview first", "Copiez d'abord l'ID d'application (client) depuis sa Vue d'ensemble")),
         // Google's and Outlook's calendar pages (embed, HTML) are not feeds.
-        CalendarKey::Link if link && !looks_like_feed(text) => Err("That is a web page: copy the calendar's secret iCal (.ics) address"),
+        CalendarKey::Link if link && !looks_like_feed(text) => Err(tr("That is a web page: copy the calendar's secret iCal (.ics) address", "C'est une page web : copiez l'adresse secrète iCal (.ics) de l'agenda")),
         CalendarKey::Link if link => Ok(text.to_string()),
-        CalendarKey::Link => Err("Copy the calendar's address (https:// or webcal://) first"),
+        CalendarKey::Link => Err(tr("Copy the calendar's address (https:// or webcal://) first", "Copiez d'abord l'adresse de l'agenda (https:// ou webcal://)")),
     }
 }
 

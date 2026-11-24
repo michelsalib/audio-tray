@@ -184,6 +184,12 @@ pub fn find_by_name(name: &str) -> Vec<u64> {
     tree.by_name.get(name).map(|set| set.iter().copied().collect()).unwrap_or_default()
 }
 
+/// How many elements have been announced: it moves whenever the tree grows (a part rebuilt adds
+/// its elements again), so what was found in it can be kept until it moves.
+pub fn version() -> u64 {
+    lock().seq
+}
+
 /// When a handle was announced, as a monotonic sequence number.
 ///
 /// Tells a live element from a stale one whose `Remove` never arrived: between candidates of the

@@ -1,16 +1,17 @@
-//! The panel: two cards over the clock's corner, the notification centre above the calendar
-//! ([`scene`]). Each card is a per-pixel-alpha layered window over Windows' acrylic, so each has
-//! its own rounded corners and the gap between them is real; both are drawn as one scene off
-//! screen with Direct2D ([`paint`]) and presented whole on every change (no `WM_PAINT`). The
-//! calendar's window takes the input for both (no capture: the tray's mouse hook closes it on a
-//! click elsewhere, and that click still lands where it was aimed).
+//! The panel: one card over the clock's corner ([`scene`]), the calendar (the clock's) or the
+//! notification centre (the bell's), as [`Panel`] says. The card is a per-pixel-alpha layered
+//! window over Windows' acrylic, drawn off screen with Direct2D ([`paint`]) and presented whole on
+//! every change (no `WM_PAINT`). No capture: the tray's mouse hook closes it on a click elsewhere,
+//! and that click still lands where it was aimed.
 //!
 //! It opens from whichever screen edge the taskbar is on, slides in like the shell's own flyouts,
-//! and closes on a click elsewhere, Escape, or losing the foreground.
+//! and closes on a click elsewhere, Escape, or losing the foreground. Asked for the other card
+//! while open, it becomes that card where it stands.
 //!
 //! **Re-entrancy.** Opening a link or Settings can pump messages: that work runs after the view's
 //! state is released ([`After`]).
 
+pub(super) mod banner;
 mod locale;
 mod paint;
 mod scene;
@@ -22,15 +23,15 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
-use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MapWindowPoints, MonitorFromPoint, ScreenToClient, MONITORINFO, MONITOR_DEFAULTTONEAREST};
+use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromPoint, ScreenToClient, MONITORINFO, MONITOR_DEFAULTTONEAREST};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, VIRTUAL_KEY, VK_BACK, VK_DELETE, VK_DOWN, VK_ESCAPE, VK_RETURN, VK_HOME, VK_LEFT, VK_NEXT, VK_PRIOR, VK_RIGHT, VK_SHIFT,
     VK_SPACE, VK_TAB, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    DefWindowProcW, DestroyWindow, GetCursorPos, ShowWindow, SW_HIDE, SW_SHOWNA, WA_INACTIVE, WHEEL_DELTA, WINDOW_EX_STYLE, WM_ACTIVATE,
+    DefWindowProcW, DestroyWindow, GetCursorPos, ShowWindow, SW_SHOWNA, WA_INACTIVE, WHEEL_DELTA, WINDOW_EX_STYLE, WM_ACTIVATE,
     WM_CHAR, WM_DESTROY, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_TIMER, KillTimer, SetTimer, WindowFromPoint, GetAncestor, GA_ROOT,
-    WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, MA_NOACTIVATE, WM_MOUSEACTIVATE,
+    WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
 };
 
 use super::model::{self, Event, Source, When};
@@ -41,10 +42,10 @@ use super::zones::WorldClock;
 use super::Setup;
 use crate::config::Config;
 use paint::{Color, Gfx, Palette, Pen};
+pub use scene::Panel;
 use scene::{Draw, Fill, Hit, Ink, Scene, R};
 
 const CLASS: PCWSTR = w!("AudioTrayCalendar");
-const CLASS_TOP: PCWSTR = w!("AudioTrayNotifications");
 /// In `Win32_UI_Controls`, which this crate does not otherwise need.
 const WM_MOUSELEAVE: u32 = 0x02A3;
 /// A click on the clock right after the panel closed is the click that closed it.
@@ -65,6 +66,13 @@ const REFRESH_TIMER: usize = 3;
 const REFRESH_MS: u32 = 30_000;
 /// A frame once input has settled ([`View::later`]).
 const FRAME_TIMER: usize = 4;
+/// The frames of a notification collapsing away and of the card easing to its height.
+const ANIM_TIMER: usize = 5;
+const ANIM_MS: u32 = 16;
+/// How long a dismissed notification takes to collapse.
+const COLLAPSE: Duration = Duration::from_millis(200);
+/// Each frame, the card's height covers this much of what is left to its own.
+const EASE: f32 = 0.35;
 /// How far ahead the next event is looked for.
 const AHEAD: i64 = 7 * DAY;
 
@@ -88,6 +96,13 @@ thread_local! {
     static RAISING: Cell<bool> = const { Cell::new(false) };
 }
 
+/// A drawing kit set aside for the next panel: its surface and decoded pictures kept (why it is
+/// kept), its last frame's pixels let go.
+fn spare(mut gfx: Gfx) -> Gfx {
+    gfx.pixels = Vec::new();
+    gfx
+}
+
 /// Whether `hwnd` is the foreground window, as the whole system sees it.
 fn foreground_is(hwnd: HWND) -> bool {
     unsafe { windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow() == hwnd }
@@ -102,10 +117,10 @@ enum Edge {
     Right,
 }
 
-/// A frame drawn: its size in pixels, its cards, and the drawing.
-type Drawn = ((u32, u32), Vec<R>, Vec<(R, Draw)>);
+/// A frame drawn: its size in pixels, its card, and the drawing.
+type Drawn = ((u32, u32), R, Vec<(R, Draw)>);
 
-/// What a card's window shows: its pixels (held in its bitmap), where, and how faded.
+/// What the card's window shows: its pixels (held in its bitmap), where, and how faded.
 struct Sent {
     canvas: crate::layered::Canvas,
     at: (i32, i32),
@@ -119,13 +134,14 @@ impl Sent {
 }
 
 struct View {
-    /// The calendar's window (input, capture) and the notification centre's.
+    /// The card's window.
     hwnd: HWND,
-    top_hwnd: HWND,
+    /// The calendar or the notifications.
+    panel: Panel,
     gfx: RefCell<Gfx>,
-    /// What each window (main, top) last showed, to skip sending the same again.
-    shown: RefCell<[Sent; 2]>,
-    /// The last frame drawn: its size, its cards and their drawing, to redraw only what changed.
+    /// What the window last showed, to skip sending the same again.
+    shown: RefCell<Sent>,
+    /// The last frame drawn: its size, its card and its drawing, to redraw only what changed.
     last: RefCell<Option<Drawn>>,
     /// Windows keeps notifications quiet (asked of Windows on opening, each refresh and after a
     /// switch: never per frame, each asking costs a WinRT call).
@@ -144,7 +160,6 @@ struct View {
     today: i32,
     month: (i32, u32),
     selected: i32,
-    month_open: bool,
     first_weekday: u32,
     /// Short day names, Monday first.
     weekdays: [String; 7],
@@ -160,15 +175,16 @@ struct View {
     rows: Vec<Event>,
     detail: Option<Event>,
     toasts: Vec<Toast>,
-    /// Apps whose notifications are open (`None`: the newest app's), and shown in full.
-    open_groups: Option<Vec<String>>,
-    full_groups: Vec<String>,
+    /// Notifications dismissed and collapsing away (still in `toasts` meanwhile), and since when.
+    leaving: Vec<(u32, Instant)>,
+    /// The notification card's height while it eases to its own (`None`: at its own).
+    shown_h: Option<f32>,
+    /// The card the last scene was built for: easing is between two heights of the same card.
+    scene_panel: Panel,
     /// The notification whose reply box is open, and what is typed in it.
     draft: Option<(u32, String)>,
     /// The notification whose menu is open.
     menu_for: Option<u32>,
-    /// The notifications have the whole panel, the calendar folded to one line.
-    center_full: bool,
     /// Where the pointer rested on what it hovers (scene point): its tooltip shows there.
     show_tip: Option<(f32, f32)>,
     clocks: Vec<WorldClock>,
@@ -181,7 +197,7 @@ struct View {
     /// Replies typed and left for another notification's, by notification.
     stash: Vec<(u32, String)>,
     /// A word for a moment (Windows refused something), and since when.
-    flash: Option<(String, Instant, bool)>,
+    flash: Option<(String, Instant)>,
     /// After a keyboard action, the Tab order's place the ring goes back to (the next target).
     refocus: Option<usize>,
 }
@@ -189,21 +205,28 @@ struct View {
 /// Work to do once the view's state is released: it may pump messages.
 type After = Box<dyn FnOnce()>;
 
-/// Open the panel, or close it if it is open.
-pub fn toggle(config: &Config) {
+/// Open `panel`, close it if it is open, or turn the open panel into it.
+pub fn toggle(config: &Config, panel: Panel) {
     if OPEN.with(Cell::get) != 0 {
-        println!("calendar: closed by a click on the clock");
-        close();
+        if with_view(|v| v.panel == panel).unwrap_or(true) {
+            println!("calendar: closed by a click on its button");
+            close();
+        } else {
+            println!("calendar: now the {panel:?}");
+            with_view(|v| v.switch(panel));
+            keep_rect();
+        }
         return;
     }
     if CLOSED_AT.with(Cell::get).is_some_and(|at| at.elapsed() < SETTLE) {
         return;
     }
-    println!("calendar: opening");
-    if let Err(e) = create(config) {
+    println!("calendar: opening the {panel:?}");
+    if let Err(e) = create(config, panel) {
         eprintln!("calendar: could not open ({e:#})");
     }
 }
+
 
 pub fn close() {
     let open = OPEN.with(Cell::get);
@@ -211,7 +234,6 @@ pub fn close() {
         return;
     }
     with_view(|v| v.animate(crate::win::Flyout::Close));
-    // Its WM_DESTROY takes the notification card along.
     let _ = unsafe { DestroyWindow(HWND(open as *mut _)) };
     CLOSING.with(|c| c.set(false));
 }
@@ -219,8 +241,8 @@ pub fn close() {
 /// A badge: its PNG, its width in DIPs, the DPI it was drawn at.
 pub type Badge = (String, u32, u32);
 
-/// The clock's unread badge: an accent pill with `count`, drawn at the taskbar's scale into a PNG
-/// the TAP paints beside the clock. Gives the file, its width in DIPs and the taskbar's DPI.
+/// The bell's badge: an accent pill with `count` (how many wait), drawn at the taskbar's scale into
+/// a PNG the TAP paints beside the bell (beside the clock without one). Gives the file, its width in DIPs and the taskbar's DPI.
 /// Each look (count, colour, scale) is its own file, drawn once: XAML caches images by address.
 pub fn badge(count: u32) -> Option<Badge> {
     // Asked at every tick: the same count within a while is the same badge (the accent and scale
@@ -239,28 +261,67 @@ pub fn badge(count: u32) -> Option<Badge> {
 /// How long a badge looked up stands for its count.
 const BADGE_FRESH: std::time::Duration = std::time::Duration::from_secs(60);
 
-fn draw_badge(count: u32) -> Option<Badge> {
+/// The focus timer on the bell, with nothing waiting: an accent pie, `done` of it filled, over a
+/// faint full disc. Drawn like the count's badge (same file naming and cleanup), in twelve steps.
+pub fn focus_pie(done: f32) -> Option<Badge> {
     use windows::Win32::UI::HiDpi::GetDpiForWindow;
     use windows::Win32::UI::WindowsAndMessaging::FindWindowW;
-    const H: f32 = 18.0;
+    const H: f32 = 14.0;
+    let step = (done.clamp(0.0, 1.0) * 12.0).round() as u32;
     let tray = unsafe { FindWindowW(w!("Shell_TrayWnd"), None) }.ok();
     let dpi = tray.map_or(96, |t| unsafe { GetDpiForWindow(t) }).max(96);
     let scale = dpi as f32 / 96.0;
-    let p = Palette::current();
-    let label = if count > 99 { "99+".to_string() } else { count.to_string() };
-    let w = (H + 7.0 * (label.chars().count().max(1) - 1) as f32).round();
-    let ink = {
-        let Color(r, g, b, _) = p.accent;
-        // Dark figures on a light accent, as the shell's own badges.
-        if 0.2126 * r + 0.7152 * g + 0.0722 * b > 0.55 { Color::hex(0x000000, 0.9) } else { Color::hex(0xFFFFFF, 1.0) }
-    };
+    let accent = Palette::current().accent;
+    let (fill, ink) = badge_colours(accent);
     let hex = |c: Color| format!("{:02x}{:02x}{:02x}", (c.0 * 255.0) as u8, (c.1 * 255.0) as u8, (c.2 * 255.0) as u8);
     let dir = std::path::PathBuf::from(std::env::var_os("LOCALAPPDATA")?).join("audio-tray").join("badges");
-    let path = dir.join(format!("{label}-{}-{}-{dpi}.png", hex(p.accent), hex(ink)).replace('+', "p"));
+    let path = dir.join(format!("pie{step}-b{}-{}-{dpi}.png", hex(fill), hex(ink)));
+    if !path.exists() {
+        let _ = std::fs::create_dir_all(&dir);
+        let size = ((H * scale).round() as u32, (H * scale).round() as u32);
+        let drawn = Gfx::new().and_then(|mut gfx| {
+            gfx.frame(size, scale, |pen| {
+                pen.clear(Color(0.0, 0.0, 0.0, 0.0));
+                let disc = R::new(0.0, 0.0, H, H);
+                pen.fill(disc, H / 2.0, fill.alpha(0.3));
+                pen.pie(R::new(1.5, 1.5, H - 3.0, H - 3.0), step as f32 / 12.0, fill);
+            })?;
+            gfx.save_png(&path)
+        });
+        if let Err(e) = drawn {
+            eprintln!("calendar: could not draw the focus pie ({e:#})");
+            return None;
+        }
+    }
+    Some((path.to_string_lossy().into_owned(), H as u32, dpi))
+}
+
+/// A badge's fill and its figures' ink: the accent, dark figures on a light one (as the shell's).
+fn badge_colours(accent: Color) -> (Color, Color) {
+    let Color(r, g, b, _) = accent;
+    let ink = if 0.2126 * r + 0.7152 * g + 0.0722 * b > 0.55 { Color::hex(0x000000, 0.9) } else { Color::hex(0xFFFFFF, 1.0) };
+    (accent, ink)
+}
+
+fn draw_badge(count: u32) -> Option<Badge> {
+    use windows::Win32::UI::HiDpi::GetDpiForWindow;
+    use windows::Win32::UI::WindowsAndMessaging::FindWindowW;
+    // A small accent bubble on the bell's shoulder (the TAP keeps the bell itself a plain outline
+    // meanwhile, so the two do not run together).
+    const H: f32 = 14.0;
+    let tray = unsafe { FindWindowW(w!("Shell_TrayWnd"), None) }.ok();
+    let dpi = tray.map_or(96, |t| unsafe { GetDpiForWindow(t) }).max(96);
+    let scale = dpi as f32 / 96.0;
+    let label = if count > 99 { "99+".to_string() } else { count.to_string() };
+    let w = (H + 6.0 * (label.chars().count().max(1) - 1) as f32).round();
+    let (fill, ink) = badge_colours(Palette::current().accent);
+    let hex = |c: Color| format!("{:02x}{:02x}{:02x}", (c.0 * 255.0) as u8, (c.1 * 255.0) as u8, (c.2 * 255.0) as u8);
+    let dir = std::path::PathBuf::from(std::env::var_os("LOCALAPPDATA")?).join("audio-tray").join("badges");
+    let look = format!("-b{}-{}-{dpi}.png", hex(fill), hex(ink));
+    let path = dir.join(format!("{label}{look}").replace('+', "p"));
     if !path.exists() {
         let _ = std::fs::create_dir_all(&dir);
         // Another colour or scale: the old looks go (one per count is kept for the current one).
-        let look = format!("-{}-{}-{dpi}.png", hex(p.accent), hex(ink));
         for old in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
             if !old.file_name().to_string_lossy().ends_with(&look) {
                 let _ = std::fs::remove_file(old.path());
@@ -270,8 +331,8 @@ fn draw_badge(count: u32) -> Option<Badge> {
         let drawn = Gfx::new().and_then(|mut gfx| {
             gfx.frame(size, scale, |pen| {
                 pen.clear(Color(0.0, 0.0, 0.0, 0.0));
-                pen.fill(R::new(0.0, 0.0, w, H), H / 2.0, p.accent);
-                pen.text(&label, paint::Font::CaptionStrong, R::new(0.0, -0.5, w, H), ink, paint::Align::Center);
+                pen.fill(R::new(0.0, 0.0, w, H), H / 2.0, fill);
+                pen.text(&label, paint::Font::TinyStrong, R::new(0.0, -0.5, w, H), ink, paint::Align::Center);
             })?;
             gfx.save_png(&path)
         });
@@ -292,11 +353,19 @@ pub fn refresh() {
             if let Some(text) = draft.filter(|t| !t.is_empty()) {
                 v.draft = Some((id, text));
             }
-            v.say(words::words().app_did_not_take, true);
+            v.say(words::words().app_did_not_take);
         }
         v.relayout();
     });
     keep_rect();
+}
+
+/// Do not disturb was switched: the moon follows (asked of Windows once, here).
+pub fn quiet_changed() {
+    with_view(|v| {
+        v.quiet = super::focus::active();
+        v.relayout();
+    });
 }
 
 fn with_view<R>(f: impl FnOnce(&mut View) -> R) -> Option<R> {
@@ -325,30 +394,17 @@ fn edge_of(rect: &RECT, work: &RECT) -> Edge {
     }
 }
 
-/// The calendar's window and the notification card's, hidden.
-fn windows() -> Result<(HWND, HWND)> {
+/// The card's window, hidden.
+fn window() -> Result<HWND> {
     let style = WINDOW_EX_STYLE(WS_EX_LAYERED.0 | WS_EX_TOOLWINDOW.0 | WS_EX_TOPMOST.0);
     let hwnd = crate::win::create_popup(CLASS, w!("Calendar"), Some(wndproc), style, (0, 0, 1, 1)).context("CreateWindowExW")?;
-    // Never activated: a click on it must not deactivate the calendar's window, which closes on that.
-    let top_style = WINDOW_EX_STYLE(style.0 | WS_EX_NOACTIVATE.0);
-    let top_hwnd = crate::win::create_popup(CLASS_TOP, w!("Notifications"), Some(top_proc), top_style, (0, 0, 1, 1));
-    let top_hwnd = match top_hwnd {
-        Ok(top) => top,
-        Err(e) => {
-            let _ = unsafe { DestroyWindow(hwnd) };
-            return Err(e).context("CreateWindowExW (the notification card)");
-        }
-    };
-    unsafe {
-        crate::layered::style_panel(hwnd, crate::layered::CORNER_ROUND);
-        crate::layered::style_panel(top_hwnd, crate::layered::CORNER_ROUND);
-    }
-    Ok((hwnd, top_hwnd))
+    unsafe { crate::layered::style_panel(hwnd, crate::layered::CORNER_ROUND) };
+    Ok(hwnd)
 }
 
-/// The panel made, its windows hidden, nothing read yet; `windowless` (drawn ahead, never shown):
-/// without windows, and without asking Windows about Do not disturb.
-fn make(config: &Config, windowless: bool) -> Result<View> {
+/// The panel made, its window hidden, nothing read yet; `windowless` (drawn ahead, never shown):
+/// without a window, and without asking Windows about Do not disturb.
+fn make(config: &Config, panel: Panel, windowless: bool) -> Result<View> {
     let mut cursor = POINT::default();
     let _ = unsafe { GetCursorPos(&mut cursor) };
     let (scale, rect, work) = monitor(cursor);
@@ -358,7 +414,7 @@ fn make(config: &Config, windowless: bool) -> Result<View> {
         Some(gfx) => gfx,
         None => Gfx::new()?,
     };
-    let (hwnd, top_hwnd) = if windowless { (HWND::default(), HWND::default()) } else { windows()? };
+    let hwnd = if windowless { HWND::default() } else { window()? };
     let today = time::today();
     let (ty, tm, _) = time::civil_from_days(today);
     let setup = config.calendar.setup();
@@ -366,9 +422,9 @@ fn make(config: &Config, windowless: bool) -> Result<View> {
     let empty = scene::build(&empty_input());
     let view = View {
         hwnd,
-        top_hwnd,
+        panel,
         gfx: RefCell::new(gfx),
-        shown: RefCell::new([Sent::new(), Sent::new()]),
+        shown: RefCell::new(Sent::new()),
         last: RefCell::new(None),
         quiet: !windowless && super::focus::active(),
         palette: Palette::current(),
@@ -383,7 +439,6 @@ fn make(config: &Config, windowless: bool) -> Result<View> {
         today,
         month: (ty, tm),
         selected: today,
-        month_open: false,
         first_weekday,
         weekdays: locale::weekday_names(),
         events: Vec::new(),
@@ -393,15 +448,15 @@ fn make(config: &Config, windowless: bool) -> Result<View> {
         rows: Vec::new(),
         detail: None,
         toasts: Vec::new(),
-        open_groups: None,
-        full_groups: Vec::new(),
+        leaving: Vec::new(),
+        shown_h: None,
+        scene_panel: panel,
         draft: None,
         menu_for: None,
         clocks: Vec::new(),
         center_scroll: 0.0,
         list_scroll: 0.0,
         hover: None,
-        center_full: false,
         show_tip: None,
         pressed: None,
         focus: None,
@@ -433,16 +488,19 @@ pub fn prewarm(config: &Config) {
     if warm && WARMED.with(|w| keys.iter().all(|k| w.borrow().contains(k))) {
         return;
     }
-    let Ok(mut view) = make(config, true) else { return };
+    // The notifications: theirs are the pictures to decode.
+    let Ok(mut view) = make(config, Panel::Notifications, true) else { return };
     view.reload();
     view.place();
     view.draw_frame();
-    SPARE_GFX.with(|s| *s.borrow_mut() = Some(view.gfx.into_inner()));
+    SPARE_GFX.with(|s| *s.borrow_mut() = Some(spare(view.gfx.into_inner())));
     WARMED.with(|w| *w.borrow_mut() = keys);
 }
 
-fn create(config: &Config) -> Result<()> {
-    let mut view = make(config, false)?;
+fn create(config: &Config, panel: Panel) -> Result<()> {
+    // The panel lists what the banners showed.
+    banner::clear();
+    let mut view = make(config, panel, false)?;
     let hwnd = view.hwnd;
     super::notifications::set_watching(true);
     view.reload();
@@ -454,9 +512,6 @@ fn create(config: &Config) -> Result<()> {
     with_view(|v| {
         unsafe {
             let _ = ShowWindow(v.hwnd, SW_SHOWNA);
-            if v.scene.top.is_some() {
-                let _ = ShowWindow(v.top_hwnd, SW_SHOWNA);
-            }
         }
         v.animate(crate::win::Flyout::Open);
     });
@@ -477,26 +532,35 @@ fn create(config: &Config) -> Result<()> {
     // at once), and the tray's mouse hook closes the calendar as it passes ([`keep_rect`]).
     arrow();
     keep_rect();
+    crate::taskbar::notify_panel(panel_code(panel));
     Ok(())
+}
+
+/// `panel` as the TAP knows it.
+fn panel_code(panel: Panel) -> usize {
+    match panel {
+        Panel::Calendar => tap_proto::OPEN_CALENDAR,
+        Panel::Notifications => tap_proto::OPEN_NOTIFICATIONS,
+    }
 }
 
 /// What the scene is built from before anything is read (never shown).
 fn empty_input() -> scene::Input {
     scene::Input {
+        panel: Panel::Calendar,
         room: 0.0,
-        columns: None,
+        card_h: None,
         grid: scene::Grid::Comfortable,
         rows_max: 5,
         week_numbers: Vec::new(),
         notifications_denied: false,
-        groups: None,
+        groups: Vec::new(),
         unread: 0,
         quiet: false,
         center_scroll: 0.0,
         weekday: String::new(),
         date: String::new(),
         clocks: String::new(),
-        month_open: false,
         month_title: String::new(),
         heads: Default::default(),
         days: Vec::new(),
@@ -509,7 +573,6 @@ fn empty_input() -> scene::Input {
         focus_running: false,
         detail: None,
         hover: None,
-        center_full: false,
         show_tip: None,
         notice: scene::Notice::None,
         focus: None,
@@ -518,9 +581,9 @@ fn empty_input() -> scene::Input {
     }
 }
 
-/// Tell the mouse hook where the panel's cards are: a click outside them closes it.
+/// Tell the mouse hook where the panel's card is: a click outside it closes it.
 fn keep_rect() {
-    with_view(|v| v.keep_cards());
+    with_view(|v| v.keep_card());
 }
 
 impl View {
@@ -544,14 +607,21 @@ impl View {
             })
             .collect();
         self.spans = self.events.iter().map(|e| e.days(&Local)).collect();
-        let toasts = if calendar.notifications { super::notifications::list() } else { Vec::new() };
+        let mut toasts = if calendar.notifications { super::notifications::list() } else { Vec::new() };
+        // Ones collapsing away are gone from Windows' list already: kept where they were until
+        // they have.
+        for (i, old) in self.toasts.iter().enumerate() {
+            if self.leaving.iter().any(|(id, _)| *id == old.id) && !toasts.iter().any(|t| t.id == old.id) {
+                toasts.insert(i.min(toasts.len()), old.clone());
+            }
+        }
         if toasts.iter().map(|t| t.id).ne(self.toasts.iter().map(|t| t.id)) {
             // Targets name a notification by its place, which has moved: a held press or the
             // keyboard's ring would act on another one.
             if self.pressed.is_some_and(|h| scene::toast_of(h).is_some()) {
                 self.pressed = None;
             }
-            if self.focus.is_some_and(|h| scene::toast_of(h).is_some() || matches!(h, Hit::Group(_) | Hit::More(_) | Hit::DismissGroup(_))) {
+            if self.focus.is_some_and(|h| scene::toast_of(h).is_some() || matches!(h, Hit::Group(_) | Hit::DismissGroup(_))) {
                 self.focus = None;
             }
         }
@@ -577,26 +647,21 @@ impl View {
         let zone = Local;
         let today = self.today;
 
-        // Notifications, by app; the newest app's open unless the user chose. Side by side, all
-        // are, in full: the column has the room, and nothing folds.
-        let wide = self.columns().is_some();
+        // Notifications, by app, every one: the card has the room (it scrolls past the screen's).
         let t = words::words();
-        // Listed while turned on, even with none waiting (it says so, as Windows' centre does).
-        let groups = self.config.calendar.notifications.then(|| {
+        let groups = if self.panel == Panel::Notifications {
             super::notifications::grouped(&self.toasts)
                 .into_iter()
-                .enumerate()
-                .map(|(g, (key, list))| {
-                    let open = match &self.open_groups {
-                        Some(open) => open.contains(&key),
-                        None => g == 0,
-                    };
+                .map(|(_, list)| {
                     scene::Group {
                         name: list.first().map_or_else(String::new, |t| t.app.clone()),
                         logo: list.first().and_then(|t| t.logo.clone().map(|l| (t.aumid.clone(), l))),
                         toasts: list
                             .iter()
-                            .map(|t| scene::Toast {
+                            .map(|t| {
+                                // Its banner's look at rest: its picture and its app's colour.
+                                let (art, tint) = banner::list_look(t);
+                                scene::Toast {
                                 index: self.toasts.iter().position(|x| x.id == t.id).unwrap_or(0),
                                 title: if t.title.is_empty() { t.app.clone() } else { t.title.clone() },
                                 when: arrived(t.at),
@@ -608,23 +673,29 @@ impl View {
                                 menu: t.rich.menu.iter().map(|a| a.label.clone()).collect(),
                                 draft: self.draft.as_ref().filter(|(id, _)| *id == t.id).map(|(_, text)| text.clone()),
                                 menu_open: self.menu_for == Some(t.id),
+                                collapse: self.collapse_of(t.id),
+                                quick: Vec::new(),
+                                sent: None,
+                                call: t.rich.call,
+                                art,
+                                tint,
+                            }
                             })
                             .collect(),
                         when: list.first().map_or_else(String::new, |t| arrived(t.at)),
-                        all: self.center_full || wide || self.full_groups.contains(&key),
-                        open: open || self.center_full || wide,
                     }
                 })
                 .collect()
-        });
+        } else {
+            Vec::new()
+        };
 
-        // The week of the selected day, or the month shown.
-        let days: Vec<i32> = if self.month_shown() {
+        // The month shown (without the grid, none).
+        let days: Vec<i32> = if self.grid() == scene::Grid::None {
+            Vec::new()
+        } else {
             let start = self.week_start(time::days_from_civil(self.month.0, self.month.1, 1));
             (0..42).map(|i| start + i).collect()
-        } else {
-            let start = self.week_start(self.selected);
-            (0..7).map(|i| start + i).collect()
         };
         let busy = |day: i32| self.spans.iter().filter(|(first, last)| *first <= day && day <= *last).count().min(2) as u8;
         let cells = days
@@ -636,7 +707,7 @@ impl View {
                     label: d.to_string(),
                     today: day == today,
                     selected: day == self.selected,
-                    dim: self.month_shown() && m != self.month.1,
+                    dim: m != self.month.1,
                     busy: busy(day),
                 }
             })
@@ -720,8 +791,9 @@ impl View {
         };
 
         scene::Input {
+            panel: self.panel,
             room: (self.work.bottom - self.work.top) as f32 / self.scale - 2.0 * MARGIN,
-            columns: self.columns(),
+            card_h: None,
             groups,
             unread: self.toasts.len(),
             quiet: self.quiet,
@@ -729,7 +801,6 @@ impl View {
             weekday: capitalised(&locale::format(today, "dddd")),
             date: locale::format(today, "d MMMM"),
             clocks,
-            month_open: self.month_shown(),
             month_title: capitalised(&locale::month_title(self.month.0, self.month.1)),
             heads: std::array::from_fn(|i| self.weekdays[(self.first_weekday as usize + i) % 7].clone()),
             days: cells,
@@ -742,12 +813,11 @@ impl View {
             focus_running: focus.is_some(),
             detail,
             hover: self.hover,
-            center_full: self.center_full,
             show_tip: self.show_tip,
             notice,
             focus: self.focus,
             pressed: self.pressed,
-            flash: self.flash.as_ref().filter(|(_, at, _)| at.elapsed() < FLASH_FOR).map(|(text, _, top)| (text.clone(), *top)),
+            flash: self.flash.as_ref().filter(|(_, at)| at.elapsed() < FLASH_FOR).map(|(text, _)| text.clone()),
             grid: self.grid(),
             rows_max: self.config.calendar.rows.max(1) as usize,
             week_numbers: if self.config.calendar.week_numbers && self.grid() != scene::Grid::None { week_numbers(&days) } else { Vec::new() },
@@ -755,16 +825,23 @@ impl View {
         }
     }
 
-    /// The cards side by side where the work area is wide enough for both, the calendar by the
-    /// taskbar's clock; else stacked.
-    fn columns(&self) -> Option<scene::Columns> {
-        let width = (self.work.right - self.work.left) as f32 / self.scale - 2.0 * MARGIN;
-        (width >= 2.0 * scene::W + scene::GAP).then_some(scene::Columns { calendar_left: self.edge == Edge::Left, from_top: self.edge == Edge::Top })
-    }
-
-    /// The month shows, not the week: opened, or always side by side (the calendar has the room).
-    fn month_shown(&self) -> bool {
-        (self.month_open || self.columns().is_some()) && self.grid() != scene::Grid::None
+    /// Become the other card where the panel stands (the clock's or the bell's, clicked while the
+    /// panel is open): what belonged to the card shown goes.
+    fn switch(&mut self, panel: Panel) {
+        self.panel = panel;
+        self.detail = None;
+        self.menu_for = None;
+        self.hover = None;
+        self.pressed = None;
+        self.focus = None;
+        self.show_tip = None;
+        self.flash = None;
+        self.center_scroll = 0.0;
+        self.list_scroll = 0.0;
+        // The other card at its own height at once (easing is within one card).
+        self.shown_h = None;
+        self.relayout();
+        crate::taskbar::notify_panel(panel_code(panel));
     }
 
     /// The days' grid, as Settings' Layout has it.
@@ -776,10 +853,65 @@ impl View {
         }
     }
 
-    /// Lay out for what there is now, and put the panel in its corner.
+    /// How much of notification `id` shows: 1, or less while it collapses away (eased in and out).
+    fn collapse_of(&self, id: u32) -> f32 {
+        let Some((_, since)) = self.leaving.iter().find(|(i, _)| *i == id) else { return 1.0 };
+        let t = (since.elapsed().as_secs_f32() / COLLAPSE.as_secs_f32()).clamp(0.0, 1.0);
+        let eased = if t < 0.5 { 4.0 * t * t * t } else { 1.0 - (-2.0 * t + 2.0).powi(3) / 2.0 };
+        1.0 - eased
+    }
+
+    /// Dismissed: notifications `ids` collapse away (Windows has them removed already).
+    fn leave(&mut self, ids: &[u32]) {
+        let now = Instant::now();
+        for &id in ids {
+            if !self.leaving.iter().any(|(i, _)| *i == id) {
+                self.leaving.push((id, now));
+            }
+        }
+        self.hover = None;
+        self.animate_soon();
+    }
+
+    /// Run the animation frames (until [`View::step`] says they are done).
+    fn animate_soon(&self) {
+        if !self.hwnd.is_invalid() {
+            unsafe { SetTimer(Some(self.hwnd), ANIM_TIMER, ANIM_MS, None) };
+        }
+    }
+
+    /// One frame: notifications done collapsing go for good, the card's height comes nearer its
+    /// own, and the scene is shown. `false` once nothing moves any more.
+    fn step(&mut self) -> bool {
+        let done: Vec<u32> = self.leaving.iter().filter(|(_, since)| since.elapsed() >= COLLAPSE).map(|(id, _)| *id).collect();
+        if !done.is_empty() {
+            self.toasts.retain(|t| !done.contains(&t.id));
+            self.leaving.retain(|(id, _)| !done.contains(id));
+        }
+        if let Some(shown) = self.shown_h {
+            let target = scene::natural_height(&self.input());
+            let next = shown + (target - shown) * EASE;
+            self.shown_h = ((target - next).abs() >= 0.5).then_some(next);
+        }
+        self.settle();
+        keep_rect();
+        !self.leaving.is_empty() || self.shown_h.is_some()
+    }
+
+    /// Lay out for what there is now, and put the panel in its corner. The open card does not jump
+    /// to a new height: it eases there ([`View::step`]).
     fn place(&mut self) {
-        let input = self.input();
+        let mut input = self.input();
+        let natural = scene::natural_height(&input);
+        let current = self.scene.main.h;
+        let open = OPEN.with(Cell::get) == self.hwnd.0 as isize && !self.hwnd.is_invalid();
+        if open && self.shown_h.is_none() && self.scene_panel == self.panel && current > 0.0 && (natural - current).abs() > 0.5 {
+            self.shown_h = Some(current);
+            self.animate_soon();
+        }
+        input.card_h = self.shown_h;
         self.scene = scene::build(&input);
+        self.scene_panel = self.panel;
         let (w, h) = (self.px(self.scene.w), self.px(self.scene.h));
         let m = self.px(MARGIN);
         let work = self.work;
@@ -790,18 +922,18 @@ impl View {
         };
         // Never above the screen's top, whatever did not fit.
         self.origin.1 = self.origin.1.max(work.top + m);
-        // The open panel's cards follow every layout (a card shrinks as its last notification goes).
+        // The open panel's card follows every layout (it shrinks as its last notification goes).
         if OPEN.with(Cell::get) == self.hwnd.0 as isize && !self.hwnd.is_invalid() {
-            self.keep_cards();
+            self.keep_card();
         }
     }
 
-    /// Each card's screen rectangle to the mouse hook ([`super::OPEN_CARDS`]).
-    fn keep_cards(&self) {
+    /// The card's screen rectangle to the mouse hook ([`super::OPEN_CARD`]).
+    fn keep_card(&self) {
         let (x, y) = self.origin;
-        let on_screen = |card: R| RECT { left: x + self.px(card.x), top: y + self.px(card.y), right: x + self.px(card.right()), bottom: y + self.px(card.bottom()) };
-        let cards = [on_screen(self.scene.main), self.scene.top.map(on_screen).unwrap_or_default()];
-        *super::OPEN_CARDS.lock().unwrap_or_else(|e| e.into_inner()) = Some(cards);
+        let card = self.scene.main;
+        let rect = RECT { left: x + self.px(card.x), top: y + self.px(card.y), right: x + self.px(card.right()), bottom: y + self.px(card.bottom()) };
+        *super::OPEN_CARD.lock().unwrap_or_else(|e| e.into_inner()) = Some(rect);
     }
 
     /// Lay out again (something came, went or was picked) and show it.
@@ -817,34 +949,27 @@ impl View {
         self.show();
     }
 
-    /// Show the scene laid out: the notification card's window shown or hidden to match, then drawn.
+    /// Show the scene laid out.
     fn show(&self) {
-        let had_top = unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(self.top_hwnd) }.as_bool();
-        let has_top = self.scene.top.is_some();
-        if had_top != has_top {
-            unsafe {
-                let _ = ShowWindow(self.top_hwnd, if has_top { SW_SHOWNA } else { SW_HIDE });
-            }
-        }
         self.render();
     }
 
     /// Draw the scene off screen.
     fn draw_frame(&self) {
         let size = (self.px(self.scene.w) as u32, self.px(self.scene.h) as u32);
-        // Only the cards whose drawing changed, when they sit where they did (a hover, a scroll
-        // changes one); everything when anything moved.
+        // Nothing when nothing changed, the card where it was.
         let mut last = self.last.borrow_mut();
-        let cards: Vec<R> = self.scene.top.into_iter().chain([self.scene.main]).collect();
-        let areas: Option<Vec<R>> = last.as_ref().filter(|(was_size, was_cards, _)| *was_size == size && *was_cards == cards).map(|(_, _, items)| {
-            cards.iter().copied().filter(|&card| !in_card(items, card).eq(in_card(&self.scene.items, card))).collect()
-        });
-        if areas.as_ref().is_some_and(Vec::is_empty) {
+        let card = self.scene.main;
+        let same = last.as_ref().is_some_and(|(was_size, was_card, items)| *was_size == size && *was_card == card && *items == self.scene.items);
+        if same {
             return;
         }
+        // Only where something changed (a hover, a pressed button, a line typed), over the same
+        // frame: the rest of the bitmap stands.
+        let areas = last.as_ref().filter(|(was_size, was_card, _)| *was_size == size && *was_card == card).and_then(|(_, _, old)| changed_areas(old, &self.scene.items, card));
         let drawn = self.gfx.borrow_mut().frame_in(size, self.scale, areas.as_deref(), |pen, area| draw(pen, &self.scene, &self.palette, area));
         match drawn {
-            Ok(_) => *last = Some((size, cards, self.scene.items.clone())),
+            Ok(_) => *last = Some((size, card, self.scene.items.clone())),
             Err(e) => {
                 *last = None;
                 eprintln!("calendar: could not draw ({e:#})");
@@ -858,7 +983,7 @@ impl View {
         self.present((0, 0), 255);
     }
 
-    /// Each card's part of the frame to its window, `offset` from its place.
+    /// The card's part of the frame to its window, `offset` from its place.
     fn present(&self, (dx, dy): (i32, i32), alpha: u8) {
         let gfx = self.gfx.borrow();
         let full_w = self.px(self.scene.w).max(0);
@@ -874,36 +999,28 @@ impl View {
             &gfx.pixels[start..start + w as usize * 4]
         };
         let (x, y) = (self.origin.0 + dx, self.origin.1 + dy);
-        let mut shown = self.shown.borrow_mut();
-        let mut show = |slot: usize, hwnd: HWND, card: R| {
-            let (x0, y0, w, h) = cut(card);
-            let span = w as usize * 4;
-            let sent = &mut shown[slot];
-            let at = (x + x0, y + y0);
-            // A card that looks as it did is not sent again (a hover changes one card at most, a
-            // slide none): compared with what its window holds, a memory compare.
-            let same = sent.canvas.size() == (w, h) && {
-                let held = sent.canvas.pixels();
-                (0..h).all(|r| held[r as usize * span..][..span] == *line(x0, y0, w, r))
-            };
-            if !same {
-                sent.canvas.present(hwnd, (w, h), at, alpha, |dst| {
-                    for (r, out) in dst.chunks_exact_mut(span.max(1)).enumerate().take(h as usize) {
-                        out.copy_from_slice(line(x0, y0, w, r as i32));
-                    }
-                });
-            } else if (sent.at, sent.alpha) != (at, alpha) {
-                // Only moved or faded (a slide): the window keeps its pixels.
-                crate::layered::Canvas::shift(hwnd, at.0, at.1, alpha);
-            }
-            sent.at = at;
-            sent.alpha = alpha;
+        let sent = &mut *self.shown.borrow_mut();
+        let (x0, y0, w, h) = cut(self.scene.main);
+        let span = w as usize * 4;
+        let at = (x + x0, y + y0);
+        // A card that looks as it did is not sent again (a slide changes nothing): compared with
+        // what its window holds, a memory compare.
+        let same = sent.canvas.size() == (w, h) && {
+            let held = sent.canvas.pixels();
+            (0..h).all(|r| held[r as usize * span..][..span] == *line(x0, y0, w, r))
         };
-        // Growing upward, the notification card goes first, so the two never overlap for a frame.
-        if let Some(top) = self.scene.top {
-            show(1, self.top_hwnd, top);
+        if !same {
+            sent.canvas.present(self.hwnd, (w, h), at, alpha, |dst| {
+                for (r, out) in dst.chunks_exact_mut(span.max(1)).enumerate().take(h as usize) {
+                    out.copy_from_slice(line(x0, y0, w, r as i32));
+                }
+            });
+        } else if (sent.at, sent.alpha) != (at, alpha) {
+            // Only moved or faded (a slide): the window keeps its pixels.
+            crate::layered::Canvas::shift(self.hwnd, at.0, at.1, alpha);
         }
-        show(0, self.hwnd, self.scene.main);
+        sent.at = at;
+        sent.alpha = alpha;
     }
 
     /// Lay out and draw once input has settled: a wheel's burst or a sweep across targets makes
@@ -991,11 +1108,6 @@ impl View {
         true
     }
 
-    /// The key of notification group `g`.
-    fn group_key(&self, g: usize) -> Option<String> {
-        super::notifications::grouped(&self.toasts).get(g).map(|(k, _)| k.clone())
-    }
-
     /// Act on a click; what needs the state released comes back.
     fn activate(&mut self, hit: Hit) -> Option<After> {
         let open = |url: String| -> Option<After> {
@@ -1010,41 +1122,12 @@ impl View {
             }))
         };
         match hit {
-            Hit::Center => {
-                self.month_open = false;
-                self.detail = None;
-            }
-            Hit::Expand => {
-                self.center_full = !self.center_full;
-                self.month_open = false;
-                self.detail = None;
-                self.center_scroll = 0.0;
-            }
-            Hit::Calendar => self.center_full = false,
-            // Side by side, every group shows in full: its line only lights its clear button.
-            Hit::Group(_) if self.columns().is_some() => {}
-            Hit::Group(g) => {
-                let key = self.group_key(g)?;
-                let groups = super::notifications::grouped(&self.toasts);
-                let mut open: Vec<String> = self.open_groups.clone().unwrap_or_else(|| groups.first().map(|(k, _)| k.clone()).into_iter().collect());
-                if open.contains(&key) {
-                    open.retain(|k| *k != key);
-                } else {
-                    open.push(key);
-                }
-                self.open_groups = Some(open);
-            }
-            Hit::More(g) => {
-                let key = self.group_key(g)?;
-                self.full_groups.push(key);
-            }
+            // Every group shows in full: its line only lights its clear button.
+            Hit::Group(_) => {}
             Hit::DismissGroup(g) => {
                 let ids: Vec<u32> = super::notifications::grouped(&self.toasts).get(g)?.1.iter().map(|t| t.id).collect();
-                self.toasts.retain(|t| !ids.contains(&t.id));
+                self.leave(&ids);
                 super::notifications::remove(ids);
-                self.hover = None;
-                // What moved under the pointer lights at once (the next one's X, to go on).
-                self.later();
             }
             Hit::Toast(i) => {
                 let toast = self.toasts.get(i)?.clone();
@@ -1092,20 +1175,21 @@ impl View {
                 return Some(Box::new(keep_rect));
             }
             Hit::Draft(_) => return None,
+            // Reactions are the banners' only.
+            Hit::Quick(..) => return None,
             Hit::Send(i) => return self.send_reply(i),
             Hit::Dismiss(i) => {
                 let id = self.toasts.get(i)?.id;
-                self.toasts.retain(|t| t.id != id);
+                self.leave(&[id]);
                 super::notifications::remove(vec![id]);
-                self.hover = None;
-                self.later();
             }
             Hit::ClearAll => {
-                let n = self.toasts.len();
+                let ids: Vec<u32> = self.toasts.iter().map(|t| t.id).filter(|id| !self.leaving.iter().any(|(l, _)| l == id)).collect();
+                let n = ids.len();
                 super::notifications::clear();
-                self.toasts.clear();
-                self.hover = None;
-                self.say(&(words::words().cleared)(n), true);
+                self.leave(&ids);
+                // Said in the emptied card's own line, once they have gone.
+                self.say(&(words::words().cleared)(n));
             }
             Hit::Allow => {
                 return Some(Box::new(|| {
@@ -1118,7 +1202,7 @@ impl View {
                 let on = super::focus::toggle();
                 if on == was {
                     let t = words::words();
-                    self.say(if was { t.dnd_refused_off } else { t.dnd_refused_on }, self.scene.top.is_some());
+                    self.say(if was { t.dnd_refused_off } else { t.dnd_refused_on });
                 }
                 self.quiet = super::focus::active();
                 crate::tray::wake_calendar();
@@ -1126,11 +1210,6 @@ impl View {
             Hit::Today => {
                 self.today = time::today();
                 self.select(self.today);
-            }
-            Hit::Month => {
-                self.month_open = !self.month_open;
-                let (y, m, _) = time::civil_from_days(self.selected);
-                self.month = (y, m);
             }
             Hit::Prev => self.show_month(-1),
             Hit::Next => self.show_month(1),
@@ -1150,17 +1229,32 @@ impl View {
                 if super::schedule::focus_end().is_some() {
                     super::schedule::stop_focus();
                 } else if !super::schedule::start_focus(self.config.calendar.focus_minutes) && !super::focus::active() {
-                    self.say(words::words().timer_not_quiet, false);
+                    self.say(words::words().timer_not_quiet);
                 }
                 self.quiet = super::focus::active();
                 // The clock and the timer follow.
                 crate::tray::wake_calendar();
             }
             Hit::Settings => {
-                return Some(Box::new(|| {
+                // The page about this card.
+                let page = match self.panel {
+                    Panel::Calendar => crate::settings::OPEN_CALENDAR,
+                    Panel::Notifications => crate::settings::OPEN_NOTIFICATIONS,
+                };
+                return Some(Box::new(move || {
                     close();
-                    crate::tray::post(crate::settings::WM_OPEN_SETTINGS, crate::settings::OPEN_CALENDAR, 0);
+                    crate::tray::post(crate::settings::WM_OPEN_SETTINGS, page, 0);
                 }))
+            }
+            Hit::WindowsSettings => {
+                let page = match self.panel {
+                    Panel::Calendar => "ms-settings:dateandtime",
+                    Panel::Notifications => "ms-settings:notifications",
+                };
+                return Some(Box::new(move || {
+                    close();
+                    crate::win::shell_open(page, None);
+                }));
             }
             Hit::Clocks => {
                 return Some(Box::new(|| {
@@ -1245,19 +1339,8 @@ impl View {
             return None;
         }
         if key == VK_ESCAPE {
-            // A step back at a time: the menu, an event's details, the month, the notifications
-            // given the panel; then the panel.
-            let stepped = if self.menu_for.take().is_some() || self.detail.take().is_some() {
-                true
-            } else if self.month_open {
-                self.month_open = false;
-                true
-            } else if self.center_full {
-                self.center_full = false;
-                true
-            } else {
-                false
-            };
+            // A step back at a time: the menu, an event's details; then the panel.
+            let stepped = self.menu_for.take().is_some() || self.detail.take().is_some();
             if !stepped {
                 return Some(Box::new(close));
             }
@@ -1325,13 +1408,10 @@ impl View {
             self.center_scroll = (self.center_scroll - notches * SCROLL_STEP).clamp(0.0, max);
         } else if let Some((_, max)) = self.scene.list_view.filter(|(a, _)| a.contains(x, y)) {
             self.list_scroll = (self.list_scroll - notches * SCROLL_STEP).clamp(0.0, max);
-        } else if self.month_shown() && delta != 0 && matches!(self.scene.hit(x, y), Some(Hit::Day(_) | Hit::Prev | Hit::Next)) {
+        } else if delta != 0 && matches!(self.scene.hit(x, y), Some(Hit::Day(_) | Hit::Prev | Hit::Next)) {
             // Over the month, as in the shell's calendar: a notch is a month (not over the rest of
             // the card, an event's details least of all).
             self.show_month(if delta > 0 { -1 } else { 1 });
-        } else if !self.month_shown() && delta != 0 && matches!(self.scene.hit(x, y), Some(Hit::Day(_))) {
-            // Over the week: a notch is a week.
-            self.select(self.selected + if delta > 0 { -7 } else { 7 });
         } else {
             return;
         }
@@ -1339,9 +1419,9 @@ impl View {
         self.later();
     }
 
-    /// Say `text` for a moment, in the notification card (`top`) or the calendar, by what was pressed.
-    fn say(&mut self, text: &str, top: bool) {
-        self.flash = Some((text.to_string(), Instant::now(), top));
+    /// Say `text` for a moment, over the card's foot.
+    fn say(&mut self, text: &str) {
+        self.flash = Some((text.to_string(), Instant::now()));
         unsafe { SetTimer(Some(self.hwnd), FLASH_TIMER, FLASH_FOR.as_millis() as u32, None) };
     }
 
@@ -1573,14 +1653,43 @@ fn capitalised(text: &str) -> String {
     chars.next().map_or_else(String::new, |c| c.to_uppercase().chain(chars).collect())
 }
 
-/// Paint the scene.
-/// The drawing that falls on `card`.
-fn in_card(items: &[(R, Draw)], card: R) -> impl Iterator<Item = &(R, Draw)> {
-    items.iter().filter(move |(r, _)| overlaps(*r, card))
-}
-
 fn overlaps(a: R, b: R) -> bool {
     a.x < b.right() && b.x < a.right() && a.y < b.bottom() && b.y < a.bottom()
+}
+
+/// Where the drawing `new` differs from `old`: the places of what went and what came (an item
+/// unchanged at another index is no change), merged where they touch. `None`: redraw it all (too
+/// much changed for parts to pay, or a clip or an unclip moved, which reshapes what follows).
+fn changed_areas(old: &[(R, Draw)], new: &[(R, Draw)], card: R) -> Option<Vec<R>> {
+    let clips = |items: &[(R, Draw)]| items.iter().filter(|(_, d)| matches!(d, Draw::Clip | Draw::Unclip)).cloned().collect::<Vec<_>>();
+    if clips(old) != clips(new) {
+        return None;
+    }
+    let mut used = vec![false; new.len()];
+    let mut areas: Vec<R> = Vec::new();
+    for (i, item) in old.iter().enumerate() {
+        // The same index first (most items stay where they were), else anywhere not yet matched.
+        let found = if new.get(i) == Some(item) && !used[i] { Some(i) } else { new.iter().enumerate().position(|(j, n)| !used[j] && n == item) };
+        match found {
+            Some(j) => used[j] = true,
+            None => areas.push(item.0),
+        }
+    }
+    areas.extend(new.iter().zip(&used).filter(|(_, u)| !**u).map(|((r, _), _)| *r));
+    // Merged where they overlap or touch, a pixel's slack for antialiased edges.
+    let grown: Vec<R> = areas.into_iter().map(|r| R::new(r.x - 1.0, r.y - 1.0, r.w + 2.0, r.h + 2.0)).collect();
+    let mut merged: Vec<R> = Vec::new();
+    for r in grown {
+        let mut r = r;
+        while let Some(at) = merged.iter().position(|m| overlaps(*m, r)) {
+            let m = merged.remove(at);
+            let (x0, y0) = (m.x.min(r.x), m.y.min(r.y));
+            r = R::new(x0, y0, m.right().max(r.right()) - x0, m.bottom().max(r.bottom()) - y0);
+        }
+        merged.push(r);
+    }
+    let changed: f32 = merged.iter().map(|r| r.w * r.h).sum();
+    (!merged.is_empty() && merged.len() <= 16 && changed < card.w * card.h * 0.5).then_some(merged)
 }
 
 /// Draw `scene`, or only what falls in `area` (the frame is clipped to it).
@@ -1592,6 +1701,8 @@ fn draw(pen: &Pen, scene: &Scene, p: &Palette, area: Option<R>) {
         Ink::Text3 => p.text3,
         Ink::Accent => p.accent,
         Ink::OnAccent => p.on_accent,
+        Ink::OnAccent2 => p.on_accent.alpha(0.78),
+        Ink::Rgba(rgb, a) => Color::rgb(rgb).alpha(a as f32 / 255.0),
     };
     let fill = |fill: Fill| match fill {
         Fill::Raised => p.raised,
@@ -1600,10 +1711,13 @@ fn draw(pen: &Pen, scene: &Scene, p: &Palette, area: Option<R>) {
         Fill::Accent => p.accent,
         Fill::AccentHover => p.accent.alpha(0.85),
         Fill::AccentPressed => p.accent.alpha(0.7),
-        Fill::Rule => p.text.alpha(0.08),
+        Fill::Shade => p.shade,
+        Fill::Divider => p.divider,
         Fill::Mark => p.text.alpha(0.5),
         Fill::Tip => p.tip,
+        Fill::OnAccentWash => p.on_accent.alpha(0.18),
         Fill::Rgb(rgb) => Color::rgb(rgb),
+        Fill::Rgba(rgb, a) => Color::rgb(rgb).alpha(a as f32 / 255.0),
     };
     for (r, d) in &scene.items {
         if area.is_some_and(|a| !overlaps(*r, a)) && !matches!(d, Draw::Clip | Draw::Unclip) {
@@ -1618,6 +1732,8 @@ fn draw(pen: &Pen, scene: &Scene, p: &Palette, area: Option<R>) {
             Draw::Logo { key, bytes } => pen.image(key, bytes, *r),
             Draw::Avatar { key, bytes } => pen.avatar(key, bytes, *r),
             Draw::Picture { key, bytes } => pen.picture(key, bytes, *r),
+            Draw::Wash { rgb, alpha, reach, radius } => pen.wash(*r, *radius, Color::rgb(*rgb).alpha(*alpha as f32 / 255.0), *reach),
+            Draw::Ring { rgb, alpha, width } => pen.ring(*r, *width, Color::rgb(*rgb).alpha(*alpha as f32 / 255.0)),
             Draw::Clip => pen.clip(*r),
             Draw::Unclip => pen.unclip(),
         }
@@ -1632,32 +1748,6 @@ fn arrow() {
 
 fn client_xy(lparam: LPARAM) -> (i32, i32) {
     ((lparam.0 & 0xFFFF) as u16 as i16 as i32, ((lparam.0 >> 16) & 0xFFFF) as u16 as i16 as i32)
-}
-
-/// The notification centre's window: its mouse input goes to the calendar's window, which takes
-/// the input for both. Points in its client area are moved to the calendar's (the wheel's is on
-/// the screen already); its own leave goes as the calendar's.
-unsafe extern "system" fn top_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    if msg == WM_MOUSEACTIVATE {
-        return LRESULT(MA_NOACTIVATE as isize);
-    }
-    let open = OPEN.with(Cell::get);
-    if open != 0 && matches!(msg, WM_MOUSEMOVE | WM_LBUTTONDOWN | WM_LBUTTONUP | WM_RBUTTONDOWN | WM_MOUSEWHEEL | WM_MOUSELEAVE) {
-        let main = HWND(open as *mut _);
-        let lparam = if matches!(msg, WM_MOUSEWHEEL | WM_MOUSELEAVE) {
-            lparam
-        } else {
-            let (x, y) = client_xy(lparam);
-            let mut pt = [POINT { x, y }];
-            unsafe { MapWindowPoints(Some(hwnd), Some(main), &mut pt) };
-            LPARAM(((pt[0].y as u16 as isize) << 16) | (pt[0].x as u16 as isize))
-        };
-        if msg == WM_MOUSEMOVE {
-            track_leave(hwnd);
-        }
-        return unsafe { wndproc(main, msg, wparam, lparam) };
-    }
-    unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
 }
 
 /// Where the pointer is, on the screen.
@@ -1688,10 +1778,7 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESUL
     match msg {
         WM_MOUSEMOVE => {
             arrow();
-            // Moves forwarded from the other card track their own window.
-            if unsafe { GetAncestor(WindowFromPoint(cursor()), GA_ROOT) } == hwnd {
-                track_leave(hwnd);
-            }
+            track_leave(hwnd);
             let (x, y) = client_xy(lparam);
             with_view(|v| {
                 let hit = v.hit(x, y);
@@ -1710,7 +1797,7 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESUL
                 v.scene.on_card(sx, sy)
             });
             if inside == Some(false) {
-                // A click on the panel's windows but off both cards (the corner between them) closes it.
+                // A click on the panel's window but off its card closes it.
                 after = Some(Box::new(close));
             }
         }
@@ -1753,13 +1840,12 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESUL
             return None;
         }
         WM_ACTIVATE if (wparam.0 & 0xFFFF) as u32 == WA_INACTIVE => {
-            // Not to its own notification card (which never takes activation, but in case).
             let to = HWND(lparam.0 as *mut _);
             if !HELD.with(Cell::get) {
                 // The deactivation of a borrowed activation (see [`HELD`]): the app it was borrowed
                 // from is still in front, and the user has not gone anywhere.
                 println!("calendar: deactivated without having had the foreground; staying open");
-            } else if with_view(|v| v.top_hwnd != to).unwrap_or(true) {
+            } else {
                 println!("calendar: closed, the foreground went to {:?} ({})", to.0, crate::win::class_name(to));
                 after = Some(Box::new(close));
             }
@@ -1774,6 +1860,11 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESUL
         WM_TIMER if wparam.0 == FRAME_TIMER => {
             let _ = unsafe { KillTimer(Some(hwnd), FRAME_TIMER) };
             with_view(View::settle);
+        }
+        WM_TIMER if wparam.0 == ANIM_TIMER => {
+            if !with_view(View::step).unwrap_or(false) {
+                let _ = unsafe { KillTimer(Some(hwnd), ANIM_TIMER) };
+            }
         }
         WM_TIMER if wparam.0 == REFRESH_TIMER => {
             with_view(|v| {
@@ -1794,10 +1885,9 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESUL
             });
         }
         WM_MOUSELEAVE => {
-            // Left this card: no hover, unless the pointer went to the other card.
+            // Left the card: no hover (unless the pointer is back on it already).
             let under = unsafe { GetAncestor(WindowFromPoint(cursor()), GA_ROOT) };
-            let ours = with_view(|v| under == v.hwnd || under == v.top_hwnd).unwrap_or(false);
-            if !ours {
+            if under != hwnd {
                 with_view(|v| v.set_hover(None));
             }
         }
@@ -1805,19 +1895,16 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESUL
         WM_DESTROY if OPEN.with(Cell::get) == hwnd.0 as isize => {
             OPEN.with(|o| o.set(0));
             super::notifications::set_watching(false);
-            *super::OPEN_CARDS.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            *super::OPEN_CARD.lock().unwrap_or_else(|e| e.into_inner()) = None;
             CLOSED_AT.with(|c| c.set(Some(Instant::now())));
-            let top = VIEW.with(|cell| cell.borrow_mut().take()).map(|v| {
+            crate::taskbar::notify_panel(tap_proto::OPEN_NONE);
+            if let Some(v) = VIEW.with(|cell| cell.borrow_mut().take()) {
                 // Drafts of notifications still waiting, for the next open.
                 let mut drafts = v.stash.clone();
                 drafts.extend(v.draft.clone().filter(|(_, text)| !text.is_empty()));
                 drafts.retain(|(id, _)| v.toasts.iter().any(|t| t.id == *id));
                 DRAFTS.with(|d| *d.borrow_mut() = drafts);
-                SPARE_GFX.with(|s| *s.borrow_mut() = Some(v.gfx.into_inner()));
-                v.top_hwnd
-            });
-            if let Some(top) = top {
-                let _ = unsafe { DestroyWindow(top) };
+                SPARE_GFX.with(|s| *s.borrow_mut() = Some(spare(v.gfx.into_inner())));
             }
         }
         _ => return None,
@@ -1830,10 +1917,10 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESUL
 
 /// Dev: the panel alone, on the config's sources, until it closes.
 #[cfg(feature = "dev")]
-pub fn preview(config: &Config) {
+pub fn preview(config: &Config, panel: Panel) {
     use windows::Win32::UI::WindowsAndMessaging::{DispatchMessageW, GetMessageW, SetTimer, TranslateMessage, MSG};
     super::notifications::start();
-    if let Err(e) = create(config) {
+    if let Err(e) = create(config, panel) {
         eprintln!("calendar: {e:#}");
         return;
     }

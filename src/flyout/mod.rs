@@ -33,7 +33,7 @@ use crate::config::Config;
 
 use layout::{ActionKind, Elem};
 use model::{build_groups, Model};
-use theme::{accent_rgb, TRACK_X0};
+use theme::TRACK_X0;
 use window::Surface;
 
 /// What the caller must do after the flyout closes.
@@ -124,7 +124,9 @@ unsafe fn show_inner(
         }
     };
     let (scale, work_area) = crate::win::monitor_at(POINT { x: cx, y: bottom });
-    let accent = accent_rgb();
+    // Windows' light or dark mode, as the calendar's and the notifications' panels.
+    theme::refresh_mode();
+    let accent = theme::panel_accent();
 
     let batteries = model::batteries_now(config);
     let groups = build_groups(backend, config, &batteries);
@@ -356,11 +358,15 @@ impl Flyout<'_> {
     /// Re-lay out for rows that came or went (a list expanded, a call started), keeping the
     /// panel's bottom edge where it was.
     fn resize(&mut self) {
+        let from = self.surface.height;
         self.rebuild_layout();
         self.surface.reposition();
         self.sync_hover_to_cursor();
         self.render_base();
         self.compose();
+        // To its new height smoothly, as the calendar's and the notifications' cards.
+        let [r, g, b] = theme::tint();
+        self.surface.ease_height(from, [r, g, b, (theme::tint_a() * 255.0).round() as u8]);
         self.surface.flush();
     }
 
@@ -760,8 +766,8 @@ impl Flyout<'_> {
                     self.model.settings = true;
                     true
                 }
-                Some(ActionKind::Quit) => {
-                    self.model.quit = true;
+                Some(ActionKind::SoundSettings) => {
+                    crate::win::shell_open("ms-settings:sound", None);
                     true
                 }
                 Some(ActionKind::Restart) => {

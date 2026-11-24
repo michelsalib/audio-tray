@@ -8,7 +8,8 @@
 //! device is read, never the key.
 //!
 //! It also announces a layout changed by anything else (Win+Space, Alt+Shift, the language bar):
-//! Windows tells no other process, so the focus window's layout is polled ([`WATCH_EVERY`]).
+//! Windows tells no other process, so the focus window's layout is polled ([`WATCH_EVERY`]), for a
+//! while after each key or change of window in front ([`WATCH_FOR`]), asleep otherwise.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -30,6 +31,31 @@ const GIDC_ARRIVAL: usize = 1;
 /// The layout watch's timer, and its period: a banner within a glance of the shortcut.
 const TIMER_WATCH: usize = 1;
 const WATCH_EVERY: u32 = 150;
+/// How long the watch runs after a key, or the focus moving to another window: a layout changes
+/// only then (a shortcut typed, the language button clicked, a window with its own layout). Asleep
+/// otherwise.
+const WATCH_FOR: std::time::Duration = std::time::Duration::from_millis(2500);
+
+thread_local! {
+    /// The switcher's window, and until when its watch runs (`None`: asleep).
+    static WATCHING: std::cell::Cell<(isize, Option<std::time::Instant>)> = const { std::cell::Cell::new((0, None)) };
+}
+
+/// Keep the layout watch running for [`WATCH_FOR`] from now (started if asleep).
+fn wake_watch() {
+    WATCHING.with(|w| {
+        let (window, until) = w.get();
+        if window != 0 && until.is_none() {
+            unsafe { SetTimer(Some(HWND(window as *mut _)), TIMER_WATCH, WATCH_EVERY, None) };
+        }
+        w.set((window, Some(std::time::Instant::now() + WATCH_FOR)));
+    });
+}
+
+/// Another window came to the front: its layout may differ.
+unsafe extern "system" fn foreground_changed(_: windows::Win32::UI::Accessibility::HWINEVENTHOOK, _: u32, _: HWND, _: i32, _: i32, _: u32, _: u32) {
+    wake_watch();
+}
 
 /// How long the focus must stay on one thread before its layout counts. A thread that gets the
 /// focus may still hold its old layout until Windows syncs it, which is not a change to announce;
@@ -91,13 +117,24 @@ impl Switcher {
                         return;
                     }
                 };
-                unsafe { SetTimer(Some(window), TIMER_WATCH, WATCH_EVERY, None) };
+                // Watching from the start (the first reading is where things stand), then asleep
+                // until a key or another window in front.
+                WATCHING.with(|w| w.set((window.0 as isize, None)));
+                wake_watch();
+                let hook = unsafe {
+                    use windows::Win32::UI::Accessibility::SetWinEventHook;
+                    use windows::Win32::UI::WindowsAndMessaging::{EVENT_SYSTEM_FOREGROUND, WINEVENT_OUTOFCONTEXT};
+                    SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, None, Some(foreground_changed), 0, 0, WINEVENT_OUTOFCONTEXT)
+                };
                 let _ = ready.send(Some(unsafe { GetCurrentThreadId() }));
                 let mut msg = MSG::default();
                 while unsafe { GetMessageW(&mut msg, None, 0, 0) }.0 > 0 {
                     unsafe { DispatchMessageW(&msg) };
                 }
                 let _ = super::register(window, false);
+                if !hook.is_invalid() {
+                    let _ = unsafe { windows::Win32::UI::Accessibility::UnhookWinEvent(hook) };
+                }
                 let _ = unsafe { DestroyWindow(window) };
             })
             .ok()?;
@@ -141,6 +178,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
             if let Some(device) = super::source(lparam) {
                 on_key(device);
             }
+            wake_watch();
         }
         WM_INPUT_DEVICE_CHANGE => {
             let device = lparam.0 as usize;
@@ -159,7 +197,17 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
                 }
             });
         }
-        WM_TIMER if wparam.0 == TIMER_WATCH => watch(),
+        WM_TIMER if wparam.0 == TIMER_WATCH => {
+            watch();
+            // Asleep again once nothing could have changed the layout for a while.
+            WATCHING.with(|w| {
+                let (window, until) = w.get();
+                if until.is_some_and(|u| std::time::Instant::now() >= u) {
+                    let _ = unsafe { windows::Win32::UI::WindowsAndMessaging::KillTimer(Some(hwnd), TIMER_WATCH) };
+                    w.set((window, None));
+                }
+            });
+        }
         _ => {}
     }
     // `WM_INPUT` must reach DefWindowProc, which frees the input.

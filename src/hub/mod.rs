@@ -247,6 +247,12 @@ pub enum Notice {
 }
 
 impl Notice {
+    /// A notification of its own when Audio Tray shows them all: news, not the pill's live state
+    /// (a song playing, an app listening).
+    pub fn is_news(&self) -> bool {
+        !matches!(self, Notice::NewTrack { .. } | Notice::Listening { .. })
+    }
+
     /// How long it shows; `None` until acknowledged.
     pub fn lifetime(&self) -> Option<std::time::Duration> {
         match self {
@@ -294,6 +300,11 @@ pub struct State {
     low_warned: Vec<String>,
     /// Devices that just went low, for the tray to raise a Windows notification about.
     pub fresh_low: Vec<Battery>,
+    /// Audio Tray shows every notification itself (Settings' take-over): the notices that are
+    /// news (not the pill's live state) go to [`State::outbox`] instead, for the banners.
+    pub handed_over: bool,
+    /// Notices for the tray to show as notifications, oldest first.
+    pub outbox: Vec<Notice>,
 }
 
 /// Points above [`State::low_battery_at`] a battery must charge back to before it can warn again:
@@ -465,6 +476,10 @@ impl State {
     }
 
     fn push_notice(&mut self, notice: Notice) {
+        if self.handed_over && notice.is_news() {
+            self.outbox.push(notice);
+            return;
+        }
         self.notices.retain(|(n, _)| std::mem::discriminant(n) != std::mem::discriminant(&notice));
         self.notices.push((notice, std::time::Instant::now()));
     }

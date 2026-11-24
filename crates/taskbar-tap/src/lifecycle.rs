@@ -131,6 +131,24 @@ unsafe extern "system" fn control_proc(
         crate::music::state::mark_changed();
         return LRESULT(0);
     }
+    if msg == tap_proto::WM_TAP_BELL_RING {
+        crate::clock::ring();
+        unsafe { SetTimer(Some(hwnd), crate::clock::RING_TIMER, crate::clock::RING_MS, None) };
+        return LRESULT(0);
+    }
+    if msg == WM_TIMER && wparam.0 == crate::clock::RING_TIMER {
+        let more = std::panic::catch_unwind(|| unsafe { crate::clock::ring_step() }).unwrap_or(false);
+        if !more {
+            let _ = unsafe { KillTimer(Some(hwnd), crate::clock::RING_TIMER) };
+        }
+        return LRESULT(0);
+    }
+    if msg == tap_proto::WM_TAP_PANEL {
+        if std::panic::catch_unwind(|| crate::clock::set_panel(wparam.0)).is_err() {
+            logf!("panel handler panicked");
+        }
+        return LRESULT(0);
+    }
     if msg == WM_TAP_WIRE_TRANSPORT {
         // Cleared before the work, so buttons announced meanwhile get another pass.
         WIRE_PENDING.store(false, Ordering::SeqCst);

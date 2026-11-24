@@ -1,6 +1,7 @@
 //! The calendar that replaces the taskbar clock's: a click on the clock (caught by the TAP, which
 //! keeps the shell's own flyout shut) opens [`view`], a month and the selected day's agenda, with
-//! the events of a Google account, a Microsoft account and calendar links.
+//! the events of a Google account, a Microsoft account and calendar links. A click on the bell
+//! beside the clock opens the same panel's other card: Windows' notifications.
 //!
 //! **Threads.** Everything here is called on the tray thread except the work: a fetch and a
 //! sign-in each run on a thread of their own and post [`WM_CALENDAR`] to the tray when they are
@@ -16,10 +17,12 @@ mod oauth;
 pub mod rich;
 pub mod schedule;
 mod sources;
+pub mod takeover;
 pub mod time;
 mod view;
 
-pub use view::Badge;
+pub use view::{Badge, Panel};
+pub use view::banner::glance;
 pub mod zones;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -38,11 +41,12 @@ pub const WM_CALENDAR: u32 = WM_APP + 42;
 pub const CLOSE: usize = 1;
 /// [`WM_CALENDAR`]'s `wParam`: Windows' notifications changed.
 pub const NOTIFICATIONS: usize = 2;
+/// [`WM_CALENDAR`]'s `wParam`: Do not disturb was switched (by anyone).
+pub const QUIET: usize = 3;
 
-/// The open calendar's cards on screen (the calendar, then the notifications or an empty
-/// rectangle), for the mouse hook: a click outside both closes it even when Windows kept the
-/// foreground from it. The gap between or above the cards is outside.
-pub static OPEN_CARDS: Mutex<Option<[windows::Win32::Foundation::RECT; 2]>> = Mutex::new(None);
+/// The open panel's card on screen, for the mouse hook: a click outside it closes it even when
+/// Windows kept the foreground from it.
+pub static OPEN_CARD: Mutex<Option<windows::Win32::Foundation::RECT>> = Mutex::new(None);
 
 /// A cache this old is fetched again when the calendar opens.
 const STALE_AFTER: i64 = 5 * 60;
@@ -69,6 +73,10 @@ pub struct Status {
     pub fetched: Option<i64>,
     /// The calendars found, to show or hide and colour.
     pub calendars: Vec<Calendar>,
+    /// Windows keeps notifications quiet (Do not disturb, a focus session, one of its rules).
+    pub quiet: bool,
+    /// Windows does not let Audio Tray read its notifications.
+    pub notifications_denied: bool,
 }
 
 impl Status {
@@ -131,9 +139,40 @@ fn notify() {
     crate::tray::post(WM_CALENDAR, 0, 0);
 }
 
-/// Open the calendar (a click on the taskbar clock), or close it when it is open.
-pub fn open(config: &crate::config::Config) {
-    view::toggle(config);
+/// Open `panel` (the clock's calendar, the bell's notifications), close it when it is open, or
+/// turn the open panel into it.
+pub fn open(config: &crate::config::Config, panel: Panel) {
+    view::toggle(config, panel);
+}
+
+/// Have Windows show its notification bell beside the clock (Taskbar settings' "Show notification
+/// bell icon"): the bell is the notifications' button, and Windows keeps its place.
+pub fn show_bell() {
+    use windows::core::w;
+    use windows::Win32::System::Registry::{RegGetValueW, RegSetKeyValueW, HKEY_CURRENT_USER, REG_DWORD, RRF_RT_REG_DWORD};
+    const KEY: windows::core::PCWSTR = w!(r"Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced");
+    const NAME: windows::core::PCWSTR = w!("ShowNotificationIcon");
+    let mut value = 0u32;
+    let mut size = 4u32;
+    let read = unsafe { RegGetValueW(HKEY_CURRENT_USER, KEY, NAME, RRF_RT_REG_DWORD, None, Some(&mut value as *mut u32 as *mut _), Some(&mut size)) };
+    // Shown already (or never set: Windows' default shows it).
+    if read.is_err() || value != 0 {
+        return;
+    }
+    let one = 1u32;
+    let set = unsafe { RegSetKeyValueW(HKEY_CURRENT_USER, KEY, NAME, REG_DWORD.0, Some(&one as *const u32 as *const _), 4) };
+    if set.is_err() {
+        eprintln!("calendar: could not show Windows' notification bell ({set:?})");
+        return;
+    }
+    println!("calendar: Windows' notification bell shown, for the notifications");
+    // The taskbar takes it at once on being told; a hung window must not hold the tray thread.
+    std::thread::spawn(|| {
+        use windows::Win32::Foundation::{LPARAM, WPARAM};
+        use windows::Win32::UI::WindowsAndMessaging::{SendMessageTimeoutW, HWND_BROADCAST, SMTO_ABORTIFHUNG, WM_SETTINGCHANGE};
+        let area = w!("TraySettings");
+        unsafe { SendMessageTimeoutW(HWND_BROADCAST, WM_SETTINGCHANGE, WPARAM(0), LPARAM(area.as_ptr() as isize), SMTO_ABORTIFHUNG, 3000, None) };
+    });
 }
 
 /// Draw the panel once, hidden, ahead of its next open (see [`view::prewarm`]).
@@ -152,9 +191,77 @@ pub fn changed() {
     crate::settings::calendar_changed();
 }
 
-/// The notifications changed: only the panel shows them (Settings lists accounts and fetches).
-pub fn notifications_changed() {
+/// The notifications changed: the panel shows them, and the banners what is new (Settings lists
+/// accounts and fetches). Apps Windows heard from for the first time have their banners taken.
+pub fn notifications_changed(config: &crate::config::Config) {
     view::refresh();
+    view::banner::list_changed(config);
+    // New apps taken; and a screen reader started since gives Windows its banners back.
+    if config.calendar.take_over {
+        follow_takeover(config);
+    }
+}
+
+/// Dev: banners of what is listed ([`view::banner::preview`]).
+/// Dev: the banners' simulation ([`view::banner::simulate`]); `false` when a check failed.
+#[cfg(feature = "dev")]
+pub fn simulate_banners() -> bool {
+    view::banner::simulate()
+}
+
+#[cfg(feature = "dev")]
+pub fn preview_digest(seconds: u64) {
+    view::banner::preview_digest(seconds);
+}
+
+#[cfg(feature = "dev")]
+pub fn preview_click(id: u32, dry: bool) {
+    view::banner::preview_click(id, dry);
+}
+
+#[cfg(feature = "dev")]
+pub fn preview_banners(count: usize, seconds: u64) {
+    view::banner::preview(count, seconds);
+}
+
+/// Audio Tray's own notices (batteries, keyboards, audio devices, reminders, focus) are
+/// notifications, listed under the bell with every app's, not the pill's: whenever the bell is
+/// Audio Tray's.
+pub fn merges_notices(config: &crate::config::Config) -> bool {
+    config.calendar.enabled && config.calendar.notifications
+}
+
+/// Audio Tray shows every notification itself: the bell's list is on, and Settings' take-over.
+/// Not while a screen reader runs: Windows' own banners are the ones it reads aloud, so they stay.
+pub fn handed_over(config: &crate::config::Config) -> bool {
+    let c = &config.calendar;
+    c.enabled && c.notifications && c.take_over && !screen_reader()
+}
+
+/// A screen reader (Narrator, NVDA, JAWS) is running, as it tells Windows.
+fn screen_reader() -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::{SystemParametersInfoW, SPI_GETSCREENREADER, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS};
+    let mut on = windows::core::BOOL(0);
+    let asked = unsafe { SystemParametersInfoW(SPI_GETSCREENREADER, 0, Some(&mut on as *mut _ as *mut _), SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0)) };
+    asked.is_ok() && on.as_bool()
+}
+
+/// Take Windows' banners, or give them back, as the config says (at start, on a change in
+/// Settings); the banners showing go when Audio Tray no longer shows them.
+pub fn follow_takeover(config: &crate::config::Config) {
+    let on = handed_over(config) && !notifications::denied();
+    takeover::apply(on);
+    // Banners want each notification as it comes.
+    notifications::set_fast(on);
+    if !on {
+        view::banner::clear();
+    }
+}
+
+/// Do not disturb was switched (by anyone): the open panel's moon follows, and Settings' switch.
+pub fn quiet_changed() {
+    view::quiet_changed();
+    crate::settings::calendar_changed();
 }
 
 /// The events fetched, and the days they cover.
@@ -189,7 +296,13 @@ pub fn fetching() -> bool {
 /// What Settings shows.
 pub fn status(setup: &Setup) -> Status {
     let state = state();
-    let mut status = Status { fetched: state.fetched, calendars: state.calendars.clone(), ..Default::default() };
+    let mut status = Status {
+        fetched: state.fetched,
+        calendars: state.calendars.clone(),
+        quiet: focus::active(),
+        notifications_denied: notifications::denied(),
+        ..Default::default()
+    };
     for provider in Provider::ALL {
         let account = status.account_mut(provider);
         account.email = sources::signed_in(provider);
@@ -465,14 +578,16 @@ pub fn links_changed() {
     state.fetched = None;
 }
 
-/// Dev: the calendar alone (no tray, no taskbar click), on the config's accounts and links.
+/// Dev: the calendar or the notifications alone (no tray, no taskbar click), on the config's
+/// accounts and links.
 #[cfg(feature = "dev")]
-pub fn preview(config: &crate::config::Config) {
-    view::preview(config);
+pub fn preview(config: &crate::config::Config, panel: Panel) {
+    view::preview(config, panel);
 }
 
-/// Win+Alt+D and Win+N (Windows' shortcuts for its calendar and notification centre) open this
-/// panel while this is on, taken by the tray's keyboard hook (installed only then).
+/// Win+Alt+D and Win+N (Windows' shortcuts for its calendar and notification centre) open the
+/// calendar and the notifications while this is on, taken by the tray's keyboard hook (installed
+/// only then; Win+N only while the notifications are on).
 pub static SHORTCUT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 pub fn set_shortcut(on: bool) {

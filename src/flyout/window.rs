@@ -83,7 +83,16 @@ impl Surface {
     }
 
     fn animate(&self, motion: crate::win::Flyout, scale: f32) {
-        motion.run(crate::win::FLYOUT_SLIDE * scale, |offset, alpha| self.present(&self.buf, self.x, self.y + offset, alpha));
+        // The picture sent once; then each frame only moves and fades the window.
+        let mut sent = false;
+        motion.run(crate::win::FLYOUT_SLIDE * scale, |offset, alpha| {
+            if sent {
+                crate::layered::Canvas::shift(self.hwnd, self.x, self.y + offset, alpha);
+            } else {
+                self.present(&self.buf, self.x, self.y + offset, alpha);
+                sent = true;
+            }
+        });
     }
 
     /// Present the current `buf` at the resting position, fully opaque.
@@ -94,6 +103,44 @@ impl Surface {
     /// Present a panel-sized buffer at `(x, y)` with a global `alpha` (this also moves the window).
     pub(super) fn present(&self, buf: &[u8], x: i32, y: i32, alpha: u8) {
         crate::layered::present(self.hwnd, buf, self.width, self.height, x, y, alpha);
+    }
+
+    /// Ease the panel from `from` pixels tall to its height now (rows came or went), its bottom
+    /// edge where it is, as the calendar's and the notifications' cards ease to theirs. Taller:
+    /// the new picture is uncovered from its foot up. Shorter: it sits at the foot, under a strip
+    /// of the panel's own ground that closes up. Then the panel as it is.
+    pub(super) fn ease_height(&self, from: i32, ground: [u8; 4]) {
+        const FRAMES: u32 = 10;
+        let to = self.height;
+        if from <= 0 || (from - to).abs() < 2 || self.width <= 0 {
+            return;
+        }
+        let row = self.width as usize * 4;
+        // One buffer for every frame of the ground closing up (the tallest is the first).
+        let mut frame = Vec::with_capacity((from.max(to) as usize) * row);
+        for i in 1..FRAMES {
+            let t = i as f32 / FRAMES as f32;
+            let eased = 1.0 - (1.0 - t).powi(3);
+            let h = (from as f32 + (to - from) as f32 * eased).round() as i32;
+            let top = (self.base_bottom - h).max(self.wa.top + self.margin);
+            if h <= to {
+                // The new picture's foot, `h` rows of it.
+                let start = (to - h) as usize * row;
+                crate::layered::present(self.hwnd, &self.buf[start..], self.width, h, self.x, top, 255);
+            } else {
+                // The ground closing up over the new picture.
+                frame.clear();
+                for _ in 0..(h - to) as usize * self.width as usize {
+                    frame.extend_from_slice(&ground);
+                }
+                frame.extend_from_slice(&self.buf);
+                crate::layered::present(self.hwnd, &frame, self.width, h, self.x, top, 255);
+            }
+            // On the compositor's beat (a 16 ms sleep is 16 to 31 ms).
+            if unsafe { windows::Win32::Graphics::Dwm::DwmFlush() }.is_err() {
+                std::thread::sleep(std::time::Duration::from_millis(16));
+            }
+        }
     }
 }
 

@@ -151,24 +151,24 @@ pub fn report_progress_window(hwnd: Option<windows::Win32::Foundation::HWND>) {
     }
 }
 
-/// Tell the TAP which of the calendar's cards is open (`tap_proto::OPEN_*`): it lights that button
-/// and keeps the clock's and the bell's tooltips off the panel meanwhile.
-/// A notification went to the bell's list (its banner flew into it): the TAP rings the bell.
-pub fn ring_bell() {
+/// Post `message` to every TAP control window (one per taskbar).
+fn post_to_taps(message: u32, wparam: usize) {
     use windows::Win32::Foundation::{LPARAM, WPARAM};
     use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
     for control in crate::win::windows_by_class(TAP_CONTROL_CLASS) {
-        let _ = unsafe { PostMessageW(Some(control), tap_proto::WM_TAP_BELL_RING, WPARAM(0), LPARAM(0)) };
+        let _ = unsafe { PostMessageW(Some(control), message, WPARAM(wparam), LPARAM(0)) };
     }
 }
 
-pub fn notify_panel(open: usize) {
-    use windows::Win32::Foundation::{LPARAM, WPARAM};
-    use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
+/// A notification went to the bell's list (its banner flew into it): the TAP rings the bell.
+pub fn ring_bell() {
+    post_to_taps(tap_proto::WM_TAP_BELL_RING, 0);
+}
 
-    for control in crate::win::windows_by_class(TAP_CONTROL_CLASS) {
-        let _ = unsafe { PostMessageW(Some(control), tap_proto::WM_TAP_PANEL, WPARAM(open), LPARAM(0)) };
-    }
+/// Tell the TAP which of the calendar's cards is open (`tap_proto::OPEN_*`): it lights that button
+/// and keeps the clock's and the bell's tooltips off the panel meanwhile.
+pub fn notify_panel(open: usize) {
+    post_to_taps(tap_proto::WM_TAP_PANEL, open);
 }
 
 /// Tell the TAP the now-playing state file changed, so it re-reads it instead of polling the
@@ -1004,9 +1004,7 @@ pub struct ClockText {
     /// A `GetDateFormatEx` pattern; empty: the locale's short date; `-`: hidden.
     pub date: String,
     pub one_line: bool,
-    /// After the time: the focus time left, never a meeting (the time stays the time).
-    pub top: String,
-    /// Notifications new since the panel was last opened (0: none).
+    /// How many notifications wait in Audio Tray's list (0: none).
     pub badge: u32,
     /// The badge drawn for it (`calendar::view::badge`): the PNG, its width in DIPs and the DPI it
     /// was drawn for. Without one, the TAP puts an emoji dot and the count before the time.
@@ -1026,7 +1024,6 @@ pub fn send_clock(text: &ClockText) -> bool {
         ("time", text.time.clone()),
         ("date", text.date.clone()),
         ("oneline", flag(text.one_line)),
-        ("top", text.top.clone()),
         ("badge", text.badge.to_string()),
         ("quiet", flag(text.quiet)),
         ("waiting", text.waiting.map_or_else(String::new, flag)),

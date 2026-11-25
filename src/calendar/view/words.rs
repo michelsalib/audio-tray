@@ -69,6 +69,9 @@ pub struct Words {
     pub away_count: fn(usize) -> String,
     pub latest_from: fn(&str) -> String,
     pub show_them: &'static str,
+    /// An app listening outside a call, and what a click on its alert does.
+    pub listening: fn(&str) -> String,
+    pub click_to_mute: &'static str,
     /// A meeting's countdown, and once it has begun.
     pub starts_in: fn(i64) -> String,
     pub started: fn(i64) -> String,
@@ -128,6 +131,8 @@ static EN: Words = Words {
     away_count: |n| if n == 1 { "1 notification".into() } else { format!("{n} notifications") },
     latest_from: |who| format!("Latest from {who}"),
     show_them: "Show them",
+    listening: |app| format!("{app} is listening"),
+    click_to_mute: "Click to mute",
     starts_in: |s| format!("Starts in {}:{:02}", s / 60, s % 60),
     started: |m| if m < 1 { "Starting now".into() } else { format!("Started {m} min ago") },
 };
@@ -186,6 +191,8 @@ static FR: Words = Words {
     away_count: |n| if n == 1 { "1 notification".into() } else { format!("{n} notifications") },
     latest_from: |who| format!("Dernière de {who}"),
     show_them: "Les afficher",
+    listening: |app| format!("{app} écoute"),
+    click_to_mute: "Cliquer pour couper le micro",
     starts_in: |s| format!("Commence dans {}:{:02}", s / 60, s % 60),
     started: |m| if m < 1 { "Commence maintenant".into() } else { format!("Commencée il y a {m} min") },
 };

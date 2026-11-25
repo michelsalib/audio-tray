@@ -17,11 +17,8 @@
 
 use std::sync::Mutex;
 
-use windows::core::{PCWSTR, PWSTR};
-use windows::Win32::System::Registry::{
-    RegCloseKey, RegDeleteKeyValueW, RegEnumKeyExW, RegGetValueW, RegOpenKeyExW, RegSetKeyValueW, HKEY, HKEY_CURRENT_USER, KEY_READ, REG_DWORD,
-    RRF_RT_REG_DWORD,
-};
+use windows::core::PCWSTR;
+use windows::Win32::System::Registry::{RegCloseKey, RegDeleteKeyValueW, RegOpenKeyExW, RegSetKeyValueW, HKEY, HKEY_CURRENT_USER, KEY_READ, REG_DWORD};
 
 const SETTINGS: &str = r"Software\Microsoft\Windows\CurrentVersion\Notifications\Settings";
 const SHOW_BANNER: &str = "ShowBanner";
@@ -55,12 +52,20 @@ pub fn apply(on: bool) {
 
 /// The written-down apps, read from the file at the first call.
 fn kept() -> std::sync::MutexGuard<'static, Option<Vec<Kept>>> {
-    let mut kept = KEPT.lock().unwrap_or_else(|e| e.into_inner());
+    let mut kept = kept_lock();
     if kept.is_none() {
         *kept = Some(load());
     }
     kept
 }
+
+/// [`KEPT`] as it is (not read from the file).
+fn kept_lock() -> std::sync::MutexGuard<'static, Option<Vec<Kept>>> {
+    KEPT.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// A walk of every app's key is owed whatever the watch says (the last could not note its work).
+static WALK_OWED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Whether app `aumid`'s notifications get Audio Tray's banner: not when the user had turned its
 /// banners off in Windows before (kept as they were), nor when they left it to Windows, nor when
@@ -168,7 +173,9 @@ fn settings_changed() -> bool {
 /// Every app's banner off (what it had written down first), and what the user changed in
 /// Windows' Settings since followed: walked only when those settings changed.
 fn take() {
-    if !settings_changed() {
+    // Both asked: the watch is re-armed by its ask even when a walk is owed anyway.
+    let changed = settings_changed();
+    if !WALK_OWED.swap(false, std::sync::atomic::Ordering::Relaxed) && !changed {
         return;
     }
     let mut guard = kept();
@@ -201,26 +208,42 @@ fn take() {
     if let Err(e) = save(kept) {
         eprintln!("notifications: could not note Windows' banner settings, leaving them ({e:#})");
         *guard = None;
+        // Nothing written, so the watch hears nothing: the next read tries again.
+        WALK_OWED.store(true, std::sync::atomic::Ordering::Relaxed);
         return;
     }
     let mut taken = 0;
+    // Given back in writing only: one Windows refused stays written down, for the next walk.
+    let mut not_given = Vec::new();
     for (app, s) in &plan {
         let key = format!(r"{SETTINGS}\{app}");
         match s {
             Step::Take { .. } => {
-                set_dword(&key, SHOW_BANNER, 0);
-                taken += 1;
+                if set_dword(&key, SHOW_BANNER, 0) {
+                    taken += 1;
+                }
             }
             Step::GiveBack { was } => {
-                match was {
+                let given = match was {
                     Some(value) => set_dword(&key, SHOW_BANNER, *value),
                     None => delete(&key, SHOW_BANNER),
+                };
+                if given {
+                    println!("notifications: {app} is kept out of Windows' centre: its banners are Windows' again");
+                } else {
+                    not_given.push(Kept { app: app.clone(), was: *was, left: false });
                 }
-                println!("notifications: {app} is kept out of Windows' centre: its banners are Windows' again");
             }
             Step::LeaveToWindows => println!("notifications: {app}'s banners were turned back on in Windows: left to Windows"),
             Step::Leave => {}
         }
+    }
+    if !not_given.is_empty() {
+        kept.extend(not_given);
+        if let Err(e) = save(kept) {
+            eprintln!("notifications: could not note the apps whose banners were not given back ({e:#})");
+        }
+        WALK_OWED.store(true, std::sync::atomic::Ordering::Relaxed);
     }
     if taken > 0 {
         println!("notifications: Windows' banners off for {} apps ({taken} new)", kept.iter().filter(|k| !k.left).count());
@@ -237,19 +260,34 @@ fn give_back() {
         return;
     }
     let mut given = 0;
+    // Those that could not be written stay written down, for the next try (the next give-back,
+    // the next start): forgetting them would leave their banners off for good.
+    let mut failed = Vec::new();
     for k in kept.iter().filter(|k| !k.left) {
         let key = format!(r"{SETTINGS}\{}", k.app);
         if !key_exists(&key) {
             continue;
         }
-        match k.was {
+        let done = match k.was {
             Some(value) => set_dword(&key, SHOW_BANNER, value),
             None => delete(&key, SHOW_BANNER),
+        };
+        if done {
+            given += 1;
+        } else {
+            failed.push(k.clone());
         }
-        given += 1;
     }
-    if let Ok(path) = file() {
-        let _ = std::fs::remove_file(path);
+    if failed.is_empty() {
+        if let Ok(path) = file() {
+            let _ = std::fs::remove_file(path);
+        }
+    } else {
+        eprintln!("notifications: {} apps' banners could not be given back; kept for the next try", failed.len());
+        if let Err(e) = save(&failed) {
+            eprintln!("notifications: could not note them either ({e:#})");
+        }
+        *kept_lock() = Some(failed);
     }
     println!("notifications: Windows' banners given back to {given} apps");
 }
@@ -262,22 +300,7 @@ pub fn give_back_now() {
 
 /// The apps Windows keeps notification settings for.
 fn apps() -> Vec<String> {
-    let path = crate::win::wide(SETTINGS);
-    let mut key = HKEY::default();
-    if unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, PCWSTR(path.as_ptr()), None, KEY_READ, &mut key) }.is_err() {
-        return Vec::new();
-    }
-    let mut names = Vec::new();
-    for index in 0u32.. {
-        let mut buf = [0u16; 256];
-        let mut len = buf.len() as u32;
-        if unsafe { RegEnumKeyExW(key, index, Some(PWSTR(buf.as_mut_ptr())), &mut len, None, None, None, None) }.is_err() {
-            break;
-        }
-        names.push(String::from_utf16_lossy(&buf[..len as usize]));
-    }
-    let _ = unsafe { RegCloseKey(key) };
-    names
+    crate::win::subkeys(HKEY_CURRENT_USER, SETTINGS)
 }
 
 fn key_exists(key: &str) -> bool {
@@ -292,25 +315,33 @@ fn key_exists(key: &str) -> bool {
 
 fn dword(key: &str, name: &str) -> Option<u32> {
     let (key, name) = (crate::win::wide(key), crate::win::wide(name));
-    let mut value = 0u32;
-    let mut size = 4u32;
-    let read = unsafe {
-        RegGetValueW(HKEY_CURRENT_USER, PCWSTR(key.as_ptr()), PCWSTR(name.as_ptr()), RRF_RT_REG_DWORD, None, Some(&mut value as *mut u32 as *mut _), Some(&mut size))
-    };
-    read.is_ok().then_some(value)
+    crate::win::hkcu_dword(PCWSTR(key.as_ptr()), PCWSTR(name.as_ptr()))
 }
 
-fn set_dword(key: &str, name: &str, value: u32) {
+/// Whether it was written.
+fn set_dword(key: &str, name: &str, value: u32) -> bool {
     let (k, n) = (crate::win::wide(key), crate::win::wide(name));
     let set = unsafe { RegSetKeyValueW(HKEY_CURRENT_USER, PCWSTR(k.as_ptr()), PCWSTR(n.as_ptr()), REG_DWORD.0, Some(&value as *const u32 as *const _), 4) };
     if set.is_err() {
         eprintln!("notifications: could not set {name} for {key} ({set:?})");
     }
+    set.is_ok()
 }
 
-fn delete(key: &str, name: &str) {
+/// Whether it is gone (or was never there).
+fn delete(key: &str, name: &str) -> bool {
     let (k, n) = (crate::win::wide(key), crate::win::wide(name));
-    let _ = unsafe { RegDeleteKeyValueW(HKEY_CURRENT_USER, PCWSTR(k.as_ptr()), PCWSTR(n.as_ptr())) };
+    let deleted = unsafe { RegDeleteKeyValueW(HKEY_CURRENT_USER, PCWSTR(k.as_ptr()), PCWSTR(n.as_ptr())) };
+    let gone = deleted.is_ok() || deleted == windows::Win32::Foundation::ERROR_FILE_NOT_FOUND;
+    if !gone {
+        eprintln!("notifications: could not delete {name} for {key} ({deleted:?})");
+    }
+    gone
+}
+
+/// Whether Windows' "Allow notifications to play sounds" is on (absent: on, its default).
+pub fn sounds_allowed() -> bool {
+    dword(SETTINGS, "NOC_GLOBAL_SETTING_ALLOW_NOTIFICATION_SOUND") != Some(0)
 }
 
 /// Where what each app had is written down.

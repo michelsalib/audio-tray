@@ -22,7 +22,7 @@ pub mod time;
 mod view;
 
 pub use view::{Badge, Panel};
-pub use view::banner::glance;
+pub use view::banner::{display_changed, glance, listening};
 pub mod zones;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -149,14 +149,11 @@ pub fn open(config: &crate::config::Config, panel: Panel) {
 /// bell icon"): the bell is the notifications' button, and Windows keeps its place.
 pub fn show_bell() {
     use windows::core::w;
-    use windows::Win32::System::Registry::{RegGetValueW, RegSetKeyValueW, HKEY_CURRENT_USER, REG_DWORD, RRF_RT_REG_DWORD};
+    use windows::Win32::System::Registry::{RegSetKeyValueW, HKEY_CURRENT_USER, REG_DWORD};
     const KEY: windows::core::PCWSTR = w!(r"Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced");
     const NAME: windows::core::PCWSTR = w!("ShowNotificationIcon");
-    let mut value = 0u32;
-    let mut size = 4u32;
-    let read = unsafe { RegGetValueW(HKEY_CURRENT_USER, KEY, NAME, RRF_RT_REG_DWORD, None, Some(&mut value as *mut u32 as *mut _), Some(&mut size)) };
     // Shown already (or never set: Windows' default shows it).
-    if read.is_err() || value != 0 {
+    if crate::win::hkcu_dword(KEY, NAME) != Some(0) {
         return;
     }
     let one = 1u32;
@@ -202,23 +199,25 @@ pub fn notifications_changed(config: &crate::config::Config) {
     }
 }
 
-/// Dev: banners of what is listed ([`view::banner::preview`]).
 /// Dev: the banners' simulation ([`view::banner::simulate`]); `false` when a check failed.
 #[cfg(feature = "dev")]
 pub fn simulate_banners() -> bool {
     view::banner::simulate()
 }
 
+/// Dev: the digest's banner ([`view::banner::preview_digest`]).
 #[cfg(feature = "dev")]
 pub fn preview_digest(seconds: u64) {
     view::banner::preview_digest(seconds);
 }
 
+/// Dev: a listed notification's banner clicked ([`view::banner::preview_click`]).
 #[cfg(feature = "dev")]
 pub fn preview_click(id: u32, dry: bool) {
     view::banner::preview_click(id, dry);
 }
 
+/// Dev: banners of what is listed ([`view::banner::preview`]).
 #[cfg(feature = "dev")]
 pub fn preview_banners(count: usize, seconds: u64) {
     view::banner::preview(count, seconds);
@@ -234,8 +233,7 @@ pub fn merges_notices(config: &crate::config::Config) -> bool {
 /// Audio Tray shows every notification itself: the bell's list is on, and Settings' take-over.
 /// Not while a screen reader runs: Windows' own banners are the ones it reads aloud, so they stay.
 pub fn handed_over(config: &crate::config::Config) -> bool {
-    let c = &config.calendar;
-    c.enabled && c.notifications && c.take_over && !screen_reader()
+    merges_notices(config) && config.calendar.take_over && !screen_reader()
 }
 
 /// A screen reader (Narrator, NVDA, JAWS) is running, as it tells Windows.

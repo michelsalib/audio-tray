@@ -193,8 +193,7 @@ fn middle_click(down: bool, pt: POINT) -> bool {
     let root: HWND = unsafe { GetAncestor(hwnd, GA_ROOT) };
     let class = crate::win::class_name(root);
     // The bell's (Do not disturb, or clear all, as `[calendar] bell_middle_click` says).
-    let on_bell = (CLOCK_HOVER.load(Relaxed) && BELL_HOVER.load(Relaxed)) || in_rect(&BELL_RECT, pt);
-    let posted = if on_bell && BELL_MIDDLE_TAKEN.load(Relaxed) && matches!(class.as_str(), "Shell_TrayWnd" | "Shell_SecondaryTrayWnd") {
+    let posted = if on_clock_part(pt) == Some(true) && BELL_MIDDLE_TAKEN.load(Relaxed) && matches!(class.as_str(), "Shell_TrayWnd" | "Shell_SecondaryTrayWnd") {
         super::post(super::WM_BELL_MIDDLE, 0, 0)
     } else if in_slot(pt) && wheel_belongs_to_tray(&class, crate::taskbar::buttons_up()) {
         super::post(super::WM_STRIP_MIDDLE, crate::taskbar::flow_code(flow_at(pt)), 0)
@@ -310,18 +309,33 @@ static MEASURING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool:
 /// Automation from a thread of our own (in our process: nothing runs in Explorer for it, and a slow
 /// answer holds up no one). The element under the pointer, or its nearest ancestor, is the clock's
 /// (`SystemTray.OmniButtonLeft`) or the bell's (`SystemTray.AccentButton`, the one in the clock's
-/// button the TAP said the pointer is over).
+/// button the TAP said the pointer is over). One long-lived thread, its UI Automation made once.
 pub(super) fn measure_parts() {
     use std::sync::atomic::Ordering::SeqCst;
+    static WORKER: std::sync::OnceLock<Option<std::sync::mpsc::Sender<()>>> = std::sync::OnceLock::new();
     if MEASURING.swap(true, SeqCst) {
         return;
     }
-    let spawned = std::thread::Builder::new().name("clock-rects".into()).spawn(|| {
-        use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED};
-        use windows::Win32::UI::Accessibility::{CUIAutomation, IUIAutomation};
+    let worker = WORKER.get_or_init(|| {
+        let (send, receive) = std::sync::mpsc::channel::<()>();
+        std::thread::Builder::new().name("clock-rects".into()).spawn(move || measure_worker(receive)).ok().map(|_| send)
+    });
+    if !worker.as_ref().is_some_and(|w| w.send(()).is_ok()) {
+        MEASURING.store(false, SeqCst);
+    }
+}
+
+/// [`measure_parts`]' thread: a measurement per word.
+fn measure_worker(receive: std::sync::mpsc::Receiver<()>) {
+    use std::sync::atomic::Ordering::SeqCst;
+    use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED};
+    use windows::Win32::UI::Accessibility::{CUIAutomation, IUIAutomation};
+    let automation: Option<IUIAutomation> = unsafe {
+        CoInitializeEx(None, COINIT_MULTITHREADED).ok().ok().and_then(|_| CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER).ok())
+    };
+    while receive.recv().is_ok() {
         let measured = (|| -> Option<(usize, RECT)> {
-            unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.ok().ok()?;
-            let automation: IUIAutomation = unsafe { CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER) }.ok()?;
+            let automation = automation.as_ref()?;
             let mut pt = POINT::default();
             unsafe { windows::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut pt) }.ok()?;
             let walker = unsafe { automation.ControlViewWalker() }.ok()?;
@@ -344,13 +358,9 @@ pub(super) fn measure_parts() {
             set_part_rect(part, tap_proto::pack_rect(r.left, r.top, r.right, r.bottom));
         }
         MEASURING.store(false, SeqCst);
-    });
-    if spawned.is_err() {
-        MEASURING.store(false, SeqCst);
     }
 }
 
-/// Whether `pt` is in a rect kept by [`set_part_rect`].
 /// The bell's middle on the screen, when it has been measured: where a banner going to the list
 /// flies.
 pub fn bell_point() -> Option<POINT> {
@@ -362,6 +372,27 @@ pub fn bell_point() -> Option<POINT> {
     Some(POINT { x: (left + right) / 2, y: (top + bottom) / 2 })
 }
 
+/// Whether `pt` is on the clock's button: `Some(true)` on its bell, `Some(false)` on the clock.
+/// Over it as the TAP last said (and within reach of where the pointer entered, so a stale word
+/// cannot take presses elsewhere), else inside where each was measured.
+fn on_clock_part(pt: POINT) -> Option<bool> {
+    use std::sync::atomic::Ordering::Relaxed;
+    if CLOCK_HOVER.load(Relaxed) {
+        let at = unpack(CLOCK_AT.load(Relaxed));
+        if (pt.x - at.x).abs() > CLOCK_REACH || (pt.y - at.y).abs() > CLOCK_REACH {
+            return None;
+        }
+        Some(BELL_HOVER.load(Relaxed))
+    } else if in_rect(&BELL_RECT, pt) {
+        Some(true)
+    } else if in_rect(&CLOCK_RECT, pt) {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+/// Whether `pt` is in a rect kept by [`set_part_rect`].
 fn in_rect(rect: &std::sync::atomic::AtomicI64, pt: POINT) -> bool {
     let packed = rect.load(std::sync::atomic::Ordering::Relaxed);
     if packed == 0 {
@@ -386,19 +417,7 @@ fn clock_click(down: bool, pt: POINT) -> bool {
     if !CLOCK_TAKEN.load(Relaxed) {
         return false;
     }
-    let bell = if CLOCK_HOVER.load(Relaxed) {
-        let at = unpack(CLOCK_AT.load(Relaxed));
-        if (pt.x - at.x).abs() > CLOCK_REACH || (pt.y - at.y).abs() > CLOCK_REACH {
-            return false;
-        }
-        BELL_HOVER.load(Relaxed)
-    } else if in_rect(&BELL_RECT, pt) {
-        true
-    } else if in_rect(&CLOCK_RECT, pt) {
-        false
-    } else {
-        return false;
-    };
+    let Some(bell) = on_clock_part(pt) else { return false };
     if bell && !BELL_TAKEN.load(Relaxed) {
         // Windows' own notification centre.
         return false;
@@ -472,7 +491,7 @@ fn in_slot(pt: POINT) -> bool {
     icon_rect().is_some_and(|slot| pt.x >= slot.left && pt.x < slot.right && pt.y >= slot.top && pt.y < slot.bottom)
 }
 
-/// The D or N of a shortcut taken for the calendar: its release goes too.
+/// The V, D or N of a shortcut taken: its release goes too.
 static SHORTCUT_HELD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Win+Ctrl+V (Windows' shortcut for its sound output) opens the audio panel, while on.

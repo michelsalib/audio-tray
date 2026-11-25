@@ -99,6 +99,12 @@ const WM_ICON_RECT_CHECK: u32 = WM_APP + 41;
 pub(super) const WM_STRIP_MIDDLE: u32 = WM_APP + 43;
 /// From the mouse hook: a middle click on the bell; see [`on_bell_middle_click`].
 pub(super) const WM_BELL_MIDDLE: u32 = WM_APP + 44;
+/// A banner's word on an app listening (`crate::calendar::listening`): `wParam` 1, the microphone
+/// muted (a click), 0, only the alert dismissed (a right click).
+pub(crate) const WM_BANNER_LISTENING: u32 = WM_APP + 45;
+/// The display changed (resolution, scale, work area): posted by [`wndproc`] so it is handled with
+/// the queue; the banners move.
+const WM_DISPLAY_CHANGED: u32 = WM_APP + 46;
 
 /// The receiver window's timer for the next timed notice (`osd::TIMER_ID` is the other one).
 const NOTICE_TIMER: usize = 0x4E54;
@@ -121,13 +127,13 @@ const SETTLE: Duration = Duration::from_millis(350);
 /// The message window, for producers on other threads.
 static WINDOW: AtomicIsize = AtomicIsize::new(0);
 
-/// Post to the tray's message window from any thread. `false` when there is no tray (the dev CLI
-/// modes) or the post failed.
 /// The bell's middle on the screen, when measured (a banner going to the list flies there).
 pub(crate) fn bell_point() -> Option<windows::Win32::Foundation::POINT> {
     hook::bell_point()
 }
 
+/// Post to the tray's message window from any thread. `false` when there is no tray (the dev CLI
+/// modes) or the post failed.
 pub(crate) fn post(message: u32, wparam: usize, lparam: isize) -> bool {
     let raw = WINDOW.load(Ordering::SeqCst);
     raw != 0
@@ -300,14 +306,14 @@ pub fn run(backend: WasapiBackend, settings: bool) -> Result<()> {
 
     let devices = backend.enumerate_flow(Flow::Output).map(|d| d.len()).unwrap_or(0);
     let gestures = if taskbar::buttons_up() {
-        "left click cycles a segment, right click opens the panel"
+        "left click opens the panel, middle click mutes or switches, right click opens the menu"
     } else {
-        "no strip — either button opens the panel"
+        "no strip — left click opens the panel, right click the menu"
     };
     println!("tray: created ({devices} output device(s)); {gestures}.");
 
     // The passive surface; the app works without it.
-    if let Err(e) = crate::pill::create(&config.pill) {
+    if let Err(e) = crate::pill::create(&pill_config(&config)) {
         eprintln!("pill: unavailable ({e:#})");
     }
 
@@ -323,7 +329,7 @@ pub fn run(backend: WasapiBackend, settings: bool) -> Result<()> {
     crate::pill::set_batteries(config.batteries.enabled && config.batteries.pill_alert, config.batteries.enabled && config.batteries.pill_card);
     let mut hub = crate::hub::State::default();
     hub.set_low_battery_at(config.batteries.warn_at());
-    hub.handed_over = crate::calendar::merges_notices(&config);
+    hub.merges_notices = crate::calendar::merges_notices(&config);
 
     TRAY.with(|cell| {
         *cell.borrow_mut() = Some(Tray {
@@ -378,8 +384,9 @@ pub fn run(backend: WasapiBackend, settings: bool) -> Result<()> {
     crate::integrations::stop();
 
     crate::calendar::close();
-    // Do not disturb Audio Tray set ends with it.
+    // Windows' banners back: Audio Tray is no longer there to show its own.
     crate::calendar::takeover::apply(false);
+    // Do not disturb Audio Tray set ends with it.
     crate::calendar::focus::release();
     crate::settings::destroy();
     crate::pill::destroy();
@@ -422,6 +429,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         crate::calendar::takeover::apply(false);
         return LRESULT(0);
     }
+    // The screen changed (its resolution, its scale, the taskbar's room): where the clock and the
+    // bell were measured is no longer where they are, and the banners move.
+    {
+        use windows::Win32::UI::WindowsAndMessaging::{SPI_SETWORKAREA, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_SETTINGCHANGE};
+        if msg == WM_DISPLAYCHANGE || msg == WM_DPICHANGED || (msg == WM_SETTINGCHANGE && wparam.0 == SPI_SETWORKAREA.0 as usize) {
+            hook::set_part_rect(tap_proto::PART_FORGET, 0);
+            let _ = unsafe { PostMessageW(Some(hwnd), WM_DISPLAY_CHANGED, WPARAM(0), LPARAM(0)) };
+            return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
+        }
+    }
     if !is_ours(msg, wparam.0) {
         return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
     }
@@ -447,6 +464,8 @@ fn is_ours(msg: u32, wparam: usize) -> bool {
             | WM_TRAY_CLICK
             | WM_STRIP_MIDDLE
             | WM_BELL_MIDDLE
+            | WM_BANNER_LISTENING
+            | WM_DISPLAY_CHANGED
             | WM_ENDPOINT_VOLUME
             | WM_ICON_CHECK
             | crate::hub::WM_HUB_EVENTS
@@ -512,6 +531,17 @@ fn handle(msg: Queued) {
         crate::settings::WM_OPEN_SETTINGS => {
             open_settings();
             crate::settings::show_page(msg.wparam);
+        }
+        WM_DISPLAY_CHANGED => crate::calendar::display_changed(),
+        WM_BANNER_LISTENING => {
+            with_tray(|tray| {
+                if msg.wparam == 1 {
+                    tray.set_microphone_muted(true);
+                }
+                // Said: the alert goes (until another app starts listening).
+                tray.hub.acknowledge(&crate::hub::Notice::Listening { app: String::new(), user: String::new() });
+                tray.hub_changed();
+            });
         }
         crate::calendar::WM_CALENDAR if msg.wparam == crate::calendar::CLOSE => {
             let (x, y) = (msg.lparam as u16 as i16, (msg.lparam >> 16) as u16 as i16);
@@ -662,8 +692,6 @@ fn on_action(action: Action) {
     });
 }
 
-/// Whether a middle click on the bell is Audio Tray's: its notifications are on, and the click does
-/// something (else it is Windows').
 /// A notice, while Audio Tray shows every notification: a Windows notification of Audio Tray's
 /// own (listed with the others, and shown by the banners as they are), or for a layout switch a
 /// glance that is not kept.
@@ -675,49 +703,69 @@ fn hand_over(notice: &crate::hub::Notice, config: &Config) {
         return;
     }
     use crate::lang::{french, tr};
-    let shown = match notice {
+    use crate::toast::{Outgoing, TAG};
+    let plain = |title: String, body: String, tag: String| Outgoing { title, body, link: None, reminder: false, tag };
+    let outgoing = match notice {
         Notice::KeyboardSwitched { keyboard, layout } => {
             crate::calendar::glance(layout, keyboard);
             return;
         }
         // Each tagged with what it is (`toast::TAG`), for the banner that draws it.
-        Notice::AudioMoved { to, from } => crate::toast::show_with(
-            &if french() { format!("Son sur {to}") } else { format!("Sound now on {to}") },
-            &if french() { format!("{from} est déconnecté.") } else { format!("{from} disconnected.") },
-            None,
-            false,
-            &format!("{}audio", crate::toast::TAG),
+        Notice::AudioMoved { to, from } => plain(
+            if french() { format!("Son sur {to}") } else { format!("Sound now on {to}") },
+            if french() { format!("{from} est déconnecté.") } else { format!("{from} disconnected.") },
+            format!("{TAG}audio"),
         ),
-        Notice::LowBattery { name, level, .. } => crate::toast::show_with(
-            &if french() { format!("Batterie faible : {name}") } else { format!("{name} battery low") },
-            &if french() { format!("Il reste {level} %. Pensez à la recharger.") } else { format!("{level}% left. Time to charge it.") },
-            None,
-            false,
-            // One per device: two low at once are two notifications.
-            &format!("{}battery/{level}/{:x}", crate::toast::TAG, name.bytes().fold(0u32, |h, b| h.wrapping_mul(31).wrapping_add(b as u32))),
-        ),
+        Notice::LowBattery { name, level, .. } => low_battery(name, *level),
         Notice::Meeting { title, line, url, lasts } => {
             // When it starts (its notice lasts until two minutes past): its banner counts down.
             let start = crate::calendar::time::now() + *lasts as i64 - 120;
-            let tag = format!("{}meeting/{start}", crate::toast::TAG);
-            crate::toast::show_with(title, line, url.as_deref().map(|url| (tr("Join", "Rejoindre"), url)), true, &tag)
+            Outgoing {
+                title: title.clone(),
+                body: line.clone(),
+                link: url.clone().map(|url| (tr("Join", "Rejoindre").to_string(), url)),
+                reminder: true,
+                tag: format!("{TAG}meeting/{start}"),
+            }
         }
-        Notice::FocusDone { minutes } => crate::toast::show_with(
-            tr("Focus done", "Concentration terminée"),
-            &if french() { format!("{minutes} min de concentration. Faites une pause.") } else { format!("{minutes} minutes of focus. Take a break.") },
-            None,
-            false,
-            &format!("{}focus/{minutes}", crate::toast::TAG),
+        Notice::FocusDone { minutes } => plain(
+            tr("Focus done", "Concentration terminée").to_string(),
+            if french() { format!("{minutes} min de concentration. Faites une pause.") } else { format!("{minutes} minutes of focus. Take a break.") },
+            format!("{TAG}focus/{minutes}"),
         ),
         Notice::NewTrack { .. } | Notice::Listening { .. } => return,
     };
-    if let Err(e) = shown {
-        eprintln!("notifications: could not show Audio Tray's own ({e:#})");
+    // Off the tray thread: Windows' notification platform can take its time.
+    crate::toast::send(outgoing);
+}
+
+/// A device's low battery, as a notification in Windows' language: tagged (`toast::TAG`) so the
+/// banner draws its battery, one per device (two low at once are two notifications), a device's
+/// next warning replacing its last (the level is in the words, not the tag).
+fn low_battery(name: &str, level: u8) -> crate::toast::Outgoing {
+    use crate::lang::french;
+    let device = name.bytes().fold(0u32, |h, b| h.wrapping_mul(31).wrapping_add(b as u32));
+    crate::toast::Outgoing {
+        title: if french() { format!("Batterie faible : {name}") } else { format!("{name} battery low") },
+        body: if french() { format!("Il reste {level} %. Pensez à la recharger.") } else { format!("{level}% left. Time to charge it.") },
+        link: None,
+        reminder: false,
+        tag: format!("{}battery/{device:x}", crate::toast::TAG),
     }
 }
 
+/// The pill's settings as the pill takes them: its alert for an app listening goes to the banners
+/// while the bell is Audio Tray's (one kind of notice, one look).
+fn pill_config(config: &Config) -> crate::config::Pill {
+    let mut pill = config.pill.clone();
+    pill.listening_alerts &= !crate::calendar::merges_notices(config);
+    pill
+}
+
+/// Whether a middle click on the bell is Audio Tray's: its notifications are on, and the click does
+/// something (else it is Windows').
 fn bell_middle_taken(config: &Config) -> bool {
-    config.calendar.enabled && config.calendar.notifications && config.calendar.bell_middle_click != crate::config::BellMiddleClick::Nothing
+    crate::calendar::merges_notices(config) && config.calendar.bell_middle_click != crate::config::BellMiddleClick::Nothing
 }
 
 /// A middle click on the bell (the hook's, [`WM_BELL_MIDDLE`]): Do not disturb on or off, or every
@@ -766,9 +814,9 @@ fn on_middle_click(flow: Flow) {
     });
 }
 
-/// A click on the plain notification icon. Right click opens the flyout; left click does too,
-/// unless a strip is up — the shell invokes the icon under the strip, so a segment's click also
-/// arrives here, and the strip's own handler is the one that opens it.
+/// A click on the plain notification icon. Right click opens the menu ([`context_menu`]); left
+/// click opens the flyout, unless a strip is up — the shell invokes the icon under the strip, so a
+/// segment's click also arrives here, and the strip's own handler is the one that opens it.
 fn on_tray_click(button: usize, packed: isize) {
     if button == 1 && taskbar::buttons_up() {
         println!("tray: left click on the strip — its own handler opens the panel");
@@ -797,7 +845,14 @@ fn context_menu() {
     const SOUND: usize = 1;
     const SETTINGS: usize = 2;
     const QUIT: usize = 3;
+    thread_local! {
+        /// The menu is up: a second right click meanwhile opens no second one.
+        static MENU_OPEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
     let Some(owner) = taskbar::receiver() else { return };
+    if MENU_OPEN.with(|open| open.replace(true)) {
+        return;
+    }
     // In Windows' language, as the panels and Settings.
     let items = [
         (SOUND, HSTRING::from(tr("Sound settings", "Paramètres du son"))),
@@ -816,10 +871,18 @@ fn context_menu() {
         let _ = GetCursorPos(&mut at);
         // Without the foreground, the menu would not close on a click elsewhere.
         let _ = SetForegroundWindow(owner);
+        // Its modal loop drains the queue as the panel's does: the strip, the banners and the
+        // hub stay live while it is open.
+        let was_draining = DRAINING.with(|draining| draining.replace(false));
         let chosen = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_BOTTOMALIGN | TPM_CENTERALIGN, at.x, at.y, None, owner, None);
+        DRAINING.with(|draining| draining.set(was_draining));
+        // Windows' advice for a menu of a window in the background: a message after it, so the
+        // next click opens it again rather than only dismissing it.
+        let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(Some(owner), windows::Win32::UI::WindowsAndMessaging::WM_NULL, Default::default(), Default::default());
         let _ = DestroyMenu(menu);
         chosen.0 as usize
     };
+    MENU_OPEN.with(|open| open.set(false));
     match chosen {
         SOUND => {
             crate::win::shell_open("ms-settings:sound", None);
@@ -997,7 +1060,7 @@ impl Tray {
         if connectors(&before) != connectors(c) {
             crate::integrations::reconfigure(&before, c);
         }
-        crate::pill::configure(&c.pill);
+        crate::pill::configure(&pill_config(c));
         if before.motion != c.motion {
             crate::config::set_motion(c.motion);
             crate::pill::motion_changed();
@@ -1022,11 +1085,11 @@ impl Tray {
         crate::calendar::set_shortcut(self.config.calendar.enabled && self.config.calendar.shortcut);
         hook::set_clock_taken(self.config.calendar.enabled, self.config.calendar.notifications);
         hook::set_bell_middle_taken(bell_middle_taken(&self.config));
-        let bell = |c: &Config| c.calendar.enabled && c.calendar.notifications;
-        if bell(&self.config) && !bell(&before) {
+        use crate::calendar::merges_notices;
+        if merges_notices(&self.config) && !merges_notices(&before) {
             crate::calendar::show_bell();
         }
-        self.hub.handed_over = crate::calendar::merges_notices(&self.config);
+        self.hub.merges_notices = merges_notices(&self.config);
         if crate::calendar::handed_over(&before) != crate::calendar::handed_over(&self.config) {
             crate::calendar::follow_takeover(&self.config);
         }
@@ -1151,15 +1214,11 @@ impl Tray {
         self.apply_tooltip();
         let low = std::mem::take(&mut self.hub.fresh_low);
         let b = &self.config.batteries;
-        if !(b.enabled && b.toast) || self.hub.handed_over {
+        if !(b.enabled && b.toast) || self.hub.merges_notices {
             return;
         }
         for battery in low {
-            let title = format!("{} battery low", battery.name);
-            let body = format!("{}% left. Time to charge it.", battery.level);
-            if let Err(e) = crate::toast::show(&title, &body) {
-                eprintln!("batteries: could not show the notification ({e:#})");
-            }
+            crate::toast::send(low_battery(&battery.name, battery.level));
         }
     }
 
@@ -1211,6 +1270,14 @@ impl Tray {
         }
         let (_, next) = self.hub.expire(Instant::now());
         crate::pill::update(&self.hub);
+        // An app listening: the banners' red alert while the bell is Audio Tray's (the pill's otherwise).
+        let listening = (self.config.pill.listening_alerts && crate::calendar::merges_notices(&self.config))
+            .then(|| self.hub.notices.iter().rev().find_map(|(n, _)| match n {
+                crate::hub::Notice::Listening { app, user } => Some((app.clone(), user.clone())),
+                _ => None,
+            }))
+            .flatten();
+        crate::calendar::listening(listening);
         crate::settings::follow(&self.hub);
         if let (Some(next), Some(window)) = (next, taskbar::receiver()) {
             // One-shot: the handler re-arms for whatever is due next.
@@ -1306,7 +1373,7 @@ impl Tray {
                     if let Err(e) = self.config.save() {
                         eprintln!("pill: could not save its place ({e:#})");
                     }
-                    crate::pill::configure(&self.config.pill);
+                    crate::pill::configure(&pill_config(&self.config));
                     crate::settings::sync(&self.config);
                 }
             }
@@ -1847,6 +1914,8 @@ mod tests {
             WM_ICON_RECT_CHECK,
             WM_STRIP_MIDDLE,
             WM_BELL_MIDDLE,
+            WM_BANNER_LISTENING,
+            WM_DISPLAY_CHANGED,
             crate::calendar::WM_CALENDAR,
             tap_proto::WM_TASKBAR_ACTION,
             tap_proto::WM_TASKBAR_RESTARTED,

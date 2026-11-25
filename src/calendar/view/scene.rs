@@ -355,7 +355,8 @@ pub struct Input {
     pub empty: String,
     pub list_scroll: f32,
     pub focus_label: String,
-    pub focus_running: bool,
+    /// The focus timer's minutes left, while it runs (shown on its button).
+    pub focus_left: Option<i64>,
     pub detail: Option<Detail>,
     pub hover: Option<Hit>,
     /// Where the pointer rested on `hover`: its tooltip shows by that target.
@@ -717,6 +718,20 @@ pub struct Banner {
     pub confetti: Vec<(f32, f32, [u8; 3], u8)>,
 }
 
+/// Audio Tray's own colours: its notices' (a battery amber or red, a meeting blue, focus green), a
+/// call's buttons (green to answer, red to decline), and the digest's purple.
+pub(super) const AMBER: [u8; 3] = [0xF2, 0xA3, 0x3A];
+pub(super) const RED: [u8; 3] = [0xE5, 0x48, 0x4D];
+pub(super) const BLUE: [u8; 3] = [0x2F, 0x86, 0xE0];
+pub(super) const GREEN: [u8; 3] = [0x3F, 0xBF, 0x7F];
+pub(super) const PURPLE: [u8; 3] = [0xB5, 0x5C, 0xC4];
+
+/// A banner's time line: in from each side, up from the card's foot (to its top), and its height,
+/// in DIPs.
+pub(super) const LINE_INSET: f32 = 20.0;
+pub(super) const LINE_UP: f32 = 5.0;
+pub(super) const LINE_H: f32 = 2.0;
+
 /// A banner's card.
 pub fn banner(b: &Banner) -> Scene {
     let h = 6.0 + BANNER_HEAD_H + b.toast.height() + 8.0;
@@ -745,7 +760,7 @@ pub fn banner(b: &Banner) -> Scene {
     let r = R::new(8.0, line.bottom(), W - 16.0, b.toast.height());
     notification(&mut ink, r, &b.toast);
     let spot = R::new(r.x + 12.0, r.y + 12.0, 36.0, 36.0);
-    let tint = b.tint.unwrap_or([0xB5, 0x5C, 0xC4]);
+    let tint = b.tint.unwrap_or(PURPLE);
     if let Some(phase) = b.pulse {
         // A call: two rings going out from the caller, one after the other.
         for k in 0..2 {
@@ -757,7 +772,7 @@ pub fn banner(b: &Banner) -> Scene {
     }
     if let Some(left) = b.left {
         // Its time left, along its foot: brighter while the pointer holds it.
-        let track = R::new(20.0, h - 5.0, W - 40.0, 2.0);
+        let track = R::new(LINE_INSET, h - LINE_UP, W - 2.0 * LINE_INSET, LINE_H);
         ink.draw(track, Draw::Rect { fill: Fill::Rgba(tint, 40), radius: 1.0 });
         let run = R::new(track.x, track.y, track.w * left.clamp(0.0, 1.0), track.h);
         ink.draw(run, Draw::Rect { fill: Fill::Rgba(tint, if b.paused { 255 } else { 190 }), radius: 1.0 });
@@ -774,24 +789,41 @@ const GLANCE_H: f32 = 52.0;
 /// A glance: news for a moment, never listed (a keyboard layout switched). Not a notification's
 /// card but Audio Tray's own solid accent pill: its glyph in a disc, its words, and a hairline
 /// running down the time it has left (`left`, 1 to 0).
-pub fn glance(glyph: char, title: &str, body: &str, left: f32, hover: bool) -> Scene {
+pub fn glance(glyph: char, title: &str, body: &str, left: f32, hover: Option<Hit>, tint: Option<[u8; 3]>, closable: bool) -> Scene {
     let words_w = text_w(title, Font::Strong).max(text_w(body, Font::Caption));
-    let w = (8.0 + 36.0 + 12.0 + words_w + 24.0).clamp(180.0, W);
+    // Room for its close button at the right end, when it has one.
+    let close_w = if closable { 36.0 } else { 0.0 };
+    let w = (8.0 + 36.0 + 12.0 + words_w + 24.0 + close_w).clamp(180.0, W);
     let main = R::new(0.0, 0.0, w, GLANCE_H);
-    let mut ink = Ink2::new(None, None, None);
+    let mut ink = Ink2::new(hover, None, None);
     let round = GLANCE_H / 2.0;
-    ink.draw(main, Draw::Rect { fill: if hover { Fill::AccentHover } else { Fill::Accent }, radius: round });
-    ink.hit(main, Hit::Dismiss(0));
+    // The accent, or a colour of its own (an alert's red), its words then in white.
+    let lit = hover == Some(Hit::Toast(0));
+    let (fill, ink_main, ink_soft) = match tint {
+        Some(rgb) => (Fill::Rgba(rgb, if lit { 225 } else { 255 }), Ink::Rgba([0xFF; 3], 255), Ink::Rgba([0xFF; 3], 205)),
+        None => (if lit { Fill::AccentHover } else { Fill::Accent }, Ink::OnAccent, Ink::OnAccent2),
+    };
+    ink.draw(main, Draw::Rect { fill, radius: round });
+    // A click on it does its thing (a glance just goes); its close button only closes it.
+    ink.hit(main, Hit::Toast(0));
     let disc = R::new(8.0, 8.0, 36.0, 36.0);
     ink.draw(disc, Draw::Rect { fill: Fill::OnAccentWash, radius: 18.0 });
-    ink.glyph(disc, glyph, Font::Icon, Ink::OnAccent);
+    ink.glyph(disc, glyph, Font::Icon, ink_main);
     let tx = disc.right() + 12.0;
-    let tw = w - tx - 20.0;
+    let tw = w - tx - 20.0 - close_w;
     if body.is_empty() {
-        ink.text(R::new(tx, 0.0, tw, GLANCE_H), title, Font::Strong, Ink::OnAccent, Align::Left);
+        ink.text(R::new(tx, 0.0, tw, GLANCE_H), title, Font::Strong, ink_main, Align::Left);
     } else {
-        ink.text(R::new(tx, 7.0, tw, 20.0), title, Font::Strong, Ink::OnAccent, Align::Left);
-        ink.text(R::new(tx, 26.0, tw, 18.0), body, Font::Caption, Ink::OnAccent2, Align::Left);
+        ink.text(R::new(tx, 7.0, tw, 20.0), title, Font::Strong, ink_main, Align::Left);
+        ink.text(R::new(tx, 26.0, tw, 18.0), body, Font::Caption, ink_soft, Align::Left);
+    }
+    if closable {
+        let x = R::new(w - 14.0 - 28.0, (GLANCE_H - 28.0) / 2.0, 28.0, 28.0);
+        if hover == Some(Hit::Dismiss(0)) {
+            ink.draw(x, Draw::Rect { fill: Fill::OnAccentWash, radius: 14.0 });
+        }
+        ink.glyph(x, '\u{E711}', Font::IconSmall, ink_main);
+        ink.hit(x, Hit::Dismiss(0));
     }
     // The time left, along the foot inside the curve.
     let run = w - 2.0 * round;
@@ -809,7 +841,7 @@ fn art(ink: &mut Ink2, spot: R, art: &Art) {
             let body = R::new(spot.x + 4.0, spot.y + 11.0, 25.0, 14.0);
             ink.draw(body, Draw::Outline { ink: Ink::Text, radius: 3.0 });
             ink.draw(R::new(body.right(), body.y + 4.0, 3.0, 6.0), Draw::Rect { fill: Fill::Rgba([0xFF; 3], 200), radius: 1.0 });
-            let fill = if *low { [0xE5, 0x48, 0x4D] } else { [0xF2, 0xA3, 0x3A] };
+            let fill = if *low { RED } else { AMBER };
             let inner = R::new(body.x + 2.5, body.y + 2.5, (body.w - 5.0) * level.clamp(0.04, 1.0), body.h - 5.0);
             ink.draw(inner, Draw::Rect { fill: Fill::Rgba(fill, 255), radius: 1.5 });
         }
@@ -1022,8 +1054,8 @@ fn notification(ink: &mut Ink2, r: R, toast: &Toast) {
                     let pill = R::new(bx, row.y + 2.0, pw, row.h - 4.0);
                     // A call answers in green and declines in red, as phones do.
                     let call = match hit {
-                        Hit::Action(_, 0) if toast.call && buttons >= 2 => Some(([0x3F, 0xBF, 0x7F], [0x08, 0x15, 0x0E])),
-                        Hit::Action(_, n) if toast.call && buttons >= 2 && n + 1 == buttons => Some(([0xE5, 0x48, 0x4D], [0xFF, 0xFF, 0xFF])),
+                        Hit::Action(_, 0) if toast.call && buttons >= 2 => Some((GREEN, [0x08, 0x15, 0x0E])),
+                        Hit::Action(_, n) if toast.call && buttons >= 2 && n + 1 == buttons => Some((RED, [0xFF, 0xFF, 0xFF])),
                         _ => None,
                     };
                     match call {
@@ -1091,7 +1123,8 @@ fn center(ink: &mut Ink2, card: R, input: &Input) -> (R, f32) {
         count_chip(ink, head.x + 8.0 + title_w + 4.0, head.y + 7.0, input.unread);
     }
     // Round buttons from the right, as every panel's header: clear all (when there is anything),
-    // Do not disturb, the focus timer (lit while it runs; its tooltip says the time left).
+    // Do not disturb, the focus timer (while it runs, a lit pill saying the minutes left; a click
+    // stops it).
     let mut right = head.right();
     let mut button = |ink: &mut Ink2, glyph: char, hit: Hit, on: bool| {
         let r = R::new(right - 32.0, head.y, 32.0, 32.0);
@@ -1102,7 +1135,20 @@ fn center(ink: &mut Ink2, card: R, input: &Input) -> (R, f32) {
         button(ink, '\u{E74D}', Hit::ClearAll, false);
     }
     button(ink, '\u{E708}', Hit::Quiet, input.quiet);
-    button(ink, '\u{E916}', Hit::Focus, input.focus_running);
+    match input.focus_left {
+        Some(minutes) => {
+            let label = format!("{minutes} min");
+            let label_w = text_w(&label, Font::CaptionStrong);
+            // The glyph where the round button has it, the minutes after it.
+            let r = R::new(right - (32.0 + label_w + 12.0), head.y, 32.0 + label_w + 12.0, 32.0);
+            let fill = ink.accent(Hit::Focus);
+            ink.draw(r, Draw::Rect { fill, radius: 16.0 });
+            ink.hit(r, Hit::Focus);
+            ink.glyph(R::new(r.x, r.y, 32.0, 32.0), '\u{E916}', Font::Icon, Ink::OnAccent);
+            ink.text(R::new(r.x + 30.0, r.y, label_w + 2.0, r.h), label, Font::CaptionStrong, Ink::OnAccent, Align::Left);
+        }
+        None => button(ink, '\u{E916}', Hit::Focus, false),
+    }
     footer(ink, card, '\u{EA8F}', words().notification_settings);
 
     let top = head.bottom() + 6.0;
@@ -1303,7 +1349,6 @@ fn footer(ink: &mut Ink2, card: R, glyph: char, label: &str) {
     ink.glyph(gear, '\u{E713}', Font::Icon, Ink::Text);
 }
 
-
 /// A day cell's height and its circle's size, for the grid.
 fn cell_size(grid: Grid) -> (f32, f32) {
     match grid {
@@ -1473,7 +1518,7 @@ mod tests {
             empty: "Nothing else this week".into(),
             list_scroll: 0.0,
             focus_label: "Focus 25 min".into(),
-            focus_running: false,
+            focus_left: None,
             detail: None,
             hover: None,
             show_tip: None,

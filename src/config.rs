@@ -83,11 +83,12 @@ pub struct Calendar {
     pub colors: std::collections::BTreeMap<String, String>,
     /// Win+Alt+D opens this calendar, Win+N the notifications.
     pub shortcut: bool,
-    /// The bell beside the clock opens Audio Tray's notifications (Windows' own otherwise).
+    /// The bell beside the clock opens Audio Tray's notifications (Windows' own otherwise), and
+    /// Audio Tray's own notices (batteries, audio devices, reminders) join that list instead of
+    /// the pill.
     pub notifications: bool,
     /// Audio Tray shows every notification itself: Windows' banners are turned off (and given back
-    /// when this is off or the app quits), its own show above the bell, and its own notices
-    /// (batteries, audio devices, reminders) join Windows' list instead of the pill.
+    /// when this is off or the app quits), and its own show above the bell.
     pub take_over: bool,
     /// What a middle click on the bell does.
     pub bell_middle_click: BellMiddleClick,

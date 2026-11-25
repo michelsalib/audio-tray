@@ -99,7 +99,7 @@ thread_local! {
 /// A drawing kit set aside for the next panel: its surface and decoded pictures kept (why it is
 /// kept), its last frame's pixels let go.
 fn spare(mut gfx: Gfx) -> Gfx {
-    gfx.pixels = Vec::new();
+    gfx.forget_frame();
     gfx
 }
 
@@ -227,7 +227,7 @@ pub fn toggle(config: &Config, panel: Panel) {
     }
 }
 
-
+/// Close the open panel, if any (its closing animation first).
 pub fn close() {
     let open = OPEN.with(Cell::get);
     if open == 0 || CLOSING.with(|c| c.replace(true)) {
@@ -242,8 +242,9 @@ pub fn close() {
 pub type Badge = (String, u32, u32);
 
 /// The bell's badge: an accent pill with `count` (how many wait), drawn at the taskbar's scale into
-/// a PNG the TAP paints beside the bell (beside the clock without one). Gives the file, its width in DIPs and the taskbar's DPI.
-/// Each look (count, colour, scale) is its own file, drawn once: XAML caches images by address.
+/// a PNG the TAP paints beside the bell (beside the clock without one). Gives the file, its width in
+/// DIPs and the taskbar's DPI. Each look (count, colour, scale) is its own file, drawn once: XAML
+/// caches images by address.
 pub fn badge(count: u32) -> Option<Badge> {
     // Asked at every tick: the same count within a while is the same badge (the accent and scale
     // seldom change, and are looked up again after).
@@ -261,39 +262,58 @@ pub fn badge(count: u32) -> Option<Badge> {
 /// How long a badge looked up stands for its count.
 const BADGE_FRESH: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// The focus timer on the bell, with nothing waiting: an accent pie, `done` of it filled, over a
-/// faint full disc. Drawn like the count's badge (same file naming and cleanup), in twelve steps.
+/// The focus timer on the bell, with nothing waiting: an accent ring (a timer at a glance, from
+/// its first second) around an accent pie, `done` of it filled, over a faint disc. A badge file
+/// as the count's ([`badge_file`]), in twelve steps, the first showing from the start.
 pub fn focus_pie(done: f32) -> Option<Badge> {
+    let step = ((done.clamp(0.0, 1.0) * 12.0).ceil() as u32).clamp(1, 12);
+    badge_file(&format!("timer{step}"), BADGE_H, |pen, fill, _| {
+        let disc = R::new(0.0, 0.0, BADGE_H, BADGE_H);
+        pen.fill(disc, BADGE_H / 2.0, fill.alpha(0.18));
+        pen.ring(disc, 1.5, fill);
+        pen.pie(R::new(3.0, 3.0, BADGE_H - 6.0, BADGE_H - 6.0), step as f32 / 12.0, fill);
+    })
+}
+
+/// A badge's height, in DIPs.
+const BADGE_H: f32 = 14.0;
+
+/// The badge file `name`, `w` DIPs wide, drawn by `draw` (given the pen, the accent fill and the
+/// figures' ink) at the taskbar's scale, once per look: `<name>-b<fill>-<ink>-<dpi>.png`. A new
+/// look (another colour or scale) clears the old looks' files.
+fn badge_file(name: &str, w: f32, draw: impl FnOnce(&paint::Pen, Color, Color)) -> Option<Badge> {
     use windows::Win32::UI::HiDpi::GetDpiForWindow;
     use windows::Win32::UI::WindowsAndMessaging::FindWindowW;
-    const H: f32 = 14.0;
-    let step = (done.clamp(0.0, 1.0) * 12.0).round() as u32;
     let tray = unsafe { FindWindowW(w!("Shell_TrayWnd"), None) }.ok();
     let dpi = tray.map_or(96, |t| unsafe { GetDpiForWindow(t) }).max(96);
     let scale = dpi as f32 / 96.0;
-    let accent = Palette::current().accent;
-    let (fill, ink) = badge_colours(accent);
+    let (fill, ink) = badge_colours(Palette::current().accent);
     let hex = |c: Color| format!("{:02x}{:02x}{:02x}", (c.0 * 255.0) as u8, (c.1 * 255.0) as u8, (c.2 * 255.0) as u8);
     let dir = std::path::PathBuf::from(std::env::var_os("LOCALAPPDATA")?).join("audio-tray").join("badges");
-    let path = dir.join(format!("pie{step}-b{}-{}-{dpi}.png", hex(fill), hex(ink)));
+    let look = format!("-b{}-{}-{dpi}.png", hex(fill), hex(ink));
+    let path = dir.join(format!("{name}{look}"));
     if !path.exists() {
         let _ = std::fs::create_dir_all(&dir);
-        let size = ((H * scale).round() as u32, (H * scale).round() as u32);
+        // Another colour or scale: the old looks' files go.
+        for old in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            if !old.file_name().to_string_lossy().ends_with(&look) {
+                let _ = std::fs::remove_file(old.path());
+            }
+        }
+        let size = ((w * scale).round() as u32, (BADGE_H * scale).round() as u32);
         let drawn = Gfx::new().and_then(|mut gfx| {
             gfx.frame(size, scale, |pen| {
                 pen.clear(Color(0.0, 0.0, 0.0, 0.0));
-                let disc = R::new(0.0, 0.0, H, H);
-                pen.fill(disc, H / 2.0, fill.alpha(0.3));
-                pen.pie(R::new(1.5, 1.5, H - 3.0, H - 3.0), step as f32 / 12.0, fill);
+                draw(pen, fill, ink);
             })?;
             gfx.save_png(&path)
         });
         if let Err(e) = drawn {
-            eprintln!("calendar: could not draw the focus pie ({e:#})");
+            eprintln!("calendar: could not draw the bell's badge {name} ({e:#})");
             return None;
         }
     }
-    Some((path.to_string_lossy().into_owned(), H as u32, dpi))
+    Some((path.to_string_lossy().into_owned(), w as u32, dpi))
 }
 
 /// A badge's fill and its figures' ink: the accent, dark figures on a light one (as the shell's).
@@ -303,45 +323,15 @@ fn badge_colours(accent: Color) -> (Color, Color) {
     (accent, ink)
 }
 
+/// A small accent bubble with `count` on the bell's shoulder (the TAP keeps the bell itself a
+/// plain outline meanwhile, so the two do not run together).
 fn draw_badge(count: u32) -> Option<Badge> {
-    use windows::Win32::UI::HiDpi::GetDpiForWindow;
-    use windows::Win32::UI::WindowsAndMessaging::FindWindowW;
-    // A small accent bubble on the bell's shoulder (the TAP keeps the bell itself a plain outline
-    // meanwhile, so the two do not run together).
-    const H: f32 = 14.0;
-    let tray = unsafe { FindWindowW(w!("Shell_TrayWnd"), None) }.ok();
-    let dpi = tray.map_or(96, |t| unsafe { GetDpiForWindow(t) }).max(96);
-    let scale = dpi as f32 / 96.0;
     let label = if count > 99 { "99+".to_string() } else { count.to_string() };
-    let w = (H + 6.0 * (label.chars().count().max(1) - 1) as f32).round();
-    let (fill, ink) = badge_colours(Palette::current().accent);
-    let hex = |c: Color| format!("{:02x}{:02x}{:02x}", (c.0 * 255.0) as u8, (c.1 * 255.0) as u8, (c.2 * 255.0) as u8);
-    let dir = std::path::PathBuf::from(std::env::var_os("LOCALAPPDATA")?).join("audio-tray").join("badges");
-    let look = format!("-b{}-{}-{dpi}.png", hex(fill), hex(ink));
-    let path = dir.join(format!("{label}{look}").replace('+', "p"));
-    if !path.exists() {
-        let _ = std::fs::create_dir_all(&dir);
-        // Another colour or scale: the old looks go (one per count is kept for the current one).
-        for old in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
-            if !old.file_name().to_string_lossy().ends_with(&look) {
-                let _ = std::fs::remove_file(old.path());
-            }
-        }
-        let size = ((w * scale).round() as u32, (H * scale).round() as u32);
-        let drawn = Gfx::new().and_then(|mut gfx| {
-            gfx.frame(size, scale, |pen| {
-                pen.clear(Color(0.0, 0.0, 0.0, 0.0));
-                pen.fill(R::new(0.0, 0.0, w, H), H / 2.0, fill);
-                pen.text(&label, paint::Font::TinyStrong, R::new(0.0, -0.5, w, H), ink, paint::Align::Center);
-            })?;
-            gfx.save_png(&path)
-        });
-        if let Err(e) = drawn {
-            eprintln!("calendar: could not draw the clock's badge ({e:#})");
-            return None;
-        }
-    }
-    Some((path.to_string_lossy().into_owned(), w as u32, dpi))
+    let w = (BADGE_H + 6.0 * (label.chars().count().max(1) - 1) as f32).round();
+    badge_file(&label.replace('+', "p"), w, |pen, fill, ink| {
+        pen.fill(R::new(0.0, 0.0, w, BADGE_H), BADGE_H / 2.0, fill);
+        pen.text(&label, paint::Font::TinyStrong, R::new(0.0, -0.5, w, BADGE_H), ink, paint::Align::Center);
+    })
 }
 
 /// The events or the notifications changed: show them.
@@ -570,7 +560,7 @@ fn empty_input() -> scene::Input {
         empty: String::new(),
         list_scroll: 0.0,
         focus_label: String::new(),
-        focus_running: false,
+        focus_left: None,
         detail: None,
         hover: None,
         show_tip: None,
@@ -810,7 +800,7 @@ impl View {
             empty,
             list_scroll: self.list_scroll,
             focus_label,
-            focus_running: focus.is_some(),
+            focus_left: focus.map(|end| (((end - now) + 59) / 60).max(1)),
             detail,
             hover: self.hover,
             show_tip: self.show_tip,

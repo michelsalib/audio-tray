@@ -126,10 +126,11 @@ pub const HANDOVER_ACCEPTED: isize = 1;
 pub const HANDOVER_DECLINED: isize = 2;
 /// App → TAP `WM_COPYDATA` tag ("ATC1"): how the clock reads, as init-data pairs: `time` and
 /// `date` (`GetTimeFormatEx`/`GetDateFormatEx` patterns, empty for the locale's, `date=-` to hide
-/// it), `oneline`, `top` (text after the time), `badge` (the unread count) and `badge_image`,
-/// `badge_width`, `badge_scale` (the app-drawn badge PNG, its width in DIPs, its pixels per DIP;
-/// on the bell's corner when Windows shows the bell, else beside the clock), `quiet` (Windows keeps
-/// notifications quiet: the bell is drawn crossed).
+/// it), `oneline`, `badge` (how many wait) and `badge_image`, `badge_width`, `badge_scale` (the
+/// app-drawn badge PNG, its width in DIPs, its pixels per DIP; on the bell's corner when Windows
+/// shows the bell, else beside the clock), `quiet` (Windows keeps notifications quiet: the bell is
+/// drawn crossed), `waiting` (`1`/`0`: Audio Tray's list has some or none, the bell filled or
+/// plain; empty: the shell's fill).
 /// `release=1` alone hands the clock back to the shell (the TAP undoes its changes and stops).
 pub const CLOCK_MAGIC: usize = 0x4154_4331;
 

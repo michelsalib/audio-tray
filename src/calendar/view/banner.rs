@@ -45,8 +45,11 @@ const CLASS: PCWSTR = w!("AudioTrayBanner");
 const MAX: usize = 3;
 /// Between two banners, in DIPs.
 const GAP: f32 = 8.0;
+/// How often a banner checks whether its time is up.
 const LIFE_TIMER: usize = 1;
 const LIFE_MS: u32 = 200;
+/// How often, while notifications are held back, the quiet is looked at for its end.
+const QUIET_POLL_MS: u32 = 2000;
 /// Its frames: every compositor tick or so (Windows timers step by 15.6 ms), so that its time line
 /// glides rather than steps.
 const FRAME_TIMER: usize = 2;
@@ -60,10 +63,18 @@ const FRAME_CALL_MS: u32 = 33;
 const FRAME_STILL_MS: u32 = 250;
 /// A layout switch's glyph (the edge pill's).
 const GLYPH_KEYBOARD: char = '\u{E765}';
+/// An app listening: the microphone (the edge pill's).
+const GLYPH_MIC: char = '\u{E720}';
+/// Pictures of Audio Tray's own: a meeting's calendar, focus done's check, a call's phone, the
+/// digest's moon (what came during a quiet time).
+const GLYPH_MEETING: char = '\u{E787}';
+const GLYPH_FOCUS: char = '\u{E73E}';
+const GLYPH_PHONE: char = '\u{E717}';
+const GLYPH_DIGEST: char = '\u{E708}';
+/// A battery this low (or lower) is drawn red, else amber.
+const LOW_LEVEL: u8 = 15;
 /// A layout switch: a glance.
 const GLANCE: Duration = Duration::from_millis(1500);
-/// A reply left half typed (the user went elsewhere): the banner waits this long for them.
-const ABANDONED: Duration = Duration::from_secs(60);
 /// A notification asking to stay long (`duration="long"`), as Windows keeps it.
 const LONG: Duration = Duration::from_secs(25);
 /// How long a sound waits for Windows' store to say whether it is wanted.
@@ -79,11 +90,7 @@ const POP_FOR: Duration = Duration::from_millis(320);
 const FRESH_S: i64 = 120;
 /// The quick reactions a chat's banner offers beside Reply.
 const QUICK: [&str; 3] = ["👍", "❤️", "😂"];
-/// Audio Tray's own colours for its own notices, and the digest's.
-const AMBER: [u8; 3] = [0xF2, 0xA3, 0x3A];
-const RED: [u8; 3] = [0xE5, 0x48, 0x4D];
-const BLUE: [u8; 3] = [0x2F, 0x86, 0xE0];
-const GREEN: [u8; 3] = [0x3F, 0xBF, 0x7F];
+use super::scene::{AMBER, BLUE, GREEN, PURPLE, RED};
 
 /// What a banner is.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -94,6 +101,10 @@ enum Is {
     Glance,
     /// What came during a quiet time, summed up; opens the list.
     Digest,
+    /// An app listening outside a call (a privacy alert, the edge pill's red one): a red glance on
+    /// a timer like the others (gone sooner when the recording stops); a click mutes the
+    /// microphone, its × or a right click dismisses it.
+    Listening,
 }
 
 /// One of Audio Tray's own notices, from its tag (`audio-tray/<kind>/<detail>`): drawn with its
@@ -116,7 +127,12 @@ impl Own {
         let Some(rest) = t.rich.tag.strip_prefix(crate::toast::TAG) else { return Own::No };
         let mut parts = rest.split('/');
         match parts.next() {
-            Some("battery") => Own::Battery(parts.next().and_then(|l| l.parse().ok()).unwrap_or(10)),
+            // Its level is in its words ("12% left"), not its tag: a tag is what Windows replaces
+            // by, and each device's warning replaces its last.
+            Some("battery") => {
+                let digits: String = t.body.chars().skip_while(|c| !c.is_ascii_digit()).take_while(char::is_ascii_digit).collect();
+                Own::Battery(digits.parse().unwrap_or(10))
+            }
             Some("audio") => Own::Audio,
             Some("meeting") => parts.next().and_then(|s| s.parse().ok()).map_or(Own::No, Own::Meeting),
             Some("focus") => Own::Focus,
@@ -154,8 +170,6 @@ struct Shown {
     more_at: Option<Instant>,
     /// Its app's colour.
     tint: Option<[u8; 3]>,
-    /// The pointer holds the banners: its time line stops, brighter.
-    paused: bool,
     /// Drawn with its time line full and empty, for a frame that only moves the line: composed
     /// from the two (a few rows copied), not drawn again. Gone when anything else changes.
     line: Option<Line>,
@@ -215,6 +229,10 @@ struct Banners {
     config: Option<Config>,
     /// Each app's colour, from its logo, by its id (`None`: a grey logo, the accent then).
     tints: Vec<(String, Option<[u8; 3]>)>,
+    /// Drawing kits of banners gone, their pixels freed, for the next ones. Never dropped: this
+    /// thread's storage goes at the process's end, after COM, and releasing Direct2D's objects
+    /// then crashes it (a few kits left to the process's end cost nothing).
+    spare: Vec<std::mem::ManuallyDrop<Gfx>>,
 }
 
 thread_local! {
@@ -231,6 +249,7 @@ thread_local! {
         quiet_timer: 0,
         config: None,
         tints: Vec::new(),
+        spare: Vec::new(),
     });
 }
 
@@ -302,18 +321,11 @@ pub fn list_changed(config: &Config) {
     if super::OPEN.with(std::cell::Cell::get) != 0 {
         return; // the panel lists them
     }
-    // Quiet (Do not disturb, a full-screen app, a presentation): only what Windows lets through
-    // by default, calls, alarms and reminders; the rest summed up once it is over.
-    let quiet = crate::calendar::focus::active() || busy();
-    let (fresh, held): (Vec<Toast>, Vec<Toast>) = fresh.into_iter().partition(|t| !quiet || t.rich.sticky);
-    if !held.is_empty() {
-        println!("banners: {} quiet (Do not disturb, a full-screen app, a presentation, or the screen locked)", held.len());
-        hold_for_digest(held.iter().map(|t| t.id));
-    }
     use crate::calendar::takeover::{wants_banner, windows_shows};
     // Each one ours to show: not one whose banners were off before Audio Tray took them, nor the
     // first of an app (or site) Windows had no settings for, whose banner Windows shows itself.
-    let ours: Vec<Toast> = fresh
+    // Sorted out first: neither would be summed up in the digest either.
+    let fresh: Vec<Toast> = fresh
         .into_iter()
         .filter(|t| {
             let windows = windows_shows(&t.aumid);
@@ -323,6 +335,14 @@ pub fn list_changed(config: &Config) {
             !windows && wants_banner(&t.aumid)
         })
         .collect();
+    // Quiet (Do not disturb, a full-screen app, a presentation): only what Windows lets through
+    // by default, calls, alarms and reminders; the rest summed up once it is over.
+    let quiet = crate::calendar::focus::active() || busy();
+    let (ours, held): (Vec<Toast>, Vec<Toast>) = fresh.into_iter().partition(|t| !quiet || t.rich.sticky);
+    if !held.is_empty() {
+        println!("banners: {} quiet (Do not disturb, a full-screen app, a presentation, or the screen locked)", held.len());
+        hold_for_digest(held.iter().map(|t| t.id));
+    }
     // A sound for those known to want one now; the others' once their payload is read.
     let sound = ours.iter().any(|t| rich::read_for(t.id) && !t.rich.silent);
     for toast in ours {
@@ -386,12 +406,12 @@ fn hold_for_digest(ids: impl Iterator<Item = u32>) {
     with(|b| {
         b.held.extend(ids);
         if b.quiet_timer == 0 {
-            b.quiet_timer = unsafe { SetTimer(None, 0, 2000, Some(quiet_over)) };
+            b.quiet_timer = unsafe { SetTimer(None, 0, QUIET_POLL_MS, Some(quiet_over)) };
         }
     });
 }
 
-/// Every two seconds while notifications are held back: the quiet over, the digest shows.
+/// Every [`QUIET_POLL_MS`] while notifications are held back: the quiet over, the digest shows.
 unsafe extern "system" fn quiet_over(_: HWND, _: u32, timer: usize, _: u32) {
     let still = std::panic::catch_unwind(|| crate::calendar::focus::active() || busy()).unwrap_or(false);
     if still {
@@ -409,6 +429,11 @@ unsafe extern "system" fn quiet_over(_: HWND, _: u32, timer: usize, _: u32) {
 /// What came during a quiet time and is still waiting, in one banner: how many, from which apps,
 /// the latest sender; its button opens the list.
 fn digest(held: &[u32]) {
+    // Banners handed back to Windows meanwhile: Windows' centre has them, no digest of Audio Tray's.
+    let handed_over = with(|b| b.config.as_ref().is_some_and(crate::calendar::handed_over)).unwrap_or(false);
+    if !handed_over {
+        return;
+    }
     let list = notifications::list();
     let waiting: Vec<&Toast> = list.iter().filter(|t| held.contains(&t.id)).collect();
     if waiting.is_empty() || super::OPEN.with(std::cell::Cell::get) != 0 {
@@ -427,14 +452,8 @@ fn digest(held: &[u32]) {
     // Newest first in Windows' list.
     let latest = waiting.first().map(|w| if w.title.is_empty() { w.app.clone() } else { w.title.clone() }).unwrap_or_default();
     let body = format!("{} · {by_app}. {}", (t.away_count)(waiting.len()), (t.latest_from)(&latest));
-    let Some(id) = with(|b| {
-        b.next_own -= 1;
-        b.next_own
-    }) else {
-        return;
-    };
     let rich = rich::Rich { buttons: vec![rich::Action { label: t.show_them.to_string(), arguments: String::new(), kind: Kind::Foreground }], ..Default::default() };
-    let toast = Toast { id, app: "Audio Tray".into(), aumid: crate::toast::AUMID.into(), title: t.away.to_string(), body, at: crate::calendar::time::now(), logo: None, rich };
+    let Some(toast) = own_toast(t.away.to_string(), body, crate::toast::AUMID.into(), rich) else { return };
     println!("banners: the digest, {} waiting", waiting.len());
     show(toast, Is::Digest, Some(lifetime() * 2), None);
     chime();
@@ -463,33 +482,73 @@ pub fn glance(title: &str, body: &str) {
     if replaced.is_some() {
         return;
     }
-    let Some(id) = with(|b| {
-        b.next_own -= 1;
-        b.next_own
-    }) else {
-        return;
-    };
-    let toast = Toast {
-        id,
-        app: "Audio Tray".into(),
-        aumid: crate::toast::AUMID.into(),
-        title: title.to_string(),
-        body: body.to_string(),
-        at: crate::calendar::time::now(),
-        logo: None,
-        rich: Default::default(),
-    };
+    let Some(toast) = own_toast(title.to_string(), body.to_string(), crate::toast::AUMID.into(), Default::default()) else { return };
     show(toast, Is::Glance, Some(GLANCE), None);
 }
 
+/// A banner's notification of Audio Tray's own, never in Windows' list (a glance, the digest, an
+/// app listening), under `aumid`, with an id of its own (counted down from the top: Windows' count
+/// up from 1). `None` while the banners are busy.
+fn own_toast(title: String, body: String, aumid: String, rich: rich::Rich) -> Option<Toast> {
+    let id = with(|b| {
+        b.next_own -= 1;
+        b.next_own
+    })?;
+    Some(Toast { id, app: "Audio Tray".into(), aumid, title, body, at: crate::calendar::time::now(), logo: None, rich })
+}
+
+/// An app listening outside a call (`Some((app, user))`, the newest), or none any more: its red
+/// alert shows, the edge pill's no more, and goes on its timer (or when the recording stops, or
+/// when closed). Shown whatever the quiet (a privacy alert, not news), never listed.
+pub fn listening(who: Option<(String, String)>) {
+    let words = |app: &str| {
+        let t = super::words::words();
+        ((t.listening)(app), t.click_to_mute.to_string())
+    };
+    let current = with(|b| b.shown.iter().find(|s| s.is == Is::Listening && !leaving(s)).map(|s| (s.hwnd, s.toast.aumid.clone()))).flatten();
+    match (who, current) {
+        // The same app still: nothing to do.
+        (Some((_, user)), Some((_, shown))) if user == shown => {}
+        // Another app now: the alert says so.
+        (Some((app, user)), Some((hwnd, _))) => {
+            with(|b| {
+                let s = b.shown.iter_mut().find(|s| s.hwnd == hwnd)?;
+                (s.toast.title, s.toast.body) = words(&app);
+                s.toast.aumid = user;
+                b.refresh(hwnd);
+                b.place();
+                b.render(hwnd, 255, 0);
+                Some(())
+            });
+        }
+        (Some((app, user)), None) => {
+            let (title, body) = words(&app);
+            // The recording app in the place of the notifying one (its id, to know it again).
+            let Some(toast) = own_toast(title, body, user, Default::default()) else { return };
+            println!("banners: {app} is listening");
+            show(toast, Is::Listening, Some(lifetime()), None);
+        }
+        (None, Some((hwnd, _))) => {
+            with(|b| leave(b, hwnd, Exit::Slide));
+        }
+        (None, None) => {}
+    }
+}
+
 /// Every banner goes at once (the panel opened, which lists them; Audio Tray no longer shows
-/// them). A reply half typed goes to the panel's drafts: its box there opens with it.
+/// them). An app listening stays said (the panel does not say it). A reply half typed goes to the
+/// panel's drafts: its box there opens with it. Those held for the digest are seen too: no digest.
 pub fn clear() {
     let hwnds: Vec<HWND> = with(|b| {
+        if b.quiet_timer != 0 {
+            let _ = unsafe { KillTimer(None, b.quiet_timer) };
+            b.quiet_timer = 0;
+        }
+        b.held.clear();
         for s in b.shown.iter().filter(|s| s.draft.as_deref().is_some_and(|d| !d.is_empty())) {
             keep_draft(s.toast.id, s.draft.clone().unwrap_or_default());
         }
-        b.shown.iter().map(|s| s.hwnd).collect()
+        b.shown.iter().filter(|s| s.is != Is::Listening).map(|s| s.hwnd).collect()
     })
     .unwrap_or_default();
     for hwnd in hwnds {
@@ -520,9 +579,13 @@ fn busy() -> bool {
     unsafe { SHQueryUserNotificationState() }.is_ok_and(|state| state != QUNS_ACCEPTS_NOTIFICATIONS)
 }
 
-/// Windows' notification sound (its banners' own are off with them).
+/// Windows' notification sound (its banners' own are off with them), unless Windows' "Allow
+/// notifications to play sounds" is off.
 fn chime() {
     use windows::Win32::Media::Audio::{PlaySoundW, SND_ALIAS, SND_ASYNC, SND_NODEFAULT};
+    if !crate::calendar::takeover::sounds_allowed() {
+        return;
+    }
     let _ = unsafe { PlaySoundW(w!("Notification.Default"), None, SND_ALIAS | SND_ASYNC | SND_NODEFAULT) };
 }
 
@@ -690,47 +753,53 @@ fn released(until: Instant, since: Instant, now: Instant) -> Instant {
 fn scene_at(s: &Shown, left: Option<f32>) -> Scene {
     let t = &s.toast;
     let now = Instant::now();
+    if s.is == Is::Listening {
+        return scene::glance(GLYPH_MIC, &t.title, &t.body, left.unwrap_or(0.0), s.hover, Some(RED), true);
+    }
     if s.is == Is::Glance {
-        return scene::glance(GLYPH_KEYBOARD, &t.title, &t.body, left.unwrap_or(0.0), s.hover.is_some());
+        return scene::glance(GLYPH_KEYBOARD, &t.title, &t.body, left.unwrap_or(0.0), s.hover, None, false);
     }
     let words = super::words::words();
+    // Windows' animation effects off: every picture at rest from the start (the battery at its
+    // level, the speaker's bars still, no confetti, no rings, no pop).
+    let still = !animated();
     let age = now.duration_since(s.born).as_secs_f32();
-    let moving = (age / ART_FOR.as_secs_f32()).min(1.0);
+    let moving = if still { 1.0 } else { (age / ART_FOR.as_secs_f32()).min(1.0) };
     let own = Own::of(t);
     let mut body = t.body.clone();
+    if let Own::Meeting(start) = own {
+        // Counting down to it, then how long ago it began.
+        let to = start - crate::calendar::time::now();
+        body = if to > 0 { (words.starts_in)(to) } else { (words.started)((-to) / 60) };
+    }
     let (art, tint) = match (s.is, own) {
-        (Is::Digest, _) => (Art::Glyph { glyph: '\u{E708}', rgb: s.tint.unwrap_or([0xB5, 0x5C, 0xC4]) }, s.tint),
-        (_, Own::Battery(level)) => {
+        (Is::Digest, _) => (Art::Glyph { glyph: GLYPH_DIGEST, rgb: s.tint.unwrap_or(PURPLE) }, s.tint),
+        (_, Own::Battery(level)) if !still => {
             // Draining from a little fuller down to its level.
             let to = level as f32 / 100.0;
             let from = (to + 0.35).min(1.0);
             let eased = 1.0 - (1.0 - moving).powi(3);
-            (Art::Battery { level: from + (to - from) * eased, low: level <= 15 }, Some(if level <= 15 { RED } else { AMBER }))
+            let (_, tint) = own_look(own);
+            (Art::Battery { level: from + (to - from) * eased, low: level <= LOW_LEVEL }, tint)
         }
-        (_, Own::Audio) => {
+        (_, Own::Audio) if !still => {
             let playing = 1.0 - moving;
             let bars = std::array::from_fn(|n| 0.35 + playing * 0.6 * ((age * 9.0 + n as f32 * 1.3).sin() * 0.5 + 0.5));
             // The speaker is in the accent: the banner with it.
             (Art::Speaker { bars }, Some(accent()))
         }
-        (_, Own::Meeting(start)) => {
-            // Counting down to it, then how long ago it began.
-            let to = start - crate::calendar::time::now();
-            body = if to > 0 { (words.starts_in)(to) } else { (words.started)((-to) / 60) };
-            (Art::Glyph { glyph: '\u{E787}', rgb: BLUE }, Some(BLUE))
-        }
-        (_, Own::Focus) => (Art::Glyph { glyph: '\u{E73E}', rgb: GREEN }, Some(GREEN)),
+        (_, Own::Battery(_) | Own::Audio | Own::Meeting(_) | Own::Focus) => own_look(own),
         _ if s.more > 0 => {
             let mut faces = vec![face_of(t)];
             faces.extend(s.faces.iter().cloned());
             (Art::Faces(faces), s.tint)
         }
         // A call without the caller's photo: a phone on its colour, the rings around it.
-        _ if t.rich.call && t.rich.avatar.is_none() => (Art::Glyph { glyph: '\u{E717}', rgb: s.tint.unwrap_or(GREEN) }, s.tint),
+        _ if t.rich.call && t.rich.avatar.is_none() => (phone(s.tint), s.tint),
         _ => (Art::None, s.tint),
     };
     let more_pop = match s.more_at {
-        Some(at) if now.duration_since(at) < POP_FOR => 1.0 + 0.3 * (1.0 - now.duration_since(at).as_secs_f32() / POP_FOR.as_secs_f32()),
+        Some(at) if !still && now.duration_since(at) < POP_FOR => 1.0 + 0.3 * (1.0 - now.duration_since(at).as_secs_f32() / POP_FOR.as_secs_f32()),
         _ => 1.0,
     };
     // Confetti for a focus session done: falling and fading through the card's first seconds.
@@ -752,7 +821,7 @@ fn scene_at(s: &Shown, left: Option<f32>) -> Scene {
         Vec::new()
     };
     let call = t.rich.call;
-    let pulse = call.then(|| (age / 1.6) % 1.0);
+    let pulse = (call && !still).then(|| (age / 1.6) % 1.0);
     scene::banner(&scene::Banner {
         app: t.app.clone(),
         logo: t.logo.clone().map(|l| (t.aumid.clone(), l)),
@@ -782,7 +851,8 @@ fn scene_at(s: &Shown, left: Option<f32>) -> Scene {
         pressed: s.pressed,
         tint,
         left,
-        paused: s.paused,
+        // Held by the pointer: its time line stops, brighter.
+        paused: s.held_since.is_some(),
         more: s.more,
         more_pop,
         pulse,
@@ -793,33 +863,51 @@ fn scene_at(s: &Shown, left: Option<f32>) -> Scene {
 /// A notification's look in the panel's list, as its banner has it at rest: its picture (Audio
 /// Tray's own illustrated, a call's phone) and its app's colour.
 pub(super) fn list_look(t: &Toast) -> (Art, Option<[u8; 3]>) {
-    let accent = accent();
     match Own::of(t) {
-        Own::Battery(level) => {
-            let low = level <= 15;
-            (Art::Battery { level: level as f32 / 100.0, low }, Some(if low { RED } else { AMBER }))
-        }
-        Own::Audio => (Art::Speaker { bars: [0.5, 0.9, 0.65, 0.4] }, Some(accent)),
-        Own::Meeting(_) => (Art::Glyph { glyph: '\u{E787}', rgb: BLUE }, Some(BLUE)),
-        Own::Focus => (Art::Glyph { glyph: '\u{E73E}', rgb: GREEN }, Some(GREEN)),
         Own::No => {
-            let tint = with(|b| b.tint_of(t)).flatten().or(Some(accent));
+            let tint = with(|b| b.tint_of(t)).flatten().or(Some(accent()));
             if t.rich.call && t.rich.avatar.is_none() {
-                (Art::Glyph { glyph: '\u{E717}', rgb: tint.unwrap_or(GREEN) }, tint)
+                (phone(tint), tint)
             } else {
                 (Art::None, tint)
             }
         }
+        own => own_look(own),
     }
 }
 
+/// Audio Tray's own notice's picture and colour, at rest (`Own::No`: none).
+fn own_look(own: Own) -> (Art, Option<[u8; 3]>) {
+    match own {
+        Own::Battery(level) => {
+            let low = level <= LOW_LEVEL;
+            (Art::Battery { level: level as f32 / 100.0, low }, Some(if low { RED } else { AMBER }))
+        }
+        Own::Audio => (Art::Speaker { bars: SPEAKER_AT_REST }, Some(accent())),
+        Own::Meeting(_) => (Art::Glyph { glyph: GLYPH_MEETING, rgb: BLUE }, Some(BLUE)),
+        Own::Focus => (Art::Glyph { glyph: GLYPH_FOCUS, rgb: GREEN }, Some(GREEN)),
+        Own::No => (Art::None, None),
+    }
+}
+
+/// A call's phone, on the caller's app's colour (green without one).
+fn phone(tint: Option<[u8; 3]>) -> Art {
+    Art::Glyph { glyph: GLYPH_PHONE, rgb: tint.unwrap_or(GREEN) }
+}
+
+/// The speaker's bars still (in the list, or with animation effects off).
+const SPEAKER_AT_REST: [f32; 4] = [0.5, 0.9, 0.65, 0.4];
+
 /// Something moves on banner `s` (its picture, a call's rings, its count growing): drawn smoothly.
+/// With Windows' animation effects off, nothing does.
 fn lively(s: &Shown) -> bool {
     let now = Instant::now();
-    s.is == Is::Glance
-        || s.toast.rich.call
-        || (Own::of(&s.toast) != Own::No && now.duration_since(s.born) < ART_FOR)
-        || s.more_at.is_some_and(|at| now.duration_since(at) < POP_FOR)
+    // Glances (the layout's, an app listening): pills, drawn whole (their line is not a card's).
+    matches!(s.is, Is::Glance | Is::Listening)
+        || (animated()
+            && (s.toast.rich.call
+                || (Own::of(&s.toast) != Own::No && now.duration_since(s.born) < ART_FOR)
+                || s.more_at.is_some_and(|at| now.duration_since(at) < POP_FOR)))
 }
 
 /// A new banner, springing in at the corner.
@@ -835,7 +923,7 @@ fn show(toast: Toast, is: Is, life: Option<Duration>, chime_at: Option<Instant>)
         }
     };
     // A notification's card over Windows' acrylic; a glance draws its own pill, solid.
-    if is != Is::Glance {
+    if !matches!(is, Is::Glance | Is::Listening) {
         unsafe { crate::layered::style_panel(hwnd, crate::layered::CORNER_ROUND) };
     }
     // Over the oldest's room, a fourth sends it to the list: the oldest that would go anyway, never
@@ -852,15 +940,8 @@ fn show(toast: Toast, is: Is, life: Option<Duration>, chime_at: Option<Instant>)
         // Where they go, and how they look, read afresh for each: the primary display's corner by
         // the taskbar, as Windows' own. A change (the scale, the taskbar moved, the theme) moves
         // and redraws those showing too.
-        let (scale, rect, work) = monitor(POINT { x: 0, y: 0 });
-        crate::flyout::theme::refresh_mode();
-        let palette = Palette::current();
-        let changed = (b.scale, b.work, b.edge) != (scale, work, edge_of(&rect, &work)) || b.palette.as_ref().is_none_or(|p| p.bg != palette.bg);
-        b.scale = scale;
-        b.work = work;
-        b.edge = edge_of(&rect, &work);
-        b.palette = Some(palette);
-        let gfx = match Gfx::new() {
+        let changed = b.read_display();
+        let gfx = match b.spare.pop().map_or_else(Gfx::new, |kept| Ok(std::mem::ManuallyDrop::into_inner(kept))) {
             Ok(gfx) => gfx,
             Err(e) => {
                 eprintln!("banners: no drawing kit ({e:#})");
@@ -868,7 +949,7 @@ fn show(toast: Toast, is: Is, life: Option<Duration>, chime_at: Option<Instant>)
             }
         };
         let tint = match is {
-            Is::Glance => None,
+            Is::Glance | Is::Listening => None,
             Is::Digest => Some(accent()),
             Is::Listed => b.tint_of(&toast),
         };
@@ -889,9 +970,8 @@ fn show(toast: Toast, is: Is, life: Option<Duration>, chime_at: Option<Instant>)
             more: 0,
             more_at: None,
             tint,
-            paused: false,
             line: None,
-            scene: scene::glance(' ', "", "", 0.0, false),
+            scene: scene::glance(' ', "", "", 0.0, None, None, false),
             gfx,
             canvas: crate::layered::Canvas::new(),
             at: (0, 0),
@@ -903,16 +983,7 @@ fn show(toast: Toast, is: Is, life: Option<Duration>, chime_at: Option<Instant>)
         };
         s.scene = scene_of(&s);
         if changed {
-            // Those staying put at their new places (a glide from the old screen's coordinates
-            // would set off from nowhere); those leaving go on their way untouched.
-            for s in b.shown.iter_mut().filter(|s| !leaving(s)) {
-                s.at = (0, 0);
-                s.glide = None;
-            }
-            let all: Vec<HWND> = b.shown.iter().filter(|s| !leaving(s)).map(|s| s.hwnd).collect();
-            for other in all {
-                b.refresh(other);
-            }
+            b.replace_all();
         }
         b.shown.push(s);
         // The stack stays on screen: the oldest go to the list while it would run past the top.
@@ -947,6 +1018,22 @@ fn show(toast: Toast, is: Is, life: Option<Duration>, chime_at: Option<Instant>)
     }
 }
 
+/// The display changed (its resolution, its scale, the taskbar moved, the theme): those showing go
+/// to their new places, redrawn. Nothing showing, nothing done (the next banner reads it anyway).
+pub fn display_changed() {
+    with(|b| {
+        if b.shown.iter().all(leaving) || !b.read_display() {
+            return;
+        }
+        b.replace_all();
+        b.place();
+        let all: Vec<HWND> = b.shown.iter().filter(|s| !leaving(s)).map(|s| s.hwnd).collect();
+        for hwnd in all {
+            b.render(hwnd, 255, 0);
+        }
+    });
+}
+
 /// Banner `hwnd` goes as `exit` says; the others close up. The keyboard goes back to where it was
 /// if its reply box had it.
 fn leave(b: &mut Banners, hwnd: HWND, exit: Exit) {
@@ -974,8 +1061,11 @@ fn leave(b: &mut Banners, hwnd: HWND, exit: Exit) {
         Exit::ToBell => {
             let s = &b.shown[at];
             let from = (s.pos.0 + b.px(s.scene.w) / 2, s.pos.1 + b.px(s.scene.h) / 2);
-            // The bell where measured, else the taskbar's corner.
-            let bell = crate::tray::bell_point().map_or((b.work.right - b.px(40.0), b.work.bottom + b.px(24.0)), |p| (p.x, p.y));
+            // The bell where measured, else about where it sits by the taskbar's corner: in from
+            // the work area's right, and below its foot (on the taskbar).
+            const BELL_IN: f32 = 40.0;
+            const BELL_BELOW: f32 = 24.0;
+            let bell = crate::tray::bell_point().map_or((b.work.right - b.px(BELL_IN), b.work.bottom + b.px(BELL_BELOW)), |p| (p.x, p.y));
             Motion::ToBell { from, bell }
         }
     };
@@ -1011,7 +1101,10 @@ fn finish(b: &mut Banners, hwnd: HWND) {
         let _ = DestroyWindow(gone.hwnd);
     }
     let landed = matches!(gone.motion, Some((Motion::ToBell { .. }, _)));
-    drop(gone);
+    // Its drawing kit kept for the next (making one is the slow part of a banner's start).
+    if b.spare.len() < MAX {
+        b.spare.push(std::mem::ManuallyDrop::new(super::spare(gone.gfx)));
+    }
     b.place();
     if landed {
         crate::taskbar::ring_bell();
@@ -1092,6 +1185,34 @@ impl Banners {
         (dip * self.scale).round() as i32
     }
 
+    /// Where they go, and how they look, read afresh: the primary display's corner by the taskbar,
+    /// as Windows' own. Whether any of it changed (the scale, the taskbar moved, the theme).
+    fn read_display(&mut self) -> bool {
+        let (scale, rect, work) = monitor(POINT { x: 0, y: 0 });
+        crate::flyout::theme::refresh_mode();
+        let palette = Palette::current();
+        let edge = edge_of(&rect, &work);
+        let changed = (self.scale, self.work, self.edge) != (scale, work, edge) || self.palette.as_ref().is_none_or(|p| p.bg != palette.bg);
+        self.scale = scale;
+        self.work = work;
+        self.edge = edge;
+        self.palette = Some(palette);
+        changed
+    }
+
+    /// Those staying put at their new places, rebuilt (a glide from the old screen's coordinates
+    /// would set off from nowhere); those leaving go on their way untouched.
+    fn replace_all(&mut self) {
+        for s in self.shown.iter_mut().filter(|s| !leaving(s)) {
+            s.at = (0, 0);
+            s.glide = None;
+        }
+        let all: Vec<HWND> = self.shown.iter().filter(|s| !leaving(s)).map(|s| s.hwnd).collect();
+        for other in all {
+            self.refresh(other);
+        }
+    }
+
     /// App `toast`'s colour, from its logo, worked out once per app.
     fn tint_of(&mut self, toast: &Toast) -> Option<[u8; 3]> {
         if let Some((_, tint)) = self.tints.iter().find(|(a, _)| *a == toast.aumid) {
@@ -1117,7 +1238,8 @@ impl Banners {
         let Some(s) = self.shown.iter_mut().find(|s| s.hwnd == hwnd) else { return };
         let ms = if s.motion.is_some() || s.glide.is_some() {
             FRAME_MS
-        } else if s.toast.rich.call {
+        } else if s.toast.rich.call && animated() {
+            // Its rings (none with animation effects off: it stays still until answered).
             FRAME_CALL_MS
         } else if lively(s) {
             FRAME_MS
@@ -1179,39 +1301,29 @@ impl Banners {
             _ => (dx, alpha),
         };
         let at = (s.pos.0 + dx, s.pos.1);
-        let scale = self.scale;
-        self.draw_at(hwnd, scale, at, alpha);
+        self.paint(hwnd, 1.0, |_| at, alpha);
     }
 
     /// Draw banner `hwnd` `zoom` times its size (smaller as it flies into the bell), centred on
     /// `centre`. Its frame keeps its full size (only what is drawn in it shrinks): its surface, its
     /// decoded pictures and its window's bitmap stay as they are.
     fn render_zoomed(&mut self, hwnd: HWND, zoom: f32, centre: (i32, i32), alpha: u8) {
+        self.paint(hwnd, zoom, |(w, h)| (centre.0 - w as i32 / 2, centre.1 - h as i32 / 2), alpha);
+    }
+
+    /// Draw banner `hwnd` whole, `zoom` times its size, and put its window at `at(size in pixels)`,
+    /// `alpha` faded.
+    fn paint(&mut self, hwnd: HWND, zoom: f32, at: impl FnOnce((u32, u32)) -> (i32, i32), alpha: u8) {
         let scale = self.scale;
         let Some(palette) = self.palette.as_ref() else { return };
         let Some(s) = self.shown.iter_mut().find(|s| s.hwnd == hwnd) else { return };
         let Shown { gfx, scene, canvas, .. } = s;
         let size = (((scene.w * scale).round() as u32).max(1), ((scene.h * scale).round() as u32).max(1));
-        if gfx.frame_zoomed(size, scale, zoom, None, |pen, area| draw(pen, scene, palette, area)).is_err() {
-            return;
-        }
-        let at = (centre.0 - size.0 as i32 / 2, centre.1 - size.1 as i32 / 2);
-        let pixels = &gfx.pixels;
-        canvas.present(hwnd, (size.0 as i32, size.1 as i32), at, alpha, |dst| {
-            let n = dst.len().min(pixels.len());
-            dst[..n].copy_from_slice(&pixels[..n]);
-        });
-    }
-
-    fn draw_at(&mut self, hwnd: HWND, scale: f32, at: (i32, i32), alpha: u8) {
-        let Some(palette) = self.palette.as_ref() else { return };
-        let Some(s) = self.shown.iter_mut().find(|s| s.hwnd == hwnd) else { return };
-        let Shown { gfx, scene, canvas, .. } = s;
-        let size = (((scene.w * scale).round() as u32).max(1), ((scene.h * scale).round() as u32).max(1));
-        if let Err(e) = gfx.frame_in(size, scale, None, |pen, area| draw(pen, scene, palette, area)) {
+        if let Err(e) = gfx.frame_zoomed(size, scale, zoom, None, |pen, area| draw(pen, scene, palette, area)) {
             eprintln!("banners: could not draw ({e:#})");
             return;
         }
+        let at = at(size);
         let pixels = &gfx.pixels;
         canvas.present(hwnd, (size.0 as i32, size.1 as i32), at, alpha, |dst| {
             let n = dst.len().min(pixels.len());
@@ -1232,10 +1344,11 @@ impl Banners {
             let size = (((full.w * scale).round() as u32).max(1), ((full.h * scale).round() as u32).max(1));
             let px = |dip: f32| (dip * scale).round() as i32;
             let (w, h) = (size.0 as i32, size.1 as i32);
-            // The line as scene::banner lays it: 20 DIPs in from each side, 5 up from the foot,
-            // 2 high; a pixel more each way for its rounded ends' blending.
-            let rows = (h - px(5.0) - 1).max(0)..(h - px(3.0) + 1).min(h);
-            let columns = (px(20.0) - 1).max(0)..(w - px(20.0) + 1).min(w);
+            // The line as scene::banner lays it; a pixel more each way for its rounded ends'
+            // blending.
+            use super::scene::{LINE_H, LINE_INSET, LINE_UP};
+            let rows = (h - px(LINE_UP) - 1).max(0)..(h - px(LINE_UP - LINE_H) + 1).min(h);
+            let columns = (px(LINE_INSET) - 1).max(0)..(w - px(LINE_INSET) + 1).min(w);
             let row = w as usize * 4;
             let (from, to) = (rows.start as usize * row, rows.end as usize * row);
             // The empty one last: its whole frame primes the window's bitmap (all but the line is
@@ -1304,7 +1417,6 @@ impl Banners {
             match (held, s.held_since) {
                 (true, None) => {
                     s.held_since = Some(now);
-                    s.paused = true;
                     s.line = None;
                     flipped.push(s.hwnd);
                 }
@@ -1313,7 +1425,6 @@ impl Banners {
                         *until = released(*until, since, now);
                     }
                     s.held_since = None;
-                    s.paused = false;
                     s.line = None;
                     flipped.push(s.hwnd);
                 }
@@ -1411,6 +1522,14 @@ fn click(b: &mut Banners, hwnd: HWND, hit: Hit) -> Option<After> {
                 rich::invoke(toast.id, &toast.aumid, toast.rich.activator, &action.arguments, action.kind, Vec::new());
             }))
         }
+        // An app listening: the microphone muted (as the edge pill did), the alert said.
+        (Is::Listening, Hit::Toast(_)) => Some(Box::new(|| {
+            crate::tray::post(crate::tray::WM_BANNER_LISTENING, 1, 0);
+        })),
+        // Its close button: the alert said, the microphone left as it is.
+        (Is::Listening, Hit::Dismiss(_)) => Some(Box::new(|| {
+            crate::tray::post(crate::tray::WM_BANNER_LISTENING, 0, 0);
+        })),
         // Its X: to the list only, as Windows' banners do.
         (_, Hit::Toast(_) | Hit::Dismiss(_)) => None,
         _ => return None,
@@ -1602,7 +1721,8 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESUL
         }
         // Left for something else: the user chose where the keyboard went (it is not taken back).
         // With nothing typed the box closes and the banner goes on its way; with a reply half
-        // typed it waits a while for them, then goes to the list (the panel keeps the draft).
+        // typed it stays, with no time running, until it is sent or closed (its X, Escape back in
+        // it); the panel's box has the draft meanwhile too.
         WM_ACTIVATE if (wparam.0 & 0xFFFF) as u32 == WA_INACTIVE => {
             with(|b| {
                 let s = b.shown.iter_mut().find(|s| s.hwnd == hwnd)?;
@@ -1611,7 +1731,7 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESUL
                     s.draft = None;
                     s.until = Some(deadline(s, lifetime()));
                 } else {
-                    s.until = Some(deadline(s, ABANDONED));
+                    s.until = None;
                     keep_draft(s.toast.id, draft);
                 }
                 b.keys_from = None;
@@ -1624,6 +1744,10 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESUL
         }
         // A right click sends it to the list.
         WM_RBUTTONUP => {
+            // An app listening: the alert said, the microphone left as it is.
+            if with(|b| b.shown.iter().any(|s| s.hwnd == hwnd && s.is == Is::Listening)).unwrap_or(false) {
+                crate::tray::post(crate::tray::WM_BANNER_LISTENING, 0, 0);
+            }
             with(|b| leave(b, hwnd, Exit::Slide));
             Some(LRESULT(0))
         }
@@ -1687,6 +1811,10 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESUL
                 // Its time ran out: a notification flies into the bell (it is in the list); a glance,
                 // a sent reply and the digest simply go.
                 let exit = if s.is == Is::Listed && s.sent.is_none() { Exit::ToBell } else { Exit::Slide };
+                // An app listening, its time up: said (the alert does not come back for it).
+                if s.is == Is::Listening {
+                    crate::tray::post(crate::tray::WM_BANNER_LISTENING, 0, 0);
+                }
                 leave(b, hwnd, exit);
             });
             Some(LRESULT(0))
@@ -1699,24 +1827,7 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESUL
 /// for `seconds`. Windows' own banners are left alone.
 #[cfg(feature = "dev")]
 pub fn preview(count: usize, seconds: u64) {
-    use windows::Win32::UI::WindowsAndMessaging::{DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE};
-    let pump = |until: Instant| {
-        let mut msg = MSG::default();
-        while Instant::now() < until {
-            while unsafe { PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE) }.as_bool() {
-                unsafe {
-                    let _ = TranslateMessage(&msg);
-                    DispatchMessageW(&msg);
-                }
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-    };
-    notifications::start();
-    let deadline = Instant::now() + Duration::from_secs(8);
-    while !notifications::read_yet() && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(100));
-    }
+    wait_for_list();
     // Pictures and buttons read from Windows' store before showing.
     std::thread::sleep(Duration::from_millis(600));
     let list = notifications::list();
@@ -1733,31 +1844,26 @@ pub fn preview(count: usize, seconds: u64) {
             s.life = Some(Duration::from_secs(seconds + 10));
         }
     });
-    pump(Instant::now() + Duration::from_secs(seconds));
+    crate::win::pump_for(Duration::from_secs(seconds));
 }
 
-/// Dev: the digest, as it would show after a quiet time over everything listed now.
+/// Dev: Windows' list read (started, and waited for up to 8 s).
 #[cfg(feature = "dev")]
-pub fn preview_digest(seconds: u64) {
-    use windows::Win32::UI::WindowsAndMessaging::{DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE};
+fn wait_for_list() {
     notifications::start();
     let deadline = Instant::now() + Duration::from_secs(8);
     while !notifications::read_yet() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(100));
     }
+}
+
+/// Dev: the digest, as it would show after a quiet time over everything listed now.
+#[cfg(feature = "dev")]
+pub fn preview_digest(seconds: u64) {
+    wait_for_list();
     let ids: Vec<u32> = notifications::list().iter().map(|t| t.id).collect();
     digest(&ids);
-    let until = Instant::now() + Duration::from_secs(seconds);
-    let mut msg = MSG::default();
-    while Instant::now() < until {
-        while unsafe { PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE) }.as_bool() {
-            unsafe {
-                let _ = TranslateMessage(&msg);
-                DispatchMessageW(&msg);
-            }
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    crate::win::pump_for(Duration::from_secs(seconds));
 }
 
 #[cfg(feature = "dev")]
@@ -1771,7 +1877,7 @@ thread_local! {
 /// place, time left and drawn line recorded meanwhile, and checked. Returns whether all passed.
 #[cfg(feature = "dev")]
 pub fn simulate() -> bool {
-    use windows::Win32::UI::WindowsAndMessaging::{DispatchMessageW, GetWindowRect, IsWindow, PeekMessageW, SendMessageW, TranslateMessage, MSG, PM_REMOVE};
+    use windows::Win32::UI::WindowsAndMessaging::{GetWindowRect, IsWindow, SendMessageW};
 
     /// One look at every banner: its window, where it is, its size, its time left, its drawn cut,
     /// whether it is leaving.
@@ -1800,14 +1906,8 @@ pub fn simulate() -> bool {
     fn run(ms: u64, mut each: impl FnMut()) -> Vec<(u64, Vec<Look>)> {
         let start = Instant::now();
         let mut seen = Vec::new();
-        let mut msg = MSG::default();
         while start.elapsed() < Duration::from_millis(ms) {
-            while unsafe { PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE) }.as_bool() {
-                unsafe {
-                    let _ = TranslateMessage(&msg);
-                    DispatchMessageW(&msg);
-                }
-            }
+            crate::win::pump_messages();
             each();
             seen.push((start.elapsed().as_millis() as u64, look()));
             std::thread::sleep(Duration::from_millis(4));
@@ -2021,11 +2121,7 @@ pub fn simulate() -> bool {
 /// the app to take it.
 #[cfg(feature = "dev")]
 pub fn preview_click(id: u32, dry: bool) {
-    notifications::start();
-    let deadline = Instant::now() + Duration::from_secs(8);
-    while !notifications::read_yet() && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(100));
-    }
+    wait_for_list();
     let Some(toast) = notifications::list().into_iter().find(|t| t.id == id) else {
         println!("banners: {id} is not listed");
         return;
@@ -2119,12 +2215,15 @@ mod tests {
 
     #[test]
     fn audio_tray_s_own_notices_say_what_they_are_by_their_tag() {
-        let own = |tag: &str| {
-            let mut t = Toast { id: 1, app: "Audio Tray".into(), aumid: crate::toast::AUMID.into(), title: String::new(), body: String::new(), at: 0, logo: None, rich: Default::default() };
+        let said = |tag: &str, body: &str| {
+            let mut t = Toast { id: 1, app: "Audio Tray".into(), aumid: crate::toast::AUMID.into(), title: String::new(), body: body.into(), at: 0, logo: None, rich: Default::default() };
             t.rich.tag = tag.to_string();
             Own::of(&t)
         };
-        assert!(own("audio-tray/battery/12/3f2a") == Own::Battery(12));
+        let own = |tag: &str| said(tag, "");
+        // A battery's level from its words, in either language (its tag is the device's alone).
+        assert!(said("audio-tray/battery/3f2a", "12% left. Time to charge it.") == Own::Battery(12));
+        assert!(said("audio-tray/battery/3f2a", "Il reste 7 %. Pensez à la recharger.") == Own::Battery(7));
         assert!(own("audio-tray/audio") == Own::Audio);
         assert!(own("audio-tray/meeting/1795512345") == Own::Meeting(1795512345));
         assert!(own("audio-tray/focus/25") == Own::Focus);

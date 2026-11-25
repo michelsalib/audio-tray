@@ -109,9 +109,14 @@ static WIRED: Mutex<Vec<u64>> = Mutex::new(Vec::new());
 /// The clock's section was found without the clock in it (and reported).
 static MISSING: AtomicBool = AtomicBool::new(false);
 
+/// Turned off with the button split: [`wire`] puts it back whole at the next sweep (this runs off
+/// the XAML thread).
+static UNSPLIT_PENDING: AtomicBool = AtomicBool::new(false);
+
 pub fn set_enabled(on: bool) {
     if ENABLED.swap(on, Ordering::SeqCst) != on {
         logf!("clock: {}", if on { "clicks open audio-tray's calendar" } else { "left to the shell" });
+        UNSPLIT_PENDING.store(!on && !crate::lock(&SPLIT).is_empty(), Ordering::SeqCst);
     }
 }
 
@@ -197,7 +202,7 @@ fn walk(root: u64) -> Vec<u64> {
 /// Nothing left to wire: off, or every clock's button (and bell) has its handlers.
 pub fn settled() -> bool {
     if !ENABLED.load(Ordering::SeqCst) {
-        return true;
+        return !UNSPLIT_PENDING.load(Ordering::SeqCst);
     }
     let targets = targets();
     if targets.is_empty() || tree::find_by_type(CONTENT).is_empty() {
@@ -205,7 +210,10 @@ pub fn settled() -> bool {
         return MISSING.load(Ordering::SeqCst);
     }
     let parts: Vec<u64> = targets.iter().filter(|s| bell_of(**s).is_some()).filter_map(|s| clock_of(*s)).chain(bells()).collect();
-    let split = targets.iter().filter(|s| bell_of(**s).is_some()).all(|s| crate::lock(&SPLIT).iter().any(|p| p.section == *s));
+    // A button that could not be split (reported once) counts as done: retrying it every sweep
+    // would only sweep forever.
+    let failed = crate::lock(&SPLIT_FAILED).clone();
+    let split = targets.iter().filter(|s| bell_of(**s).is_some()).all(|s| failed.contains(s) || crate::lock(&SPLIT).iter().any(|p| p.section == *s));
     let wired = crate::lock(&WIRED);
     split && targets.iter().chain(parts.iter()).all(|t| wired.contains(t))
 }
@@ -216,6 +224,11 @@ pub fn settled() -> bool {
 /// XAML UI thread only, behind the wiring gate.
 pub unsafe fn wire(diagnostics: &xamlom::IXamlDiagnostics) {
     if !ENABLED.load(Ordering::SeqCst) {
+        // Turned off while live: the button whole again and the bell the shell's.
+        if UNSPLIT_PENDING.swap(false, Ordering::SeqCst) {
+            restore(diagnostics);
+            unsplit(diagnostics);
+        }
         return;
     }
     // Elements gone from the tree (a taskbar rebuilt) are forgotten: their handles can come back.
@@ -289,6 +302,18 @@ const BELL_ROOM: f64 = 10.0;
 const BELL_GLYPH: &str = "SystemTray.TextIconContent";
 
 static SPLIT: Mutex<Vec<Split>> = Mutex::new(Vec::new());
+/// Sections whose button could not be split (missing parts): left whole, not retried.
+static SPLIT_FAILED: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+
+/// `section` left whole: what was missing, logged once.
+fn split_failed(section: u64, missing: &str) {
+    let mut failed = crate::lock(&SPLIT_FAILED);
+    if !failed.contains(&section) {
+        logf!("clock: the button cannot be split ({missing} missing); left whole");
+        failed.push(section);
+    }
+}
+
 /// The icon grid lit as under the pointer.
 static HOVERED: Mutex<Option<u64>> = Mutex::new(None);
 /// The part (icon, and whether it is the bell) the pointer is on, or was last on while still in
@@ -318,11 +343,15 @@ struct Hidden {
 unsafe fn split(diagnostics: &xamlom::IXamlDiagnostics, section: u64) {
     use crate::winrt::{CornerRadius, IBorder, IFrameworkElement, IGrid2, Thickness};
     use windows_core::Interface;
-    if crate::lock(&SPLIT).iter().any(|s| s.section == section) {
+    if crate::lock(&SPLIT).iter().any(|s| s.section == section) || crate::lock(&SPLIT_FAILED).contains(&section) {
         return;
     }
-    let (Some(plate), Some(clock), Some(bell)) = (named(section, PLATE), clock_of(section), bell_of(section)) else { return };
-    let (Some(clock_grid), Some(bell_grid)) = (named(clock, ICON_GRID), named(bell, ICON_GRID)) else { return };
+    let (Some(plate), Some(clock), Some(bell)) = (named(section, PLATE), clock_of(section), bell_of(section)) else {
+        return split_failed(section, "the plate, the clock or the bell");
+    };
+    let (Some(clock_grid), Some(bell_grid)) = (named(clock, ICON_GRID), named(bell, ICON_GRID)) else {
+        return split_failed(section, "an icon grid");
+    };
     // The shell's plate: its inset and its corners, for ours.
     let mut margin = Thickness::default();
     let mut radius = CornerRadius::default();
@@ -351,13 +380,21 @@ unsafe fn split(diagnostics: &xamlom::IXamlDiagnostics, section: u64) {
         let _ = border.get_BorderThickness(&mut edge as *mut Thickness as *mut core::ffi::c_void);
     }
     let edge = edge.top.max(edge.left).max(1.0);
-    let mut grids = Vec::new();
+    // Both grids found (and their looks saved) before either is written: half a split could not
+    // be put back.
+    let mut found = Vec::new();
     for (grid, left, right) in [(clock_grid, margin.left, PLATE_GAP / 2.0), (bell_grid, PLATE_GAP / 2.0, margin.right)] {
-        let (Some(framework), Some(rounded)) = (crate::decorate::element::<IFrameworkElement>(diagnostics, grid), crate::decorate::element::<IGrid2>(diagnostics, grid)) else { return };
+        let (Some(framework), Some(rounded)) = (crate::decorate::element::<IFrameworkElement>(diagnostics, grid), crate::decorate::element::<IGrid2>(diagnostics, grid)) else {
+            return split_failed(section, "an icon grid's interfaces");
+        };
         let mut was_margin = Thickness::default();
         let mut was_radius = CornerRadius::default();
         let _ = framework.get_Margin(&mut was_margin);
         let _ = rounded.get_CornerRadius(&mut was_radius);
+        found.push((grid, left, right, framework, rounded, was_margin, was_radius));
+    }
+    let mut grids = Vec::new();
+    for (grid, left, right, framework, rounded, was_margin, was_radius) in found {
         let _ = framework.put_Margin(Thickness { left: left - edge, top: margin.top - edge, right: right - edge, bottom: margin.bottom - edge });
         let _ = rounded.put_BorderThickness(Thickness { left: edge, top: edge, right: edge, bottom: edge });
         let _ = rounded.put_CornerRadius(radius);
@@ -427,6 +464,17 @@ impl IDependencyPropertyChangedCallback_Impl for PlateChanged_Impl {
 /// XAML UI thread only.
 unsafe fn watch_plate(diagnostics: &xamlom::IXamlDiagnostics, plate: u64) {
     use windows_core::Interface;
+    /// Plates already watched: a re-split after a stand-down (callbacks never detached) must not
+    /// pile another pair on.
+    static WATCHED: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+    {
+        let mut watched = crate::lock(&WATCHED);
+        watched.retain(|h| tree::type_of(*h).is_some());
+        if watched.contains(&plate) {
+            return;
+        }
+        watched.push(plate);
+    }
     let Some(object) = crate::decorate::element::<crate::winrt::IDependencyObject2>(diagnostics, plate) else { return };
     let Some(statics) = crate::decorate::factory::<crate::winrt::IBorderStatics>(crate::winrt::BORDER) else { return };
     let mut ok = true;
@@ -454,6 +502,7 @@ pub unsafe fn unsplit(diagnostics: &xamlom::IXamlDiagnostics) {
     OPEN.store(tap_proto::OPEN_NONE, Ordering::SeqCst);
     quiet_tooltips(diagnostics, false);
     use crate::winrt::{IFrameworkElement, IGrid2, IPanel};
+    crate::lock(&SPLIT_FAILED).clear();
     for split in std::mem::take(&mut *crate::lock(&SPLIT)) {
         crate::decorate::set_opacity(diagnostics, split.plate, 1.0);
         if let Some(framework) = crate::decorate::element::<IFrameworkElement>(diagnostics, split.bell_grid) {
@@ -640,7 +689,7 @@ unsafe fn light(diagnostics: &xamlom::IXamlDiagnostics) {
             let look = if hovered == Some(grid) {
                 now.clone()
             } else if open == part {
-                remembered.clone().or_else(|| fallback_look(diagnostics))
+                remembered.clone().or_else(|| fallback_look())
             } else {
                 None
             };
@@ -665,7 +714,7 @@ unsafe fn light(diagnostics: &xamlom::IXamlDiagnostics) {
 ///
 /// # Safety
 /// XAML UI thread only.
-unsafe fn fallback_look(_diagnostics: &xamlom::IXamlDiagnostics) -> Option<Look> {
+unsafe fn fallback_look() -> Option<Look> {
     use windows_core::Interface;
     let color = if light_taskbar() { "#0A000000" } else { "#12FFFFFF" };
     let markup = format!(r#"<SolidColorBrush xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" Color="{color}"/>"#);
@@ -787,9 +836,7 @@ pub struct Text {
     date: String,
     /// The date after the time, on one line.
     one_line: bool,
-    /// After the time: the focus time left (never meeting info).
-    top: String,
-    /// Windows' unread notifications (0: none).
+    /// How many notifications wait in audio-tray's list (0: none).
     badge: u32,
     /// The badge drawn by the app (a PNG), its width in DIPs and its pixels per DIP; empty: the
     /// emoji dot and the count in the text instead.
@@ -832,7 +879,6 @@ pub fn set_text(data: &str) {
         time: value("time"),
         date: value("date"),
         one_line: flag("oneline"),
-        top: value("top"),
         badge: value("badge").parse().unwrap_or(0),
         badge_image: value("badge_image"),
         badge_width: value("badge_width").parse().unwrap_or(0.0),
@@ -885,7 +931,7 @@ pub unsafe fn restore(diagnostics: &xamlom::IXamlDiagnostics) {
         show_bell_badge(diagnostics, bell, None);
         uncross_bell(diagnostics, bell);
         // Its fill as the shell has it again.
-        fill_bell(diagnostics, bell, true);
+        fill_bell(diagnostics, bell, None);
     }
     crate::lock(&BADGED).clear();
     // The shell's bindings rewrite the date's text, never its visibility.
@@ -956,7 +1002,8 @@ unsafe fn show_badge(diagnostics: &xamlom::IXamlDiagnostics, stack: u64, image: 
     crate::lock(&HELD).retain(|(h, _)| *h != stack);
 }
 
-/// How far below the bell's middle the badge's middle sits, in DIPs: level with the glyph's top.
+/// How far below the bell's middle the badge's middle sits, in DIPs (negative: above): level with
+/// the glyph's top.
 const BELL_BADGE_DROP: f64 = -5.0;
 
 /// The badge beside the bell's glyph, at its upper right (`image` as in [`show_badge`]), or taken
@@ -1006,8 +1053,8 @@ unsafe fn show_bell_badge(diagnostics: &xamlom::IXamlDiagnostics, bell: u64, ima
     match image {
         Some((path, _, scale)) => {
             let shrink = 1.0 / scale.max(0.5);
-            // At the glyph's lower right, as the badges on the taskbar's app buttons: from the
-            // grid's right edge and middle, moved down by BELL_BADGE_DROP (relative to its height).
+            // At the glyph's upper right: from the grid's right edge and middle, moved by
+            // BELL_BADGE_DROP (relative to its height; negative is up).
             let height = crate::decorate::actual_size(diagnostics, grid).map_or(0.0, |(_, h)| h);
             let drop = if height > 0.0 { BELL_BADGE_DROP / height } else { 0.0 };
             let markup = format!(
@@ -1035,11 +1082,17 @@ unsafe fn show_bell_badge(diagnostics: &xamlom::IXamlDiagnostics, bell: u64, ima
 const CROSSED_BELL: &str = "\u{E7ED}";
 /// The bell's glyph layers (`InnerTextBlock`s under its base, accent and underlay).
 const GLYPH_LAYER: &str = "InnerTextBlock";
+/// The bell's glyph layer (the shell's filled bell when something is new).
+const BASE_LAYER: &str = "Base";
 
-/// The shell's ordinary bell (its `Base` layer; the underlay and the accent overlay stay empty).
-/// Any other glyph it draws there is its quiet bell ("zz"): Windows keeps notifications quiet by a
-/// rule of its own (a full-screen app, a game, a presentation) that Audio Tray is not told of.
+/// The shell's bell with something new (its `Base` layer, filled, in the accent; the underlay and
+/// the accent overlay stay empty).
 const SHELL_BELL: &str = "\u{F2A5}";
+/// The shell's ordinary bell, nothing new (an outline); also the TAP's with nothing waiting in
+/// Audio Tray's list. Any glyph other than these two (and the cross) is its quiet bell ("zz"):
+/// Windows keeps notifications quiet by a rule of its own (a full-screen app, a game, a
+/// presentation) that Audio Tray is not told of.
+const SHELL_PLAIN_BELL: &str = "\u{F2A3}";
 
 /// Each bell layer whose glyph was crossed, and the shell's glyph to put back.
 static UNCROSSED: Mutex<Vec<(u64, String)>> = Mutex::new(Vec::new());
@@ -1074,7 +1127,7 @@ unsafe fn cross_bell(diagnostics: &xamlom::IXamlDiagnostics, bell: u64, quiet: b
         let drawn = texts.iter().map(|(_, t)| t.as_str()).find(|t| !t.is_empty() && *t != CROSSED_BELL);
         let was = shell_quiet.contains(&bell);
         // The shell's bell, or Audio Tray's outline in its place ([`fill_bell`]): ordinary.
-        let ordinary = |g: &str| g == SHELL_BELL || g == OUTLINE_BELL;
+        let ordinary = |g: &str| g == SHELL_BELL || g == SHELL_PLAIN_BELL;
         match drawn {
             Some(glyph) if ordinary(glyph) && was => {
                 shell_quiet.retain(|b| *b != bell);
@@ -1110,65 +1163,62 @@ unsafe fn cross_bell(diagnostics: &xamlom::IXamlDiagnostics, bell: u64, quiet: b
     }
 }
 
+/// The bell's "something new" look (the shell's filled glyph, in the accent): the shell's says what
+/// *it* has not shown, which it counts as seen only when its own centre opens, never now that the
+/// bell opens Audio Tray's. So it follows Audio Tray's list instead (`Some(waiting)`): the shell's
+/// filled bell while anything waits there, its plain one otherwise. `None`: the bell is not Audio
+/// Tray's, so the glyph the shell drew is given back (saved before the first write) and left alone.
+/// What the bell's layers hold is logged at each change.
+///
+/// # Safety
+/// XAML UI thread only.
+unsafe fn fill_bell(diagnostics: &xamlom::IXamlDiagnostics, bell: u64, waiting: Option<bool>) {
+    /// The layers' texts as last logged.
+    static LAYERS_SEEN: Mutex<String> = Mutex::new(String::new());
+    /// Each glyph block written here, and the shell's glyph in it before.
+    static SHELL_GLYPHS: Mutex<Vec<(u64, String)>> = Mutex::new(Vec::new());
+    let Some(base) = named(bell, BASE_LAYER) else { return };
+    let Some(glyph) = descendants(base).into_iter().find(|h| tree::name_of(*h).as_deref() == Some(GLYPH_LAYER)) else { return };
+    let now = crate::decorate::text_of(diagnostics, glyph).unwrap_or_default();
+    let Some(filled) = waiting else {
+        // Not Audio Tray's: what the shell drew, back (unless it has drawn anew since).
+        let mut saved = crate::lock(&SHELL_GLYPHS);
+        if let Some(at) = saved.iter().position(|(g, _)| *g == glyph) {
+            let (_, shell) = saved.remove(at);
+            if now == SHELL_BELL || now == SHELL_PLAIN_BELL {
+                crate::decorate::set_text(diagnostics, glyph, &shell);
+            }
+        }
+        return;
+    };
+    {
+        let mut seen = crate::lock(&LAYERS_SEEN);
+        let layers = format!("{} (Audio Tray has {})", code_points(&now), if filled { "some waiting" } else { "none waiting" });
+        if *seen != layers {
+            logf!("clock: the bell's glyph now: {layers}");
+            *seen = layers;
+        }
+    }
+    // The cross, when quiet, takes over ([`cross_bell`] writes every layer then, and leaves this
+    // glyph alone). Looked at each tick (the cross ending puts back what it found), written only
+    // when it differs.
+    if now == CROSSED_BELL {
+        return;
+    }
+    let wanted = if filled { SHELL_BELL } else { SHELL_PLAIN_BELL };
+    if now != wanted {
+        let mut saved = crate::lock(&SHELL_GLYPHS);
+        if !saved.iter().any(|(g, _)| *g == glyph) {
+            saved.push((glyph, now.clone()));
+        }
+        crate::decorate::set_text(diagnostics, glyph, wanted);
+    }
+}
+
 /// `bell` with the shell's own glyph again, whatever the quiet (the TAP lets go).
 ///
 /// # Safety
 /// XAML UI thread only.
-/// The bell's accent fill ("something new"): the shell's says what *it* has not shown, which it
-/// counts as seen only when its own centre opens, never now that the bell opens Audio Tray's. So
-/// the fill follows Audio Tray's list instead: shown while anything waits there (`filled`), hidden
-/// otherwise. What the bell's layers hold is logged at each change, to see what the shell draws.
-///
-/// # Safety
-/// XAML UI thread only.
-unsafe fn fill_bell(diagnostics: &xamlom::IXamlDiagnostics, bell: u64, filled: bool) {
-    /// The layers' texts as last logged.
-    static LAYERS_SEEN: Mutex<String> = Mutex::new(String::new());
-    let layers: String = descendants(bell)
-        .into_iter()
-        .filter(|h| tree::name_of(*h).as_deref() == Some(GLYPH_LAYER))
-        .map(|h| crate::decorate::text_of(diagnostics, h).map(|t| code_points(&t)).unwrap_or_default())
-        .collect::<Vec<_>>()
-        .join(" | ");
-    {
-        let mut seen = crate::lock(&LAYERS_SEEN);
-        if *seen != layers {
-            logf!("clock: the bell's layers now: {layers} (Audio Tray has {})", if filled { "some waiting" } else { "none waiting" });
-            *seen = layers;
-        }
-    }
-    // The shell's "something new" bell is its filled glyph, in the `Base` layer. Nothing waiting:
-    // the plain outline bell there instead (the layer's own font has it; the underlay's has not,
-    // a box was drawn), and the shell's glyph again when something waits. The crossed bell, when
-    // quiet, takes over ([`cross_bell`] writes every layer then, and leaves this glyph alone).
-    let Some(base) = named(bell, BASE_LAYER) else { return };
-    // Whatever an earlier build left in the underlay, gone (it drew a box).
-    if let Some(under) = named(bell, UNDER_LAYER).and_then(|u| descendants(u).into_iter().find(|h| tree::name_of(*h).as_deref() == Some(GLYPH_LAYER))) {
-        if crate::decorate::text_of(diagnostics, under).is_some_and(|t| t == OUTLINE_BELL) {
-            crate::decorate::set_text(diagnostics, under, "");
-        }
-    }
-    crate::decorate::set_opacity(diagnostics, base, 1.0);
-    if let Some(glyph) = descendants(base).into_iter().find(|h| tree::name_of(*h).as_deref() == Some(GLYPH_LAYER)) {
-        let now = crate::decorate::text_of(diagnostics, glyph).unwrap_or_default();
-        if now != CROSSED_BELL {
-            // Looked at each tick (the cross ending puts back what it found), written when it differs.
-            let wanted = if filled { SHELL_BELL } else { OUTLINE_BELL };
-            if now != wanted {
-                crate::decorate::set_text(diagnostics, glyph, wanted);
-            }
-        }
-    }
-}
-
-/// The bell's layers: its glyph (the shell's filled bell when something is new), and the one
-/// under it, empty in the shell's own drawing.
-const BASE_LAYER: &str = "Base";
-const UNDER_LAYER: &str = "Underlay";
-/// The plain bell (Segoe's `Ringer`): nothing waiting. Audio Tray's own glyph: never taken for
-/// the shell going quiet ([`cross_bell`]).
-const OUTLINE_BELL: &str = "\u{EA8F}";
-
 unsafe fn uncross_bell(diagnostics: &xamlom::IXamlDiagnostics, bell: u64) {
     crate::lock(&SHELL_QUIET).retain(|b| *b != bell);
     let layers = descendants(bell).into_iter().filter(|h| tree::name_of(*h).as_deref() == Some(GLYPH_LAYER));
@@ -1291,9 +1341,6 @@ pub fn accent_dot(accent: Option<[u8; 3]>) -> &'static str {
 /// The two lines for `text` at `st`: the time line, and the date line (`None`: hidden).
 fn lines(text: &Text, st: &windows::Win32::Foundation::SYSTEMTIME, dot: &str) -> (String, Option<String>) {
     let mut time = format_time(st, &text.time);
-    if !text.top.is_empty() {
-        time = format!("{time} · {}", text.top);
-    }
     if text.badge > 0 && text.badge_image.is_empty() {
         time = format!("{dot} {}   {time}", text.badge);
     }
@@ -1356,8 +1403,6 @@ pub unsafe fn tick() -> Option<u32> {
             None => {}
         }
     }
-    // Hold each clock's width at the widest it drew, so the shell's own (shorter) text, shown for a
-    // moment after each minute, does not move the taskbar.
     // A picture is shown whatever the count: the focus timer's pie comes with none.
     let badge = (!text.badge_image.is_empty()).then_some((text.badge_image.as_str(), text.badge_width, text.badge_scale));
     // On the bell's corner when Windows shows the bell, else beside the clock's lines.
@@ -1365,10 +1410,12 @@ pub unsafe fn tick() -> Option<u32> {
     for &bell in &bells {
         show_bell_badge(&diagnostics, bell, badge);
         cross_bell(&diagnostics, bell, text.quiet);
-        fill_bell(&diagnostics, bell, text.waiting.unwrap_or(true));
+        fill_bell(&diagnostics, bell, text.waiting);
     }
     for stack in tree::find_by_name(STACK) {
         show_badge(&diagnostics, stack, if bells.is_empty() { badge } else { None });
+        // Hold each clock's width at the widest it drew, so the shell's own (shorter) text, shown
+        // for a moment after each minute, does not move the taskbar.
         let width = crate::decorate::actual_width(&diagnostics, stack).unwrap_or(0.0);
         let mut held = crate::lock(&HELD);
         match held.iter_mut().find(|(h, _)| *h == stack) {
@@ -1474,8 +1521,8 @@ mod tests {
         assert_eq!(lines(&plain, &st, "x"), ("09:05".into(), Some("18/11".into())));
         let one = Text { one_line: true, ..plain.clone() };
         assert_eq!(lines(&one, &st, "x"), ("09:05   18/11".into(), None));
-        let hidden = Text { date: "-".into(), top: "Focus · 18 min left".into(), ..plain.clone() };
-        assert_eq!(lines(&hidden, &st, "x"), ("09:05 · Focus · 18 min left".into(), None));
+        let hidden = Text { date: "-".into(), ..plain.clone() };
+        assert_eq!(lines(&hidden, &st, "x"), ("09:05".into(), None));
         // A count without its badge picture: the dot and the count go first.
         let badged = Text { badge: 3, ..plain.clone() };
         assert_eq!(lines(&badged, &st, "x").0, "x 3   09:05");

@@ -14,20 +14,26 @@ use windows::Win32::System::Registry::{RegSetKeyValueW, HKEY_CURRENT_USER, REG_S
 /// The id the notifications show under.
 pub(crate) const AUMID: &str = "MichelSalib.AudioTray";
 
-/// Show a notification: a bold first line, then the body.
+/// Dev: a plain notification, a bold first line, then the body.
+#[cfg(feature = "dev")]
 pub fn show(title: &str, body: &str) -> Result<()> {
     show_with(title, body, None, false, "")
 }
 
-/// [`show`], with a web address its click and its one button (`label`) open, as a reminder
-/// (`reminder`: it stays until dismissed), and with Windows' tag `tag` (empty: none): what it is,
-/// for the banner that draws it (`audio-tray/battery/12`, see [`TAG`]). Windows replaces an earlier
-/// notification of the same tag.
+/// A notification: a bold first line, then the body, with a web address its click and its one
+/// button (`label`) open, as a reminder (`reminder`: it stays until dismissed), and with Windows'
+/// tag `tag` (empty: none): what it is, for the banner that draws it (`audio-tray/battery/3f2a`,
+/// see [`TAG`]). Windows replaces an earlier notification of the same tag.
 pub fn show_with(title: &str, body: &str, link: Option<(&str, &str)>, reminder: bool, tag: &str) -> Result<()> {
+    show_payload(&payload(title, body, link, reminder), tag)
+}
+
+/// Show toast XML `xml` under Audio Tray's id, tagged `tag` (empty: none).
+fn show_payload(xml: &str, tag: &str) -> Result<()> {
     register();
-    let xml = XmlDocument::new()?;
-    xml.LoadXml(&HSTRING::from(payload(title, body, link, reminder))).context("toast XML")?;
-    let toast = ToastNotification::CreateToastNotification(&xml)?;
+    let doc = XmlDocument::new()?;
+    doc.LoadXml(&HSTRING::from(xml)).context("toast XML")?;
+    let toast = ToastNotification::CreateToastNotification(&doc)?;
     if !tag.is_empty() {
         // Windows takes 64 characters at most.
         let tag: String = tag.chars().take(64).collect();
@@ -37,18 +43,60 @@ pub fn show_with(title: &str, body: &str, link: Option<(&str, &str)>, reminder: 
     Ok(())
 }
 
+/// [`show_with`] for `o`, its failure logged.
+fn show_outgoing(o: &Outgoing) {
+    let link = o.link.as_ref().map(|(label, url)| (label.as_str(), url.as_str()));
+    if let Err(e) = show_with(&o.title, &o.body, link, o.reminder, &o.tag) {
+        eprintln!("notifications: could not show Audio Tray's own ({e:#})");
+    }
+}
+
+/// A notification to send: [`show_with`]'s arguments, owned.
+pub struct Outgoing {
+    pub title: String,
+    pub body: String,
+    /// Its button's label and the web address it (and a click) opens.
+    pub link: Option<(String, String)>,
+    pub reminder: bool,
+    pub tag: String,
+}
+
+/// [`show_with`] on a thread of its own (one, long-lived): Windows' notification platform can be
+/// slow to answer, and the tray thread must not wait for it. Failures are logged.
+pub fn send(outgoing: Outgoing) {
+    use std::sync::mpsc::{channel, Sender};
+    static WORKER: std::sync::Mutex<Option<Sender<Outgoing>>> = std::sync::Mutex::new(None);
+    let mut worker = WORKER.lock().unwrap_or_else(|e| e.into_inner());
+    if worker.is_none() {
+        let (send, receive) = channel::<Outgoing>();
+        let spawned = std::thread::Builder::new().name("toasts".into()).spawn(move || {
+            use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
+            let _ = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+            while let Ok(o) = receive.recv() {
+                show_outgoing(&o);
+            }
+        });
+        if spawned.is_ok() {
+            *worker = Some(send);
+        }
+    }
+    let o = match worker.as_ref() {
+        Some(w) => match w.send(outgoing) {
+            Ok(()) => return,
+            Err(std::sync::mpsc::SendError(o)) => o,
+        },
+        None => outgoing,
+    };
+    // The thread is gone (or never started): sent from here instead.
+    *worker = None;
+    drop(worker);
+    show_outgoing(&o);
+}
+
 /// Dev: a notification from its own XML, as an app would send it (a call's, a chat's).
 #[cfg(feature = "dev")]
 pub fn show_xml(xml: &str, tag: &str) -> Result<()> {
-    register();
-    let doc = XmlDocument::new()?;
-    doc.LoadXml(&HSTRING::from(xml)).context("toast XML")?;
-    let toast = ToastNotification::CreateToastNotification(&doc)?;
-    if !tag.is_empty() {
-        toast.SetTag(&HSTRING::from(tag))?;
-    }
-    ToastNotificationManager::CreateToastNotifierWithId(&HSTRING::from(AUMID))?.Show(&toast).context("show the toast")?;
-    Ok(())
+    show_payload(xml, tag)
 }
 
 /// What Audio Tray's own notifications' tags start with: `audio-tray/<kind>/<detail>`.

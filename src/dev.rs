@@ -222,7 +222,7 @@ pub fn run(args: &[String], backend: &WasapiBackend) -> Result<bool> {
         Some("--own-toast") => {
             let tag = |kind: &str| format!("{}{kind}", crate::toast::TAG);
             match args.get(1).map_or("battery", String::as_str) {
-                "battery" => crate::toast::show_with("G705 Mouse battery low", "12% left. Time to charge it.", None, false, &tag("battery/12/a1"))?,
+                "battery" => crate::toast::show_with("G705 Mouse battery low", "12% left. Time to charge it.", None, false, &tag("battery/a1"))?,
                 "audio" => crate::toast::show_with("Sound now on WH-1000XM5", "Speakers disconnected.", None, false, &tag("audio"))?,
                 "meeting" => {
                     let start = crate::calendar::time::now() + 300;
@@ -242,6 +242,10 @@ pub fn run(args: &[String], backend: &WasapiBackend) -> Result<bool> {
             if !crate::calendar::simulate_banners() {
                 anyhow::bail!("the banner simulation failed");
             }
+        }
+        Some("--listening-preview") => {
+            crate::calendar::listening(Some(("SystemSettings".into(), "SystemSettings.exe".into())));
+            crate::win::pump_for(std::time::Duration::from_secs(6));
         }
         Some("--digest") => crate::calendar::preview_digest(args.get(1).and_then(|s| s.parse().ok()).unwrap_or(8)),
         Some("--keyboards") => crate::keyboards::spike::run(&args[1..])?,

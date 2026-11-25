@@ -300,9 +300,10 @@ pub struct State {
     low_warned: Vec<String>,
     /// Devices that just went low, for the tray to raise a Windows notification about.
     pub fresh_low: Vec<Battery>,
-    /// Audio Tray shows every notification itself (Settings' take-over): the notices that are
-    /// news (not the pill's live state) go to [`State::outbox`] instead, for the banners.
-    pub handed_over: bool,
+    /// Audio Tray's notices merge into the notification list (`calendar::merges_notices`: the bell
+    /// is Audio Tray's): the notices that are news (not the pill's live state) go to
+    /// [`State::outbox`] instead, for the list and its banners.
+    pub merges_notices: bool,
     /// Notices for the tray to show as notifications, oldest first.
     pub outbox: Vec<Notice>,
 }
@@ -476,7 +477,7 @@ impl State {
     }
 
     fn push_notice(&mut self, notice: Notice) {
-        if self.handed_over && notice.is_news() {
+        if self.merges_notices && notice.is_news() {
             self.outbox.push(notice);
             return;
         }
@@ -505,7 +506,8 @@ impl State {
 
     /// Acknowledge (dismiss) the notice of the same kind as `notice`.
     pub fn acknowledge(&mut self, notice: &Notice) {
-        self.notices.retain(|(n, _)| n != notice);
+        // By kind, as said: an alert dismissed from a banner names no app.
+        self.notices.retain(|(n, _)| std::mem::discriminant(n) != std::mem::discriminant(notice));
     }
 
     /// The call the pill shows: the first one reported (two voice apps in calls at once is rare).
@@ -609,6 +611,18 @@ mod tests {
             outputs: active.iter().map(|id| Choice { id: DeviceId(id.to_string()), name: id.to_string(), icon: crate::icons::IconId::Speakers }).collect(),
             inputs: Vec::new(),
         })
+    }
+
+    #[test]
+    fn a_notice_is_acknowledged_by_its_kind() {
+        // A banner's close button names no app: it still dismisses the app's alert, and only that
+        // kind (a battery warning stays).
+        let mut state = State::default();
+        let now = std::time::Instant::now();
+        state.notices.push((Notice::Listening { app: "SystemSettings".into(), user: "SystemSettings.exe".into() }, now));
+        state.notices.push((Notice::FocusDone { minutes: 25 }, now));
+        state.acknowledge(&Notice::Listening { app: String::new(), user: String::new() });
+        assert!(matches!(&state.notices[..], [(Notice::FocusDone { .. }, _)]), "{:?}", state.notices.len());
     }
 
     #[test]

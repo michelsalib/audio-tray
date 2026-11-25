@@ -166,6 +166,12 @@ const LAYOUTS_MAX: usize = 4000;
 const IMAGES_MAX: usize = 64;
 
 impl Gfx {
+    /// Kept for later: the last frame's pixels freed, so the next frame is drawn whole.
+    pub fn forget_frame(&mut self) {
+        self.pixels = Vec::new();
+        self.drawn = (0, 0);
+    }
+
     pub fn new() -> Result<Self> {
         unsafe {
             let factory: ID2D1Factory = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None).context("D2D1CreateFactory")?;
@@ -247,7 +253,8 @@ impl Gfx {
                 self.surface = Some((size, bitmap, target));
                 self.images.borrow_mut().clear();
             }
-            // In parts only over a frame of the same size, whose other pixels stand.
+            // In parts only over a frame of the same size, whose other pixels stand (none after
+            // [`Gfx::forget_frame`]).
             let areas = areas.filter(|_| fits && self.drawn == size);
             let full = areas.is_none();
             {

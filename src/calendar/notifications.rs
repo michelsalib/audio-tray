@@ -98,7 +98,14 @@ pub fn start() {
     }
     let raw = WAKE.load(SeqCst);
     let spawned = std::thread::Builder::new().name("notifications".into()).spawn(move || {
-        run(windows::Win32::Foundation::HANDLE(raw as *mut _));
+        // A panic (an app's notification read wrong) must not leave notifications silent for good:
+        // the reader can start again, and Windows' banners are its own again meanwhile (Audio
+        // Tray shows none of its own without it).
+        let caught = std::panic::catch_unwind(|| run(windows::Win32::Foundation::HANDLE(raw as *mut _)));
+        if caught.is_err() {
+            eprintln!("notifications: the reader stopped on an error; Windows' banners are given back");
+            super::takeover::apply(false);
+        }
         // Refused, or gone: a later start may try again.
         RUNNING.store(false, SeqCst);
     });
@@ -209,7 +216,8 @@ pub fn open_app(aumid: &str) -> bool {
 
 /// Audio Tray shows the banners: a new notification must be seen at once. Windows does not tell
 /// an unpackaged app, and it stamps its store's files lazily (a write can go unseen for half a
-/// minute), so the store is asked for its newest id every [`PROBE_EVERY`] meanwhile.
+/// minute), so the store is asked whether it changed (SQLite's `data_version`) every
+/// [`PROBE_EVERY`] meanwhile.
 static FAST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 const PROBE_EVERY: Duration = Duration::from_secs(1);
 
@@ -220,23 +228,23 @@ pub fn set_fast(on: bool) {
     }
 }
 
-/// The newest notification's id in Windows' store (and how many), read-only: one small query.
-/// One connection kept open between probes (opening the store each second costs more than asking
-/// it); closed when fast mode ends, opened again when a query fails.
-fn probe(db: &mut Option<rusqlite::Connection>) -> Option<(i64, i64)> {
+/// Windows' store's `data_version` (a counter SQLite moves at each commit by another connection),
+/// read-only: one pragma. One connection kept open between probes (opening the store each second
+/// costs more than asking it); closed when fast mode ends, opened again when a query fails.
+fn probe(db: &mut Option<rusqlite::Connection>) -> Option<i64> {
     use rusqlite::{Connection, OpenFlags};
     if !FAST.load(std::sync::atomic::Ordering::SeqCst) {
         *db = None;
         return None;
     }
     if db.is_none() {
-        let path = std::path::PathBuf::from(std::env::var_os("LOCALAPPDATA")?).join(r"Microsoft\Windows\Notifications\wpndatabase.db");
+        let path = store_path()?;
         let opened = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX).ok()?;
         opened.busy_timeout(Duration::from_millis(200)).ok()?;
         *db = Some(opened);
     }
     // SQLite's own counter of commits made by others: nothing read from the store itself.
-    let asked = db.as_ref()?.query_row("PRAGMA data_version", [], |row| Ok((row.get(0)?, 0)));
+    let asked = db.as_ref()?.query_row("PRAGMA data_version", [], |row| row.get(0));
     if asked.is_err() {
         *db = None;
     }
@@ -276,7 +284,7 @@ fn run(wake: windows::Win32::Foundation::HANDLE) {
     let mut known = Known::default();
     let mut stamp = store_stamp();
     let mut read_now = true;
-    // The store's newest id at the last read, and when that was (fast mode's probe).
+    // The store's `data_version` at the last read, and when that was (fast mode's probe).
     let mut probed = None;
     let mut store = None;
     let mut read_at = Instant::now();
@@ -498,14 +506,21 @@ fn logo_of(app: &str, aumid: &str, info: Option<&windows::ApplicationModel::AppI
 /// The store's files as they stand (size and last write of the database and its log), to tell a
 /// real change from the reader's own traces.
 fn store_stamp() -> Vec<(u64, Option<std::time::SystemTime>)> {
-    let Ok(folder) = std::env::var("LOCALAPPDATA") else { return Vec::new() };
-    ["wpndatabase.db", "wpndatabase.db-wal"]
+    let Some(db) = store_path() else { return Vec::new() };
+    let mut log = db.clone().into_os_string();
+    log.push("-wal");
+    [db, log.into()]
         .iter()
-        .map(|name| {
-            let meta = std::fs::metadata(format!(r"{folder}\Microsoft\Windows\Notifications\{name}")).ok();
+        .map(|file| {
+            let meta = std::fs::metadata(file).ok();
             (meta.as_ref().map_or(0, |m| m.len()), meta.and_then(|m| m.modified().ok()))
         })
         .collect()
+}
+
+/// Windows' notification store (`wpndatabase.db`), where it is for this user.
+pub(super) fn store_path() -> Option<std::path::PathBuf> {
+    Some(std::path::PathBuf::from(std::env::var_os("LOCALAPPDATA")?).join(r"Microsoft\Windows\Notifications\wpndatabase.db"))
 }
 
 /// A change notification on the folder of Windows' notification store.

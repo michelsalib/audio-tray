@@ -76,7 +76,7 @@ pub struct Rich {
     /// banner shared with the others of it; empty: its own.
     pub thread: String,
     /// Windows' tag for it (the app's own name for this notification): Audio Tray's own say
-    /// what they are there (`audio-tray/battery/12`).
+    /// what they are there (`audio-tray/battery/3f2a`).
     pub tag: String,
     /// The app's activator, when it has one: buttons and replies can reach it.
     pub activator: Option<u128>,
@@ -124,16 +124,16 @@ fn thread_of(launch: &str) -> String {
     let mut i = 0;
     while i < bytes.len() {
         match bytes[i] {
-            b'%' if i + 2 < bytes.len() => {
-                match u8::from_str_radix(&value[i + 1..i + 3], 16) {
-                    Ok(b) => {
-                        out.push(b);
-                        i += 3;
-                        continue;
-                    }
-                    Err(_) => out.push(b'%'),
+            // Hex digits read as bytes (never a slice of the text: a character of several bytes
+            // after the `%` would cut through it, and panic).
+            b'%' if i + 2 < bytes.len() => match ((bytes[i + 1] as char).to_digit(16), (bytes[i + 2] as char).to_digit(16)) {
+                (Some(hi), Some(lo)) => {
+                    out.push((hi * 16 + lo) as u8);
+                    i += 3;
+                    continue;
                 }
-            }
+                _ => out.push(b'%'),
+            },
             b'+' => out.push(b' '),
             b => out.push(b),
         }
@@ -227,8 +227,7 @@ pub fn for_toasts(wanted: &[(u32, String, Option<windows::ApplicationModel::AppI
 /// store keeps none).
 fn payloads(ids: &[u32]) -> anyhow::Result<Vec<(u32, String, String)>> {
     use rusqlite::{types::ValueRef, Connection, OpenFlags};
-    let path = std::path::PathBuf::from(std::env::var_os("LOCALAPPDATA").ok_or_else(|| anyhow::anyhow!("no LOCALAPPDATA"))?)
-        .join(r"Microsoft\Windows\Notifications\wpndatabase.db");
+    let path = super::notifications::store_path().ok_or_else(|| anyhow::anyhow!("no LOCALAPPDATA"))?;
     let db = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
     db.busy_timeout(std::time::Duration::from_millis(500))?;
     let text = |v: ValueRef| match v {
@@ -431,28 +430,10 @@ impl Base {
 /// The install folder of package family `family` (`Name_PublisherId`), from Windows' package
 /// repository: its main package (no resource id, `Name_Version_Arch__PublisherId`), the newest.
 fn package_folder(family: &str) -> Option<String> {
-    use windows::Win32::System::Registry::{RegCloseKey, RegEnumKeyExW, RegGetValueW, RegOpenKeyExW, HKEY, HKEY_CLASSES_ROOT, KEY_READ, RRF_RT_REG_SZ};
-    use windows::core::PWSTR;
+    use windows::Win32::System::Registry::{RegGetValueW, HKEY_CLASSES_ROOT, RRF_RT_REG_SZ};
     let (name, publisher) = family.rsplit_once('_')?;
     let repo = r"Local Settings\Software\Microsoft\Windows\CurrentVersion\AppModel\PackageRepository\Packages";
-    let wide = crate::win::wide(repo);
-    let mut key = HKEY::default();
-    if unsafe { RegOpenKeyExW(HKEY_CLASSES_ROOT, PCWSTR(wide.as_ptr()), None, KEY_READ, &mut key) }.is_err() {
-        return None;
-    }
-    let mut mains = Vec::new();
-    for index in 0u32.. {
-        let mut buf = [0u16; 256];
-        let mut len = buf.len() as u32;
-        if unsafe { RegEnumKeyExW(key, index, Some(PWSTR(buf.as_mut_ptr())), &mut len, None, None, None, None) }.is_err() {
-            break;
-        }
-        let full = String::from_utf16_lossy(&buf[..len as usize]);
-        if main_package_of(&full, name, publisher).is_some() {
-            mains.push(full);
-        }
-    }
-    let _ = unsafe { RegCloseKey(key) };
+    let mut mains: Vec<String> = crate::win::subkeys(HKEY_CLASSES_ROOT, repo).into_iter().filter(|full| main_package_of(full, name, publisher).is_some()).collect();
     // The newest version first.
     mains.sort_by_key(|full| std::cmp::Reverse(main_package_of(full, name, publisher)));
     mains.into_iter().find_map(|full| {
@@ -706,8 +687,7 @@ pub fn print_activator(aumid: &str) {
 #[cfg(feature = "dev")]
 pub fn print_latest(count: usize) -> anyhow::Result<()> {
     use rusqlite::{types::ValueRef, Connection, OpenFlags};
-    let path = std::path::PathBuf::from(std::env::var_os("LOCALAPPDATA").ok_or_else(|| anyhow::anyhow!("no LOCALAPPDATA"))?)
-        .join(r"Microsoft\Windows\Notifications\wpndatabase.db");
+    let path = super::notifications::store_path().ok_or_else(|| anyhow::anyhow!("no LOCALAPPDATA"))?;
     let db = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
     let columns: Vec<String> = db.prepare("PRAGMA table_info(Notification)")?.query_map([], |row| row.get::<_, String>(1))?.collect::<Result<_, _>>()?;
     println!("columns: {}", columns.join(", "));
@@ -747,6 +727,10 @@ mod tests {
         assert_eq!(thread_of("action=LaunchApp"), "");
         // A trailing lone percent is kept as it is.
         assert_eq!(thread_of("tag=a%4"), "a%4");
+        // A character of several bytes next to a `%` (an escape gone wrong): kept, no panic.
+        assert_eq!(thread_of("tag=%1é"), "%1é");
+        assert_eq!(thread_of("tag=%éé"), "%éé");
+        assert_eq!(thread_of("tag=caf%C3%A9"), "café");
     }
 
     #[test]

@@ -159,7 +159,17 @@ pub fn send_calendar() {
     let _ = post(WM_TASKBAR_ACTION, tap_proto::ACTION_OPEN_CALENDAR, 0);
 }
 
-/// The pointer entered (`true`) or left the clock.
+/// The pointer entered (`true`) or left the clock's button.
 pub fn send_clock_hover(over: bool) {
-    let _ = post(tap_proto::WM_TASKBAR_CLOCK_HOVER, usize::from(over), 0);
+    let _ = post(tap_proto::WM_TASKBAR_CLOCK_HOVER, if over { tap_proto::HOVER_OVER } else { tap_proto::HOVER_LEFT }, 0);
+}
+
+/// The pointer entered (`true`) or left the bell, inside the clock's button.
+pub fn send_bell_hover(over: bool) {
+    let _ = post(tap_proto::WM_TASKBAR_CLOCK_HOVER, if over { tap_proto::HOVER_BELL } else { tap_proto::HOVER_BELL_LEFT }, 0);
+}
+
+/// The rects the app measured are out of date (the bell changed width): the app forgets them.
+pub fn forget_part_rects() {
+    let _ = post(tap_proto::WM_TASKBAR_CLOCK_RECT, tap_proto::PART_FORGET, 0);
 }

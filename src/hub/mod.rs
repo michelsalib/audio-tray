@@ -247,6 +247,12 @@ pub enum Notice {
 }
 
 impl Notice {
+    /// A notification of its own when Audio Tray shows them all: news, not the pill's live state
+    /// (a song playing, an app listening).
+    pub fn is_news(&self) -> bool {
+        !matches!(self, Notice::NewTrack { .. } | Notice::Listening { .. })
+    }
+
     /// How long it shows; `None` until acknowledged.
     pub fn lifetime(&self) -> Option<std::time::Duration> {
         match self {
@@ -294,6 +300,12 @@ pub struct State {
     low_warned: Vec<String>,
     /// Devices that just went low, for the tray to raise a Windows notification about.
     pub fresh_low: Vec<Battery>,
+    /// Audio Tray's notices merge into the notification list (`calendar::merges_notices`: the bell
+    /// is Audio Tray's): the notices that are news (not the pill's live state) go to
+    /// [`State::outbox`] instead, for the list and its banners.
+    pub merges_notices: bool,
+    /// Notices for the tray to show as notifications, oldest first.
+    pub outbox: Vec<Notice>,
 }
 
 /// Points above [`State::low_battery_at`] a battery must charge back to before it can warn again:
@@ -465,6 +477,10 @@ impl State {
     }
 
     fn push_notice(&mut self, notice: Notice) {
+        if self.merges_notices && notice.is_news() {
+            self.outbox.push(notice);
+            return;
+        }
         self.notices.retain(|(n, _)| std::mem::discriminant(n) != std::mem::discriminant(&notice));
         self.notices.push((notice, std::time::Instant::now()));
     }
@@ -490,7 +506,8 @@ impl State {
 
     /// Acknowledge (dismiss) the notice of the same kind as `notice`.
     pub fn acknowledge(&mut self, notice: &Notice) {
-        self.notices.retain(|(n, _)| n != notice);
+        // By kind, as said: an alert dismissed from a banner names no app.
+        self.notices.retain(|(n, _)| std::mem::discriminant(n) != std::mem::discriminant(notice));
     }
 
     /// The call the pill shows: the first one reported (two voice apps in calls at once is rare).
@@ -594,6 +611,18 @@ mod tests {
             outputs: active.iter().map(|id| Choice { id: DeviceId(id.to_string()), name: id.to_string(), icon: crate::icons::IconId::Speakers }).collect(),
             inputs: Vec::new(),
         })
+    }
+
+    #[test]
+    fn a_notice_is_acknowledged_by_its_kind() {
+        // A banner's close button names no app: it still dismisses the app's alert, and only that
+        // kind (a battery warning stays).
+        let mut state = State::default();
+        let now = std::time::Instant::now();
+        state.notices.push((Notice::Listening { app: "SystemSettings".into(), user: "SystemSettings.exe".into() }, now));
+        state.notices.push((Notice::FocusDone { minutes: 25 }, now));
+        state.acknowledge(&Notice::Listening { app: String::new(), user: String::new() });
+        assert!(matches!(&state.notices[..], [(Notice::FocusDone { .. }, _)]), "{:?}", state.notices.len());
     }
 
     #[test]

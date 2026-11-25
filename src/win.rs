@@ -3,6 +3,53 @@
 
 use windows::core::PCWSTR;
 
+/// Dev: every message waiting on this thread handled (the dev tools' windows live without the
+/// tray's loop).
+#[cfg(feature = "dev")]
+pub(crate) fn pump_messages() {
+    use windows::Win32::UI::WindowsAndMessaging::{DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE};
+    let mut msg = MSG::default();
+    while unsafe { PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE) }.as_bool() {
+        unsafe {
+            let _ = TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+}
+
+/// Dev: this thread's messages handled for `length`, looked for every 10 ms.
+#[cfg(feature = "dev")]
+pub(crate) fn pump_for(length: std::time::Duration) {
+    let until = std::time::Instant::now() + length;
+    while std::time::Instant::now() < until {
+        pump_messages();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+/// The names of the subkeys of `root\path` (none when it cannot be opened).
+pub(crate) fn subkeys(root: windows::Win32::System::Registry::HKEY, path: &str) -> Vec<String> {
+    use windows::core::PWSTR;
+    use windows::Win32::System::Registry::{RegCloseKey, RegEnumKeyExW, RegOpenKeyExW, HKEY, KEY_READ};
+    let path = wide(path);
+    let mut key = HKEY::default();
+    if unsafe { RegOpenKeyExW(root, PCWSTR(path.as_ptr()), None, KEY_READ, &mut key) }.is_err() {
+        return Vec::new();
+    }
+    let mut names = Vec::new();
+    for index in 0u32.. {
+        // The registry caps a key's name at 255 characters.
+        let mut buf = [0u16; 256];
+        let mut len = buf.len() as u32;
+        if unsafe { RegEnumKeyExW(key, index, Some(PWSTR(buf.as_mut_ptr())), &mut len, None, None, None, None) }.is_err() {
+            break;
+        }
+        names.push(String::from_utf16_lossy(&buf[..len as usize]));
+    }
+    let _ = unsafe { RegCloseKey(key) };
+    names
+}
+
 /// A Rust string as a NUL-terminated UTF-16 buffer. Bind it to a local before taking a
 /// `PCWSTR`: a pointer into a temporary dangles.
 pub(crate) fn wide(text: &str) -> Vec<u16> {

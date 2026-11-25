@@ -1,7 +1,8 @@
 //! Wheel over the taskbar → [`WM_TASKBAR_SCROLL`] to the tray's message window; a left click on the
-//! taskbar clock → the calendar, while it replaces the shell's (the TAP says when the pointer is
-//! over the clock, [`set_clock_hover`]). The click is swallowed whole, down and up: Explorer's
-//! clock button opens its own flyout whatever its XAML handlers do with the press.
+//! taskbar clock → the calendar, and on the bell beside it → the notifications, while they replace
+//! the shell's (the TAP says when the pointer is over either, [`set_clock_hover`]). The click is
+//! swallowed whole, down and up: Explorer's button opens its own flyout whatever its XAML handlers
+//! do with the press.
 //!
 //! A `WH_MOUSE_LL` hook on a thread of its own, with a bare message loop: Windows silently
 //! unhooks a low-level hook whose thread misses `LowLevelHooksTimeout`, and the tray thread does
@@ -13,7 +14,7 @@ use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, GetAncestor, GetMessageW, PostThreadMessageW, SetWindowsHookExW,
-    UnhookWindowsHookEx, WindowFromPoint, GA_ROOT, MSG, MSLLHOOKSTRUCT, WH_MOUSE_LL, WM_LBUTTONDOWN,
+    UnhookWindowsHookEx, WindowFromPoint, GA_ROOT, MSG, MSLLHOOKSTRUCT, WH_MOUSE_LL, WM_LBUTTONDOWN, WM_MBUTTONDOWN, WM_MBUTTONUP,
     WM_LBUTTONUP, WM_MOUSEWHEEL, WM_QUIT, WM_RBUTTONDOWN, WH_KEYBOARD_LL,
 };
 
@@ -39,8 +40,8 @@ impl Hooks {
                 let hook = unsafe { SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook), None, 0) };
                 let _ = ready.send(hook.is_ok().then(|| unsafe { GetCurrentThreadId() }));
                 let Ok(hook) = hook else { return };
-                // Win+Alt+D and Win+N, for the calendar, only while its shortcut is on: a keyboard
-                // hook routes every keystroke in the session through this thread.
+                // Win+Ctrl+V, Win+Alt+D and Win+N, only while a shortcut is on: a keyboard hook
+                // routes every keystroke in the session through this thread.
                 let mut keys = None;
                 let want = |on: bool, keys: &mut Option<windows::Win32::UI::WindowsAndMessaging::HHOOK>| {
                     match (on, keys.is_some()) {
@@ -53,7 +54,7 @@ impl Hooks {
                         _ => {}
                     }
                 };
-                want(crate::calendar::SHORTCUT.load(std::sync::atomic::Ordering::SeqCst), &mut keys);
+                want(crate::calendar::SHORTCUT.load(std::sync::atomic::Ordering::SeqCst) || AUDIO_SHORTCUT.load(std::sync::atomic::Ordering::SeqCst), &mut keys);
                 let mut msg = MSG::default();
                 while unsafe { GetMessageW(&mut msg, None, 0, 0) }.0 > 0 {
                     if msg.message == WM_WANT_KEYS {
@@ -82,7 +83,8 @@ const WM_WANT_KEYS: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 1;
 /// The hook thread, for [`want_keys`] (0: none).
 static HOOK_THREAD: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
-/// The calendar's shortcut on or off: the keyboard hook follows (call after `set_shortcut`).
+/// Any shortcut on, or none: the keyboard hook follows (call after `set_shortcut` and
+/// [`AUDIO_SHORTCUT`]).
 pub(super) fn want_keys(on: bool) {
     let thread = HOOK_THREAD.load(std::sync::atomic::Ordering::SeqCst);
     if thread != 0 {
@@ -129,6 +131,12 @@ unsafe extern "system" fn mouse_hook(code: i32, wparam: WPARAM, lparam: LPARAM) 
             super::post(crate::calendar::WM_CALENDAR, crate::calendar::CLOSE, ((info.pt.y as u16 as isize) << 16) | info.pt.x as u16 as isize);
         }
     }
+    if code >= 0 && matches!(wparam.0 as u32, WM_MBUTTONDOWN | WM_MBUTTONUP) {
+        let info = unsafe { &*(lparam.0 as *const MSLLHOOKSTRUCT) };
+        if middle_click(wparam.0 as u32 == WM_MBUTTONDOWN, info.pt) {
+            return LRESULT(1);
+        }
+    }
     if code >= 0 && wparam.0 as u32 == WM_MOUSEWHEEL {
         let info = unsafe { &*(lparam.0 as *const MSLLHOOKSTRUCT) };
         let delta = (info.mouseData >> 16) as i16;
@@ -170,27 +178,85 @@ fn flow_at(pt: POINT) -> Flow {
     }
 }
 
-/// The pointer is over the taskbar clock, as the TAP last said.
+/// A middle press on the strip was taken: its release goes too.
+static MIDDLE_PRESSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether a middle button event is the strip's to take: a press on our icon slot (in a taskbar,
+/// not under another app's window), posted to the tray as [`super::WM_STRIP_MIDDLE`] with the
+/// half it landed on, or the release of one. Swallowed, so the shell does nothing with it.
+fn middle_click(down: bool, pt: POINT) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    if !down {
+        return MIDDLE_PRESSED.swap(false, Relaxed);
+    }
+    let hwnd = unsafe { WindowFromPoint(pt) };
+    let root: HWND = unsafe { GetAncestor(hwnd, GA_ROOT) };
+    let class = crate::win::class_name(root);
+    // The bell's (Do not disturb, or clear all, as `[calendar] bell_middle_click` says).
+    let posted = if on_clock_part(pt) == Some(true) && BELL_MIDDLE_TAKEN.load(Relaxed) && matches!(class.as_str(), "Shell_TrayWnd" | "Shell_SecondaryTrayWnd") {
+        super::post(super::WM_BELL_MIDDLE, 0, 0)
+    } else if in_slot(pt) && wheel_belongs_to_tray(&class, crate::taskbar::buttons_up()) {
+        super::post(super::WM_STRIP_MIDDLE, crate::taskbar::flow_code(flow_at(pt)), 0)
+    } else {
+        false
+    };
+    if posted {
+        MIDDLE_PRESSED.store(true, Relaxed);
+    }
+    posted
+}
+
+/// Whether a middle click on the bell is Audio Tray's (its notifications are on, and the click is
+/// set to do something).
+static BELL_MIDDLE_TAKEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub(super) fn set_bell_middle_taken(on: bool) {
+    BELL_MIDDLE_TAKEN.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The pointer is over the taskbar clock's button, as the TAP last said.
 static CLOCK_HOVER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// ... and over the bell in it.
+static BELL_HOVER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// A press on the clock was swallowed: its release goes too.
 static CLOCK_PRESSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// The TAP's word on whether the pointer is over the clock (it only says "over" while the calendar
-/// replaces the shell's).
-pub(super) fn set_clock_hover(over: bool) {
+/// The TAP's word on where the pointer is on the clock's button (`tap_proto::HOVER_*`; it only says
+/// "over" while the calendar replaces the shell's).
+pub(super) fn set_clock_hover(code: usize) {
     use std::sync::atomic::Ordering::Relaxed;
-    if over {
-        // Where it was over the clock: a click far from there is not on the clock, whatever a
-        // stale word (the TAP unloaded before saying "left") claims.
-        let mut pt = POINT::default();
-        let _ = unsafe { windows::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut pt) };
-        CLOCK_AT.store(pack(pt), Relaxed);
+    match code {
+        tap_proto::HOVER_OVER | tap_proto::HOVER_BELL => {
+            // Where it was over the button: a click far from there is not on it, whatever a stale
+            // word (the TAP unloaded before saying "left") claims.
+            let mut pt = POINT::default();
+            let _ = unsafe { windows::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut pt) };
+            CLOCK_AT.store(pack(pt), Relaxed);
+            // The bell is inside the button: over it is over the button.
+            CLOCK_HOVER.store(true, Relaxed);
+            if code == tap_proto::HOVER_BELL {
+                BELL_HOVER.store(true, Relaxed);
+            }
+        }
+        tap_proto::HOVER_BELL_LEFT => BELL_HOVER.store(false, Relaxed),
+        _ => {
+            CLOCK_HOVER.store(false, Relaxed);
+            BELL_HOVER.store(false, Relaxed);
+        }
     }
-    CLOCK_HOVER.store(over, Relaxed);
+}
+
+/// The TAP that measured the clock is gone (a revert, Explorer restarted): so are its rects.
+pub(super) fn forget_clock() {
+    set_clock_hover(tap_proto::HOVER_LEFT);
+    set_part_rect(tap_proto::PART_FORGET, 0);
 }
 
 /// Whether clicks on the clock open the calendar (the calendar is on).
 static CLOCK_TAKEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Whether clicks on the bell open audio-tray's notifications (they are on too); else the bell's
+/// clicks are the shell's.
+static BELL_TAKEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// Where the pointer was when the TAP said it was over the clock (x, y packed).
 static CLOCK_AT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// The clock's button is about this wide: a press further than this from where the pointer
@@ -205,27 +271,155 @@ fn unpack(v: u64) -> POINT {
     POINT { x: (v >> 32) as u32 as i32, y: v as u32 as i32 }
 }
 
-/// The calendar on or off: off, the clock's clicks are the shell's whatever the TAP says.
-pub(super) fn set_clock_taken(on: bool) {
+/// The calendar on or off, and its notifications: off, the clock's (or the bell's) clicks are the
+/// shell's whatever the TAP says.
+pub(super) fn set_clock_taken(calendar: bool, notifications: bool) {
     use std::sync::atomic::Ordering::Relaxed;
-    CLOCK_TAKEN.store(on, Relaxed);
-    if !on {
+    CLOCK_TAKEN.store(calendar, Relaxed);
+    BELL_TAKEN.store(calendar && notifications, Relaxed);
+    if !calendar {
         CLOCK_HOVER.store(false, Relaxed);
+        BELL_HOVER.store(false, Relaxed);
+        set_part_rect(tap_proto::PART_FORGET, 0);
     }
 }
 
-/// Whether a left button event is a click on the clock to take: a press while over it (and over a
-/// taskbar, so a stale word from the TAP cannot take clicks elsewhere), or the release of one.
+/// Where the clock and the bell are on the screen, as the TAP measured them when the pointer last
+/// entered each (`tap_proto::pack_rect`; 0: not known).
+static CLOCK_RECT: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+static BELL_RECT: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+/// The TAP's word on where the clock or the bell is (`tap_proto::PART_*`), or that they moved.
+pub(super) fn set_part_rect(part: usize, packed: isize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    match part {
+        tap_proto::PART_CLOCK => CLOCK_RECT.store(packed as i64, Relaxed),
+        tap_proto::PART_BELL => BELL_RECT.store(packed as i64, Relaxed),
+        _ => {
+            CLOCK_RECT.store(0, Relaxed);
+            BELL_RECT.store(0, Relaxed);
+        }
+    }
+}
+
+/// A measurement is running.
+static MEASURING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The pointer has just entered the clock or the bell: measure where that is on the screen, with UI
+/// Automation from a thread of our own (in our process: nothing runs in Explorer for it, and a slow
+/// answer holds up no one). The element under the pointer, or its nearest ancestor, is the clock's
+/// (`SystemTray.OmniButtonLeft`) or the bell's (`SystemTray.AccentButton`, the one in the clock's
+/// button the TAP said the pointer is over). One long-lived thread, its UI Automation made once.
+pub(super) fn measure_parts() {
+    use std::sync::atomic::Ordering::SeqCst;
+    static WORKER: std::sync::OnceLock<Option<std::sync::mpsc::Sender<()>>> = std::sync::OnceLock::new();
+    if MEASURING.swap(true, SeqCst) {
+        return;
+    }
+    let worker = WORKER.get_or_init(|| {
+        let (send, receive) = std::sync::mpsc::channel::<()>();
+        std::thread::Builder::new().name("clock-rects".into()).spawn(move || measure_worker(receive)).ok().map(|_| send)
+    });
+    if !worker.as_ref().is_some_and(|w| w.send(()).is_ok()) {
+        MEASURING.store(false, SeqCst);
+    }
+}
+
+/// [`measure_parts`]' thread: a measurement per word.
+fn measure_worker(receive: std::sync::mpsc::Receiver<()>) {
+    use std::sync::atomic::Ordering::SeqCst;
+    use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED};
+    use windows::Win32::UI::Accessibility::{CUIAutomation, IUIAutomation};
+    let automation: Option<IUIAutomation> = unsafe {
+        CoInitializeEx(None, COINIT_MULTITHREADED).ok().ok().and_then(|_| CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER).ok())
+    };
+    while receive.recv().is_ok() {
+        let measured = (|| -> Option<(usize, RECT)> {
+            let automation = automation.as_ref()?;
+            let mut pt = POINT::default();
+            unsafe { windows::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut pt) }.ok()?;
+            let walker = unsafe { automation.ControlViewWalker() }.ok()?;
+            let mut element = unsafe { automation.ElementFromPoint(pt) }.ok()?;
+            for _ in 0..6 {
+                let class = unsafe { element.CurrentClassName() }.map(|c| c.to_string()).unwrap_or_default();
+                let part = match class.as_str() {
+                    "SystemTray.OmniButtonLeft" => Some(tap_proto::PART_CLOCK),
+                    "SystemTray.AccentButton" if BELL_HOVER.load(std::sync::atomic::Ordering::Relaxed) => Some(tap_proto::PART_BELL),
+                    _ => None,
+                };
+                if let Some(part) = part {
+                    return Some((part, unsafe { element.CurrentBoundingRectangle() }.ok()?));
+                }
+                element = unsafe { walker.GetParentElement(&element) }.ok()?;
+            }
+            None
+        })();
+        if let Some((part, r)) = measured {
+            set_part_rect(part, tap_proto::pack_rect(r.left, r.top, r.right, r.bottom));
+        }
+        MEASURING.store(false, SeqCst);
+    }
+}
+
+/// The bell's middle on the screen, when it has been measured: where a banner going to the list
+/// flies.
+pub fn bell_point() -> Option<POINT> {
+    let packed = BELL_RECT.load(std::sync::atomic::Ordering::Relaxed);
+    if packed == 0 {
+        return None;
+    }
+    let (left, top, right, bottom) = tap_proto::unpack_rect(packed as isize);
+    Some(POINT { x: (left + right) / 2, y: (top + bottom) / 2 })
+}
+
+/// Whether `pt` is on the clock's button: `Some(true)` on its bell, `Some(false)` on the clock.
+/// Over it as the TAP last said (and within reach of where the pointer entered, so a stale word
+/// cannot take presses elsewhere), else inside where each was measured.
+fn on_clock_part(pt: POINT) -> Option<bool> {
+    use std::sync::atomic::Ordering::Relaxed;
+    if CLOCK_HOVER.load(Relaxed) {
+        let at = unpack(CLOCK_AT.load(Relaxed));
+        if (pt.x - at.x).abs() > CLOCK_REACH || (pt.y - at.y).abs() > CLOCK_REACH {
+            return None;
+        }
+        Some(BELL_HOVER.load(Relaxed))
+    } else if in_rect(&BELL_RECT, pt) {
+        Some(true)
+    } else if in_rect(&CLOCK_RECT, pt) {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+/// Whether `pt` is in a rect kept by [`set_part_rect`].
+fn in_rect(rect: &std::sync::atomic::AtomicI64, pt: POINT) -> bool {
+    let packed = rect.load(std::sync::atomic::Ordering::Relaxed);
+    if packed == 0 {
+        return false;
+    }
+    let (left, top, right, bottom) = tap_proto::unpack_rect(packed as isize);
+    pt.x >= left && pt.x < right && pt.y >= top && pt.y < bottom
+}
+
+/// Whether a left button event is a click on the clock (or its bell) to take: a press while over
+/// it (and over a taskbar, so a stale word from the TAP cannot take clicks elsewhere), or the
+/// release of one. The clock opens the calendar, the bell the notifications.
+///
+/// Over it as the TAP last said, or, with no word since the pointer left, inside where it was
+/// measured: Windows' right-click menu takes the pointer (the TAP hears it leave) and gives no
+/// enter back when it closes, so the next click on the clock went to the shell's own flyout.
 fn clock_click(down: bool, pt: POINT) -> bool {
     use std::sync::atomic::Ordering::Relaxed;
     if !down {
         return CLOCK_PRESSED.swap(false, Relaxed);
     }
-    if !CLOCK_TAKEN.load(Relaxed) || !CLOCK_HOVER.load(Relaxed) {
+    if !CLOCK_TAKEN.load(Relaxed) {
         return false;
     }
-    let at = unpack(CLOCK_AT.load(Relaxed));
-    if (pt.x - at.x).abs() > CLOCK_REACH || (pt.y - at.y).abs() > CLOCK_REACH {
+    let Some(bell) = on_clock_part(pt) else { return false };
+    if bell && !BELL_TAKEN.load(Relaxed) {
+        // Windows' own notification centre.
         return false;
     }
     let hwnd = unsafe { WindowFromPoint(pt) };
@@ -233,7 +427,8 @@ fn clock_click(down: bool, pt: POINT) -> bool {
     if !matches!(crate::win::class_name(root).as_str(), "Shell_TrayWnd" | "Shell_SecondaryTrayWnd") {
         return false;
     }
-    if !super::post(crate::taskbar::WM_TASKBAR_ACTION, tap_proto::ACTION_OPEN_CALENDAR, 0) {
+    let action = if bell { tap_proto::ACTION_OPEN_NOTIFICATIONS } else { tap_proto::ACTION_OPEN_CALENDAR };
+    if !super::post(crate::taskbar::WM_TASKBAR_ACTION, action, 0) {
         return false;
     }
     CLOCK_PRESSED.store(true, Relaxed);
@@ -243,8 +438,8 @@ fn clock_click(down: bool, pt: POINT) -> bool {
 /// Whether the calendar is open and `pt` is outside it: the click that closes it, as a menu's would.
 /// The calendar closes on losing the foreground too, but Windows may never have given it that.
 fn outside_calendar(pt: POINT) -> bool {
-    let open = *crate::calendar::OPEN_CARDS.lock().unwrap_or_else(|e| e.into_inner());
-    open.is_some_and(|cards| !cards.iter().any(|r| pt.x >= r.left && pt.x < r.right && pt.y >= r.top && pt.y < r.bottom))
+    let open = *crate::calendar::OPEN_CARD.lock().unwrap_or_else(|e| e.into_inner());
+    open.is_some_and(|r| !(pt.x >= r.left && pt.x < r.right && pt.y >= r.top && pt.y < r.bottom))
 }
 
 /// A [`super::WM_ICON_RECT_CHECK`] is on its way: one is enough however fast the wheel turns.
@@ -296,28 +491,37 @@ fn in_slot(pt: POINT) -> bool {
     icon_rect().is_some_and(|slot| pt.x >= slot.left && pt.x < slot.right && pt.y >= slot.top && pt.y < slot.bottom)
 }
 
-/// The D or N of a shortcut taken for the calendar: its release goes too.
+/// The V, D or N of a shortcut taken: its release goes too.
 static SHORTCUT_HELD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Win+Alt+D and Win+N (Windows' shortcuts for the clock's calendar and the notification centre)
-/// open ours, while it replaces Windows'.
+/// Win+Ctrl+V (Windows' shortcut for its sound output) opens the audio panel, while on.
+pub static AUDIO_SHORTCUT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Windows' own shortcuts for what each of our taskbar buttons replaces open ours: Win+Ctrl+V the
+/// audio panel, Win+Alt+D the calendar, Win+N the notifications (each while it is on).
 unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     use std::sync::atomic::Ordering::Relaxed;
     use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT};
     use windows::Win32::UI::WindowsAndMessaging::{KBDLLHOOKSTRUCT, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP};
-    if code >= 0 && crate::calendar::SHORTCUT.load(Relaxed) {
+    if code >= 0 {
         let key = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
-        // Win+Alt+D (the clock's calendar) and Win+N (the notification centre).
-        if key.vkCode == b'D' as u32 || key.vkCode == b'N' as u32 {
+        let calendar = crate::calendar::SHORTCUT.load(Relaxed);
+        // The action and the modifiers it takes (Ctrl, Alt), exactly: other combinations are other
+        // apps' shortcuts.
+        let shortcut = match key.vkCode {
+            k if k == b'V' as u32 && AUDIO_SHORTCUT.load(Relaxed) => Some((tap_proto::ACTION_OPEN_PANEL, true, false)),
+            k if k == b'D' as u32 && calendar => Some((tap_proto::ACTION_OPEN_CALENDAR, false, true)),
+            k if k == b'N' as u32 && calendar && BELL_TAKEN.load(Relaxed) => Some((tap_proto::ACTION_OPEN_NOTIFICATIONS, false, false)),
+            _ => None,
+        };
+        if let Some((action, ctrl, alt)) = shortcut {
             let down = matches!(wparam.0 as u32, WM_KEYDOWN | WM_SYSKEYDOWN);
             let up = matches!(wparam.0 as u32, WM_KEYUP | WM_SYSKEYUP);
             let held = |vk: windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY| unsafe { GetAsyncKeyState(vk.0 as i32) } as u16 & 0x8000 != 0;
-            // Exactly those: Win+Ctrl+N or Win+Shift+N are other apps' shortcuts.
-            let others = held(VK_CONTROL) || held(VK_SHIFT);
-            let wanted = !others && if key.vkCode == b'D' as u32 { held(VK_MENU) } else { !held(VK_MENU) };
+            let wanted = held(VK_CONTROL) == ctrl && held(VK_MENU) == alt && !held(VK_SHIFT);
             if down && (held(VK_LWIN) || held(VK_RWIN)) && wanted {
                 if !SHORTCUT_HELD.swap(true, Relaxed) {
-                    super::post(crate::taskbar::WM_TASKBAR_ACTION, tap_proto::ACTION_OPEN_CALENDAR, 0);
+                    super::post(crate::taskbar::WM_TASKBAR_ACTION, action, 0);
                     // A key between the Windows key's press and release, so letting go of it does
                     // not open Start.
                     mask_windows_key();

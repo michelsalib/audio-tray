@@ -12,9 +12,9 @@
 //! is borrowed across its modal loop, so draining is re-enabled for it, and [`next_message`] holds
 //! back what has to wait for it to close.
 //!
-//! Left click on a strip segment cycles that endpoint ([`Tray::taskbar_action`]), mutes it or
-//! opens the flyout, as `[strip] left_click` says ([`on_action`]); right click, or
-//! either click on the plain icon when there is no strip, opens the flyout. Scrolling a button
+//! Left click on a strip segment opens the flyout ([`on_action`]), as does a right click or either
+//! click on the plain icon when there is no strip; a middle click mutes that endpoint or switches
+//! it to its next device, as `[strip] middle_click` says ([`on_middle_click`]). Scrolling a button
 //! changes that endpoint's volume: the wheel through [`hook`], a precision touchpad through the
 //! TAP, both as [`WM_TASKBAR_SCROLL`]; the level is shown by [`crate::osd`].
 
@@ -36,7 +36,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use crate::audio::wasapi::WasapiBackend;
 use crate::audio::{mic, notify, sessions, Flow};
-use crate::config::{Config, LeftClick};
+use crate::config::{Config, MiddleClick};
 use crate::flyout;
 use crate::icons::IconId;
 use crate::osd::Osd;
@@ -94,6 +94,17 @@ const WM_ICON_CHECK: u32 = WM_APP + 33;
 /// From the wheel hook: a wheel over the taskbar missed the icon slot, which may have moved;
 /// re-read it. (`WM_APP + 40` is the TAP's.)
 const WM_ICON_RECT_CHECK: u32 = WM_APP + 41;
+/// From the mouse hook: a middle click on the strip (`wParam`: the flow code); see
+/// [`on_middle_click`]. (`WM_APP + 42` is the calendar's.)
+pub(super) const WM_STRIP_MIDDLE: u32 = WM_APP + 43;
+/// From the mouse hook: a middle click on the bell; see [`on_bell_middle_click`].
+pub(super) const WM_BELL_MIDDLE: u32 = WM_APP + 44;
+/// A banner's word on an app listening (`crate::calendar::listening`): `wParam` 1, the microphone
+/// muted (a click), 0, only the alert dismissed (a right click).
+pub(crate) const WM_BANNER_LISTENING: u32 = WM_APP + 45;
+/// The display changed (resolution, scale, work area): posted by [`wndproc`] so it is handled with
+/// the queue; the banners move.
+const WM_DISPLAY_CHANGED: u32 = WM_APP + 46;
 
 /// The receiver window's timer for the next timed notice (`osd::TIMER_ID` is the other one).
 const NOTICE_TIMER: usize = 0x4E54;
@@ -115,6 +126,11 @@ const SETTLE: Duration = Duration::from_millis(350);
 
 /// The message window, for producers on other threads.
 static WINDOW: AtomicIsize = AtomicIsize::new(0);
+
+/// The bell's middle on the screen, when measured (a banner going to the list flies there).
+pub(crate) fn bell_point() -> Option<windows::Win32::Foundation::POINT> {
+    hook::bell_point()
+}
 
 /// Post to the tray's message window from any thread. `false` when there is no tray (the dev CLI
 /// modes) or the post failed.
@@ -290,14 +306,14 @@ pub fn run(backend: WasapiBackend, settings: bool) -> Result<()> {
 
     let devices = backend.enumerate_flow(Flow::Output).map(|d| d.len()).unwrap_or(0);
     let gestures = if taskbar::buttons_up() {
-        "left click cycles a segment, right click opens the panel"
+        "left click opens the panel, middle click mutes or switches, right click opens the menu"
     } else {
-        "no strip — either button opens the panel"
+        "no strip — left click opens the panel, right click the menu"
     };
     println!("tray: created ({devices} output device(s)); {gestures}.");
 
     // The passive surface; the app works without it.
-    if let Err(e) = crate::pill::create(&config.pill) {
+    if let Err(e) = crate::pill::create(&pill_config(&config)) {
         eprintln!("pill: unavailable ({e:#})");
     }
 
@@ -313,6 +329,7 @@ pub fn run(backend: WasapiBackend, settings: bool) -> Result<()> {
     crate::pill::set_batteries(config.batteries.enabled && config.batteries.pill_alert, config.batteries.enabled && config.batteries.pill_card);
     let mut hub = crate::hub::State::default();
     hub.set_low_battery_at(config.batteries.warn_at());
+    hub.merges_notices = crate::calendar::merges_notices(&config);
 
     TRAY.with(|cell| {
         *cell.borrow_mut() = Some(Tray {
@@ -338,12 +355,24 @@ pub fn run(backend: WasapiBackend, settings: bool) -> Result<()> {
     crate::calendar::focus::recover();
     if with_tray(|tray| tray.config.calendar.enabled).unwrap_or(false) {
         crate::calendar::notifications::start();
+        crate::calendar::focus::watch();
         // The first open finds its fonts loaded and its pictures decoded.
         prewarm_later(10_000);
     }
     crate::calendar::set_shortcut(with_tray(|tray| tray.config.calendar.enabled && tray.config.calendar.shortcut).unwrap_or(false));
-    hook::set_clock_taken(with_tray(|tray| tray.config.calendar.enabled).unwrap_or(false));
-    hook::want_keys(crate::calendar::SHORTCUT.load(std::sync::atomic::Ordering::SeqCst));
+    let (calendar, notifications) = with_tray(|tray| (tray.config.calendar.enabled, tray.config.calendar.notifications)).unwrap_or_default();
+    hook::set_clock_taken(calendar, notifications);
+    hook::set_bell_middle_taken(with_tray(|tray| bell_middle_taken(&tray.config)).unwrap_or(false));
+    if calendar && notifications {
+        crate::calendar::show_bell();
+    }
+    // Windows' banners taken (or given back after a crash), as Settings says.
+    if let Some(config) = with_tray(|tray| tray.config.clone()) {
+        crate::calendar::follow_takeover(&config);
+    }
+    let audio_shortcut = with_tray(|tray| tray.config.strip.shortcut).unwrap_or(false);
+    hook::AUDIO_SHORTCUT.store(audio_shortcut, Ordering::SeqCst);
+    hook::want_keys(crate::calendar::SHORTCUT.load(Ordering::SeqCst) || audio_shortcut);
     reschedule();
     if settings {
         post(crate::settings::WM_OPEN_SETTINGS, 0, 0);
@@ -355,6 +384,8 @@ pub fn run(backend: WasapiBackend, settings: bool) -> Result<()> {
     crate::integrations::stop();
 
     crate::calendar::close();
+    // Windows' banners back: Audio Tray is no longer there to show its own.
+    crate::calendar::takeover::apply(false);
     // Do not disturb Audio Tray set ends with it.
     crate::calendar::focus::release();
     crate::settings::destroy();
@@ -381,8 +412,32 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
     }
     // A plain store too, read by the mouse hook on its own thread.
     if msg == tap_proto::WM_TASKBAR_CLOCK_HOVER {
-        hook::set_clock_hover(wparam.0 != 0);
+        hook::set_clock_hover(wparam.0);
+        if matches!(wparam.0, tap_proto::HOVER_OVER | tap_proto::HOVER_BELL) {
+            // Where it is, for a click with no hover told (after Windows' right-click menu).
+            hook::measure_parts();
+        }
         return LRESULT(0);
+    }
+    if msg == tap_proto::WM_TASKBAR_CLOCK_RECT {
+        hook::set_part_rect(wparam.0, lparam.0);
+        return LRESULT(0);
+    }
+    // Windows is signing out or shutting down: the process may end as soon as this returns, so
+    // Windows' banners are given back now (taken again at the next start).
+    if msg == windows::Win32::UI::WindowsAndMessaging::WM_ENDSESSION && wparam.0 != 0 {
+        crate::calendar::takeover::apply(false);
+        return LRESULT(0);
+    }
+    // The screen changed (its resolution, its scale, the taskbar's room): where the clock and the
+    // bell were measured is no longer where they are, and the banners move.
+    {
+        use windows::Win32::UI::WindowsAndMessaging::{SPI_SETWORKAREA, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_SETTINGCHANGE};
+        if msg == WM_DISPLAYCHANGE || msg == WM_DPICHANGED || (msg == WM_SETTINGCHANGE && wparam.0 == SPI_SETWORKAREA.0 as usize) {
+            hook::set_part_rect(tap_proto::PART_FORGET, 0);
+            let _ = unsafe { PostMessageW(Some(hwnd), WM_DISPLAY_CHANGED, WPARAM(0), LPARAM(0)) };
+            return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
+        }
     }
     if !is_ours(msg, wparam.0) {
         return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
@@ -407,6 +462,10 @@ fn is_ours(msg: u32, wparam: usize) -> bool {
             | WM_MUSIC_PROGRESS
             | WM_APPLY_SCROLL
             | WM_TRAY_CLICK
+            | WM_STRIP_MIDDLE
+            | WM_BELL_MIDDLE
+            | WM_BANNER_LISTENING
+            | WM_DISPLAY_CHANGED
             | WM_ENDPOINT_VOLUME
             | WM_ICON_CHECK
             | crate::hub::WM_HUB_EVENTS
@@ -471,17 +530,33 @@ fn handle(msg: Queued) {
         },
         crate::settings::WM_OPEN_SETTINGS => {
             open_settings();
-            if msg.wparam == crate::settings::OPEN_CALENDAR {
-                crate::settings::show_calendar();
-            }
+            crate::settings::show_page(msg.wparam);
+        }
+        WM_DISPLAY_CHANGED => crate::calendar::display_changed(),
+        WM_BANNER_LISTENING => {
+            with_tray(|tray| {
+                if msg.wparam == 1 {
+                    tray.set_microphone_muted(true);
+                }
+                // Said: the alert goes (until another app starts listening).
+                tray.hub.acknowledge(&crate::hub::Notice::Listening { app: String::new(), user: String::new() });
+                tray.hub_changed();
+            });
         }
         crate::calendar::WM_CALENDAR if msg.wparam == crate::calendar::CLOSE => {
             let (x, y) = (msg.lparam as u16 as i16, (msg.lparam >> 16) as u16 as i16);
             println!("calendar: closed by a click outside it, at {x},{y}");
             crate::calendar::close()
         }
+        crate::calendar::WM_CALENDAR if msg.wparam == crate::calendar::QUIET => {
+            // The bell's cross and the panel's moon follow.
+            crate::calendar::quiet_changed();
+            reschedule();
+        }
         crate::calendar::WM_CALENDAR if msg.wparam == crate::calendar::NOTIFICATIONS => {
-            crate::calendar::notifications_changed();
+            if let Some(config) = with_tray(|tray| tray.config.clone()) {
+                crate::calendar::notifications_changed(&config);
+            }
             // New pictures decoded before the panel opens, once the burst has settled.
             prewarm_later(PREWARM_AFTER_MS);
             reschedule();
@@ -543,9 +618,11 @@ fn handle(msg: Queued) {
             }
         }
         WM_TRAY_CLICK => on_tray_click(msg.wparam, msg.lparam),
+        WM_STRIP_MIDDLE => on_middle_click(if msg.wparam == taskbar::flow_code(Flow::Input) { Flow::Input } else { Flow::Output }),
+        WM_BELL_MIDDLE => on_bell_middle_click(),
         WM_TASKBAR_RESTARTED => {
             // The clock the TAP said the pointer was over is gone with the old shell.
-            hook::set_clock_hover(false);
+            hook::forget_clock();
             with_tray(Tray::taskbar_restarted);
         }
         _ => {}
@@ -568,11 +645,16 @@ fn click_allowed(what: &dyn std::fmt::Debug) -> bool {
 
 /// A gesture on the injected strip, relayed by the TAP.
 fn on_action(action: Action) {
-    if action == Action::OpenCalendar {
+    let panel = match action {
+        Action::OpenCalendar => Some(crate::calendar::Panel::Calendar),
+        Action::OpenNotifications => Some(crate::calendar::Panel::Notifications),
+        _ => None,
+    };
+    if let Some(panel) = panel {
         // One click can arrive twice (the mouse hook and the TAP's tap handler, for touch or pen):
         // opening toggles, so the second would close what the first opened.
         let now = std::time::Instant::now();
-        let echo = LAST_OPEN.with(|last| last.replace(Some(now))).is_some_and(|at| now - at < std::time::Duration::from_millis(300));
+        let echo = LAST_OPEN.with(|last| last.replace(Some((now, panel)))).is_some_and(|(at, was)| was == panel && now - at < std::time::Duration::from_millis(300));
         if echo {
             return;
         }
@@ -580,7 +662,7 @@ fn on_action(action: Action) {
         // calendar would open), so it is not the click that closed it: the panel gives way and the
         // calendar opens once it has ([`open_flyout`]).
         if with_tray(|tray| tray.flyout_open).unwrap_or(false) {
-            CALENDAR_NEXT.with(|next| next.set(true));
+            CALENDAR_NEXT.with(|next| next.set(Some(panel)));
             // The panel closes on losing the capture (same thread).
             let _ = unsafe { windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture() };
             return;
@@ -589,32 +671,142 @@ fn on_action(action: Action) {
             tray.osd.hide();
             tray.config.clone()
         }) {
-            crate::calendar::open(&config);
+            crate::calendar::open(&config, panel);
         }
         return;
     }
     if !click_allowed(&action) {
         return;
     }
-    // A segment's left click does what `[strip] left_click` says.
-    let click = with_tray(|tray| tray.config.strip.left_click).unwrap_or_default();
-    let segment = match action {
-        Action::CycleOutput => Some(Flow::Output),
-        Action::CycleInput => Some(Flow::Input),
-        _ => None,
-    };
-    if action == Action::OpenPanel || (segment.is_some() && click == LeftClick::Panel) {
+    // A segment's left click opens the panel (its middle click does what `[strip] middle_click`
+    // says: [`on_middle_click`]).
+    if matches!(action, Action::OpenPanel | Action::CycleOutput | Action::CycleInput) {
         // No anchor: the strip's rect is not ours to know; the flyout uses its default place.
         return open_flyout(None);
     }
     with_tray(|tray| {
-        let done = match segment {
-            Some(flow) if click == LeftClick::Mute => tray.toggle_endpoint_mute(flow),
-            _ => tray.taskbar_action(action),
+        // Never propagated: COM against a session that can vanish mid-click must not end the loop.
+        if let Err(e) = tray.taskbar_action(action) {
+            eprintln!("taskbar: {action:?} failed ({e:#})");
+        }
+    });
+}
+
+/// A notice, while Audio Tray shows every notification: a Windows notification of Audio Tray's
+/// own (listed with the others, and shown by the banners as they are), or for a layout switch a
+/// glance that is not kept.
+fn hand_over(notice: &crate::hub::Notice, config: &Config) {
+    use crate::hub::Notice;
+    // Battery alerts as Settings has them: either of its alerts (pill or notification) asks for it.
+    let b = &config.batteries;
+    if matches!(notice, Notice::LowBattery { .. }) && !(b.enabled && (b.toast || b.pill_alert)) {
+        return;
+    }
+    use crate::lang::{french, tr};
+    use crate::toast::{Outgoing, TAG};
+    let plain = |title: String, body: String, tag: String| Outgoing { title, body, link: None, reminder: false, tag };
+    let outgoing = match notice {
+        Notice::KeyboardSwitched { keyboard, layout } => {
+            crate::calendar::glance(layout, keyboard);
+            return;
+        }
+        // Each tagged with what it is (`toast::TAG`), for the banner that draws it.
+        Notice::AudioMoved { to, from } => plain(
+            if french() { format!("Son sur {to}") } else { format!("Sound now on {to}") },
+            if french() { format!("{from} est déconnecté.") } else { format!("{from} disconnected.") },
+            format!("{TAG}audio"),
+        ),
+        Notice::LowBattery { name, level, .. } => low_battery(name, *level),
+        Notice::Meeting { title, line, url, lasts } => {
+            // When it starts (its notice lasts until two minutes past): its banner counts down.
+            let start = crate::calendar::time::now() + *lasts as i64 - 120;
+            Outgoing {
+                title: title.clone(),
+                body: line.clone(),
+                link: url.clone().map(|url| (tr("Join", "Rejoindre").to_string(), url)),
+                reminder: true,
+                tag: format!("{TAG}meeting/{start}"),
+            }
+        }
+        Notice::FocusDone { minutes } => plain(
+            tr("Focus done", "Concentration terminée").to_string(),
+            if french() { format!("{minutes} min de concentration. Faites une pause.") } else { format!("{minutes} minutes of focus. Take a break.") },
+            format!("{TAG}focus/{minutes}"),
+        ),
+        Notice::NewTrack { .. } | Notice::Listening { .. } => return,
+    };
+    // Off the tray thread: Windows' notification platform can take its time.
+    crate::toast::send(outgoing);
+}
+
+/// A device's low battery, as a notification in Windows' language: tagged (`toast::TAG`) so the
+/// banner draws its battery, one per device (two low at once are two notifications), a device's
+/// next warning replacing its last (the level is in the words, not the tag).
+fn low_battery(name: &str, level: u8) -> crate::toast::Outgoing {
+    use crate::lang::french;
+    let device = name.bytes().fold(0u32, |h, b| h.wrapping_mul(31).wrapping_add(b as u32));
+    crate::toast::Outgoing {
+        title: if french() { format!("Batterie faible : {name}") } else { format!("{name} battery low") },
+        body: if french() { format!("Il reste {level} %. Pensez à la recharger.") } else { format!("{level}% left. Time to charge it.") },
+        link: None,
+        reminder: false,
+        tag: format!("{}battery/{device:x}", crate::toast::TAG),
+    }
+}
+
+/// The pill's settings as the pill takes them: its alert for an app listening goes to the banners
+/// while the bell is Audio Tray's (one kind of notice, one look).
+fn pill_config(config: &Config) -> crate::config::Pill {
+    let mut pill = config.pill.clone();
+    pill.listening_alerts &= !crate::calendar::merges_notices(config);
+    pill
+}
+
+/// Whether a middle click on the bell is Audio Tray's: its notifications are on, and the click does
+/// something (else it is Windows').
+fn bell_middle_taken(config: &Config) -> bool {
+    crate::calendar::merges_notices(config) && config.calendar.bell_middle_click != crate::config::BellMiddleClick::Nothing
+}
+
+/// A middle click on the bell (the hook's, [`WM_BELL_MIDDLE`]): Do not disturb on or off, or every
+/// notification cleared, as `[calendar] bell_middle_click` says.
+fn on_bell_middle_click() {
+    let Some(click) = with_tray(|tray| tray.config.calendar.bell_middle_click) else { return };
+    match click {
+        crate::config::BellMiddleClick::DoNotDisturb => {
+            let on = crate::calendar::focus::toggle();
+            println!("calendar: Do not disturb {} by a middle click on the bell", if on { "on" } else { "off" });
+            // The bell's cross and the panel's moon follow.
+            crate::calendar::quiet_changed();
+            reschedule();
+        }
+        crate::config::BellMiddleClick::ClearAll => {
+            crate::calendar::notifications::clear();
+            if let Some(config) = with_tray(|tray| tray.config.clone()) {
+                crate::calendar::notifications_changed(&config);
+            }
+            reschedule();
+        }
+        crate::config::BellMiddleClick::Nothing => {}
+    }
+}
+
+/// A middle click on the strip's output or input button (the hook's, [`WM_STRIP_MIDDLE`]): mute
+/// it, or switch it to its next device, with or without a muted stop, as `[strip] middle_click`
+/// says.
+fn on_middle_click(flow: Flow) {
+    if !click_allowed(&"middle click") {
+        return;
+    }
+    with_tray(|tray| {
+        let done = match tray.config.strip.middle_click {
+            MiddleClick::Mute => tray.toggle_endpoint_mute(flow),
+            MiddleClick::Switch => tray.cycle(flow, false),
+            MiddleClick::SwitchMute => tray.cycle(flow, true),
         };
         // Never propagated: COM against endpoints that can vanish mid-click must not end the loop.
         if let Err(e) = done {
-            eprintln!("taskbar: {action:?} failed ({e:#})");
+            eprintln!("taskbar: middle click on {flow:?} failed ({e:#})");
             // The strip may be previewing a switch that failed: put the truth back.
             tray.strip = None;
             tray.refresh();
@@ -622,19 +814,85 @@ fn on_action(action: Action) {
     });
 }
 
-/// A click on the plain notification icon. Right click opens the flyout; left click does too,
-/// unless a strip is up — the shell invokes the icon under the strip, so a segment's click also
-/// arrives here, and the strip's own handler is the one that cycles.
+/// A click on the plain notification icon. Right click opens the menu ([`context_menu`]); left
+/// click opens the flyout, unless a strip is up — the shell invokes the icon under the strip, so a
+/// segment's click also arrives here, and the strip's own handler is the one that opens it.
 fn on_tray_click(button: usize, packed: isize) {
     if button == 1 && taskbar::buttons_up() {
-        println!("tray: left click on the strip — cycling, not opening");
+        println!("tray: left click on the strip — its own handler opens the panel");
         return;
     }
     if !click_allowed(&"tray click") {
         return;
     }
     let (cx, bottom) = unpack_point(packed);
+    if button == 2 {
+        // A right click is a menu, as on Windows' own buttons beside it (the clock, the bell).
+        return context_menu();
+    }
     open_flyout(Some(flyout::Anchor { cx, bottom }));
+}
+
+/// The strip's (and the plain icon's) right-click menu, at the pointer: Windows' sound settings,
+/// Audio Tray's, and Quit (no longer in the panel's footer).
+fn context_menu() {
+    use crate::lang::tr;
+    use windows::core::{HSTRING, PCWSTR};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        AppendMenuW, CreatePopupMenu, DestroyMenu, GetCursorPos, SetForegroundWindow, TrackPopupMenu, MF_SEPARATOR, MF_STRING,
+        TPM_BOTTOMALIGN, TPM_CENTERALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON,
+    };
+    const SOUND: usize = 1;
+    const SETTINGS: usize = 2;
+    const QUIT: usize = 3;
+    thread_local! {
+        /// The menu is up: a second right click meanwhile opens no second one.
+        static MENU_OPEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+    let Some(owner) = taskbar::receiver() else { return };
+    if MENU_OPEN.with(|open| open.replace(true)) {
+        return;
+    }
+    // In Windows' language, as the panels and Settings.
+    let items = [
+        (SOUND, HSTRING::from(tr("Sound settings", "Paramètres du son"))),
+        (SETTINGS, HSTRING::from(tr("Audio Tray settings", "Paramètres d'Audio Tray"))),
+        (QUIT, HSTRING::from(tr("Quit Audio Tray", "Quitter Audio Tray"))),
+    ];
+    let chosen = unsafe {
+        let Ok(menu) = CreatePopupMenu() else { return };
+        for (id, label) in &items {
+            if *id == QUIT {
+                let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
+            }
+            let _ = AppendMenuW(menu, MF_STRING, *id, PCWSTR(label.as_ptr()));
+        }
+        let mut at = windows::Win32::Foundation::POINT::default();
+        let _ = GetCursorPos(&mut at);
+        // Without the foreground, the menu would not close on a click elsewhere.
+        let _ = SetForegroundWindow(owner);
+        // Its modal loop drains the queue as the panel's does: the strip, the banners and the
+        // hub stay live while it is open.
+        let was_draining = DRAINING.with(|draining| draining.replace(false));
+        let chosen = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_BOTTOMALIGN | TPM_CENTERALIGN, at.x, at.y, None, owner, None);
+        DRAINING.with(|draining| draining.set(was_draining));
+        // Windows' advice for a menu of a window in the background: a message after it, so the
+        // next click opens it again rather than only dismissing it.
+        let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(Some(owner), windows::Win32::UI::WindowsAndMessaging::WM_NULL, Default::default(), Default::default());
+        let _ = DestroyMenu(menu);
+        chosen.0 as usize
+    };
+    MENU_OPEN.with(|open| open.set(false));
+    match chosen {
+        SOUND => {
+            crate::win::shell_open("ms-settings:sound", None);
+        }
+        SETTINGS => {
+            post(crate::settings::WM_OPEN_SETTINGS, crate::settings::OPEN_TASKBAR, 0);
+        }
+        QUIT => quit(),
+        _ => {}
+    }
 }
 
 /// tray-icon's event handler (called on this thread, from its own window's procedure): turn an
@@ -683,7 +941,10 @@ fn open_flyout(anchor: Option<flyout::Anchor>) {
     };
 
     let was_draining = DRAINING.with(|draining| draining.replace(false));
+    // No tooltip of the strip's (or the clock's) over the panel while it is open.
+    taskbar::notify_panel(tap_proto::OPEN_AUDIO);
     let outcome = flyout::show(&backend, &mut config, anchor);
+    taskbar::notify_panel(tap_proto::OPEN_NONE);
     DRAINING.with(|draining| draining.set(was_draining));
 
     with_tray(|tray| {
@@ -701,21 +962,23 @@ fn open_flyout(anchor: Option<flyout::Anchor>) {
         return;
     }
     if outcome.settings {
+        // The audio panel's gear: the Taskbar page, its buttons'.
         open_settings();
+        crate::settings::show_page(crate::settings::OPEN_TASKBAR);
     }
-    // The clock was clicked while the panel was open: the calendar it asked for.
-    if CALENDAR_NEXT.with(|next| next.replace(false)) {
+    // The clock (or the bell) was clicked while the panel was open: the card it asked for.
+    if let Some(panel) = CALENDAR_NEXT.with(|next| next.take()) {
         if let Some(config) = with_tray(|tray| tray.config.clone()) {
-            crate::calendar::open(&config);
+            crate::calendar::open(&config, panel);
         }
     }
 }
 
 thread_local! {
-    /// The calendar is to open as soon as the audio panel has closed.
-    static CALENDAR_NEXT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    /// When the clock last asked for the calendar, to drop the same click's echo.
-    static LAST_OPEN: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) };
+    /// The calendar's card to open as soon as the audio panel has closed.
+    static CALENDAR_NEXT: std::cell::Cell<Option<crate::calendar::Panel>> = const { std::cell::Cell::new(None) };
+    /// When the clock or the bell last asked for a card, and which, to drop the same click's echo.
+    static LAST_OPEN: std::cell::Cell<Option<(std::time::Instant, crate::calendar::Panel)>> = const { std::cell::Cell::new(None) };
 }
 
 /// Have the calendar look again now (the focus timer started, a setting changed).
@@ -797,7 +1060,7 @@ impl Tray {
         if connectors(&before) != connectors(c) {
             crate::integrations::reconfigure(&before, c);
         }
-        crate::pill::configure(&c.pill);
+        crate::pill::configure(&pill_config(c));
         if before.motion != c.motion {
             crate::config::set_motion(c.motion);
             crate::pill::motion_changed();
@@ -815,12 +1078,23 @@ impl Tray {
         }
         if self.config.calendar.enabled {
             crate::calendar::notifications::start();
+            crate::calendar::focus::watch();
         } else {
             crate::calendar::notifications::stop();
         }
         crate::calendar::set_shortcut(self.config.calendar.enabled && self.config.calendar.shortcut);
-        hook::set_clock_taken(self.config.calendar.enabled);
-        hook::want_keys(self.config.calendar.enabled && self.config.calendar.shortcut);
+        hook::set_clock_taken(self.config.calendar.enabled, self.config.calendar.notifications);
+        hook::set_bell_middle_taken(bell_middle_taken(&self.config));
+        use crate::calendar::merges_notices;
+        if merges_notices(&self.config) && !merges_notices(&before) {
+            crate::calendar::show_bell();
+        }
+        self.hub.merges_notices = merges_notices(&self.config);
+        if crate::calendar::handed_over(&before) != crate::calendar::handed_over(&self.config) {
+            crate::calendar::follow_takeover(&self.config);
+        }
+        hook::AUDIO_SHORTCUT.store(self.config.strip.shortcut, Ordering::SeqCst);
+        hook::want_keys((self.config.calendar.enabled && self.config.calendar.shortcut) || self.config.strip.shortcut);
         if before.calendar != self.config.calendar || before.clock != self.config.clock {
             post(WM_TIMER, CALENDAR_TIMER, 0);
         }
@@ -861,7 +1135,7 @@ impl Tray {
     fn apply_taskbar(&mut self) {
         taskbar::revert(0);
         // The TAP that said the pointer was over the clock goes: its word with it.
-        hook::set_clock_hover(false);
+        hook::forget_clock();
         self.strip = None;
         crate::calendar::schedule::forget_clock();
         if self.config.injects() {
@@ -926,6 +1200,9 @@ impl Tray {
         if batteries {
             self.follow_batteries();
         }
+        for notice in std::mem::take(&mut self.hub.outbox) {
+            hand_over(&notice, &self.config);
+        }
         if changed {
             self.hub_changed();
         }
@@ -937,15 +1214,11 @@ impl Tray {
         self.apply_tooltip();
         let low = std::mem::take(&mut self.hub.fresh_low);
         let b = &self.config.batteries;
-        if !(b.enabled && b.toast) {
+        if !(b.enabled && b.toast) || self.hub.merges_notices {
             return;
         }
         for battery in low {
-            let title = format!("{} battery low", battery.name);
-            let body = format!("{}% left. Time to charge it.", battery.level);
-            if let Err(e) = crate::toast::show(&title, &body) {
-                eprintln!("batteries: could not show the notification ({e:#})");
-            }
+            crate::toast::send(low_battery(&battery.name, battery.level));
         }
     }
 
@@ -997,6 +1270,14 @@ impl Tray {
         }
         let (_, next) = self.hub.expire(Instant::now());
         crate::pill::update(&self.hub);
+        // An app listening: the banners' red alert while the bell is Audio Tray's (the pill's otherwise).
+        let listening = (self.config.pill.listening_alerts && crate::calendar::merges_notices(&self.config))
+            .then(|| self.hub.notices.iter().rev().find_map(|(n, _)| match n {
+                crate::hub::Notice::Listening { app, user } => Some((app.clone(), user.clone())),
+                _ => None,
+            }))
+            .flatten();
+        crate::calendar::listening(listening);
         crate::settings::follow(&self.hub);
         if let (Some(next), Some(window)) = (next, taskbar::receiver()) {
             // One-shot: the handler re-arms for whatever is due next.
@@ -1092,7 +1373,7 @@ impl Tray {
                     if let Err(e) = self.config.save() {
                         eprintln!("pill: could not save its place ({e:#})");
                     }
-                    crate::pill::configure(&self.config.pill);
+                    crate::pill::configure(&pill_config(&self.config));
                     crate::settings::sync(&self.config);
                 }
             }
@@ -1296,8 +1577,8 @@ impl Tray {
         }
     }
 
-    /// Mute or unmute `flow`'s default device: a segment's left click under
-    /// [`LeftClick::Mute`]. Like the cycle, the strip shows it before the audio work.
+    /// Mute or unmute `flow`'s default device: a segment's middle click under
+    /// [`MiddleClick::Mute`]. Like the cycle, the strip shows it before the audio work.
     fn toggle_endpoint_mute(&mut self, flow: Flow) -> Result<()> {
         let Some(id) = self.backend.default_of(flow)? else { return Ok(()) };
         let muted = !self.backend.is_muted(&id)?;
@@ -1308,41 +1589,37 @@ impl Tray {
         Ok(())
     }
 
-    /// Act on a click from the injected strip.
-    ///
-    /// Left click (under the default [`LeftClick::Switch`]) steps that endpoint around a cycle of the active devices, each unmuted, plus
-    /// one muted stop on the last device before the wrap:
+    /// Act on a gesture from the injected strip that is not a panel's (those are `on_action`'s): the
+    /// music tile's transport.
+    fn taskbar_action(&mut self, action: Action) -> Result<()> {
+        use crate::music::smtc::Command;
+        // Handed to the feed thread and not awaited: a slow media session must not stall this
+        // thread. The strip catches up on the next poll.
+        let command = match action {
+            Action::MusicPrevious => Command::Previous,
+            Action::MusicNext => Command::Next,
+            Action::MusicPlayPause => Command::TogglePlayPause,
+            _ => return Ok(()),
+        };
+        let Some(music) = self.music.as_ref() else {
+            println!("taskbar: {action:?} ignored — the music half is not running");
+            return Ok(());
+        };
+        music.command(command);
+        Ok(())
+    }
+
+    /// Switch `flow` to its next device (a segment's middle click), around a cycle of the active
+    /// devices, each unmuted, plus (`mute_stop`) one muted stop on the last device before the wrap:
     ///
     /// ```text
     /// device 1 → device 2 → … → device N → device N, muted → device 1 → …
     /// ```
     ///
-    /// With `[strip] mute_in_cycle` off there is no muted stop: device N wraps to device 1.
-    /// Every device stop is unmuted: arriving on a muted device unmutes it, and stepping off the
-    /// muted stop takes the mute with it, so the cycle never leaves a muted device behind.
-    fn taskbar_action(&mut self, action: Action) -> Result<()> {
-        use crate::music::smtc::Command;
-
-        let flow = match action {
-            Action::CycleOutput => Flow::Output,
-            Action::CycleInput => Flow::Input,
-            Action::OpenPanel | Action::OpenCalendar => return Ok(()), // handled by `on_action`
-            // Handed to the feed thread and not awaited: a slow media session must not stall this
-            // thread. The strip catches up on the next poll.
-            Action::MusicPrevious | Action::MusicPlayPause | Action::MusicNext => {
-                let Some(music) = self.music.as_ref() else {
-                    println!("taskbar: {action:?} ignored — the music half is not running");
-                    return Ok(());
-                };
-                music.command(match action {
-                    Action::MusicPrevious => Command::Previous,
-                    Action::MusicNext => Command::Next,
-                    _ => Command::TogglePlayPause,
-                });
-                return Ok(());
-            }
-        };
-
+    /// Without `mute_stop`, device N wraps to device 1. Every device stop is unmuted: arriving on a
+    /// muted device unmutes it, and stepping off the muted stop takes the mute with it, so the cycle
+    /// never leaves a muted device behind.
+    fn cycle(&mut self, flow: Flow, mute_stop: bool) -> Result<()> {
         let devices = self.backend.enumerate_flow(flow)?;
         if devices.is_empty() {
             return Ok(());
@@ -1354,7 +1631,7 @@ impl Tray {
         // Which device the click lands on, or `None` for the muted stop.
         let next = match at {
             Some(i) if muted => Some((i + 1) % devices.len()),
-            Some(i) if i + 1 == devices.len() && self.config.strip.mute_in_cycle => None,
+            Some(i) if i + 1 == devices.len() && mute_stop => None,
             Some(i) => Some((i + 1) % devices.len()),
             None => Some(0),
         };
@@ -1635,6 +1912,10 @@ mod tests {
             crate::settings::WM_SETTINGS,
             crate::settings::WM_OPEN_SETTINGS,
             WM_ICON_RECT_CHECK,
+            WM_STRIP_MIDDLE,
+            WM_BELL_MIDDLE,
+            WM_BANNER_LISTENING,
+            WM_DISPLAY_CHANGED,
             crate::calendar::WM_CALENDAR,
             tap_proto::WM_TASKBAR_ACTION,
             tap_proto::WM_TASKBAR_RESTARTED,
@@ -1642,6 +1923,8 @@ mod tests {
             tap_proto::WM_MUSIC_PROGRESS,
             tap_proto::WM_TASKBAR_STATUS,
             tap_proto::WM_TASKBAR_CLOCK_HOVER,
+            tap_proto::WM_TASKBAR_CLOCK_RECT,
+            tap_proto::WM_TAP_PANEL,
         ];
         for (i, a) in ids.iter().enumerate() {
             assert!(ids[i + 1..].iter().all(|b| a != b), "0x{a:x} is used twice");

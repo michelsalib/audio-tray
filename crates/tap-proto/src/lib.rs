@@ -44,9 +44,53 @@ pub const WM_TAP_MUSIC_CHANGED: u32 = WM_APP + 29;
 /// TAP → app: which parts of the taskbar integration are not working (`wParam`, `STATUS_*` bits;
 /// 0 = all well). Posted when it changes, after a start-up grace period.
 pub const WM_TASKBAR_STATUS: u32 = WM_APP + 40;
-/// TAP → app: the pointer is over the taskbar clock (`wParam` 1) or has left it (0), while the
-/// calendar replaces the shell's. The app's mouse hook then takes the clock's left clicks.
+/// TAP → app: where the pointer is on the clock's button, while the calendar replaces the shell's
+/// (`wParam`, one of `HOVER_*`). The app's mouse hook then takes the button's left clicks.
 pub const WM_TASKBAR_CLOCK_HOVER: u32 = WM_APP + 50;
+
+/// [`WM_TASKBAR_CLOCK_HOVER`]'s values. The button holds the clock and, when Windows shows it, the
+/// bell: the button's own enter and leave say 1 and 0, the bell's 2 and 3, each independently.
+pub const HOVER_LEFT: usize = 0;
+pub const HOVER_OVER: usize = 1;
+pub const HOVER_BELL: usize = 2;
+pub const HOVER_BELL_LEFT: usize = 3;
+
+/// TAP → app, `wParam` [`PART_FORGET`]: the clock and the bell moved (the bell widened for its
+/// badge), so the rects the app measured for them (UI Automation, [`PART_CLOCK`], [`PART_BELL`],
+/// packed with [`pack_rect`]) are out of date. The hook falls back on those rects when no hover was
+/// told since the pointer last left (Windows' right-click menu takes the pointer and gives no enter
+/// back).
+pub const WM_TASKBAR_CLOCK_RECT: u32 = WM_APP + 52;
+pub const PART_CLOCK: usize = 0;
+pub const PART_BELL: usize = 1;
+pub const PART_FORGET: usize = 2;
+
+/// Four signed 16-bit coordinates in one 64-bit `lParam`, and back.
+pub fn pack_rect(left: i32, top: i32, right: i32, bottom: i32) -> isize {
+    let p = |v: i32| v as i16 as u16 as u64;
+    (p(left) | p(top) << 16 | p(right) << 32 | p(bottom) << 48) as isize
+}
+
+pub fn unpack_rect(packed: isize) -> (i32, i32, i32, i32) {
+    let v = packed as u64;
+    let q = |shift: u32| (v >> shift) as u16 as i16 as i32;
+    (q(0), q(16), q(32), q(48))
+}
+
+/// App → TAP: which of audio-tray's panels is open (`wParam`, one of `OPEN_*`). The TAP keeps the
+/// clock or the bell lit while its card is open, as the shell's buttons are while their flyouts
+/// are, and takes the tooltips of the strip, the clock and the bell off while any panel is open, so
+/// none shows over it.
+pub const WM_TAP_PANEL: u32 = WM_APP + 51;
+pub const OPEN_NONE: usize = 0;
+pub const OPEN_CALENDAR: usize = 1;
+pub const OPEN_NOTIFICATIONS: usize = 2;
+/// The audio panel (the strip's or the tray icon's).
+pub const OPEN_AUDIO: usize = 3;
+
+/// App → TAP: a notification went to the bell's list (its banner flew into it): the bell gives a
+/// little ring, its glyph swinging for a moment.
+pub const WM_TAP_BELL_RING: u32 = WM_APP + 53;
 
 /// Our buttons are not on the taskbar (the notification icon was not found or not decorated).
 pub const STATUS_NO_STRIP: usize = 1 << 0;
@@ -66,6 +110,8 @@ pub const ACTION_CYCLE_INPUT: usize = 2;
 pub const ACTION_OPEN_PANEL: usize = 3;
 /// A click on the taskbar clock, when the calendar replaces the shell's (init data `clock=1`).
 pub const ACTION_OPEN_CALENDAR: usize = 4;
+/// A click on the bell beside the clock: audio-tray's notifications.
+pub const ACTION_OPEN_NOTIFICATIONS: usize = 5;
 pub const ACTION_MUSIC_PREVIOUS: usize = 10;
 pub const ACTION_MUSIC_PLAY_PAUSE: usize = 11;
 pub const ACTION_MUSIC_NEXT: usize = 12;
@@ -80,8 +126,11 @@ pub const HANDOVER_ACCEPTED: isize = 1;
 pub const HANDOVER_DECLINED: isize = 2;
 /// App → TAP `WM_COPYDATA` tag ("ATC1"): how the clock reads, as init-data pairs: `time` and
 /// `date` (`GetTimeFormatEx`/`GetDateFormatEx` patterns, empty for the locale's, `date=-` to hide
-/// it), `oneline`, `top` (text after the time), `badge` (the unread count) and `badge_image`,
-/// `badge_width`, `badge_scale` (the app-drawn badge PNG, its width in DIPs, its pixels per DIP).
+/// it), `oneline`, `badge` (how many wait) and `badge_image`, `badge_width`, `badge_scale` (the
+/// app-drawn badge PNG, its width in DIPs, its pixels per DIP; on the bell's corner when Windows
+/// shows the bell, else beside the clock), `quiet` (Windows keeps notifications quiet: the bell is
+/// drawn crossed), `waiting` (`1`/`0`: Audio Tray's list has some or none, the bell filled or
+/// plain; empty: the shell's fill).
 /// `release=1` alone hands the clock back to the shell (the TAP undoes its changes and stops).
 pub const CLOCK_MAGIC: usize = 0x4154_4331;
 
@@ -95,7 +144,7 @@ pub const MUSIC_STATE_FILE: &str = "audio-tray-music.txt";
 /// Version of the app ↔ TAP contract (init-data keys, messages, state file). A loaded TAP adopts a
 /// new app on a handover when this matches and the DLL file is the same, instead of requiring the
 /// identical app version. Bump it on any change an older TAP or app would misread.
-pub const PROTOCOL: u32 = 4;
+pub const PROTOCOL: u32 = 5;
 
 /// Encodes init data: `key=value` pairs joined by `;`. Values escape `%`, `;` and `=` as `%25`,
 /// `%3B` and `%3D`, so a tile name or install path containing them survives; anything else is
@@ -192,10 +241,18 @@ mod tests {
         let ids = [
             WM_TASKBAR_ACTION, WM_TAP_REVERT, WM_TASKBAR_RESTARTED, WM_TAP_RESTYLE, WM_TASKBAR_SCROLL,
             WM_MUSIC_PROGRESS, WM_TAP_WIRE_TRANSPORT, WM_TAP_REPIN, WM_TAP_PROGRESS_WINDOW,
-            WM_TAP_MUSIC_CHANGED, WM_TASKBAR_STATUS, WM_TASKBAR_CLOCK_HOVER,
+            WM_TAP_MUSIC_CHANGED, WM_TASKBAR_STATUS, WM_TASKBAR_CLOCK_HOVER, WM_TAP_PANEL,
+            WM_TASKBAR_CLOCK_RECT, WM_TAP_BELL_RING,
         ];
         for (i, a) in ids.iter().enumerate() {
             assert!(ids[i + 1..].iter().all(|b| a != b));
+        }
+    }
+
+    #[test]
+    fn rects_survive_packing_on_any_monitor() {
+        for r in [(0, 0, 10, 20), (1713, 1128, 1854, 1200), (-1920, -40, -1800, 32), (-32768, 32767, -1, 1)] {
+            assert_eq!(unpack_rect(pack_rect(r.0, r.1, r.2, r.3)), r);
         }
     }
 

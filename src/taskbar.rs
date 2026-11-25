@@ -151,6 +151,26 @@ pub fn report_progress_window(hwnd: Option<windows::Win32::Foundation::HWND>) {
     }
 }
 
+/// Post `message` to every TAP control window (one per taskbar).
+fn post_to_taps(message: u32, wparam: usize) {
+    use windows::Win32::Foundation::{LPARAM, WPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
+    for control in crate::win::windows_by_class(TAP_CONTROL_CLASS) {
+        let _ = unsafe { PostMessageW(Some(control), message, WPARAM(wparam), LPARAM(0)) };
+    }
+}
+
+/// A notification went to the bell's list (its banner flew into it): the TAP rings the bell.
+pub fn ring_bell() {
+    post_to_taps(tap_proto::WM_TAP_BELL_RING, 0);
+}
+
+/// Tell the TAP which of the calendar's cards is open (`tap_proto::OPEN_*`): it lights that button
+/// and keeps the clock's and the bell's tooltips off the panel meanwhile.
+pub fn notify_panel(open: usize) {
+    post_to_taps(tap_proto::WM_TAP_PANEL, open);
+}
+
 /// Tell the TAP the now-playing state file changed, so it re-reads it instead of polling the
 /// file. Best-effort: the TAP still re-checks the file on a slow timer.
 pub fn notify_music_changed() {
@@ -175,11 +195,11 @@ pub fn set_status(bits: usize) {
 /// when all is well. Pure on the status bits, for testing.
 pub fn status_notice(bits: usize) -> Option<&'static str> {
     if bits & tap_proto::STATUS_SHAPE_CHANGED != 0 {
-        Some("Taskbar buttons partly unavailable on this Windows build")
+        Some(crate::lang::tr("Taskbar buttons partly unavailable on this Windows build", "Boutons de la barre des tâches en partie indisponibles sur cette version de Windows"))
     } else if bits & tap_proto::STATUS_NO_STRIP != 0 {
-        Some("Taskbar buttons could not be placed")
+        Some(crate::lang::tr("Taskbar buttons could not be placed", "Impossible de placer les boutons dans la barre des tâches"))
     } else if bits & tap_proto::STATUS_REORDER_FAILED != 0 {
-        Some("Could not move the tray icons next to wifi")
+        Some(crate::lang::tr("Could not move the tray icons next to wifi", "Impossible de placer les icônes à côté du Wi-Fi"))
     } else {
         None
     }
@@ -493,6 +513,8 @@ pub enum Action {
     OpenPanel,
     /// A click on the taskbar clock.
     OpenCalendar,
+    /// A click on the bell beside it.
+    OpenNotifications,
     /// Music transport. Codes 10+, deliberately far from the audio ones on the same window.
     MusicPrevious,
     MusicPlayPause,
@@ -507,6 +529,7 @@ impl Action {
             tap_proto::ACTION_CYCLE_INPUT => Some(Self::CycleInput),
             tap_proto::ACTION_OPEN_PANEL => Some(Self::OpenPanel),
             tap_proto::ACTION_OPEN_CALENDAR => Some(Self::OpenCalendar),
+            tap_proto::ACTION_OPEN_NOTIFICATIONS => Some(Self::OpenNotifications),
             tap_proto::ACTION_MUSIC_PREVIOUS => Some(Self::MusicPrevious),
             tap_proto::ACTION_MUSIC_PLAY_PAUSE => Some(Self::MusicPlayPause),
             tap_proto::ACTION_MUSIC_NEXT => Some(Self::MusicNext),
@@ -522,6 +545,7 @@ impl Action {
             Self::CycleInput => tap_proto::ACTION_CYCLE_INPUT,
             Self::OpenPanel => tap_proto::ACTION_OPEN_PANEL,
             Self::OpenCalendar => tap_proto::ACTION_OPEN_CALENDAR,
+            Self::OpenNotifications => tap_proto::ACTION_OPEN_NOTIFICATIONS,
             Self::MusicPrevious => tap_proto::ACTION_MUSIC_PREVIOUS,
             Self::MusicPlayPause => tap_proto::ACTION_MUSIC_PLAY_PAUSE,
             Self::MusicNext => tap_proto::ACTION_MUSIC_NEXT,
@@ -980,13 +1004,17 @@ pub struct ClockText {
     /// A `GetDateFormatEx` pattern; empty: the locale's short date; `-`: hidden.
     pub date: String,
     pub one_line: bool,
-    /// After the time: the focus time left, never a meeting (the time stays the time).
-    pub top: String,
-    /// Notifications new since the panel was last opened (0: none).
+    /// How many notifications wait in Audio Tray's list (0: none).
     pub badge: u32,
     /// The badge drawn for it (`calendar::view::badge`): the PNG, its width in DIPs and the DPI it
     /// was drawn for. Without one, the TAP puts an emoji dot and the count before the time.
     pub badge_image: Option<crate::calendar::Badge>,
+    /// Windows keeps notifications quiet (Do not disturb, a focus session): the bell is crossed.
+    pub quiet: bool,
+    /// Anything waits in Audio Tray's list: the bell is filled (else not, whatever the shell
+    /// thinks is new: it counts as seen only what its own centre showed). `None`: the bell is the
+    /// shell's, its fill too.
+    pub waiting: Option<bool>,
 }
 
 /// Tell the loaded TAP how the clock reads. `false` when no TAP took it.
@@ -996,8 +1024,9 @@ pub fn send_clock(text: &ClockText) -> bool {
         ("time", text.time.clone()),
         ("date", text.date.clone()),
         ("oneline", flag(text.one_line)),
-        ("top", text.top.clone()),
         ("badge", text.badge.to_string()),
+        ("quiet", flag(text.quiet)),
+        ("waiting", text.waiting.map_or_else(String::new, flag)),
         ("badge_image", text.badge_image.as_ref().map(|b| b.0.clone()).unwrap_or_default()),
         ("badge_width", text.badge_image.as_ref().map(|b| b.1.to_string()).unwrap_or_default()),
         ("badge_scale", text.badge_image.as_ref().map(|b| (b.2 as f32 / 96.0).to_string()).unwrap_or_default()),

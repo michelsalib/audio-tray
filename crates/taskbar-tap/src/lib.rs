@@ -744,6 +744,7 @@ pub(crate) unsafe fn stand_down() {
             // The clock's width let go; the shell writes its own text at the next minute.
             clock::release_text();
             clock::restore(&diagnostics);
+            clock::unsplit(&diagnostics);
         }
         None => logf!("stand down: no IXamlDiagnostics — cannot revert"),
     }

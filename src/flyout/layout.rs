@@ -12,26 +12,28 @@ use super::theme::*;
 pub(super) enum ActionKind {
     /// Audio Tray's settings window.
     Settings,
-    Quit,
+    /// Windows' own sound settings: every panel's footer links to Windows' settings for what it
+    /// shows on the left, and to Audio Tray's on the right (Quit is in Audio Tray's settings).
+    SoundSettings,
     /// Relaunch into an update already staged on disk. Only offered while there is one.
     Restart,
 }
 
 impl ActionKind {
     /// The footer's labelled left-hand item (glyph + text).
-    pub(super) const LEFT: ActionKind = ActionKind::Quit;
+    pub(super) const LEFT: ActionKind = ActionKind::SoundSettings;
 
     pub(super) fn label(self) -> &'static str {
         match self {
-            ActionKind::Settings => "Settings",
-            ActionKind::Quit => "Quit Audio Tray",
-            ActionKind::Restart => "Restart to update",
+            ActionKind::Settings => crate::lang::tr("Settings", "Paramètres"),
+            ActionKind::SoundSettings => crate::lang::tr("Sound settings", "Paramètres du son"),
+            ActionKind::Restart => crate::lang::tr("Restart to update", "Redémarrer pour mettre à jour"),
         }
     }
     pub(super) fn glyph(self) -> char {
         match self {
             ActionKind::Settings => GLYPH_SETTINGS,
-            ActionKind::Quit => GLYPH_CANCEL,
+            ActionKind::SoundSettings => GLYPH_SOUND,
             ActionKind::Restart => GLYPH_UPDATE,
         }
     }
@@ -537,7 +539,7 @@ mod tests {
 
     #[test]
     fn main_view_always_ends_with_the_footer() {
-        // Sound settings and Quit are only reachable through the footer.
+        // Windows' sound settings and Audio Tray's are reached through the footer.
         let m = model(vec![output_group(vec![dev("Speakers", None)])], None);
         let (elems, total) = build_view(&m, 1.0);
         let last = elems.last().expect("main view is never empty");

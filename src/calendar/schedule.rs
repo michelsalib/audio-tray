@@ -97,12 +97,6 @@ fn quiet_until(events: &[Event], now: i64, in_meetings: bool, in_call: bool) -> 
     }
 }
 
-/// The text after the time: the focus time left, if a focus timer runs. Meetings stay off the
-/// clock: the time is the time.
-fn focus_left(now: i64, end: i64) -> String {
-    (super::view::words::words().focus_left)(((end - now) + 59) / 60)
-}
-
 /// The clock's time and date patterns, from the `[clock]` settings and the locale's own formats.
 pub fn patterns(clock: &crate::config::Clock) -> (String, String) {
     let time = if !clock.time_pattern.is_empty() {
@@ -225,19 +219,36 @@ pub fn tick(config: &Config) -> Duration {
             }
         }
 
-        // The clock.
-        let top = s.focus.map_or_else(String::new, |(end, _, _)| focus_left(now, end));
-        // Only with the notification list on: a badge pointing at nothing helps no one.
-        let unread = if config.calendar.enabled && config.calendar.notifications && config.clock.unread { super::notifications::unseen() } else { 0 };
-        if !top.is_empty() {
-            // The countdown moves with the minute.
+        // The clock says the time, nothing more: what waits and the focus timer are the bell's.
+        let bell = super::merges_notices(config);
+        let count = if bell { super::notifications::count() } else { 0 };
+        // How many wait, as the notification card's header says. Only with the notification list
+        // on: a badge pointing at nothing helps no one.
+        let unread = if config.clock.unread { count } else { 0 };
+        // With none waiting, a running focus timer shows as a pie on the bell, filling as it goes.
+        let focus_done = s.focus.filter(|_| bell && unread == 0).map(|(end, minutes, _)| {
+            let length = (minutes as i64 * 60).max(60);
+            (1.0 - (end - now) as f32 / length as f32).clamp(0.0, 1.0)
+        });
+        if focus_done.is_some() {
+            // The pie moves with the minute.
             next = next.min(now - now % 60 + 60);
         }
         let (time_pattern, date_pattern) = patterns(&config.clock);
-        let badge_image = if unread > 0 { super::view::badge(unread as u32) } else { None };
-        let text = ClockText { time: time_pattern, date: date_pattern, one_line: config.clock.one_line, top, badge: unread as u32, badge_image };
-        // Nothing to say: the shell's clock is the shell's (handed back if the TAP had it).
-        let wanted = config.clock.styled() || !text.top.is_empty() || text.badge > 0;
+        let badge_image = match focus_done {
+            Some(done) => super::view::focus_pie(done),
+            None if unread > 0 => super::view::badge(unread as u32),
+            None => None,
+        };
+        // The bell crossed while Windows keeps notifications quiet, when it is the notifications' button.
+        let quiet = bell && focus::active();
+        // The bell filled while anything waits in Audio Tray's list, whatever its count badge: the
+        // shell's fill says what *it* has not shown, never seen now that its centre stays shut.
+        let waiting = bell.then_some(count > 0);
+        let text = ClockText { time: time_pattern, date: date_pattern, one_line: config.clock.one_line, badge: unread as u32, badge_image, quiet, waiting };
+        // Nothing to say: the shell's clock is the shell's (handed back if the TAP had it). While
+        // the bell is Audio Tray's, the TAP keeps it (its fill follows Audio Tray's list).
+        let wanted = config.clock.styled() || bell || text.badge > 0 || text.badge_image.is_some() || text.quiet;
         if !wanted {
             if s.sent.is_some() {
                 if crate::taskbar::release_clock() {
@@ -249,7 +260,7 @@ pub fn tick(config: &Config) -> Duration {
             }
         } else if s.sent.as_ref() != Some(&text) {
             if crate::taskbar::send_clock(&text) {
-                println!("calendar: the clock now reads {:?}, {} unread", text.top, text.badge);
+                println!("calendar: the clock's bell now has {} waiting", text.badge);
                 s.sent = Some(text);
             } else {
                 // The TAP is busy or reloading: soon again, not at the next quarter hour.
@@ -298,13 +309,6 @@ pub fn focus_end() -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn the_focus_time_left_rounds_up_to_the_minute() {
-        let now = 1_000_000;
-        assert_eq!(focus_left(now, now + 18 * 60), "Focus · 18 min left");
-        assert_eq!(focus_left(now, now + 17 * 60 + 1), "Focus · 18 min left");
-    }
 
     fn meeting(start: i64, end: i64) -> Event {
         Event {

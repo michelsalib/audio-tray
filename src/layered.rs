@@ -164,6 +164,35 @@ impl Canvas {
         }
     }
 
+    /// Only `rows` of the bitmap rewritten by `fill` (the rest stands as last presented), and only
+    /// they sent to Windows, at `(x, y)`. `false`: the bitmap is not `w`×`h` (nothing presented yet,
+    /// or another size): present it whole instead.
+    pub(crate) fn present_rows(&mut self, hwnd: HWND, (w, h): (i32, i32), (x, y): (i32, i32), rows: std::ops::Range<i32>, fill: impl FnOnce(&mut [u8])) -> bool {
+        use windows::Win32::UI::WindowsAndMessaging::{UpdateLayeredWindowIndirect, UPDATELAYEREDWINDOWINFO};
+        if self.size != (w, h) || self.dc.is_invalid() || self.bits.is_null() {
+            return false;
+        }
+        unsafe {
+            fill(std::slice::from_raw_parts_mut(self.bits, (w * h) as usize * 4));
+            let (dst, src, size, blend) = (POINT { x, y }, POINT { x: 0, y: 0 }, SIZE { cx: w, cy: h }, blend(255));
+            let dirty = windows::Win32::Foundation::RECT { left: 0, top: rows.start.max(0), right: w, bottom: rows.end.min(h) };
+            let info = UPDATELAYEREDWINDOWINFO {
+                cbSize: std::mem::size_of::<UPDATELAYEREDWINDOWINFO>() as u32,
+                pptDst: &dst,
+                psize: &size,
+                hdcSrc: self.dc,
+                pptSrc: &src,
+                crKey: COLORREF(0),
+                pblend: &blend,
+                dwFlags: ULW_ALPHA,
+                prcDirty: &dirty,
+                ..Default::default()
+            };
+            let _ = UpdateLayeredWindowIndirect(hwnd, &info);
+        }
+        true
+    }
+
     /// Move `hwnd` to `(x, y)` and fade it to `alpha`, its pixels as they are.
     pub(crate) fn shift(hwnd: HWND, x: i32, y: i32, alpha: u8) {
         let _ = unsafe { UpdateLayeredWindow(hwnd, None, Some(&POINT { x, y }), None, None, None, COLORREF(0), Some(&blend(alpha)), ULW_ALPHA) };
@@ -213,6 +242,15 @@ pub(crate) unsafe fn style_panel(hwnd: HWND, corner: i32) {
 /// # Safety
 /// `hwnd` must be a live window this process owns.
 pub(crate) unsafe fn enable_acrylic(hwnd: HWND) {
+    set_acrylic(hwnd, true);
+}
+
+/// Acrylic behind `hwnd` on or off (a banner shrinking into the bell drops it: the blur would stay
+/// the window's full size behind the shrinking card).
+///
+/// # Safety
+/// `hwnd` must be a live window this process owns.
+pub(crate) unsafe fn set_acrylic(hwnd: HWND, on: bool) {
     #[repr(C)]
     struct AccentPolicy {
         accent_state: u32,
@@ -239,7 +277,7 @@ pub(crate) unsafe fn enable_acrylic(hwnd: HWND) {
     const ACCENT_ENABLE_ACRYLICBLURBEHIND: u32 = 4;
     const WCA_ACCENT_POLICY: u32 = 19;
     let mut policy = AccentPolicy {
-        accent_state: ACCENT_ENABLE_ACRYLICBLURBEHIND,
+        accent_state: if on { ACCENT_ENABLE_ACRYLICBLURBEHIND } else { 0 },
         accent_flags: 0,
         gradient_color: 0x0020_2020,
         animation_id: 0,

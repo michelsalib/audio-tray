@@ -433,7 +433,14 @@ pub fn run_host() -> Result<()> {
         if stdin.read_exact(&mut len).is_err() {
             return Ok(());
         }
-        let mut body = vec![0u8; u32::from_le_bytes(len) as usize];
+        let len = u32::from_le_bytes(len) as usize;
+        // Chrome caps what it sends a host at 4 GiB, the extension's messages are tiny: anything
+        // past this is not the extension talking, and is not allocated for.
+        if len > 16 * 1024 * 1024 {
+            eprintln!("browser host: a {len}-byte message; closing");
+            return Ok(());
+        }
+        let mut body = vec![0u8; len];
         if stdin.read_exact(&mut body).is_err() {
             return Ok(());
         }

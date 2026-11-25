@@ -276,7 +276,7 @@ pub(super) fn build_groups(backend: &WasapiBackend, config: &Config, batteries: 
     };
 
     let mut groups = Vec::new();
-    for (flow, title) in [(Flow::Output, "Output"), (Flow::Input, "Input")] {
+    for (flow, title) in [(Flow::Output, crate::lang::tr("Output", "Sortie")), (Flow::Input, crate::lang::tr("Input", "Entrée"))] {
         let devices = backend.enumerate_flow(flow).unwrap_or_default();
         if devices.is_empty() {
             continue;

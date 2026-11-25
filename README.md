@@ -109,8 +109,12 @@ input:
 
 | Action | Result |
 |--------|--------|
-| Left-click a button | Switch that endpoint to the next device; or mute/unmute it, or open the flyout (Settings > Taskbar, `[strip] left_click = "switch"`, `"mute"` or `"panel"`). Switching stops once on the last device muted before wrapping, unless `[strip] mute_in_cycle = false` |
-| Right-click a button | Open the Audio Tray control flyout (volume, mute, switch output/input, pick icon, Settings, Quit) |
+| Left-click a button | Open the Audio Tray control flyout (volume, mute, switch output/input, pick icon, Windows' sound settings, Audio Tray's settings) |
+| Right-click a button | A menu: Windows' sound settings, Audio Tray's settings, Quit |
+| Middle-click a button | Mute/unmute that endpoint, switch it to the next device, or switch and stop once on the last device muted before wrapping (Settings > Taskbar, `[strip] middle_click = "mute"`, `"switch"` or `"switch_mute"`, the default) |
+| Win+Ctrl+V | Open the flyout (Windows' shortcut for its sound output; `[strip] shortcut`) |
+| Click the clock / the bell | Audio Tray's calendar / notifications, when on (Settings > Taskbar); Win+Alt+D and Win+N open them too |
+| Middle-click the bell | Do not disturb on/off, or clear every notification, or nothing (`[calendar] bell_middle_click = "do_not_disturb"`, `"clear_all"` or `"nothing"`) |
 | Scroll a button (wheel or touchpad) | Adjust that endpoint's volume, 2% per notch, with a level bar beside the buttons |
 | Scroll elsewhere on the taskbar | Adjust the output volume |
 

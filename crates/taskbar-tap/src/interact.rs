@@ -401,9 +401,9 @@ pub unsafe fn attach_clock(diagnostics: &IXamlDiagnostics, element: InstanceHand
     let press = target.add_PointerPressed(pressed.as_raw(), &mut token);
     let tapped: ITappedEventHandler = ClockTap.into();
     let tap = target.add_Tapped(tapped.as_raw(), &mut token);
-    let entered: IPointerEventHandler = ClockHover(true).into();
+    let entered: IPointerEventHandler = ClockHover { section: element, over: true }.into();
     let enter = target.add_PointerEntered(entered.as_raw(), &mut token);
-    let exited: IPointerEventHandler = ClockHover(false).into();
+    let exited: IPointerEventHandler = ClockHover { section: element, over: false }.into();
     let exit = target.add_PointerExited(exited.as_raw(), &mut token);
     press == S_OK && tap == S_OK && enter == S_OK && exit == S_OK
 }
@@ -412,17 +412,64 @@ pub unsafe fn attach_clock(diagnostics: &IXamlDiagnostics, element: InstanceHand
 /// clock's clicks before Explorer sees them (marking the press handled here does not stop
 /// `NotificationCenterButton`, which opens its flyout regardless).
 #[implement(IPointerEventHandler)]
-struct ClockHover(bool);
+struct ClockHover {
+    section: InstanceHandle,
+    over: bool,
+}
 
 impl IPointerEventHandler_Impl for ClockHover_Impl {
     unsafe fn Invoke(&self, _sender: *mut c_void, _args: *mut c_void) -> HRESULT {
         guard("clock-hover", || {
             // Leaving is always told, so the app never keeps a stale "over the clock".
-            if self.0 && !crate::clock::enabled() {
+            if self.over && !crate::clock::enabled() {
                 return;
             }
-            crate::ipc::send_clock_hover(self.0);
+            crate::ipc::send_clock_hover(self.over);
+            // Its strips (beside and between the parts) light the nearest part, as the shell's one
+            // plate lit over the whole button; the bell's is told to the app from there.
+            crate::clock::section_hover(self.section, self.over);
             crate::clock::watch_closely();
+        })
+    }
+}
+
+/// Wire an icon inside the clock's button (the clock's, or the bell's): the pointer entering and
+/// leaving it lights its own plate, and the bell's is told to the app, whose hook sends its clicks
+/// to audio-tray's notifications (or leaves them to the shell when those are off). Never detached.
+///
+/// # Safety
+/// XAML UI thread only.
+pub unsafe fn attach_part(diagnostics: &IXamlDiagnostics, element: InstanceHandle, bell: bool) -> bool {
+    let Some(target) = ui_element(diagnostics, element) else {
+        return false;
+    };
+    let mut token = 0i64;
+    let entered: IPointerEventHandler = PartHover { icon: element, bell, over: true }.into();
+    let enter = target.add_PointerEntered(entered.as_raw(), &mut token);
+    let exited: IPointerEventHandler = PartHover { icon: element, bell, over: false }.into();
+    let exit = target.add_PointerExited(exited.as_raw(), &mut token);
+    enter == S_OK && exit == S_OK
+}
+
+/// The pointer entering or leaving the clock's or the bell's icon.
+#[implement(IPointerEventHandler)]
+struct PartHover {
+    icon: InstanceHandle,
+    bell: bool,
+    over: bool,
+}
+
+impl IPointerEventHandler_Impl for PartHover_Impl {
+    unsafe fn Invoke(&self, _sender: *mut c_void, _args: *mut c_void) -> HRESULT {
+        guard("part-hover", || {
+            // Leaving is always told and always unlit, so nothing stays stale.
+            if self.over && !crate::clock::enabled() {
+                return;
+            }
+            // Where it is on the screen is measured by the app (UI Automation, in its own process):
+            // nothing more runs in Explorer on a hover. Measuring here through the pointer's
+            // position crashed Explorer (an `IInspectable` handed where XAML wants a `UIElement`).
+            crate::clock::part_hover(self.icon, self.bell, self.over);
         })
     }
 }

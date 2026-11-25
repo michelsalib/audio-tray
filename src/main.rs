@@ -13,6 +13,7 @@
 //!   audio-tray --tap-version       which TAP is on disk next to the exe
 //!   audio-tray --taskbar-restart   restart explorer.exe (frees the TAP, placing a staged one)
 //!   audio-tray --taskbar-revert    ask an injected TAP to put the taskbar back
+//!   audio-tray --give-back-banners give Windows its notification banners back (the uninstaller)
 //!
 //! Developer and diagnostic modes live in `dev.rs`, behind the `dev` cargo feature.
 
@@ -37,6 +38,7 @@ mod image;
 mod instance;
 mod integrations;
 mod keyboards;
+mod lang;
 mod layered;
 mod motion;
 mod music;
@@ -87,6 +89,10 @@ fn main() -> Result<()> {
             println!("taskbar: restarting Explorer...");
             taskbar::restart_explorer()?;
             println!("taskbar: done.");
+        }
+        Some("--give-back-banners") => {
+            // What Audio Tray turned off is turned back on, from its note alone (it may not run).
+            calendar::takeover::give_back_now();
         }
         Some("--taskbar-revert") => {
             // Escape hatch: put the taskbar back without touching the running tray.

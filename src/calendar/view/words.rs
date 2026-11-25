@@ -12,13 +12,12 @@ pub struct Words {
     pub not_allowed: &'static str,
     pub do_not_disturb: &'static str,
     pub turn_off_dnd: &'static str,
-    pub show_all: &'static str,
-    pub back_to_calendar: &'static str,
-    pub show_week: &'static str,
-    pub show_month: &'static str,
     pub previous_month: &'static str,
     pub next_month: &'static str,
     pub settings: &'static str,
+    /// The footers' links to Windows' own settings.
+    pub date_settings: &'static str,
+    pub notification_settings: &'static str,
     pub back: &'static str,
     pub dismiss: &'static str,
     pub clear_app: &'static str,
@@ -45,14 +44,10 @@ pub struct Words {
     pub dnd_refused_off: &'static str,
     pub timer_not_quiet: &'static str,
     pub app_did_not_take: &'static str,
-    /// "3 more from Teams".
-    pub more_from: fn(usize, &str) -> String,
     /// "Focus 25 min", the timer to start.
     pub focus: fn(u32) -> String,
     /// "Stop · 24 min left", the timer running.
     pub focus_stop: fn(i64) -> String,
-    /// "Focus · 24 min left", on the taskbar clock while it runs.
-    pub focus_left: fn(i64) -> String,
     /// "Cleared 14 notifications".
     pub cleared: fn(usize) -> String,
     /// "Next · in 12 min", "Next · in 2 h 05".
@@ -65,6 +60,21 @@ pub struct Words {
     pub you: fn(&str) -> String,
     /// "12 min" ago.
     pub minutes: fn(i64) -> String,
+    /// A conversation's banner: how many more came.
+    pub more: fn(usize) -> String,
+    /// A reply or reaction sent.
+    pub sent: &'static str,
+    /// The digest after a quiet time: its title, its count, its button.
+    pub away: &'static str,
+    pub away_count: fn(usize) -> String,
+    pub latest_from: fn(&str) -> String,
+    pub show_them: &'static str,
+    /// An app listening outside a call, and what a click on its alert does.
+    pub listening: fn(&str) -> String,
+    pub click_to_mute: &'static str,
+    /// A meeting's countdown, and once it has begun.
+    pub starts_in: fn(i64) -> String,
+    pub started: fn(i64) -> String,
 }
 
 static EN: Words = Words {
@@ -76,13 +86,11 @@ static EN: Words = Words {
     not_allowed: "Allow Audio Tray to read notifications",
     do_not_disturb: "Do not disturb",
     turn_off_dnd: "Turn off Do not disturb",
-    show_all: "Show all notifications",
-    back_to_calendar: "Back to the calendar",
-    show_week: "Show the week",
-    show_month: "Show the month",
     previous_month: "Previous month",
     next_month: "Next month",
     settings: "Settings",
+    date_settings: "Date & time settings",
+    notification_settings: "Notification settings",
     back: "Back",
     dismiss: "Dismiss",
     clear_app: "Clear all from this app",
@@ -109,16 +117,24 @@ static EN: Words = Words {
     dnd_refused_off: "Windows would not turn off Do not disturb",
     timer_not_quiet: "Timer on; Windows kept notifications on",
     app_did_not_take: "The app did not take it: open the app to finish",
-    more_from: |n, app| format!("{n} more from {app}"),
     focus: |m| format!("Focus {m} min"),
     focus_stop: |m| format!("Stop · {m} min left"),
-    focus_left: |m| format!("Focus · {m} min left"),
     cleared: |n| if n == 1 { "Cleared 1 notification".into() } else { format!("Cleared {n} notifications") },
     next_in: |m| if m < 60 { format!("Next · in {m} min") } else { format!("Next · in {} h {:02}", m / 60, m % 60) },
     next_on: |day| format!("Next · {day}"),
     now_until: |end| format!("Now · until {end}"),
     you: |answer| format!("you: {answer}"),
     minutes: |m| format!("{m} min"),
+    more: |n| format!("+{n} more"),
+    sent: "Sent",
+    away: "While you were away",
+    away_count: |n| if n == 1 { "1 notification".into() } else { format!("{n} notifications") },
+    latest_from: |who| format!("Latest from {who}"),
+    show_them: "Show them",
+    listening: |app| format!("{app} is listening"),
+    click_to_mute: "Click to mute",
+    starts_in: |s| format!("Starts in {}:{:02}", s / 60, s % 60),
+    started: |m| if m < 1 { "Starting now".into() } else { format!("Started {m} min ago") },
 };
 
 static FR: Words = Words {
@@ -130,13 +146,11 @@ static FR: Words = Words {
     not_allowed: "Autoriser Audio Tray à lire les notifications",
     do_not_disturb: "Ne pas déranger",
     turn_off_dnd: "Désactiver Ne pas déranger",
-    show_all: "Afficher toutes les notifications",
-    back_to_calendar: "Revenir au calendrier",
-    show_week: "Afficher la semaine",
-    show_month: "Afficher le mois",
     previous_month: "Mois précédent",
     next_month: "Mois suivant",
     settings: "Paramètres",
+    date_settings: "Paramètres de date et d'heure",
+    notification_settings: "Paramètres de notification",
     back: "Retour",
     dismiss: "Ignorer",
     clear_app: "Tout effacer pour cette application",
@@ -163,24 +177,30 @@ static FR: Words = Words {
     dnd_refused_off: "Windows n'a pas désactivé Ne pas déranger",
     timer_not_quiet: "Minuteur lancé ; Windows garde les notifications",
     app_did_not_take: "L'application ne l'a pas pris : ouvrez-la pour finir",
-    more_from: |n, app| format!("{n} de plus de {app}"),
     focus: |m| format!("Concentration {m} min"),
     focus_stop: |m| format!("Arrêter · {m} min"),
-    focus_left: |m| format!("Concentration · {m} min"),
     cleared: |n| if n == 1 { "1 notification effacée".into() } else { format!("{n} notifications effacées") },
     next_in: |m| if m < 60 { format!("Prochain · dans {m} min") } else { format!("Prochain · dans {} h {:02}", m / 60, m % 60) },
     next_on: |day| format!("Prochain · {day}"),
     now_until: |end| format!("En cours · jusqu'à {end}"),
     you: |answer| format!("vous : {answer}"),
     minutes: |m| format!("{m} min"),
+    more: |n| format!("+{n} autres"),
+    sent: "Envoyé",
+    away: "Pendant votre absence",
+    away_count: |n| if n == 1 { "1 notification".into() } else { format!("{n} notifications") },
+    latest_from: |who| format!("Dernière de {who}"),
+    show_them: "Les afficher",
+    listening: |app| format!("{app} écoute"),
+    click_to_mute: "Cliquer pour couper le micro",
+    starts_in: |s| format!("Commence dans {}:{:02}", s / 60, s % 60),
+    started: |m| if m < 1 { "Commence maintenant".into() } else { format!("Commencée il y a {m} min") },
 };
 
 /// The words in Windows' display language (French for any French, else English).
 pub fn words() -> &'static Words {
-    static CHOSEN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    // LANG_FRENCH, the primary language of the display language's id.
-    let french = *CHOSEN.get_or_init(|| unsafe { windows::Win32::Globalization::GetUserDefaultUILanguage() } & 0x3ff == 0x0c);
-    if french && !cfg!(test) {
+    // The rule every panel and Settings follow ([`crate::lang`]).
+    if crate::lang::french() {
         &FR
     } else {
         &EN

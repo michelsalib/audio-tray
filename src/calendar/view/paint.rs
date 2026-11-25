@@ -59,6 +59,9 @@ pub struct Palette {
     pub on_accent: Color,
     /// A tooltip's ground.
     pub tip: Color,
+    /// The footer's strip and its hairline: the audio panel's, so every panel ends alike.
+    pub shade: Color,
+    pub divider: Color,
 }
 
 impl Palette {
@@ -77,11 +80,14 @@ impl Palette {
                 accent: Color::rgb(crate::flyout::theme::accent_shade(4).unwrap_or([0x00, 0x5F, 0xB8])),
                 on_accent: Color::hex(0xFFFFFF, 1.0),
                 tip: Color::hex(0xF9F9F9, 1.0),
+                // A shade darker on the light ground too, the hairline as faint as on the dark.
+                shade: Color::hex(0x000000, 0.04),
+                divider: Color::hex(0x000000, 0.10),
             }
         } else {
-            let [r, g, b] = crate::flyout::theme::TINT;
+            let [r, g, b] = crate::flyout::theme::DARK_TINT;
             Palette {
-                bg: Color::rgb([r, g, b]).alpha(crate::flyout::theme::TINT_A),
+                bg: Color::rgb([r, g, b]).alpha(crate::flyout::theme::DARK_TINT_A),
                 raised: Color::hex(0xFFFFFF, 0.05),
                 text: Color::hex(0xFFFFFF, 1.0),
                 text2: Color::hex(0xFFFFFF, 0.786),
@@ -90,6 +96,8 @@ impl Palette {
                 accent: Color::rgb(crate::flyout::theme::accent_rgb()),
                 on_accent: Color::hex(0x000000, 1.0),
                 tip: Color::hex(0x2C2C2C, 1.0),
+                shade: Color::hex(0x000000, crate::flyout::theme::FOOTER_SHADE_A),
+                divider: Color::hex(0xFFFFFF, crate::flyout::theme::DIVIDER_A),
             }
         }
     }
@@ -158,6 +166,12 @@ const LAYOUTS_MAX: usize = 4000;
 const IMAGES_MAX: usize = 64;
 
 impl Gfx {
+    /// Kept for later: the last frame's pixels freed, so the next frame is drawn whole.
+    pub fn forget_frame(&mut self) {
+        self.pixels = Vec::new();
+        self.drawn = (0, 0);
+    }
+
     pub fn new() -> Result<Self> {
         unsafe {
             let factory: ID2D1Factory = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None).context("D2D1CreateFactory")?;
@@ -215,7 +229,14 @@ impl Gfx {
     /// Draw a frame of `size` pixels, only in `areas` (DIPs) where given and the last frame was the
     /// same size: `draw` is called for each area (`None`: the whole frame), clipped to it, and
     /// should skip what lies outside it. Returns whether the whole frame was drawn.
-    pub fn frame_in(&mut self, size: (u32, u32), scale: f32, areas: Option<&[R]>, mut draw: impl FnMut(&Pen, Option<R>)) -> Result<bool> {
+    pub fn frame_in(&mut self, size: (u32, u32), scale: f32, areas: Option<&[R]>, draw: impl FnMut(&Pen, Option<R>)) -> Result<bool> {
+        self.frame_zoomed(size, scale, 1.0, areas, draw)
+    }
+
+    /// [`Gfx::frame_in`], everything drawn `zoom` times its size about the frame's middle (a banner
+    /// shrinking into the bell): the frame keeps its size, so its surface and its decoded pictures
+    /// stay, and so does the window's bitmap.
+    pub fn frame_zoomed(&mut self, size: (u32, u32), scale: f32, zoom: f32, areas: Option<&[R]>, mut draw: impl FnMut(&Pen, Option<R>)) -> Result<bool> {
         unsafe {
             // The surface only grows (same width): a panel growing or shrinking keeps its target,
             // and so its decoded pictures. Only the top `size.1` rows are read back.
@@ -232,7 +253,8 @@ impl Gfx {
                 self.surface = Some((size, bitmap, target));
                 self.images.borrow_mut().clear();
             }
-            // In parts only over a frame of the same size, whose other pixels stand.
+            // In parts only over a frame of the same size, whose other pixels stand (none after
+            // [`Gfx::forget_frame`]).
             let areas = areas.filter(|_| fits && self.drawn == size);
             let full = areas.is_none();
             {
@@ -249,6 +271,10 @@ impl Gfx {
             }
             let (_, bitmap, target) = self.surface.as_ref().context("no surface")?;
             target.SetDpi(96.0 * scale, 96.0 * scale);
+            // Zoomed about the middle (in DIPs), or not at all: set each frame, never left over.
+            let (cx, cy) = (size.0 as f32 / scale / 2.0, size.1 as f32 / scale / 2.0);
+            let zoom = zoom.clamp(0.01, 1.0);
+            target.SetTransform(&windows_numerics::Matrix3x2 { M11: zoom, M12: 0.0, M21: 0.0, M22: zoom, M31: cx * (1.0 - zoom), M32: cy * (1.0 - zoom) });
             let brush = target.CreateSolidColorBrush(&D2D1_COLOR_F::default(), None).context("CreateSolidColorBrush")?;
             target.BeginDraw();
             let pen = Pen { gfx: self, target: target.clone(), scale, brush };
@@ -348,6 +374,46 @@ impl Pen<'_> {
         }
     }
 
+    /// A pie in circle `r`, `fraction` of it filled clockwise from the top (the focus timer's).
+    pub fn pie(&self, r: R, fraction: f32, c: Color) {
+        use windows::Win32::Graphics::Direct2D::Common::{D2D1_FIGURE_BEGIN_FILLED, D2D1_FIGURE_END_CLOSED, D2D_SIZE_F};
+        use windows::Win32::Graphics::Direct2D::{D2D1_ARC_SEGMENT, D2D1_ARC_SIZE_LARGE, D2D1_ARC_SIZE_SMALL, D2D1_SWEEP_DIRECTION_CLOCKWISE};
+        let fraction = fraction.clamp(0.0, 1.0);
+        if fraction >= 0.999 {
+            self.fill(r, r.w / 2.0, c);
+            return;
+        }
+        if fraction <= 0.001 {
+            return;
+        }
+        let Some(brush) = self.brush(c) else { return };
+        let (cx, cy, radius) = (r.x + r.w / 2.0, r.y + r.h / 2.0, r.w / 2.0);
+        let angle = fraction * std::f32::consts::TAU;
+        let end = Vector2 { X: cx + radius * angle.sin(), Y: cy - radius * angle.cos() };
+        let drawn = (|| -> windows::core::Result<()> {
+            let path = unsafe { self.gfx.factory.CreatePathGeometry() }?;
+            let sink = unsafe { path.Open() }?;
+            unsafe {
+                sink.BeginFigure(Vector2 { X: cx, Y: cy }, D2D1_FIGURE_BEGIN_FILLED);
+                sink.AddLine(Vector2 { X: cx, Y: cy - radius });
+                sink.AddArc(&D2D1_ARC_SEGMENT {
+                    point: end,
+                    size: D2D_SIZE_F { width: radius, height: radius },
+                    rotationAngle: 0.0,
+                    sweepDirection: D2D1_SWEEP_DIRECTION_CLOCKWISE,
+                    arcSize: if fraction > 0.5 { D2D1_ARC_SIZE_LARGE } else { D2D1_ARC_SIZE_SMALL },
+                });
+                sink.EndFigure(D2D1_FIGURE_END_CLOSED);
+                sink.Close()?;
+                self.target.FillGeometry(&path, brush, None);
+            }
+            Ok(())
+        })();
+        if let Err(e) = drawn {
+            eprintln!("calendar: could not draw a pie ({e})");
+        }
+    }
+
     pub fn stroke(&self, r: R, radius: f32, width: f32, c: Color) {
         if let Some(brush) = self.brush(c) {
             let half = width / 2.0;
@@ -363,7 +429,32 @@ impl Pen<'_> {
         }
         let Some(layout) = self.layout(text, font, r, align) else { return };
         let Some(brush) = self.brush(c) else { return };
-        unsafe { self.target.DrawTextLayout(Vector2 { X: r.x, Y: r.y }, &layout, brush, D2D1_DRAW_TEXT_OPTIONS_CLIP) };
+        // Colour fonts in colour: an emoji (a quick reaction) as the app shows it.
+        let options = D2D1_DRAW_TEXT_OPTIONS_CLIP | windows::Win32::Graphics::Direct2D::D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT;
+        unsafe { self.target.DrawTextLayout(Vector2 { X: r.x, Y: r.y }, &layout, brush, options) };
+    }
+
+    /// `c` washed in from the left edge of `r`, gone by `reach` (0..1) of its width: an app's
+    /// colour on its banner.
+    pub fn wash(&self, r: R, radius: f32, c: Color, reach: f32) {
+        use windows::Win32::Graphics::Direct2D::Common::D2D1_GRADIENT_STOP;
+        use windows::Win32::Graphics::Direct2D::{D2D1_EXTEND_MODE_CLAMP, D2D1_GAMMA_2_2, D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES};
+        let stop = |position: f32, a: f32| D2D1_GRADIENT_STOP { position, color: D2D1_COLOR_F { r: c.0, g: c.1, b: c.2, a } };
+        let stops = [stop(0.0, c.3), stop(1.0, 0.0)];
+        let Ok(collection) = (unsafe { self.target.CreateGradientStopCollection(&stops, D2D1_GAMMA_2_2, D2D1_EXTEND_MODE_CLAMP) }) else { return };
+        let line = D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES { startPoint: Vector2 { X: r.x, Y: r.y }, endPoint: Vector2 { X: r.x + r.w * reach.max(0.05), Y: r.y + r.h * 0.35 } };
+        let Ok(brush) = (unsafe { self.target.CreateLinearGradientBrush(&line, None, &collection) }) else { return };
+        let rounded = D2D1_ROUNDED_RECT { rect: rect(r), radiusX: radius, radiusY: radius };
+        unsafe { self.target.FillRoundedRectangle(&rounded, &brush) };
+    }
+
+    /// A circle's outline inside `r`, `width` thick.
+    pub fn ring(&self, r: R, width: f32, c: Color) {
+        use windows::Win32::Graphics::Direct2D::D2D1_ELLIPSE;
+        if let Some(brush) = self.brush(c) {
+            let ellipse = D2D1_ELLIPSE { point: Vector2 { X: r.x + r.w / 2.0, Y: r.y + r.h / 2.0 }, radiusX: (r.w - width) / 2.0, radiusY: (r.h - width) / 2.0 };
+            unsafe { self.target.DrawEllipse(&ellipse, brush, width, None) };
+        }
     }
 
     /// `text` laid out in a box of `r`'s size: made once, then kept while it is drawn.

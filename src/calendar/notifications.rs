@@ -64,37 +64,9 @@ static WATCHING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::
 pub fn set_watching(on: bool) {
     WATCHING.store(on, std::sync::atomic::Ordering::SeqCst);
     if on {
-        // Looked at: the clock's badge clears, as Windows' does.
-        // Their ids only, taken first: [`unseen`] locks the seen list before this one.
-        let ids: Vec<u32> = TOASTS.lock().unwrap_or_else(|e| e.into_inner()).iter().flatten().map(|t| t.id).collect();
-        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-        for id in ids {
-            if !seen.contains(&id) {
-                seen.push(id);
-            }
-        }
-        drop(seen);
-        held_changed();
+        // Opened: read afresh.
         refresh();
     }
-}
-
-/// Notifications the user has had in front of them (the panel open), by id.
-static SEEN: Mutex<Vec<u32>> = Mutex::new(Vec::new());
-
-fn see(toasts: &[Toast]) {
-    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-    for t in toasts {
-        if !seen.contains(&t.id) {
-            seen.push(t.id);
-        }
-    }
-}
-
-/// How many notifications came since the panel was last open: the clock's badge.
-pub fn unseen() -> usize {
-    let seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-    TOASTS.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map_or(0, |list| list.iter().filter(|t| !seen.contains(&t.id)).count())
 }
 
 /// Every notification, newest first, as last read; `None` before the first read or when the
@@ -126,7 +98,14 @@ pub fn start() {
     }
     let raw = WAKE.load(SeqCst);
     let spawned = std::thread::Builder::new().name("notifications".into()).spawn(move || {
-        run(windows::Win32::Foundation::HANDLE(raw as *mut _));
+        // A panic (an app's notification read wrong) must not leave notifications silent for good:
+        // the reader can start again, and Windows' banners are its own again meanwhile (Audio
+        // Tray shows none of its own without it).
+        let caught = std::panic::catch_unwind(|| run(windows::Win32::Foundation::HANDLE(raw as *mut _)));
+        if caught.is_err() {
+            eprintln!("notifications: the reader stopped on an error; Windows' banners are given back");
+            super::takeover::apply(false);
+        }
         // Refused, or gone: a later start may try again.
         RUNNING.store(false, SeqCst);
     });
@@ -143,8 +122,12 @@ pub fn list() -> Vec<Toast> {
     TOASTS.lock().unwrap_or_else(|e| e.into_inner()).clone().unwrap_or_default()
 }
 
-/// How many notifications are waiting (the dev preview follows them).
-#[cfg(feature = "dev")]
+/// Windows' list has been read (what was listed at the first read is not new).
+pub fn read_yet() -> bool {
+    TOASTS.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+}
+
+/// How many notifications are waiting: the bell's badge, as the card's header counts them.
 pub fn count() -> usize {
     TOASTS.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map_or(0, Vec::len)
 }
@@ -231,6 +214,43 @@ pub fn open_app(aumid: &str) -> bool {
     !aumid.is_empty() && crate::win::shell_open(&format!(r"shell:AppsFolder\{aumid}"), None)
 }
 
+/// Audio Tray shows the banners: a new notification must be seen at once. Windows does not tell
+/// an unpackaged app, and it stamps its store's files lazily (a write can go unseen for half a
+/// minute), so the store is asked whether it changed (SQLite's `data_version`) every
+/// [`PROBE_EVERY`] meanwhile.
+static FAST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+const PROBE_EVERY: Duration = Duration::from_secs(1);
+
+/// New notifications seen at once (banners shown) or as cheaply as may be.
+pub fn set_fast(on: bool) {
+    if FAST.swap(on, std::sync::atomic::Ordering::SeqCst) != on {
+        refresh();
+    }
+}
+
+/// Windows' store's `data_version` (a counter SQLite moves at each commit by another connection),
+/// read-only: one pragma. One connection kept open between probes (opening the store each second
+/// costs more than asking it); closed when fast mode ends, opened again when a query fails.
+fn probe(db: &mut Option<rusqlite::Connection>) -> Option<i64> {
+    use rusqlite::{Connection, OpenFlags};
+    if !FAST.load(std::sync::atomic::Ordering::SeqCst) {
+        *db = None;
+        return None;
+    }
+    if db.is_none() {
+        let path = store_path()?;
+        let opened = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX).ok()?;
+        opened.busy_timeout(Duration::from_millis(200)).ok()?;
+        *db = Some(opened);
+    }
+    // SQLite's own counter of commits made by others: nothing read from the store itself.
+    let asked = db.as_ref()?.query_row("PRAGMA data_version", [], |row| row.get(0));
+    if asked.is_err() {
+        *db = None;
+    }
+    asked.ok()
+}
+
 /// The reader: it sleeps until asked, until the store changes on disk, or until a recheck is due,
 /// and then reads once.
 fn run(wake: windows::Win32::Foundation::HANDLE) {
@@ -264,29 +284,48 @@ fn run(wake: windows::Win32::Foundation::HANDLE) {
     let mut known = Known::default();
     let mut stamp = store_stamp();
     let mut read_now = true;
+    // The store's `data_version` at the last read, and when that was (fast mode's probe).
+    let mut probed = None;
+    let mut store = None;
+    let mut read_at = Instant::now();
     loop {
         if read_now {
             stamp = store_stamp();
+            probed = probe(&mut store);
+            read_at = Instant::now();
             match read(&listener, &mut known) {
                 Ok(toasts) => publish(toasts),
                 Err(e) => eprintln!("notifications: could not read them ({e:#})"),
             }
         }
         let waiting = TOASTS.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|l| !l.is_empty());
-        let timeout = if WATCHING.load(std::sync::atomic::Ordering::SeqCst) {
-            RECHECK_OPEN.as_millis() as u32
+        let fast = FAST.load(std::sync::atomic::Ordering::SeqCst);
+        let recheck = if WATCHING.load(std::sync::atomic::Ordering::SeqCst) {
+            Some(RECHECK_OPEN)
         } else if waiting {
-            if HEARD.load(std::sync::atomic::Ordering::SeqCst) { RECHECK_HEARD.as_millis() as u32 } else { RECHECK.as_millis() as u32 }
+            Some(if HEARD.load(std::sync::atomic::Ordering::SeqCst) { RECHECK_HEARD } else { RECHECK })
         } else {
-            INFINITE
+            None
+        };
+        let timeout = match (fast, recheck) {
+            (true, Some(r)) => PROBE_EVERY.min(r).as_millis() as u32,
+            (true, None) => PROBE_EVERY.as_millis() as u32,
+            (false, Some(r)) => r.as_millis() as u32,
+            (false, None) => INFINITE,
         };
         let mut handles = vec![wake];
-        if let Some(c) = &changes {
+        // Fast, the probe sees every change: the folder's watch would only wake it for nothing
+        // (each probe touches the store's shared-memory file).
+        if let Some(c) = changes.as_ref().filter(|_| !fast) {
             handles.push(c.0);
         }
         let woke = unsafe { WaitForMultipleObjects(&handles, false, timeout) };
         if woke == WAIT_TIMEOUT {
-            read_now = true;
+            // Fast: a full read when the store has something new (or gone), or the recheck is due.
+            read_now = !fast || recheck.is_some_and(|r| read_at.elapsed() >= r) || {
+                let now = probe(&mut store);
+                now.is_some() && now != probed
+            };
         } else if woke == WAIT_OBJECT_0 {
             for asked in std::mem::take(&mut *ASKS.lock().unwrap_or_else(|e| e.into_inner())) {
                 match asked {
@@ -333,14 +372,6 @@ fn run(wake: windows::Win32::Foundation::HANDLE) {
 
 /// Hold a fresh read (less what was removed here meanwhile), and tell the tray if it changed.
 fn publish(mut toasts: Vec<Toast>) {
-    {
-        // Those gone are forgotten; while the panel is open, what arrives is seen.
-        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-        seen.retain(|id| toasts.iter().any(|t| t.id == *id));
-    }
-    if WATCHING.load(std::sync::atomic::Ordering::SeqCst) {
-        see(&toasts);
-    }
     // Held while the list is replaced: a removal in between ([`hide`]) would come back until the
     // next read.
     let mut removed = REMOVED.lock().unwrap_or_else(|e| e.into_inner());
@@ -441,6 +472,11 @@ type Logo = std::sync::Arc<Vec<u8>>;
 /// An app's logo, as its notifications show it in Windows' centre (by its id, else its name: apps
 /// without an id must not share one's logo).
 fn logo_of(app: &str, aumid: &str, info: Option<&windows::ApplicationModel::AppInfo>) -> Option<std::sync::Arc<Vec<u8>>> {
+    // Audio Tray's own: Windows has no logo to give an unpackaged app, its icon is at hand.
+    if aumid == crate::toast::AUMID {
+        static OURS: std::sync::OnceLock<std::sync::Arc<Vec<u8>>> = std::sync::OnceLock::new();
+        return Some(OURS.get_or_init(|| std::sync::Arc::new(include_bytes!("../../assets/app.ico").to_vec())).clone());
+    }
     let key = if aumid.is_empty() { format!("name:{app}") } else { aumid.to_string() };
     if let Some((_, logo)) = LOGOS.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|(a, _)| *a == key) {
         return logo.clone();
@@ -470,14 +506,21 @@ fn logo_of(app: &str, aumid: &str, info: Option<&windows::ApplicationModel::AppI
 /// The store's files as they stand (size and last write of the database and its log), to tell a
 /// real change from the reader's own traces.
 fn store_stamp() -> Vec<(u64, Option<std::time::SystemTime>)> {
-    let Ok(folder) = std::env::var("LOCALAPPDATA") else { return Vec::new() };
-    ["wpndatabase.db", "wpndatabase.db-wal"]
+    let Some(db) = store_path() else { return Vec::new() };
+    let mut log = db.clone().into_os_string();
+    log.push("-wal");
+    [db, log.into()]
         .iter()
-        .map(|name| {
-            let meta = std::fs::metadata(format!(r"{folder}\Microsoft\Windows\Notifications\{name}")).ok();
+        .map(|file| {
+            let meta = std::fs::metadata(file).ok();
             (meta.as_ref().map_or(0, |m| m.len()), meta.and_then(|m| m.modified().ok()))
         })
         .collect()
+}
+
+/// Windows' notification store (`wpndatabase.db`), where it is for this user.
+pub(super) fn store_path() -> Option<std::path::PathBuf> {
+    Some(std::path::PathBuf::from(std::env::var_os("LOCALAPPDATA")?).join(r"Microsoft\Windows\Notifications\wpndatabase.db"))
 }
 
 /// A change notification on the folder of Windows' notification store.

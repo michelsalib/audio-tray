@@ -12,15 +12,16 @@
 //!                                  the edge pill alone there, with a song and the devices
 //!   --settings-preview [page]      the settings window alone (taskbar, pill, devices, connectors,
 //!                                  about); changes are not applied, there is no tray to apply them
-//!   --calendar [ics-url …]         the calendar flyout alone, on the config's accounts and links
-//!                                  plus these links (for this run only)
+//!   --calendar [bell] [ics-url …]  the calendar flyout alone (with `bell`: the notifications),
+//!                                  on the config's accounts and links plus these links (this run only)
 //!   --vol <up|down|get>            nudge or read the default output volume by one scroll notch
 //!   --osd [out|in] [level%]        preview the scroll readout beside the cursor until it fades
 //!   --mic [secs]                   who holds the microphone, then watch it change
 //!   --batteries [secs]             the connected devices' battery levels, then each change
 //!   --battery-toast               the low-battery Windows notification, with a made-up device
 //!   --meter                        sample the default output+input peak meters for 4 s
-//!   --taskbar-click <out|in|panel> post a strip gesture to the running tray (clicks on the
+//!   --taskbar-click <out|in|panel|clock|bell>
+//!                                  post a strip gesture to the running tray (clicks on the
 //!                                  taskbar cannot be synthesised)
 //!   --taskbar-scroll <out|in> [notches]
 //!                                  post a strip scroll (the only way to drive touchpad deltas)
@@ -74,11 +75,17 @@ pub fn run(args: &[String], backend: &WasapiBackend) -> Result<bool> {
         Some("--calendar") => {
             // Extra calendar links for this run only (nothing is saved).
             let mut config = Config::load();
-            for url in &args[1..] {
+            let bell = args.get(1).is_some_and(|a| a == "bell");
+            for url in &args[1 + usize::from(bell)..] {
                 config.calendar.links.push(crate::calendar::Link { name: crate::calendar::link_name(url), url: url.clone() });
             }
-            crate::calendar::preview(&config);
+            let panel = if bell { crate::calendar::Panel::Notifications } else { crate::calendar::Panel::Calendar };
+            crate::calendar::preview(&config, panel);
         }
+        Some("--activator") => crate::calendar::rich::print_activator(args.get(1).map_or("", String::as_str)),
+        Some("--payloads") => crate::calendar::rich::print_latest(args.get(1).and_then(|n| n.parse().ok()).unwrap_or(5))?,
+        Some("--click-notification") => crate::calendar::preview_click(args.get(1).and_then(|n| n.parse().ok()).unwrap_or(0), args.get(2).is_some_and(|a| a == "dry")),
+        Some("--banners") => crate::calendar::preview_banners(args.get(1).and_then(|n| n.parse().ok()).unwrap_or(2), args.get(2).and_then(|s| s.parse().ok()).unwrap_or(10)),
         Some("--settings-preview") => crate::settings::preview(&Config::load(), args.get(1).map_or("", String::as_str)),
         Some("--list") => list(backend)?,
         Some("--set") => {
@@ -184,7 +191,9 @@ pub fn run(args: &[String], backend: &WasapiBackend) -> Result<bool> {
                 Some("out") => taskbar::Action::CycleOutput,
                 Some("in") => taskbar::Action::CycleInput,
                 Some("panel") => taskbar::Action::OpenPanel,
-                other => bail!("usage: audio-tray --taskbar-click <out|in|panel> (got {other:?})"),
+                Some("clock") => taskbar::Action::OpenCalendar,
+                Some("bell") => taskbar::Action::OpenNotifications,
+                other => bail!("usage: audio-tray --taskbar-click <out|in|panel|clock|bell> (got {other:?})"),
             };
             taskbar::post_action(action)?;
             println!("taskbar: posted {action:?} to the running tray.");
@@ -209,6 +218,36 @@ pub fn run(args: &[String], backend: &WasapiBackend) -> Result<bool> {
         }
         Some("--batteries") => crate::batteries::trace(args.get(1).and_then(|s| s.parse().ok()).unwrap_or(0)),
         Some("--battery-toast") => crate::toast::show("G705 Mouse battery low", "12% left. Time to charge it.")?,
+        // Audio Tray's own notices as the tray sends them (tagged), and a call and a chat.
+        Some("--own-toast") => {
+            let tag = |kind: &str| format!("{}{kind}", crate::toast::TAG);
+            match args.get(1).map_or("battery", String::as_str) {
+                "battery" => crate::toast::show_with("G705 Mouse battery low", "12% left. Time to charge it.", None, false, &tag("battery/a1"))?,
+                "audio" => crate::toast::show_with("Sound now on WH-1000XM5", "Speakers disconnected.", None, false, &tag("audio"))?,
+                "meeting" => {
+                    let start = crate::calendar::time::now() + 300;
+                    crate::toast::show_with("Sync produit", "In 5 min · Teams", Some(("Join", "https://teams.microsoft.com/")), true, &tag(&format!("meeting/{start}")))?
+                }
+                "focus" => crate::toast::show_with("Focus done", "25 minutes of focus. Take a break.", None, false, &tag("focus/25"))?,
+                "call" => crate::toast::show_xml(
+                    r#"<toast scenario="incomingCall"><visual><binding template="ToastGeneric"><text>Camille Bernard</text><text>Incoming call</text></binding></visual><actions><action content="Accept" arguments="accept" activationType="foreground"/><action content="Decline" arguments="decline" activationType="foreground"/></actions></toast>"#,
+                    "",
+                )?,
+                // Audio Tray's own test notifications gone from Windows' list.
+                "clear" => windows::UI::Notifications::ToastNotificationManager::History()?.ClearWithId(&windows::core::HSTRING::from(crate::toast::AUMID))?,
+                other => anyhow::bail!("--own-toast battery|audio|meeting|focus|call|clear, not {other:?}"),
+            }
+        }
+        Some("--banner-sim") => {
+            if !crate::calendar::simulate_banners() {
+                anyhow::bail!("the banner simulation failed");
+            }
+        }
+        Some("--listening-preview") => {
+            crate::calendar::listening(Some(("SystemSettings".into(), "SystemSettings.exe".into())));
+            crate::win::pump_for(std::time::Duration::from_secs(6));
+        }
+        Some("--digest") => crate::calendar::preview_digest(args.get(1).and_then(|s| s.parse().ok()).unwrap_or(8)),
         Some("--keyboards") => crate::keyboards::spike::run(&args[1..])?,
         Some("--music-probe") => music::probe()?,
         Some("--music-timeline") => {

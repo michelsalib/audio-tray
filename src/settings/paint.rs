@@ -34,6 +34,7 @@ use std::cell::RefCell;
 
 use crate::config::PillAlign;
 use crate::icons::IconId;
+use crate::lang::tr;
 
 /// An sRGB colour with straight alpha.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -540,7 +541,7 @@ fn text_limit(items: &[Item], index: usize, card: R) -> f32 {
         .take_while(|i| !matches!(i.kind, Kind::Card { .. } | Kind::Section(_) | Kind::Title(_) | Kind::Map { .. }))
         .filter(|i| i.r.x > card.x + layout::CARD_TEXT_X && i.r.y >= card.y && i.r.bottom() <= card.bottom() + 0.5)
         // A switch's On or Off sits before it.
-        .map(|i| i.r.x - 16.0 - if matches!(i.kind, Kind::Toggle { .. }) { layout::TOGGLE_LABEL_W + 8.0 } else { 0.0 })
+        .map(|i| i.r.x - 16.0 - if matches!(i.kind, Kind::Toggle { .. }) { layout::toggle_label_w() + 8.0 } else { 0.0 })
         .fold(card.right() - layout::CARD_PAD, f32::min)
 }
 
@@ -602,7 +603,7 @@ fn draw_item(pen: &Pen, s: &Scene, items: &[Item], index: usize, item: &Item) {
         Kind::Toggle { on, dim, toggle } => {
             let a = if *dim { 0.4 } else { 1.0 };
             let t = Target::Toggle(*toggle);
-            pen.text(if *on { "On" } else { "Off" }, Font::Body, R::new(r.x - layout::TOGGLE_LABEL_W - 8.0, r.y - 6.0, layout::TOGGLE_LABEL_W, r.h + 12.0), p.text.alpha(a), Align::Right);
+            pen.text(if *on { tr("On", "Activé") } else { tr("Off", "Désactivé") }, Font::Body, R::new(r.x - layout::toggle_label_w() - 8.0, r.y - 6.0, layout::toggle_label_w(), r.h + 12.0), p.text.alpha(a), Align::Right);
             let knob = if hover(t) && !dim { 7.0 } else { 6.0 };
             let cy = r.y + r.h / 2.0;
             match (*on, *dim) {
@@ -795,7 +796,7 @@ fn draw_map(pen: &Pen, s: &Scene, r: R, dim: bool) {
         let label = R::new(screen.x, screen.y + screen.h / 2.0 - 18.0, screen.w, 28.0);
         pen.text(&(i + 1).to_string(), Font::Number, label, p.text.alpha(a), Align::Center);
         if s.model.monitors.get(i).is_some_and(|m| m.primary) {
-            pen.text("Main", Font::Caption, R::new(screen.x, label.bottom(), screen.w, 18.0), p.text2.alpha(a), Align::Center);
+            pen.text(tr("Main", "Principal"), Font::Caption, R::new(screen.x, label.bottom(), screen.w, 18.0), p.text2.alpha(a), Align::Center);
         }
         if !(on || hovered == Some(i)) {
             continue;
@@ -821,11 +822,11 @@ fn draw_map(pen: &Pen, s: &Scene, r: R, dim: bool) {
         let labels = layout::align_labels(pill.edge);
         let at = layout::ALIGNS.iter().position(|x| *x == pill.align).unwrap_or(1);
         let edge = match pill.edge {
-            crate::config::PillEdge::Left => "Left edge",
-            crate::config::PillEdge::Right => "Right edge",
-            crate::config::PillEdge::Top => "Top edge",
+            crate::config::PillEdge::Left => tr("Left edge", "Bord gauche"),
+            crate::config::PillEdge::Right => tr("Right edge", "Bord droit"),
+            crate::config::PillEdge::Top => tr("Top edge", "Bord supérieur"),
         };
-        let place = if pill.align == PillAlign::Center { "middle".to_string() } else { labels[at].to_lowercase() };
+        let place = if pill.align == PillAlign::Center { tr("middle", "milieu").to_string() } else { labels[at].to_lowercase() };
         pen.text(&format!("{edge}, {place}"), Font::Caption, R::new(r.x + 16.0, r.bottom() - 26.0, r.w - 32.0, 20.0), p.text2, Align::Left);
     }
 }
@@ -916,6 +917,7 @@ fn picture_of(pen: &Pen, s: &Scene, picture: layout::Picture, r: R, a: f32) {
     match picture {
         Picture::Size(size) => size_picture(pen, size, r, a),
         Picture::Click(click) => click_picture(pen, s, click, r, a),
+        Picture::Bell(click) => bell_picture(pen, s, click, r, a),
         Picture::PlayerButton(style) => player_picture(pen, s, style, r, a),
         Picture::Ring(style) => {
             let radius = (r.w.min(r.h) / 2.0 - 10.0).max(10.0);
@@ -1119,10 +1121,10 @@ fn taskbar_strip(pen: &Pen, r: R, a: f32) -> f32 {
     bar.y
 }
 
-/// What a left click on the output button does: the button on the taskbar, and above it what
+/// What a middle click on the output button does: the button on the taskbar, and above it what
 /// happens.
-fn click_picture(pen: &Pen, s: &Scene, click: crate::config::LeftClick, r: R, a: f32) {
-    use crate::config::LeftClick;
+fn click_picture(pen: &Pen, s: &Scene, click: crate::config::MiddleClick, r: R, a: f32) {
+    use crate::config::MiddleClick;
     let p = s.palette;
     let white = Color::hex(0xFFFFFF, a);
     pen.clip(r);
@@ -1134,27 +1136,59 @@ fn click_picture(pen: &Pen, s: &Scene, click: crate::config::LeftClick, r: R, a:
     pen.glyph('\u{E767}', Font::Icon, button, white);
     let row = R::new(r.x, r.y + 8.0, r.w, top - r.y - 16.0);
     match click {
-        LeftClick::Switch => {
-            pen.glyph('\u{E7F6}', Font::IconLarge, R::new(cx - 64.0, row.y, 40.0, row.h), white.alpha(0.6));
-            pen.glyph('\u{E72A}', Font::Icon, R::new(cx - 12.0, row.y, 24.0, row.h), p.accent.alpha(a));
-            pen.glyph('\u{E7F5}', Font::IconLarge, R::new(cx + 24.0, row.y, 40.0, row.h), white);
-        }
-        LeftClick::Mute => {
+        MiddleClick::Mute => {
             pen.glyph('\u{E767}', Font::IconLarge, R::new(cx - 64.0, row.y, 40.0, row.h), white.alpha(0.6));
             pen.glyph('\u{E72A}', Font::Icon, R::new(cx - 12.0, row.y, 24.0, row.h), p.accent.alpha(a));
             pen.glyph('\u{E74F}', Font::IconLarge, R::new(cx + 24.0, row.y, 40.0, row.h), white);
         }
-        LeftClick::Panel => {
-            // The panel, risen over the taskbar, its two sliders.
-            let panel = R::new(cx - 52.0, row.y + 4.0, 104.0, row.h - 4.0);
-            pen.fill(panel, 6.0, Color::hex(0x2C2C2C, a));
-            pen.stroke(panel, 6.0, 1.0, Color::hex(0xFFFFFF, 0.1 * a));
-            for (i, level) in [0.62, 0.4].into_iter().enumerate() {
-                let y = panel.y + panel.h * (0.35 + 0.33 * i as f32);
-                let (x0, x1) = (panel.x + 12.0, panel.right() - 12.0);
-                pen.fill(R::new(x0, y - 1.5, x1 - x0, 3.0), 1.5, Color::hex(0xFFFFFF, 0.25 * a));
-                pen.fill(R::new(x0, y - 1.5, (x1 - x0) * level, 3.0), 1.5, p.accent.alpha(a));
+        MiddleClick::Switch => {
+            pen.glyph('\u{E7F6}', Font::IconLarge, R::new(cx - 64.0, row.y, 40.0, row.h), white.alpha(0.6));
+            pen.glyph('\u{E72A}', Font::Icon, R::new(cx - 12.0, row.y, 24.0, row.h), p.accent.alpha(a));
+            pen.glyph('\u{E7F5}', Font::IconLarge, R::new(cx + 24.0, row.y, 40.0, row.h), white);
+        }
+        MiddleClick::SwitchMute => {
+            // Speakers, headphones, then muted.
+            pen.glyph('\u{E7F6}', Font::IconLarge, R::new(cx - 78.0, row.y, 36.0, row.h), white.alpha(0.6));
+            pen.glyph('\u{E72A}', Font::IconSmall, R::new(cx - 44.0, row.y, 16.0, row.h), p.accent.alpha(a));
+            pen.glyph('\u{E7F5}', Font::IconLarge, R::new(cx - 26.0, row.y, 36.0, row.h), white.alpha(0.8));
+            pen.glyph('\u{E72A}', Font::IconSmall, R::new(cx + 10.0, row.y, 16.0, row.h), p.accent.alpha(a));
+            pen.glyph('\u{E74F}', Font::IconLarge, R::new(cx + 28.0, row.y, 36.0, row.h), white);
+        }
+    }
+    pen.unclip();
+}
+
+/// What a middle click on the bell does: the bell on the taskbar, and above it what happens.
+fn bell_picture(pen: &Pen, s: &Scene, click: crate::config::BellMiddleClick, r: R, a: f32) {
+    use crate::config::BellMiddleClick;
+    let p = s.palette;
+    let white = Color::hex(0xFFFFFF, a);
+    pen.clip(r);
+    let top = taskbar_strip(pen, r, a);
+    let cx = r.x + r.w / 2.0;
+    // The bell, under the pointer.
+    let button = R::new(cx - 16.0, top + 2.0, 32.0, 26.0);
+    pen.fill(button, 13.0, Color::hex(0xFFFFFF, 0.12 * a));
+    let quiet = click == BellMiddleClick::DoNotDisturb;
+    pen.glyph(if quiet { '\u{E7ED}' } else { '\u{EA8F}' }, Font::Icon, button, white);
+    let row = R::new(r.x, r.y + 8.0, r.w, top - r.y - 16.0);
+    match click {
+        BellMiddleClick::DoNotDisturb => {
+            pen.glyph('\u{EA8F}', Font::IconLarge, R::new(cx - 64.0, row.y, 40.0, row.h), white.alpha(0.6));
+            pen.glyph('\u{E72A}', Font::Icon, R::new(cx - 12.0, row.y, 24.0, row.h), p.accent.alpha(a));
+            pen.glyph('\u{E708}', Font::IconLarge, R::new(cx + 24.0, row.y, 40.0, row.h), white);
+        }
+        BellMiddleClick::ClearAll => {
+            // Notifications, then none.
+            for i in 0..3 {
+                let card = R::new(cx - 70.0, row.y + 8.0 + i as f32 * 12.0, 44.0, 9.0);
+                pen.fill(card, 3.0, Color::hex(0xFFFFFF, 0.25 * a));
             }
+            pen.glyph('\u{E72A}', Font::Icon, R::new(cx - 12.0, row.y, 24.0, row.h), p.accent.alpha(a));
+            pen.glyph('\u{E894}', Font::IconLarge, R::new(cx + 24.0, row.y, 40.0, row.h), white);
+        }
+        BellMiddleClick::Nothing => {
+            pen.glyph('\u{E738}', Font::IconLarge, R::new(cx - 20.0, row.y, 40.0, row.h), white.alpha(0.4));
         }
     }
     pen.unclip();
@@ -1201,5 +1235,5 @@ fn pill_preview(pen: &Pen, s: &Scene, r: R, on: bool) {
     pen.circle(r.x + 32.0, cy + 30.0, 16.0, DEVICE_DISC.alpha(a));
     pen.glyph('\u{E767}', Font::IconSmall, R::new(r.x + 24.0, cy + 22.0, 16.0, 16.0), Color::hex(0xFFFFFF, a));
     pen.unclip();
-    pen.text("Main display", Font::Caption, R::new(r.x, r.bottom() - 24.0, r.w - 12.0, 18.0), Color::hex(0xD6D6D6, 1.0), Align::Right);
+    pen.text(tr("Main display", "Écran principal"), Font::Caption, R::new(r.x, r.bottom() - 24.0, r.w - 12.0, 18.0), Color::hex(0xD6D6D6, 1.0), Align::Right);
 }

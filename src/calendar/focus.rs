@@ -67,6 +67,29 @@ fn mark(ours: bool) {
     }
 }
 
+/// Follow whether Windows keeps notifications quiet, from now on (once): its focus state, which
+/// its automatic rules switch too (a full-screen app, a duplicated display, a game), and Do not
+/// disturb switched by hand. Each change has the tray look again, so the panel's moon and the
+/// bell's cross always say the same as Windows.
+pub fn watch() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static WATCHING: AtomicBool = AtomicBool::new(false);
+    if WATCHING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    dnd::watch();
+    let Some(manager) = manager() else { return };
+    let handler = windows::Foundation::TypedEventHandler::<FocusSessionManager, windows_core::IInspectable>::new(|_, _| {
+        crate::tray::post(super::WM_CALENDAR, super::QUIET, 0);
+        Ok(())
+    });
+    match manager.IsFocusActiveChanged(&handler) {
+        // The manager is kept for the process's life, and the subscription with it.
+        Ok(_) => std::mem::forget(manager),
+        Err(e) => eprintln!("calendar: could not follow Windows' focus ({e}); it is read when the panel or the clock next look"),
+    }
+}
+
 /// At start: Do not disturb a previous run set and never ended (it quit or crashed) is ended.
 pub fn recover() {
     if marker().is_some_and(|p| p.exists()) {
@@ -238,6 +261,47 @@ pub mod dnd {
     /// Whether Do not disturb (any profile) is on.
     pub fn on() -> bool {
         profile().is_some_and(|p| p != 0)
+    }
+
+    #[link(name = "ntdll", kind = "raw-dylib")]
+    unsafe extern "system" {
+        fn RtlSubscribeWnfStateChangeNotification(
+            subscription: *mut *mut c_void,
+            name: u64,
+            stamp: u32,
+            callback: unsafe extern "system" fn(u64, u32, *const c_void, *const c_void, *const c_void, u32) -> i32,
+            context: *const c_void,
+            type_id: *const c_void,
+            serialization_group: u32,
+            unknown: u32,
+        ) -> i32;
+    }
+
+    /// Called on a pool thread whenever Do not disturb changes, by anyone (Windows' Quick Settings
+    /// too): the tray looks again (the bell's cross, the panel's moon).
+    unsafe extern "system" fn changed(_name: u64, _stamp: u32, _type: *const c_void, _context: *const c_void, _buffer: *const c_void, _length: u32) -> i32 {
+        crate::tray::post(super::super::WM_CALENDAR, super::super::QUIET, 0);
+        0
+    }
+
+    /// Follow Do not disturb from now on (once, through [`super::watch`]; the subscription lasts as
+    /// long as the process).
+    pub fn watch() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static WATCHING: AtomicBool = AtomicBool::new(false);
+        if WATCHING.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        // From the current stamp, so only changes call back.
+        let mut stamp = 0u32;
+        let mut value = 0u32;
+        let mut size = 4u32;
+        let _ = unsafe { NtQueryWnfStateData(&STATE, core::ptr::null(), core::ptr::null(), &mut stamp, (&mut value as *mut u32).cast(), &mut size) };
+        let mut subscription = core::ptr::null_mut();
+        let status = unsafe { RtlSubscribeWnfStateChangeNotification(&mut subscription, STATE, stamp, changed, core::ptr::null(), core::ptr::null(), 0, 0) };
+        if status < 0 {
+            eprintln!("calendar: could not follow Do not disturb (0x{status:08x}); it is read when the panel or the clock next look");
+        }
     }
 
     /// Switch it; `false` when Windows refused.

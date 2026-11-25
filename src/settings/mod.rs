@@ -36,6 +36,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use crate::audio::wasapi::WasapiBackend;
 use crate::config::{Config, PillSize, TileStyle};
+use crate::lang::tr;
 use layout::{Button, Choice, Laid, Page, Target, Toggle};
 use model::{Model, Status};
 use paint::{Font, Gfx, Palette, Pointer};
@@ -50,8 +51,10 @@ pub const APPLY: usize = 0;
 pub const QUIT: usize = 1;
 /// Relaunch into a staged update.
 pub const RESTART: usize = 2;
-/// [`WM_OPEN_SETTINGS`]'s `wParam` to open on the Calendar page.
+/// [`WM_OPEN_SETTINGS`]'s `wParam` to open on a page: each panel's gear opens the page about it.
 pub const OPEN_CALENDAR: usize = 1;
+pub const OPEN_TASKBAR: usize = 2;
+pub const OPEN_NOTIFICATIONS: usize = 3;
 
 /// Posted to this window: something in [`INBOX`] to read.
 const WM_FOLLOW: u32 = WM_APP + 1;
@@ -164,10 +167,17 @@ pub fn calendar_changed() {
     wake();
 }
 
-/// Show the Calendar page (the calendar's gear opens it).
-pub fn show_calendar() {
+/// Show the page [`WM_OPEN_SETTINGS`]'s `wParam` names ([`OPEN_CALENDAR`] …): each panel's gear
+/// opens the page about it.
+pub fn show_page(code: usize) {
+    let page = match code {
+        OPEN_CALENDAR => Page::Calendar,
+        OPEN_TASKBAR => Page::Taskbar,
+        OPEN_NOTIFICATIONS => Page::Notifications,
+        _ => return,
+    };
     with_window(|w| {
-        w.model.page = Page::Calendar;
+        w.model.page = page;
         w.model.calendar = crate::calendar::status(&w.model.config.calendar.setup());
         w.scroll = 0.0;
         w.relayout();
@@ -221,7 +231,7 @@ fn create(config: &Config) -> Result<()> {
     let h = ((OPEN_SIZE.1 * scale) as i32).min(wh * 9 / 10);
     let (x, y) = (work.left + (ww - w) / 2, work.top + (wh - h) / 2);
     let hwnd = unsafe {
-        CreateWindowExW(WINDOW_EX_STYLE(0), CLASS, w!("Audio Tray Settings"), WS_OVERLAPPEDWINDOW, x, y, w, h, None, None, Some(instance.into()), None)
+        CreateWindowExW(WINDOW_EX_STYLE(0), CLASS, &windows::core::HSTRING::from(tr("Audio Tray Settings", "Paramètres d'Audio Tray")), WS_OVERLAPPEDWINDOW, x, y, w, h, None, None, Some(instance.into()), None)
     }
     .context("CreateWindowExW")?;
 
@@ -448,10 +458,10 @@ impl Window {
                 let flag = match toggle {
                     Toggle::Site(_) => return,
                     Toggle::Strip => &mut c.strip.enabled,
+                    Toggle::StripShortcut => &mut c.strip.shortcut,
                     Toggle::NextToWifi => &mut c.strip.next_to_wifi,
                     Toggle::HideVolume => &mut c.strip.hide_windows_volume,
                     Toggle::HideMic => &mut c.strip.hide_windows_mic,
-                    Toggle::MuteInCycle => &mut c.strip.mute_in_cycle,
                     Toggle::HideLanguage => &mut c.strip.hide_windows_language,
                     Toggle::Keyboards => &mut c.keyboards.enabled,
                     Toggle::KeyboardReadout => &mut c.keyboards.show_readout,
@@ -473,6 +483,7 @@ impl Window {
                     Toggle::WeekNumbers => &mut c.calendar.week_numbers,
                     Toggle::WorldClocks => &mut c.calendar.world_clocks,
                     Toggle::CalendarNotifications => &mut c.calendar.notifications,
+                    Toggle::TakeOver => &mut c.calendar.take_over,
                     Toggle::CalendarShortcut => &mut c.calendar.shortcut,
                     Toggle::QuietMeetings => &mut c.calendar.quiet_in_meetings,
                     Toggle::QuietCalls => &mut c.calendar.quiet_in_calls,
@@ -494,7 +505,8 @@ impl Window {
                 let monitors: Vec<String> = self.model.monitors.iter().map(|m| m.name.clone()).collect();
                 self.change(|c| match choice {
                     Choice::Tile => c.music.tile_style = [TileStyle::Off, TileStyle::Cover, TileStyle::Full][i.min(2)],
-                    Choice::LeftClick => c.strip.left_click = layout::LEFT_CLICKS[i.min(2)],
+                    Choice::MiddleClick => c.strip.middle_click = layout::MIDDLE_CLICKS[i.min(2)],
+                    Choice::BellMiddle => c.calendar.bell_middle_click = layout::BELL_MIDDLE_CLICKS[i.min(2)],
                     Choice::PillSize => c.pill.size = [PillSize::Hidden, PillSize::Small, PillSize::Big][i.min(2)],
                     Choice::BrowserTabs => c.browser.every_site = i == 0,
                     // Automatic, then each display.
@@ -567,12 +579,23 @@ impl Window {
             Button::Mpc => match crate::integrations::mpc::share_media() {
                 Ok(()) => {
                     self.model.mpc = Some(true);
-                    self.say(Button::Mpc, "On from MPC-HC's next start", model::Tone::Good);
+                    self.say(Button::Mpc, tr("On from MPC-HC's next start", "Actif au prochain lancement de MPC-HC"), model::Tone::Good);
                 }
                 Err(hint) => self.hint(Button::Mpc, hint),
             },
             Button::SoundSettings => return Some(Box::new(|| {
                 crate::win::shell_open("ms-settings:sound", None);
+            })),
+            // The bell's cross, the panel's moon and this page follow (Windows says it changed).
+            Button::Quiet => return Some(Box::new(|| {
+                crate::calendar::focus::toggle();
+                crate::calendar::quiet_changed();
+            })),
+            Button::QuietRules => return Some(Box::new(|| {
+                crate::win::shell_open("ms-settings:notifications", None);
+            })),
+            Button::AllowNotifications => return Some(Box::new(|| {
+                crate::win::shell_open("ms-settings:privacy-notifications", None);
             })),
             // System and performance, where the "Never put these sites to sleep" list is.
             Button::EdgeSleep => return Some(Box::new(|| {
@@ -584,7 +607,7 @@ impl Window {
                 return Some(Box::new(|| {
                     crate::integrations::browser::open_extensions_page();
                     if !crate::integrations::browser::show_extension_dir() {
-                        with_window(|w| w.hint(Button::ExtensionFolder, "The extension's folder was not found next to Audio Tray"));
+                        with_window(|w| w.hint(Button::ExtensionFolder, tr("The extension's folder was not found next to Audio Tray", "Le dossier de l'extension est introuvable à côté d'Audio Tray")));
                     }
                 }));
             }
@@ -596,12 +619,12 @@ impl Window {
             Button::DiscordRedirect => {
                 let copied = crate::win::set_clipboard_text(crate::integrations::discord_rpc::REDIRECT);
                 match copied {
-                    true => self.say(button, "Copied: paste it in OAuth2 > Redirects", model::Tone::Good),
-                    false => self.hint(button, "The clipboard is busy: copy again"),
+                    true => self.say(button, tr("Copied: paste it in OAuth2 > Redirects", "Copié : collez-le dans OAuth2 > Redirects"), model::Tone::Good),
+                    false => self.hint(button, tr("The clipboard is busy: copy again", "Presse-papiers occupé : copiez à nouveau")),
                 }
             }
             Button::DiscordId | Button::DiscordSecret => match crate::win::clipboard_text() {
-                Err(()) => self.hint(button, "The clipboard is busy: paste again"),
+                Err(()) => self.hint(button, tr("The clipboard is busy: paste again", "Presse-papiers occupé : collez à nouveau")),
                 Ok(text) => {
                     let text = text.map(|t| t.trim().to_string()).unwrap_or_default();
                     match model::paste_key(button, &text) {
@@ -689,8 +712,8 @@ impl Window {
             Cal::GoogleCredentials => return open("https://console.cloud.google.com/apis/credentials"),
             Cal::MicrosoftPortal => return open("https://entra.microsoft.com/#view/Microsoft_AAD_RegisteredApps/ApplicationsListBlade/quickStartType~/null/sourceType/Microsoft_AAD_IAM"),
             Cal::MicrosoftRedirect => match crate::win::set_clipboard_text("http://localhost") {
-                true => self.say(button, "Copied: add it under Mobile and desktop applications", model::Tone::Good),
-                false => self.hint(button, "The clipboard is busy: copy again"),
+                true => self.say(button, tr("Copied: add it under Mobile and desktop applications", "Copié : ajoutez-le sous Applications mobiles et de bureau"), model::Tone::Good),
+                false => self.hint(button, tr("The clipboard is busy: copy again", "Presse-papiers occupé : copiez à nouveau")),
             },
             Cal::GoogleId | Cal::GoogleSecret | Cal::MicrosoftId | Cal::AddLink => {
                 let key = match cal {
@@ -701,7 +724,7 @@ impl Window {
                 };
                 let text = match crate::win::clipboard_text() {
                     Err(()) => {
-                        self.hint(button, "The clipboard is busy: paste again");
+                        self.hint(button, tr("The clipboard is busy: paste again", "Presse-papiers occupé : collez à nouveau"));
                         return None;
                     }
                     Ok(text) => text.unwrap_or_default(),
@@ -714,7 +737,7 @@ impl Window {
                         CalendarKey::MicrosoftId => self.change(|c| c.calendar.microsoft_client_id = Some(value)),
                         CalendarKey::Link => {
                             if self.model.config.calendar.links.iter().any(|l| l.url == value) {
-                                self.hint(button, "That calendar is already here");
+                                self.hint(button, tr("That calendar is already here", "Cet agenda est déjà là"));
                             } else {
                                 let name = crate::calendar::link_name(&value);
                                 self.change(|c| c.calendar.links.push(crate::calendar::Link { name, url: value }));
@@ -813,10 +836,11 @@ impl Window {
         let into = self.model.capture_into;
         if let Some(name) = captured.assigned {
             let mine = into.and_then(|i| self.model.config.keyboards.assigned.get(i)).is_some_and(|k| k.has(&captured.path));
-            let hint = if mine {
-                format!("That connection is already part of \"{name}\": connect it another way, then press a key")
-            } else {
-                format!("That one is already here, as \"{name}\": press a key on another keyboard")
+            let hint = match (mine, crate::lang::french()) {
+                (true, false) => format!("That connection is already part of \"{name}\": connect it another way, then press a key"),
+                (true, true) => format!("Cette connexion fait déjà partie de « {name} » : branchez le clavier autrement, puis appuyez sur une touche"),
+                (false, false) => format!("That one is already here, as \"{name}\": press a key on another keyboard"),
+                (false, true) => format!("Celui-ci est déjà là, sous le nom « {name} » : appuyez sur une touche d'un autre clavier"),
             };
             self.model.capture = Some(Some(hint));
             self.relayout();
@@ -1036,15 +1060,17 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESUL
 pub fn preview(config: &Config, page: &str) {
     open(config);
     with_window(|w| {
-        if let Some(page) = Page::ALL.into_iter().find(|p| p.title().to_lowercase().contains(&page.to_lowercase())) {
+        // Its English or its French title.
+        let named = |title: &str| title.to_lowercase().contains(&page.to_lowercase());
+        if let Some(page) = Page::ALL.into_iter().find(|p| named(p.titles().0) || named(p.titles().1)) {
             w.model.page = page;
             w.relayout();
             w.invalidate();
         }
     });
-    // `calendar`: Connectors, with the calendar's card open.
+    // `calendar`: the Calendar page, with its accounts read.
     if page.eq_ignore_ascii_case("calendar") {
-        show_calendar();
+        show_page(OPEN_CALENDAR);
     }
     let mut msg = windows::Win32::UI::WindowsAndMessaging::MSG::default();
     while HWND_OPEN.with(Cell::get) != 0 && crate::wait::get_message(&mut msg) {

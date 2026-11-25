@@ -13,7 +13,7 @@
 use crate::canvas::{lerp3, Canvas, Rect};
 use crate::config::MotionStyle;
 
-const TEXT: [u8; 3] = [0xFF, 0xFF, 0xFF];
+use crate::flyout::theme::text;
 const GREY: [u8; 3] = [0x6A, 0x6A, 0x6A];
 
 /// A damped spring's position and speed.
@@ -137,8 +137,8 @@ pub fn draw(cv: &mut Canvas, style: MotionStyle, track: Track, motion: &SliderMo
         MotionStyle::None => {
             let (th, tr) = (d(4.0), d(if compact { 6.0 } else { 7.0 }));
             let fx = x0 + (x1 - x0) * level.min(1.0);
-            cv.fill_round_rect(Rect::new(x0, cy - th / 2.0, x1, cy + th / 2.0), th / 2.0, TEXT, 0.28);
-            let (col, a) = if muted { (TEXT, 0.34) } else { (accent, 1.0) };
+            cv.fill_round_rect(Rect::new(x0, cy - th / 2.0, x1, cy + th / 2.0), th / 2.0, text(), 0.28);
+            let (col, a) = if muted { (text(), 0.34) } else { (accent, 1.0) };
             if fx > x0 {
                 cv.fill_round_rect(Rect::new(x0, cy - th / 2.0, fx, cy + th / 2.0), th / 2.0, col, a);
             }
@@ -151,7 +151,7 @@ pub fn draw(cv: &mut Canvas, style: MotionStyle, track: Track, motion: &SliderMo
             let fx = x0 + (x1 - x0) * (level * unmuted).min(1.0);
             let (fill_end, rest_start) = (fx - hw / 2.0 - gap, fx + hw / 2.0 + gap);
             if x1 > rest_start {
-                cv.fill_round_rect(Rect::new(rest_start, cy - th / 2.0, x1, cy + th / 2.0), th / 2.0, TEXT, 0.18);
+                cv.fill_round_rect(Rect::new(rest_start, cy - th / 2.0, x1, cy + th / 2.0), th / 2.0, text(), 0.18);
                 // The stop dot, while there is room before it.
                 if x1 - rest_start > th * 1.5 {
                     let r = d(2.0);
@@ -162,7 +162,7 @@ pub fn draw(cv: &mut Canvas, style: MotionStyle, track: Track, motion: &SliderMo
                 cv.fill_round_rect(Rect::new(x0, cy - th / 2.0, fill_end, cy + th / 2.0), th / 2.0, fill_col, 1.0);
                 if peak > 0.01 {
                     let px = x0 + (fill_end - x0) * peak;
-                    cv.fill_round_rect(Rect::new(x0, cy - th / 2.0, px.max(x0 + th), cy + th / 2.0), th / 2.0, TEXT, 0.28);
+                    cv.fill_round_rect(Rect::new(x0, cy - th / 2.0, px.max(x0 + th), cy + th / 2.0), th / 2.0, text(), 0.28);
                 }
             }
             cv.fill_round_rect(Rect::new(fx - hw / 2.0, cy - hh / 2.0, fx + hw / 2.0, cy + hh / 2.0), hw / 2.0, fill_col, 1.0);
@@ -171,12 +171,12 @@ pub fn draw(cv: &mut Canvas, style: MotionStyle, track: Track, motion: &SliderMo
             let stretch = d(motion.stretch.x);
             let (x0, x1) = if stretch > 0.0 { (x0, x1 + stretch) } else { (x0 + stretch, x1) };
             let th = d(if compact { 16.0 } else { 22.0 }) * (1.0 - (stretch.abs() / d(70.0)).min(0.22));
-            cv.fill_round_rect(Rect::new(x0, cy - th / 2.0, x1, cy + th / 2.0), th / 2.0, TEXT, 0.12);
+            cv.fill_round_rect(Rect::new(x0, cy - th / 2.0, x1, cy + th / 2.0), th / 2.0, text(), 0.12);
             // The fill is never shorter than a circle.
             let fx = x0 + th + (x1 - x0 - th) * (level * unmuted).clamp(0.0, 1.0);
             cv.fill_round_rect(Rect::new(x0, cy - th / 2.0, fx, cy + th / 2.0), th / 2.0, fill_col, 1.0);
             if peak > 0.01 {
-                cv.fill_round_rect(Rect::new(x0, cy - th / 2.0, x0 + th + (fx - x0 - th) * peak, cy + th / 2.0), th / 2.0, TEXT, 0.16);
+                cv.fill_round_rect(Rect::new(x0, cy - th / 2.0, x0 + th + (fx - x0 - th) * peak, cy + th / 2.0), th / 2.0, text(), 0.16);
             }
         }
     }

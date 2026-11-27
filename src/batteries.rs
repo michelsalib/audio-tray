@@ -22,6 +22,9 @@
 mod hid;
 mod hidpp;
 mod razer;
+mod system;
+
+pub use system::{presence, refresh_presence, system, watch_power, Presence, SystemBattery, PBT_POWERSETTINGCHANGE, WM_POWERBROADCAST};
 
 use std::collections::HashMap;
 
@@ -29,13 +32,9 @@ use windows::core::{GUID, HSTRING, PCWSTR};
 use windows::Devices::Enumeration::{DeviceInformation, DeviceInformationKind, DeviceWatcher};
 use windows::Foundation::TypedEventHandler;
 use windows::Win32::Devices::DeviceAndDriverInstallation::{
-    CM_Get_DevNode_PropertyW, CM_Get_Device_ID_ListW, CM_Get_Device_ID_List_SizeW, CM_Locate_DevNodeW,
-    CM_GETIDLIST_FILTER_PRESENT, CM_LOCATE_DEVNODE_NORMAL, CR_SUCCESS,
+    CM_Get_Device_ID_ListW, CM_Get_Device_ID_List_SizeW, CM_GETIDLIST_FILTER_PRESENT, CR_SUCCESS,
 };
-use windows::Win32::Devices::Properties::{
-    DEVPKEY_DeviceContainer_Category, DEVPKEY_Device_ContainerId, DEVPKEY_Device_FriendlyName, DEVPROPTYPE,
-    DEVPROP_TYPE_BOOLEAN, DEVPROP_TYPE_BYTE, DEVPROP_TYPE_GUID, DEVPROP_TYPE_STRING, DEVPROP_TYPE_STRING_LIST,
-};
+use windows::Win32::Devices::Properties::{DEVPKEY_DeviceContainer_Category, DEVPKEY_Device_ContainerId, DEVPKEY_Device_FriendlyName};
 use windows::Win32::Foundation::{CloseHandle, DEVPROPKEY, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
 use windows::Win32::System::Threading::{CreateEventW, SetEvent, WaitForMultipleObjects, WaitForSingleObject, INFINITE};
@@ -69,6 +68,42 @@ pub fn read() -> Vec<Battery> {
     Sources::default().read().0
 }
 
+/// How a level reads, coloured as Windows 11 colours its battery: fine, getting low, low.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Tone {
+    Good,
+    Fair,
+    Low,
+}
+
+impl Tone {
+    /// `level` against the low level `low_at`: low at or under it, fair up to twice it.
+    pub fn of(level: u8, low_at: u8) -> Tone {
+        if level <= low_at {
+            Tone::Low
+        } else if level <= low_at.saturating_mul(2) {
+            Tone::Fair
+        } else {
+            Tone::Good
+        }
+    }
+
+    /// Its colour on a dark or a light taskbar (Fluent's status colours, legible on each).
+    pub fn rgb(self, light: bool) -> [u8; 3] {
+        match (self, light) {
+            (Tone::Good, false) => [0x6C, 0xCB, 0x5F],
+            (Tone::Good, true) => [0x0F, 0x7B, 0x0F],
+            (Tone::Fair, false) => [0xF2, 0xA3, 0x3A],
+            (Tone::Fair, true) => [0x9D, 0x5D, 0x00],
+            (Tone::Low, false) => [0xFF, 0x5F, 0x5F],
+            (Tone::Low, true) => [0xC4, 0x2B, 0x1C],
+        }
+    }
+}
+
+/// The least of a level drawn (a bar, a ring, a battery's fill): an empty one still shows its colour.
+pub const MIN_SHOWN: f32 = 0.06;
+
 /// Where levels come from, and what they remember between reads.
 #[derive(Default)]
 struct Sources {
@@ -78,7 +113,7 @@ struct Sources {
 impl Sources {
     /// Every level, and whether a receiver is plugged in (whose devices must be polled).
     fn read(&mut self) -> (Vec<Battery>, bool) {
-        let mut list = unsafe { collect() }.unwrap_or_default();
+        let mut list = collect().unwrap_or_default();
         let mut polled = false;
         for receivers in [hidpp::read(&mut self.logitech), razer::read()] {
             polled |= receivers.is_some();
@@ -149,26 +184,23 @@ fn is_root(instance_id: &[u16]) -> bool {
     id.starts_with(r"BTHENUM\DEV_") || id.starts_with(r"BTHLE\DEV_")
 }
 
-unsafe fn collect() -> Option<Vec<Battery>> {
+fn collect() -> Option<Vec<Battery>> {
+    use crate::win::{devnode_bool, devnode_byte, devnode_guid, devnode_string};
     let mut by_container: HashMap<String, Gathered> = HashMap::new();
     for id in present_ids()? {
-        let wide: Vec<u16> = id.iter().copied().chain(std::iter::once(0)).collect();
-        let mut devinst = 0u32;
-        if CM_Locate_DevNodeW(&mut devinst, PCWSTR(wide.as_ptr()), CM_LOCATE_DEVNODE_NORMAL) != CR_SUCCESS {
-            continue;
-        }
+        let Some(devinst) = crate::win::devnode(&id) else { continue };
         let root = is_root(&id);
-        let level = byte_prop(devinst, &BATTERY);
-        let connected = bool_prop(devinst, &CONNECTED);
+        let level = devnode_byte(devinst, &BATTERY);
+        let connected = devnode_bool(devinst, &CONNECTED);
         if !root && level.is_none() && connected.is_none() {
             continue;
         }
-        let Some(container) = guid_prop(devinst, &DEVPKEY_Device_ContainerId) else { continue };
+        let Some(container) = devnode_guid(devinst, &DEVPKEY_Device_ContainerId) else { continue };
         let facts = Facts {
             level,
             connected,
-            name: string_prop(devinst, &DEVPKEY_Device_FriendlyName),
-            category: if root { string_prop(devinst, &DEVPKEY_DeviceContainer_Category) } else { None },
+            name: devnode_string(devinst, &DEVPKEY_Device_FriendlyName),
+            category: if root { devnode_string(devinst, &DEVPKEY_DeviceContainer_Category) } else { None },
         };
         by_container.entry(guid_string(&container)).or_default().add(facts, root);
     }
@@ -176,81 +208,20 @@ unsafe fn collect() -> Option<Vec<Battery>> {
 }
 
 /// Every present device's instance id.
-unsafe fn present_ids() -> Option<Vec<Vec<u16>>> {
+fn present_ids() -> Option<Vec<Vec<u16>>> {
     // A double-NUL-terminated multi-string; a device arriving between the two calls makes the
     // second fail, so try again once.
     for _ in 0..2 {
         let mut len = 0u32;
-        if CM_Get_Device_ID_List_SizeW(&mut len, PCWSTR::null(), CM_GETIDLIST_FILTER_PRESENT) != CR_SUCCESS || len == 0 {
+        if unsafe { CM_Get_Device_ID_List_SizeW(&mut len, PCWSTR::null(), CM_GETIDLIST_FILTER_PRESENT) } != CR_SUCCESS || len == 0 {
             return None;
         }
         let mut buf = vec![0u16; len as usize];
-        if CM_Get_Device_ID_ListW(PCWSTR::null(), &mut buf, CM_GETIDLIST_FILTER_PRESENT) == CR_SUCCESS {
+        if unsafe { CM_Get_Device_ID_ListW(PCWSTR::null(), &mut buf, CM_GETIDLIST_FILTER_PRESENT) } == CR_SUCCESS {
             return Some(buf.split(|&c| c == 0).filter(|s| !s.is_empty()).map(<[u16]>::to_vec).collect());
         }
     }
     None
-}
-
-/// A devnode property's raw bytes and type.
-unsafe fn prop(devinst: u32, key: &DEVPROPKEY) -> Option<(DEVPROPTYPE, Vec<u8>)> {
-    let mut ptype = DEVPROPTYPE(0);
-    let mut size = 0u32;
-    // Sized first: CR_BUFFER_SMALL, with the size.
-    let _ = CM_Get_DevNode_PropertyW(devinst, key, &mut ptype, None, &mut size, 0);
-    if size == 0 {
-        return None;
-    }
-    let mut buf = vec![0u8; size as usize];
-    let ret = CM_Get_DevNode_PropertyW(devinst, key, &mut ptype, Some(buf.as_mut_ptr()), &mut size, 0);
-    (ret == CR_SUCCESS).then(|| {
-        buf.truncate(size as usize);
-        (ptype, buf)
-    })
-}
-
-unsafe fn byte_prop(devinst: u32, key: &DEVPROPKEY) -> Option<u8> {
-    match prop(devinst, key)? {
-        (DEVPROP_TYPE_BYTE, bytes) => bytes.first().copied(),
-        _ => None,
-    }
-}
-
-unsafe fn bool_prop(devinst: u32, key: &DEVPROPKEY) -> Option<bool> {
-    match prop(devinst, key)? {
-        // DEVPROP_BOOLEAN: 0 is false, 0xFF true.
-        (DEVPROP_TYPE_BOOLEAN, bytes) => bytes.first().map(|&b| b != 0),
-        _ => None,
-    }
-}
-
-unsafe fn guid_prop(devinst: u32, key: &DEVPROPKEY) -> Option<GUID> {
-    match prop(devinst, key)? {
-        (DEVPROP_TYPE_GUID, bytes) if bytes.len() >= 16 => Some(GUID::from_u128(u128::from_be_bytes(guid_bytes(&bytes)))),
-        _ => None,
-    }
-}
-
-/// A GUID's in-memory layout (little-endian fields) as the big-endian `u128` `GUID::from_u128` takes.
-fn guid_bytes(raw: &[u8]) -> [u8; 16] {
-    let mut b = [0u8; 16];
-    b[0..4].copy_from_slice(&[raw[3], raw[2], raw[1], raw[0]]);
-    b[4..6].copy_from_slice(&[raw[5], raw[4]]);
-    b[6..8].copy_from_slice(&[raw[7], raw[6]]);
-    b[8..16].copy_from_slice(&raw[8..16]);
-    b
-}
-
-/// A string, or a string list's first entry (a container's category is a list).
-unsafe fn string_prop(devinst: u32, key: &DEVPROPKEY) -> Option<String> {
-    let (ptype, bytes) = prop(devinst, key)?;
-    if ptype != DEVPROP_TYPE_STRING && ptype != DEVPROP_TYPE_STRING_LIST {
-        return None;
-    }
-    let wide: Vec<u16> = bytes.as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes(*c)).collect();
-    let first = wide.split(|&c| c == 0).next()?;
-    let s = String::from_utf16_lossy(first).trim().to_string();
-    (!s.is_empty()).then_some(s)
 }
 
 /// Format a GUID as an upper-case `{XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX}` string, matching
@@ -431,6 +402,15 @@ pub fn trace(secs: u64) {
 mod tests {
     use super::*;
 
+    /// Low at the low level, fair up to twice it, fine above.
+    #[test]
+    fn a_level_reads_as_its_tone() {
+        assert_eq!(Tone::of(20, 20), Tone::Low);
+        assert_eq!(Tone::of(21, 20), Tone::Fair);
+        assert_eq!(Tone::of(40, 20), Tone::Fair);
+        assert_eq!(Tone::of(41, 20), Tone::Good);
+    }
+
     fn facts(level: Option<u8>, connected: Option<bool>, name: &str, category: Option<&str>) -> Facts {
         Facts { level, connected, name: Some(name.into()), category: category.map(Into::into) }
     }
@@ -475,7 +455,7 @@ mod tests {
     fn a_guid_reads_back_from_its_bytes_as_windows_prints_it() {
         let g = GUID::from_u128(0x8B1C_8F60_1714_5936_8857_5330_03A0_D008);
         let raw: [u8; 16] = unsafe { std::mem::transmute(g) };
-        let back = GUID::from_u128(u128::from_be_bytes(guid_bytes(&raw)));
+        let back = GUID::from_u128(u128::from_be_bytes(crate::win::guid_bytes(&raw)));
         assert_eq!(guid_string(&back), "{8B1C8F60-1714-5936-8857-533003A0D008}");
     }
 }

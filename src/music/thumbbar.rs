@@ -15,11 +15,8 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{CreateIconIndirect, DestroyIcon, HICON, ICONINFO};
 
-/// The Segoe Fluent glyphs (same codepoints the taskbar strip uses).
-const PREVIOUS: char = '\u{E892}';
-const PLAY: char = '\u{E768}';
-const PAUSE: char = '\u{E769}';
-const NEXT: char = '\u{E893}';
+// The Segoe Fluent glyphs (same codepoints the taskbar strip uses).
+use crate::icons::glyph::{NEXT, PAUSE, PLAY, PREVIOUS};
 
 /// Button ids, deliberately the same as the strip's transport wire codes (10/11/12).
 const ID_PREVIOUS: u32 = 10;

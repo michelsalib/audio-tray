@@ -10,6 +10,7 @@
 //! minute while any are waiting (a dismissal in Windows' own centre is not always written promptly).
 
 use std::sync::Mutex;
+use super::lock;
 use std::time::{Duration, Instant};
 
 use windows::core::HSTRING;
@@ -48,8 +49,6 @@ enum Ask {
 const RECHECK: Duration = Duration::from_secs(60);
 /// …once Windows has been heard saying what changed: a slow safety net only.
 const RECHECK_HEARD: Duration = Duration::from_secs(300);
-/// Windows has sent a change event (it does not always, to an unpackaged app).
-static HEARD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// …and while the calendar is open, so what it lists follows what arrives.
 const RECHECK_OPEN: Duration = Duration::from_secs(3);
 /// Windows writes its store in bursts: one read once it has settled.
@@ -57,8 +56,25 @@ const SETTLE: Duration = Duration::from_millis(300);
 /// How long a notification removed here stays hidden from reads that may predate its removal.
 const REMOVED_FOR: Duration = Duration::from_secs(10);
 
+/// Every notification, newest first, as last read; `None` before the first read or when the
+/// listener is not allowed.
+static TOASTS: Mutex<Option<Vec<Toast>>> = Mutex::new(None);
+/// Asks waiting for the reader thread, which [`WAKE`] wakes.
+static ASKS: Mutex<Vec<Ask>> = Mutex::new(Vec::new());
+/// The reader thread's wake-up event (a raw handle), made once; 0 before.
+static WAKE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// The reader runs (or is starting).
+static RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Notifications removed here, and when: a read already under way must not bring them back.
+static REMOVED: Mutex<Vec<(u32, Instant)>> = Mutex::new(Vec::new());
+/// The last action an app did not take: its notification and what was typed ([`take_failure`]).
+static FAILURE: Mutex<Option<(u32, Option<String>)>> = Mutex::new(None);
 /// The calendar is open.
 static WATCHING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Windows has sent a change event (it does not always, to an unpackaged app).
+static HEARD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Windows does not let Audio Tray read notifications.
+static DENIED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// The calendar opened (read often) or closed.
 pub fn set_watching(on: bool) {
@@ -68,16 +84,6 @@ pub fn set_watching(on: bool) {
         refresh();
     }
 }
-
-/// Every notification, newest first, as last read; `None` before the first read or when the
-/// listener is not allowed.
-static TOASTS: Mutex<Option<Vec<Toast>>> = Mutex::new(None);
-/// Asks waiting for the reader thread, which [`WAKE`] wakes.
-static ASKS: Mutex<Vec<Ask>> = Mutex::new(Vec::new());
-/// The reader thread's wake-up event (a raw handle), made once; 0 before.
-static WAKE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-/// Notifications removed here, and when: a read already under way must not bring them back.
-static REMOVED: Mutex<Vec<(u32, Instant)>> = Mutex::new(Vec::new());
 
 /// Start reading (once; again if Windows refused the last time). The tray hears of each change as
 /// [`super::WM_CALENDAR`] with [`super::NOTIFICATIONS`].
@@ -114,22 +120,19 @@ pub fn start() {
     }
 }
 
-/// The reader runs (or is starting).
-static RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
 /// The notifications, newest first; empty when there are none or they cannot be read.
 pub fn list() -> Vec<Toast> {
-    TOASTS.lock().unwrap_or_else(|e| e.into_inner()).clone().unwrap_or_default()
+    lock(&TOASTS).clone().unwrap_or_default()
 }
 
 /// Windows' list has been read (what was listed at the first read is not new).
 pub fn read_yet() -> bool {
-    TOASTS.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+    lock(&TOASTS).is_some()
 }
 
 /// How many notifications are waiting: the bell's badge, as the card's header counts them.
 pub fn count() -> usize {
-    TOASTS.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map_or(0, Vec::len)
+    lock(&TOASTS).as_ref().map_or(0, Vec::len)
 }
 
 fn ask(what: Ask) {
@@ -137,7 +140,7 @@ fn ask(what: Ask) {
     if event == 0 || !RUNNING.load(std::sync::atomic::Ordering::SeqCst) {
         return;
     }
-    ASKS.lock().unwrap_or_else(|e| e.into_inner()).push(what);
+    lock(&ASKS).push(what);
     let _ = unsafe { windows::Win32::System::Threading::SetEvent(windows::Win32::Foundation::HANDLE(event as *mut _)) };
 }
 
@@ -146,12 +149,10 @@ pub fn denied() -> bool {
     DENIED.load(std::sync::atomic::Ordering::SeqCst)
 }
 
-static DENIED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
 /// End the reader (the calendar was turned off): nothing wakes for notifications no one shows.
 pub fn stop() {
     ask(Ask::Stop);
-    *TOASTS.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *lock(&TOASTS) = None;
 }
 
 /// Read the list again now (the calendar is opening, a picture has come).
@@ -165,7 +166,7 @@ pub fn remove(ids: Vec<u32>) {
     held_changed();
 }
 
-/// Take notification `id` off the list while its action runs ([`super::rich::invoke`]): removed
+/// Take notification `id` off the list while its action runs ([`super::rich::carry_out`]): removed
 /// from Windows once done ([`remove`]), back if not ([`failed`]).
 pub fn hold(id: u32) {
     hide(&[id]);
@@ -175,17 +176,15 @@ pub fn hold(id: u32) {
 /// An action the app did not take: `id` comes back, with what was typed (`draft`), and the panel
 /// says so ([`take_failure`]).
 pub fn failed(id: u32, draft: Option<String>) {
-    REMOVED.lock().unwrap_or_else(|e| e.into_inner()).retain(|(r, _)| *r != id);
-    *FAILURE.lock().unwrap_or_else(|e| e.into_inner()) = Some((id, draft));
+    lock(&REMOVED).retain(|(r, _)| *r != id);
+    *lock(&FAILURE) = Some((id, draft));
     refresh();
 }
 
 /// The last action not taken: its notification and what was typed, once.
 pub fn take_failure() -> Option<(u32, Option<String>)> {
-    FAILURE.lock().unwrap_or_else(|e| e.into_inner()).take()
+    lock(&FAILURE).take()
 }
-
-static FAILURE: Mutex<Option<(u32, Option<String>)>> = Mutex::new(None);
 
 pub fn clear() {
     let ids: Vec<u32> = list().iter().map(|t| t.id).collect();
@@ -197,8 +196,8 @@ pub fn clear() {
 /// Take `ids` off the list now, and off reads for a while.
 fn hide(ids: &[u32]) {
     let now = Instant::now();
-    REMOVED.lock().unwrap_or_else(|e| e.into_inner()).extend(ids.iter().map(|&id| (id, now)));
-    if let Some(list) = TOASTS.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+    lock(&REMOVED).extend(ids.iter().map(|&id| (id, now)));
+    if let Some(list) = lock(&TOASTS).as_mut() {
         list.retain(|t| !ids.contains(&t.id));
     }
 }
@@ -298,7 +297,7 @@ fn run(wake: windows::Win32::Foundation::HANDLE) {
                 Err(e) => eprintln!("notifications: could not read them ({e:#})"),
             }
         }
-        let waiting = TOASTS.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|l| !l.is_empty());
+        let waiting = lock(&TOASTS).as_ref().is_some_and(|l| !l.is_empty());
         let fast = FAST.load(std::sync::atomic::Ordering::SeqCst);
         let recheck = if WATCHING.load(std::sync::atomic::Ordering::SeqCst) {
             Some(RECHECK_OPEN)
@@ -327,7 +326,7 @@ fn run(wake: windows::Win32::Foundation::HANDLE) {
                 now.is_some() && now != probed
             };
         } else if woke == WAIT_OBJECT_0 {
-            for asked in std::mem::take(&mut *ASKS.lock().unwrap_or_else(|e| e.into_inner())) {
+            for asked in std::mem::take(&mut *lock(&ASKS)) {
                 match asked {
                     Ask::Stop => return,
                     Ask::Read => {}
@@ -374,11 +373,11 @@ fn run(wake: windows::Win32::Foundation::HANDLE) {
 fn publish(mut toasts: Vec<Toast>) {
     // Held while the list is replaced: a removal in between ([`hide`]) would come back until the
     // next read.
-    let mut removed = REMOVED.lock().unwrap_or_else(|e| e.into_inner());
+    let mut removed = lock(&REMOVED);
     removed.retain(|(id, at)| at.elapsed() < REMOVED_FOR && toasts.iter().any(|t| t.id == *id));
     toasts.retain(|t| !removed.iter().any(|(id, _)| *id == t.id));
     let changed = {
-        let mut held = TOASTS.lock().unwrap_or_else(|e| e.into_inner());
+        let mut held = lock(&TOASTS);
         let changed = held.as_ref() != Some(&toasts);
         if changed {
             println!("notifications: {} waiting", toasts.len());
@@ -478,7 +477,7 @@ fn logo_of(app: &str, aumid: &str, info: Option<&windows::ApplicationModel::AppI
         return Some(OURS.get_or_init(|| std::sync::Arc::new(include_bytes!("../../assets/app.ico").to_vec())).clone());
     }
     let key = if aumid.is_empty() { format!("name:{app}") } else { aumid.to_string() };
-    if let Some((_, logo)) = LOGOS.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|(a, _)| *a == key) {
+    if let Some((_, logo)) = lock(&LOGOS).iter().find(|(a, _)| *a == key) {
         return logo.clone();
     }
     let read = || -> Option<Vec<u8>> {
@@ -498,7 +497,7 @@ fn logo_of(app: &str, aumid: &str, info: Option<&windows::ApplicationModel::AppI
     let logo = read().map(std::sync::Arc::new);
     // Kept when read: a failure (a moment's refusal) is tried again with the app's next notification.
     if logo.is_some() {
-        LOGOS.lock().unwrap_or_else(|e| e.into_inner()).push((key, logo.clone()));
+        lock(&LOGOS).push((key, logo.clone()));
     }
     logo
 }

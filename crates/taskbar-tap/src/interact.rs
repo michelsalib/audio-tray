@@ -12,7 +12,6 @@ use crate::winrt::{
 use crate::xamlom::{IXamlDiagnostics, InstanceHandle};
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicBool, Ordering};
-use std::mem::ManuallyDrop;
 use std::sync::Mutex;
 use windows::Win32::Foundation::S_OK;
 use windows_core::{implement, IInspectable, Interface, HRESULT};
@@ -41,11 +40,10 @@ impl Segment {
     }
 }
 
-/// Runs `work`, swallowing any panic. Nothing may unwind into Explorer.
+/// Runs a handler's `work` under [`crate::guard`] (a panic is logged and the event swallowed: nothing
+/// may unwind into Explorer), answering XAML `S_OK` either way.
 fn guard(what: &str, work: impl FnOnce()) -> HRESULT {
-    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)).is_err() {
-        logf!("{what} handler panicked — event swallowed");
-    }
+    crate::guard(what, work);
     S_OK
 }
 
@@ -63,7 +61,7 @@ impl IPointerEventHandler_Impl for Hover_Impl {
                 return;
             };
             // Not deduped: idempotent.
-            decorate::set_opacity(&diagnostics, self.plate, self.opacity);
+            crate::xaml::set_opacity(&diagnostics, self.plate, self.opacity);
         })
     }
 }
@@ -140,26 +138,22 @@ impl IPointerEventHandler_Impl for Wheel_Impl {
 /// `None`, left unhandled, for horizontal swipes and zero deltas.
 ///
 /// # Safety
-/// `args` is borrowed from XAML: never release it (hence [`ManuallyDrop`]).
+/// `args` is borrowed from XAML: never release it (hence `from_raw_borrowed`).
 unsafe fn claim_wheel(args: *mut c_void) -> Option<i32> {
-    if args.is_null() {
-        return None;
-    }
-    let borrowed = ManuallyDrop::new(core::mem::transmute::<*mut c_void, IInspectable>(args));
-    let event = borrowed.cast::<IPointerRoutedEventArgs>().ok()?;
+    let event = IInspectable::from_raw_borrowed(&args)?.cast::<IPointerRoutedEventArgs>().ok()?;
 
     // `relativeTo` null: only the point's properties matter.
     let mut raw_point: *mut c_void = core::ptr::null_mut();
     if event.GetCurrentPoint(core::ptr::null_mut(), &mut raw_point) != S_OK || raw_point.is_null() {
         return None;
     }
-    let point = core::mem::transmute::<*mut c_void, IPointerPoint>(raw_point);
+    // Owned: dropping them releases the out-parameters' references.
+    let point = IPointerPoint::from_raw(raw_point);
     let mut raw_properties: *mut c_void = core::ptr::null_mut();
     if point.get_Properties(&mut raw_properties) != S_OK || raw_properties.is_null() {
         return None;
     }
-    let properties =
-        core::mem::transmute::<*mut c_void, IPointerPointProperties>(raw_properties);
+    let properties = IPointerPointProperties::from_raw(raw_properties);
 
     let mut horizontal = 0u8;
     if properties.get_IsHorizontalMouseWheel(&mut horizontal) == S_OK && horizontal != 0 {
@@ -190,7 +184,7 @@ unsafe fn ui_element(
     diagnostics: &IXamlDiagnostics,
     handle: InstanceHandle,
 ) -> Option<IUIElement> {
-    decorate::object_from_handle(diagnostics, handle)?
+    crate::xaml::object_from_handle(diagnostics, handle)?
         .cast::<IUIElement>()
         .ok()
 }
@@ -295,16 +289,10 @@ impl IPointerEventHandler_Impl for MusicPress_Impl {
 /// # Safety
 /// `args` must be the live args pointer XAML passed to `Invoke`.
 unsafe fn suppress_tap(args: *mut c_void) -> bool {
-    if args.is_null() {
-        return false;
-    }
-    // Borrowed: XAML owns the args. ManuallyDrop means a panic below cannot release them.
-    let inspectable = ManuallyDrop::new(core::mem::transmute::<*mut c_void, IInspectable>(args));
-    inspectable
-        .cast::<crate::winrt::ITappedRoutedEventArgs>()
-        .ok()
-        .map(|event| event.put_Handled(1) == S_OK)
-        .unwrap_or(false)
+    // Borrowed: XAML owns the args, never released here.
+    IInspectable::from_raw_borrowed(&args)
+        .and_then(|inspectable| inspectable.cast::<crate::winrt::ITappedRoutedEventArgs>().ok())
+        .is_some_and(|event| event.put_Handled(1) == S_OK)
 }
 
 /// The same, for a pointer press.
@@ -312,15 +300,10 @@ unsafe fn suppress_tap(args: *mut c_void) -> bool {
 /// # Safety
 /// `args` must be the live args pointer XAML passed to `Invoke`.
 unsafe fn suppress_pointer(args: *mut c_void) -> bool {
-    if args.is_null() {
-        return false;
-    }
-    let inspectable = ManuallyDrop::new(core::mem::transmute::<*mut c_void, IInspectable>(args));
-    inspectable
-        .cast::<IPointerRoutedEventArgs>()
-        .ok()
-        .map(|event| event.put_Handled(1) == S_OK)
-        .unwrap_or(false)
+    // Borrowed: XAML owns the args, never released here.
+    IInspectable::from_raw_borrowed(&args)
+        .and_then(|inspectable| inspectable.cast::<IPointerRoutedEventArgs>().ok())
+        .is_some_and(|event| event.put_Handled(1) == S_OK)
 }
 
 /// Wire one of the music tile's transport glyphs (press suppression and tap; no hover or wheel).
@@ -373,8 +356,8 @@ struct ClockTap;
 impl ITappedEventHandler_Impl for ClockTap_Impl {
     unsafe fn Invoke(&self, _sender: *mut c_void, args: *mut c_void) -> HRESULT {
         guard("clock-tap", || {
-            if !crate::clock::enabled() {
-                logf!("clock: tap left to the shell ({})", crate::clock::why());
+            if !crate::clock::calendar() {
+                logf!("clock: tap left to the shell ({}; the calendar the app's or not)", crate::clock::why());
                 return;
             }
             suppress_tap(args);
@@ -449,6 +432,43 @@ pub unsafe fn attach_part(diagnostics: &IXamlDiagnostics, element: InstanceHandl
     let exited: IPointerEventHandler = PartHover { icon: element, bell, over: false }.into();
     let exit = target.add_PointerExited(exited.as_raw(), &mut token);
     enter == S_OK && exit == S_OK
+}
+
+/// Wire Windows' battery icon (inside the Quick Settings button): the pointer entering and leaving
+/// it is told to the app, whose hook sends its clicks to audio-tray's batteries, and lights its own
+/// plate. Never detached: the handler checks [`crate::battery::enabled`] on every event.
+///
+/// # Safety
+/// XAML UI thread only.
+pub unsafe fn attach_battery(diagnostics: &IXamlDiagnostics, element: InstanceHandle) -> bool {
+    let Some(target) = ui_element(diagnostics, element) else {
+        return false;
+    };
+    let mut token = 0i64;
+    let entered: IPointerEventHandler = BatteryHover { over: true }.into();
+    let enter = target.add_PointerEntered(entered.as_raw(), &mut token);
+    let exited: IPointerEventHandler = BatteryHover { over: false }.into();
+    let exit = target.add_PointerExited(exited.as_raw(), &mut token);
+    enter == S_OK && exit == S_OK
+}
+
+/// The pointer entering or leaving the battery icon.
+#[implement(IPointerEventHandler)]
+struct BatteryHover {
+    over: bool,
+}
+
+impl IPointerEventHandler_Impl for BatteryHover_Impl {
+    unsafe fn Invoke(&self, _sender: *mut c_void, _args: *mut c_void) -> HRESULT {
+        guard("battery-hover", || {
+            // Leaving is always told and always unlit, so nothing stays stale.
+            if self.over && !crate::battery::enabled() {
+                return;
+            }
+            crate::ipc::send_battery_hover(self.over);
+            crate::battery::hover(self.over);
+        })
+    }
 }
 
 /// The pointer entering or leaving the clock's or the bell's icon.

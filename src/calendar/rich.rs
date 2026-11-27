@@ -13,6 +13,7 @@
 //! text typed. An app without one can only be opened; a `protocol` button opens its address.
 
 use std::sync::{Arc, Mutex};
+use super::lock;
 
 use windows::core::{GUID, HSTRING, PCWSTR};
 
@@ -145,14 +146,14 @@ fn thread_of(launch: &str) -> String {
 /// Whether notification `id`'s payload has been read from Windows' store (or given up on): until
 /// then its extras are not known (whether it wants a sound, whether it is a call).
 pub fn read_for(id: u32) -> bool {
-    READ.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|(r, _)| *r == id)
+    lock(&READ).iter().any(|(r, _)| *r == id)
 }
 
 /// Each notification's extras, read once (what is no longer listed is forgotten).
 pub fn for_toasts(wanted: &[(u32, String, Option<windows::ApplicationModel::AppInfo>)]) -> Vec<Rich> {
-    let mut read = READ.lock().unwrap_or_else(|e| e.into_inner());
+    let mut read = lock(&READ);
     read.retain(|(id, _)| wanted.iter().any(|(w, ..)| w == id));
-    let mut misses = MISSES.lock().unwrap_or_else(|e| e.into_inner());
+    let mut misses = lock(&MISSES);
     misses.retain(|(id, _)| wanted.iter().any(|(w, ..)| w == id));
     let missing: Vec<u32> = wanted.iter().map(|(id, ..)| *id).filter(|id| !read.iter().any(|(r, _)| r == id)).collect();
     let payloads = if missing.is_empty() { Vec::new() } else { payloads(&missing).unwrap_or_else(|e| {
@@ -219,7 +220,7 @@ pub fn for_toasts(wanted: &[(u32, String, Option<windows::ApplicationModel::AppI
         .collect();
     // Pictures no listed notification shows are let go.
     let shown: Vec<&str> = read.iter().flat_map(|(_, k)| [k.avatar.as_deref(), k.picture.as_deref()]).flatten().collect();
-    PICTURES.lock().unwrap_or_else(|e| e.into_inner()).retain(|(src, _)| shown.contains(&src.as_str()));
+    lock(&PICTURES).retain(|(src, _)| shown.contains(&src.as_str()));
     out
 }
 
@@ -471,20 +472,20 @@ const PICTURE_MAX: u64 = 4 * 1024 * 1024;
 const PICTURES_MAX: usize = 32 * 1024 * 1024;
 
 fn picture(src: &str, base: &Base) -> Option<Picture> {
-    if let Some((_, bytes)) = PICTURES.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|(s, _)| s == src) {
+    if let Some((_, bytes)) = lock(&PICTURES).iter().find(|(s, _)| s == src) {
         return bytes.clone().map(|bytes| Picture { key: src.to_string(), bytes });
     }
     if is_web(src) {
         // Downloaded aside, so a slow host never holds up the list; the list is read again when
         // it has come.
-        let mut downloading = DOWNLOADING.lock().unwrap_or_else(|e| e.into_inner());
+        let mut downloading = lock(&DOWNLOADING);
         if !downloading.iter().any(|s| s == src) {
             downloading.push(src.to_string());
             let src = src.to_string();
             let _ = std::thread::Builder::new().name("toast-picture".into()).spawn(move || {
                 let bytes = download(&src);
                 keep(&src, bytes);
-                DOWNLOADING.lock().unwrap_or_else(|e| e.into_inner()).retain(|s| *s != src);
+                lock(&DOWNLOADING).retain(|s| *s != src);
                 super::notifications::refresh();
             });
         }
@@ -498,7 +499,7 @@ fn picture(src: &str, base: &Base) -> Option<Picture> {
 /// is kept as none: evicting another listed one would only fetch it again, and evict this one, on
 /// and on. Pictures no longer listed go at each read ([`for_toasts`]).
 fn keep(src: &str, bytes: Option<Vec<u8>>) -> Option<Bytes> {
-    let mut held = PICTURES.lock().unwrap_or_else(|e| e.into_inner());
+    let mut held = lock(&PICTURES);
     held.retain(|(s, _)| s != src);
     let size: usize = held.iter().filter_map(|(_, b)| b.as_ref()).map(|b| b.len()).sum();
     let bytes = bytes.filter(|b| !b.is_empty() && size + b.len() <= PICTURES_MAX).map(Arc::new);
@@ -564,7 +565,7 @@ static ACTIVATORS: Mutex<Vec<(String, Option<u128>)>> = Mutex::new(Vec::new());
 
 /// The COM class an app registers to receive its notifications' buttons.
 fn activator(aumid: &str, base: &Base) -> Option<u128> {
-    if let Some((_, clsid)) = ACTIVATORS.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|(a, _)| a == aumid) {
+    if let Some((_, clsid)) = lock(&ACTIVATORS).iter().find(|(a, _)| a == aumid) {
         return *clsid;
     }
     let from_manifest = || -> Option<u128> {
@@ -588,7 +589,7 @@ fn activator(aumid: &str, base: &Base) -> Option<u128> {
         any
     };
     let clsid = from_manifest().or_else(|| registry_activator(aumid));
-    ACTIVATORS.lock().unwrap_or_else(|e| e.into_inner()).push((aumid.to_string(), clsid));
+    lock(&ACTIVATORS).push((aumid.to_string(), clsid));
     clsid
 }
 
@@ -621,7 +622,7 @@ fn parse_guid(text: &str) -> Option<u128> {
 /// would, for notification `id` (held out of the list meanwhile): removed once done, put back if
 /// the app did not take it, with what was typed. On a thread of its own: the app's activator may
 /// take a moment to start.
-pub fn invoke(id: u32, aumid: &str, activator: Option<u128>, arguments: &str, kind: Kind, inputs: Vec<(String, String)>) {
+fn invoke(id: u32, aumid: &str, activator: Option<u128>, arguments: &str, kind: Kind, inputs: Vec<(String, String)>) {
     let (aumid, arguments) = (aumid.to_string(), arguments.to_string());
     // What a click carried, and where it went: an app opened without its link says which.
     let shown: String = arguments.chars().take(160).collect();
@@ -657,6 +658,31 @@ pub fn invoke(id: u32, aumid: &str, activator: Option<u128>, arguments: &str, ki
             super::notifications::failed(id, draft);
         }
     });
+}
+
+/// Open notification `toast`, as a click on it does: its link (through its app), or with none the
+/// app alone. Held off the list meanwhile, and settled as [`invoke`] settles it: removed once
+/// opened, back (and said so) when nothing opened.
+pub fn open(toast: &super::notifications::Toast) {
+    let rich = &toast.rich;
+    super::notifications::hold(toast.id);
+    if rich.launch.is_empty() && rich.launch_kind != Kind::Protocol {
+        if super::notifications::open_app(&toast.aumid) {
+            super::notifications::remove(vec![toast.id]);
+        } else {
+            super::notifications::failed(toast.id, None);
+        }
+    } else {
+        invoke(toast.id, &toast.aumid, rich.activator, &rich.launch, rich.launch_kind, Vec::new());
+    }
+}
+
+/// Carry out `action` of notification `toast` (one of its buttons, or its reply's send with what
+/// was typed in `inputs`), as a click on it in Windows' centre does: held off the list meanwhile,
+/// and settled as [`invoke`] settles it.
+pub fn carry_out(toast: &super::notifications::Toast, action: &Action, inputs: Vec<(String, String)>) {
+    super::notifications::hold(toast.id);
+    invoke(toast.id, &toast.aumid, toast.rich.activator, &action.arguments, action.kind, inputs);
 }
 
 fn activate(aumid: &str, clsid: u128, arguments: &str, kind: Kind, inputs: &[(String, String)]) -> windows::core::Result<()> {

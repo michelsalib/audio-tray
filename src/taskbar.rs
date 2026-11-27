@@ -13,16 +13,30 @@
 //! (TranslucentTB, Windhawk use the same endpoint).
 
 use std::path::PathBuf;
+use std::sync::atomic::Ordering::SeqCst;
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicUsize};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
+use tap_proto::{
+    key, CONTROL_CLASS as TAP_CONTROL_CLASS, ENDPOINT_NAME, GLYPH_ROUND_EARBUDS, GLYPH_WIRELESS_EARBUDS, HANDOVER_ACCEPTED, HANDOVER_DECLINED,
+    HANDOVER_MAGIC, TAP_DLL, WM_TAP_RESTYLE, WM_TAP_REVERT,
+};
+use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
-use windows::Win32::UI::WindowsAndMessaging::{GetShellWindow, GetWindowThreadProcessId};
+use windows::Win32::UI::WindowsAndMessaging::{GetShellWindow, GetWindowThreadProcessId, PostMessageW};
 use windows_core::{GUID, HRESULT, PCSTR, PCWSTR};
+
+use crate::config::Config;
+
+pub use tap_proto::{WM_MUSIC_PROGRESS, WM_TASKBAR_ACTION, WM_TASKBAR_RESTARTED, WM_TASKBAR_SCROLL};
+
+#[cfg(feature = "dev")]
+use tap_proto::RECEIVER_CLASS as RECEIVER_CLASS_NAME;
 
 /// The TAP's class id, matched by the DLL's `DllGetClassObject`.
 const CLSID_TAP: GUID = GUID::from_u128(tap_proto::CLSID_TAP);
-
-use tap_proto::{ENDPOINT_NAME, TAP_DLL};
 
 type InitializeXamlDiagnosticsEx = unsafe extern "system" fn(
     end_point_name: PCWSTR,
@@ -47,38 +61,38 @@ fn tap_path() -> Result<PathBuf> {
 }
 
 /// Shell process and time of the last successful injection, to suppress a duplicate.
-static LAST_INJECTED: std::sync::Mutex<Option<(u32, std::time::Instant)>> =
-    std::sync::Mutex::new(None);
+static LAST_INJECTED: Mutex<Option<(u32, Instant)>> = Mutex::new(None);
 
 /// Whether a strip of ours is currently up, as far as we know. See [`strip_is_up`].
-static STRIP_UP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static STRIP_UP: AtomicBool = AtomicBool::new(false);
 
 /// Whether the strip is up and so owns left clicks on our tray icon (the shell also delivers a
 /// segment click as a tray-icon click). Optimistic — it tracks our injections and reverts only —
 /// so the icon's right click stays live regardless.
 pub fn strip_is_up() -> bool {
-    STRIP_UP.load(std::sync::atomic::Ordering::SeqCst)
+    STRIP_UP.load(SeqCst)
 }
 
 /// Inject the TAP into the shell's Explorer. Best-effort by contract: every error
 /// means "no strip this time", and the message says why.
-fn enable(icons: StripIcons) -> Result<()> {
+fn enable(icons: StripIcons, config: &Config) -> Result<()> {
     // Cleared first so any failure leaves it false.
-    STRIP_UP.store(false, std::sync::atomic::Ordering::SeqCst);
+    STRIP_UP.store(false, SeqCst);
     let dll = tap_path()?;
     let pid = shell_pid()?;
-    unsafe { inject(pid, &dll, icons)? };
+    inject(pid, &dll, icons, config)?;
     if let Ok(mut last) = LAST_INJECTED.lock() {
-        *last = Some((pid, std::time::Instant::now()));
+        *last = Some((pid, Instant::now()));
     }
-    STRIP_UP.store(true, std::sync::atomic::Ordering::SeqCst);
+    STRIP_UP.store(true, SeqCst);
     // The initialization data had to leave the tile out: hand the TAP the whole of it by
     // WM_COPYDATA (no cap) once it is up, as a handover from its own owner.
-    if TRIMMED.swap(false, std::sync::atomic::Ordering::SeqCst) {
+    if TRIMMED.swap(false, SeqCst) {
+        let config = config.clone();
         std::thread::spawn(move || {
             for _ in 0..10 {
-                std::thread::sleep(std::time::Duration::from_millis(500));
-                if offer_handover(icons, std::process::id()).is_ok() {
+                std::thread::sleep(Duration::from_millis(500));
+                if offer_handover(icons, std::process::id(), &config).is_ok() {
                     return;
                 }
             }
@@ -89,12 +103,12 @@ fn enable(icons: StripIcons) -> Result<()> {
 }
 
 /// Set when the injection's initialization data went without the tile (see [`init_data`]).
-static TRIMMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static TRIMMED: AtomicBool = AtomicBool::new(false);
 
 /// Whether we injected into this same Explorer a moment ago.
 fn just_injected(pid: u32) -> bool {
     /// Covers "started as the shell came up"; short enough not to block a deliberate re-inject.
-    const WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
+    const WINDOW: Duration = Duration::from_secs(10);
 
     LAST_INJECTED
         .lock()
@@ -103,38 +117,25 @@ fn just_injected(pid: u32) -> bool {
         .is_some_and(|(was, at)| was == pid && at.elapsed() < WINDOW)
 }
 
-use tap_proto::CONTROL_CLASS as TAP_CONTROL_CLASS;
-
-use tap_proto::WM_TAP_REVERT;
-
 /// Ask the injected TAP to undo its changes in place (it stays loaded). `owner_pid` 0 is
 /// unconditional; otherwise the TAP ignores it once another process owns the strip. Best-effort.
 pub fn revert(owner_pid: u32) {
-    use windows::Win32::Foundation::{LPARAM, WPARAM};
-    use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
-
     // Unconditionally: the plain icon's clicks matter again from here on.
-    STRIP_UP.store(false, std::sync::atomic::Ordering::SeqCst);
+    STRIP_UP.store(false, SeqCst);
     *PROGRESS_REPORTED.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = (0, 0);
-    // Posted, not sent: never block on Explorer's UI thread.
-    for control in crate::win::windows_by_class(TAP_CONTROL_CLASS) {
-        if let Err(e) = unsafe { PostMessageW(Some(control), WM_TAP_REVERT, WPARAM(owner_pid as usize), LPARAM(0)) } {
-            eprintln!("taskbar: could not ask for a revert ({e})");
-        }
+    if let Some(e) = post_to_taps(WM_TAP_REVERT, owner_pid as usize) {
+        eprintln!("taskbar: could not ask for a revert ({e})");
     }
 }
 
 /// (control window, reported window) last posted by [`report_progress_window`]. Cleared by
 /// [`revert`]: the TAP forgets the window when it reverts, so it must be told again.
-static PROGRESS_REPORTED: std::sync::Mutex<(isize, isize)> = std::sync::Mutex::new((0, 0));
+static PROGRESS_REPORTED: Mutex<(isize, isize)> = Mutex::new((0, 0));
 
 /// Tell the TAP which window carries our taskbar progress bar (`None`: none), so its revert can
 /// clear exactly that window when this process dies. Posted only on change (per TAP instance).
 /// Best-effort.
-pub fn report_progress_window(hwnd: Option<windows::Win32::Foundation::HWND>) {
-    use windows::Win32::Foundation::{LPARAM, WPARAM};
-    use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
-
+pub fn report_progress_window(hwnd: Option<HWND>) {
     let Some(control) = control_window() else {
         return;
     };
@@ -151,13 +152,16 @@ pub fn report_progress_window(hwnd: Option<windows::Win32::Foundation::HWND>) {
     }
 }
 
-/// Post `message` to every TAP control window (one per taskbar).
-fn post_to_taps(message: u32, wparam: usize) {
-    use windows::Win32::Foundation::{LPARAM, WPARAM};
-    use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
+/// Post `message` to every TAP control window (one per taskbar). Posted, not sent: never block on
+/// Explorer's UI thread. The last failure, if any did.
+fn post_to_taps(message: u32, wparam: usize) -> Option<windows_core::Error> {
+    let mut failed = None;
     for control in crate::win::windows_by_class(TAP_CONTROL_CLASS) {
-        let _ = unsafe { PostMessageW(Some(control), message, WPARAM(wparam), LPARAM(0)) };
+        if let Err(e) = unsafe { PostMessageW(Some(control), message, WPARAM(wparam), LPARAM(0)) } {
+            failed = Some(e);
+        }
     }
+    failed
 }
 
 /// A notification went to the bell's list (its banner flew into it): the TAP rings the bell.
@@ -174,20 +178,19 @@ pub fn notify_panel(open: usize) {
 /// Tell the TAP the now-playing state file changed, so it re-reads it instead of polling the
 /// file. Best-effort: the TAP still re-checks the file on a slow timer.
 pub fn notify_music_changed() {
-    use windows::Win32::Foundation::{LPARAM, WPARAM};
-    use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
-
-    for control in crate::win::windows_by_class(TAP_CONTROL_CLASS) {
-        let _ = unsafe { PostMessageW(Some(control), tap_proto::WM_TAP_MUSIC_CHANGED, WPARAM(0), LPARAM(0)) };
-    }
+    post_to_taps(tap_proto::WM_TAP_MUSIC_CHANGED, 0);
 }
 
 /// The TAP's last `WM_TASKBAR_STATUS` (`tap_proto::STATUS_*` bits).
-static STATUS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static STATUS: AtomicUsize = AtomicUsize::new(0);
 
 pub fn set_status(bits: usize) {
-    if STATUS.swap(bits, std::sync::atomic::Ordering::SeqCst) != bits {
-        eprintln!("taskbar: TAP status 0x{bits:x}");
+    if STATUS.swap(bits, SeqCst) != bits {
+        if bits == 0 {
+            println!("taskbar: TAP status 0x0");
+        } else {
+            eprintln!("taskbar: TAP status 0x{bits:x}");
+        }
     }
 }
 
@@ -207,17 +210,17 @@ pub fn status_notice(bits: usize) -> Option<&'static str> {
 
 /// [`status_notice`] for the current status.
 pub fn current_notice() -> Option<&'static str> {
-    status_notice(STATUS.load(std::sync::atomic::Ordering::SeqCst))
+    status_notice(STATUS.load(SeqCst))
 }
 
 /// The injected TAP's control window, if there is one.
-fn control_window() -> Option<windows::Win32::Foundation::HWND> {
+fn control_window() -> Option<HWND> {
     window_by_class(TAP_CONTROL_CLASS)
 }
 
 /// A top-level window with this exact class name, in any process. `EnumWindows`, because
 /// `FindWindow` does not find these windows across processes.
-fn window_by_class(class_name: &str) -> Option<windows::Win32::Foundation::HWND> {
+fn window_by_class(class_name: &str) -> Option<HWND> {
     let mut found = None;
     crate::win::enum_windows(|hwnd| {
         if crate::win::class_name(hwnd) == class_name {
@@ -242,27 +245,30 @@ fn shell_pid() -> Result<u32> {
     Ok(pid)
 }
 
-unsafe fn inject(pid: u32, dll: &std::path::Path, icons: StripIcons) -> Result<()> {
+fn inject(pid: u32, dll: &std::path::Path, icons: StripIcons, config: &Config) -> Result<()> {
     // No import library for the system XAML runtime: resolve dynamically.
-    let module = LoadLibraryW(PCWSTR(crate::win::wide("Windows.UI.Xaml.dll").as_ptr()))
-        .context("load Windows.UI.Xaml.dll")?;
-    let symbol = GetProcAddress(module, PCSTR(c"InitializeXamlDiagnosticsEx".as_ptr().cast()))
+    let xaml = crate::win::wide("Windows.UI.Xaml.dll");
+    let module = unsafe { LoadLibraryW(PCWSTR(xaml.as_ptr())) }.context("load Windows.UI.Xaml.dll")?;
+    let symbol = unsafe { GetProcAddress(module, PCSTR(c"InitializeXamlDiagnosticsEx".as_ptr().cast())) }
         .context("Windows.UI.Xaml.dll does not export InitializeXamlDiagnosticsEx")?;
-    let initialize: InitializeXamlDiagnosticsEx = std::mem::transmute(symbol);
+    // SAFETY: the export has this signature (documented, `xamlOM.h`).
+    let initialize: InitializeXamlDiagnosticsEx = unsafe { std::mem::transmute(symbol) };
 
     // Both DLL parameters get the TAP's own path, matching the known-good C++ TAPs.
     let endpoint = crate::win::wide(ENDPOINT_NAME);
     let path = crate::win::wide(&dll.to_string_lossy());
-    let init_data = crate::win::wide(&init_data(icons, std::process::id(), Payload::Injection));
+    let init_data = crate::win::wide(&init_data(icons, std::process::id(), Payload::Injection, config));
 
-    let hr = initialize(
-        PCWSTR(endpoint.as_ptr()),
-        pid,
-        PCWSTR(path.as_ptr()),
-        PCWSTR(path.as_ptr()),
-        CLSID_TAP,
-        PCWSTR(init_data.as_ptr()),
-    );
+    let hr = unsafe {
+        initialize(
+            PCWSTR(endpoint.as_ptr()),
+            pid,
+            PCWSTR(path.as_ptr()),
+            PCWSTR(path.as_ptr()),
+            CLSID_TAP,
+            PCWSTR(init_data.as_ptr()),
+        )
+    };
     if hr.is_err() {
         // Name the likeliest cause: another consumer holds the endpoint.
         bail!(
@@ -303,8 +309,6 @@ impl Default for StripIcons {
     }
 }
 
-use tap_proto::{GLYPH_ROUND_EARBUDS, GLYPH_WIRELESS_EARBUDS};
-
 /// The codepoint the strip should carry for an icon: `IconId::glyph`, except the hand-drawn earbuds
 /// map to marker codepoints so the TAP draws the real shape instead of the headphone fallback.
 pub fn strip_glyph(icon: crate::icons::IconId) -> char {
@@ -319,16 +323,15 @@ pub fn strip_glyph(icon: crate::icons::IconId) -> char {
 /// Alpha applied to the accent fill, as hex: half, to match the weight of the shell's own buttons.
 const PILL_ALPHA: &str = "80";
 
-/// The `key=value;` init payload for the TAP, read once in `SetSite` (or on a handover).
-/// `tooltip` is matched as a substring of our icon's accessible name ([`crate::tray::TRAY_MARKER`]
-/// is the stable part); `pid` is the owner the TAP watches and reverts on exit; `hidevolume`/`hidemic`
-/// collapse Windows' own indicators; `tile` names the app button for the music tile (empty = off);
-/// `ver`/`tap`/`hwnd` identify the build and receiver for [`offer_handover`].
-fn init_data(icons: StripIcons, owner_pid: u32, payload: Payload) -> String {
-    let [r, g, b] = crate::flyout::theme::accent_rgb();
-    let config = crate::config::Config::load();
+/// The `key=value;` init payload for the TAP, read once in `SetSite` (or on a handover), from the
+/// tray's `config`. [`key::TOOLTIP`] is matched as a substring of our icon's accessible name
+/// ([`crate::tray::TRAY_MARKER`] is the stable part); [`key::PID`] is the owner the TAP watches and
+/// reverts on exit; [`key::HIDE_VOLUME`]/[`key::HIDE_MIC`] collapse Windows' own indicators;
+/// [`key::TILE`] names the app button for the music tile (empty = off); [`key::VER`]/[`key::TAP`]/
+/// [`key::HWND`] identify the build and receiver for [`offer_handover`].
+fn init_data(icons: StripIcons, owner_pid: u32, payload: Payload, config: &Config) -> String {
+    let [r, g, b] = crate::theme::accent_rgb();
     let buttons = config.strip.enabled;
-    BUTTONS_WANTED.store(buttons, std::sync::atomic::Ordering::SeqCst);
     let tile = if config.tile_shown() { config.music.tile.clone() } else { String::new() };
     // A cover-only tile: just the cover's width (the TAP drops the text column and its gap).
     let strip = match config.music.tile_style {
@@ -338,55 +341,63 @@ fn init_data(icons: StripIcons, owner_pid: u32, payload: Payload) -> String {
     let tap = tap_path().map(|path| path.display().to_string()).unwrap_or_default();
     let flag = |on: bool| u8::from(on).to_string();
     let pairs = [
-        ("tooltip", crate::tray::TRAY_MARKER.to_string()),
-        ("out", format!("{:04X}", icons.output as u32)),
-        ("in", format!("{:04X}", icons.input as u32)),
-        ("outmuted", flag(icons.output_muted)),
-        ("inmuted", flag(icons.input_muted)),
-        ("inrec", flag(icons.input_recording)),
-        ("accent", format!("{r:02X}{g:02X}{b:02X}")),
-        ("alpha", PILL_ALPHA.to_string()),
+        (key::TOOLTIP, crate::tray::TRAY_MARKER.to_string()),
+        (key::OUT, format!("{:04X}", icons.output as u32)),
+        (key::IN, format!("{:04X}", icons.input as u32)),
+        (key::OUT_MUTED, flag(icons.output_muted)),
+        (key::IN_MUTED, flag(icons.input_muted)),
+        (key::IN_RECORDING, flag(icons.input_recording)),
+        (key::ACCENT, format!("{r:02X}{g:02X}{b:02X}")),
+        (key::ALPHA, PILL_ALPHA.to_string()),
         // Windows' own icons are only hidden, and the tray only reordered, for our buttons.
-        ("hidevolume", flag(buttons && config.strip.hide_windows_volume)),
-        ("hidemic", flag(buttons && config.strip.hide_windows_mic)),
-        ("reorder", flag(buttons && config.strip.next_to_wifi)),
-        ("tile", tile),
-        ("pid", owner_pid.to_string()),
-        ("ver", env!("CARGO_PKG_VERSION").to_string()),
-        ("proto", tap_proto::PROTOCOL.to_string()),
-        ("hwnd", RECEIVER.load(std::sync::atomic::Ordering::SeqCst).to_string()),
+        (key::HIDE_VOLUME, flag(buttons && config.strip.hide_windows_volume)),
+        (key::HIDE_MIC, flag(buttons && config.strip.hide_windows_mic)),
+        (key::REORDER, flag(buttons && config.strip.next_to_wifi)),
+        (key::TILE, tile),
+        (key::PID, owner_pid.to_string()),
+        (key::VER, env!("CARGO_PKG_VERSION").to_string()),
+        (key::PROTO, tap_proto::PROTOCOL.to_string()),
+        (key::HWND, RECEIVER.load(SeqCst).to_string()),
     ];
     // Only when they differ from the TAP's defaults (buttons on, the full tile width): the
     // initialization data arrives empty past roughly 256 characters, so every key costs.
     let mut pairs = pairs.to_vec();
     if !buttons {
-        pairs.push(("buttons", "0".to_string()));
+        pairs.push((key::BUTTONS, "0".to_string()));
     }
     // Not tied to the buttons: the strip does not replace the layout indicator. Off is the default.
     if config.strip.hide_windows_language {
-        pairs.push(("hidelanguage", "1".to_string()));
+        pairs.push((key::HIDE_LANGUAGE, "1".to_string()));
     }
-    // The clock's clicks open our calendar instead of the shell's. Off is the default.
+    // The clock's clicks open our calendar, or the bell's our notifications, instead of the
+    // shell's (the TAP splits the button either way; the hook takes only the parts that are ours).
+    // Off is the default; the bell alone leaves the clock's own taps to the shell.
     if config.calendar.enabled {
-        pairs.push(("clock", "1".to_string()));
+        pairs.push((key::CLOCK, tap_proto::CLOCK_CALENDAR.to_string()));
+    } else if config.calendar.bell {
+        pairs.push((key::CLOCK, tap_proto::CLOCK_BELL_ONLY.to_string()));
+    }
+    // Windows' battery icon's clicks open our batteries (on a laptop, asked for, and injected anyway).
+    if config.uses_windows_battery_icon() {
+        pairs.push((key::BATTERY, "1".to_string()));
     }
     // The DLL path only matters to a handover's compatibility check, which comes by WM_COPYDATA
     // (no length cap); the injection's initialization data cannot spare its 70-odd characters.
     if payload == Payload::Handover {
-        pairs.push(("tap", tap));
+        pairs.push((key::TAP, tap));
     }
     // A fresh TAP starts at the full width, so an injection names only the cover width; a TAP
     // taking a handover keeps the width it last had, so a handover always names it.
     if strip != FULL_WIDTH || payload == Payload::Handover {
-        pairs.push(("strip", strip.to_string()));
+        pairs.push((key::STRIP, strip.to_string()));
     }
     let data = tap_proto::encode_init(pairs.clone());
     if payload == Payload::Injection && data.len() > INIT_DATA_BUDGET {
         // Past the budget it all arrives empty: the user-named tile is what grows, so it goes,
         // and follows by handover once the TAP is up (see [`enable`]).
-        eprintln!("taskbar: the TAP's init data is {} characters; the tile follows by handover", data.len());
-        TRIMMED.store(true, std::sync::atomic::Ordering::SeqCst);
-        pairs.retain(|(key, _)| *key != "tile");
+        println!("taskbar: the TAP's init data is {} characters; the tile follows by handover", data.len());
+        TRIMMED.store(true, SeqCst);
+        pairs.retain(|(name, _)| *name != key::TILE);
         return tap_proto::encode_init(pairs);
     }
     data
@@ -409,53 +420,50 @@ const COVER_ONLY_WIDTH: u32 = 28;
 /// The full tile's content width: the TAP's own default (`music::layout::STRIP_WIDTH`).
 const FULL_WIDTH: u32 = 150;
 
-/// Whether the last injection asked for the audio buttons (`buttons=`).
-static BUTTONS_WANTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+/// Whether the last injection asked for the audio buttons ([`key::BUTTONS`]).
+static BUTTONS_WANTED: AtomicBool = AtomicBool::new(true);
 
 /// Whether our audio buttons are on the taskbar: injected, and asked for. With only the music
 /// tile, the notification icon is the plain one and its clicks are ours again.
 pub fn buttons_up() -> bool {
-    strip_is_up() && BUTTONS_WANTED.load(std::sync::atomic::Ordering::SeqCst)
+    strip_is_up() && BUTTONS_WANTED.load(SeqCst)
 }
 
-/// Our receiver window, for the `hwnd=` key. Set by [`create_receiver`].
-static RECEIVER: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+/// Our receiver window, for the [`key::HWND`] key. Set by [`create_receiver`].
+static RECEIVER: AtomicIsize = AtomicIsize::new(0);
 
-use tap_proto::{HANDOVER_ACCEPTED, HANDOVER_DECLINED, HANDOVER_MAGIC};
-
-/// Hand every TAP loaded in Explorer a fresh init payload naming `owner_pid` as owner. A TAP from
-/// this exact build adopts it (no Explorer restart needed); `Err` says why none did.
-fn offer_handover(icons: StripIcons, owner_pid: u32) -> Result<()> {
-    use windows::Win32::Foundation::{LPARAM, WPARAM};
+/// `WM_COPYDATA` `data`, tagged `magic`, to one TAP control window, with `wparam` (the sender's
+/// window, or 0), waiting at most `wait_ms` (a wedged shell must not hang the tray). The TAP's
+/// answer; `None` when it did not answer.
+fn copy_data(control: HWND, magic: usize, data: &str, wparam: usize, wait_ms: u32) -> Option<usize> {
     use windows::Win32::System::DataExchange::COPYDATASTRUCT;
     use windows::Win32::UI::WindowsAndMessaging::{SendMessageTimeoutW, SMTO_ABORTIFHUNG, WM_COPYDATA};
 
-    let payload = crate::win::wide(&init_data(icons, owner_pid, Payload::Handover));
+    let payload = crate::win::wide(data);
     let copy = COPYDATASTRUCT {
-        dwData: HANDOVER_MAGIC,
+        dwData: magic,
         cbData: (payload.len() * 2) as u32,
         lpData: payload.as_ptr() as *mut core::ffi::c_void,
     };
+    let mut result = 0usize;
+    // `WM_COPYDATA` must be sent, not posted.
+    let sent = unsafe {
+        SendMessageTimeoutW(control, WM_COPYDATA, WPARAM(wparam), LPARAM(&copy as *const COPYDATASTRUCT as isize), SMTO_ABORTIFHUNG, wait_ms, Some(&mut result))
+    };
+    (sent.0 != 0).then_some(result)
+}
+
+/// Hand every TAP loaded in Explorer a fresh init payload naming `owner_pid` as owner. A TAP from
+/// this exact build adopts it (no Explorer restart needed); `Err` says why none did.
+fn offer_handover(icons: StripIcons, owner_pid: u32, config: &Config) -> Result<()> {
+    let payload = init_data(icons, owner_pid, Payload::Handover, config);
     let mut why = Vec::new();
     for control in crate::win::windows_by_class(TAP_CONTROL_CLASS) {
-        let mut result = 0usize;
-        // `WM_COPYDATA` must be sent; bounded so a wedged shell cannot hang the tray.
-        let sent = unsafe {
-            SendMessageTimeoutW(
-                control,
-                WM_COPYDATA,
-                WPARAM(RECEIVER.load(std::sync::atomic::Ordering::SeqCst) as usize),
-                LPARAM(&copy as *const COPYDATASTRUCT as isize),
-                SMTO_ABORTIFHUNG,
-                3_000,
-                Some(&mut result),
-            )
-        };
-        match (sent.0, result as isize) {
-            (0, _) => why.push("did not answer".to_string()),
-            (_, HANDOVER_ACCEPTED) => return Ok(()),
-            (_, HANDOVER_DECLINED) => why.push("is from another build".to_string()),
-            _ => why.push("predates the handover".to_string()),
+        match copy_data(control, HANDOVER_MAGIC, &payload, RECEIVER.load(SeqCst) as usize, 3_000).map(|result| result as isize) {
+            None => why.push("did not answer".to_string()),
+            Some(HANDOVER_ACCEPTED) => return Ok(()),
+            Some(HANDOVER_DECLINED) => why.push("is from another build".to_string()),
+            Some(_) => why.push("predates the handover".to_string()),
         }
     }
     if why.is_empty() {
@@ -466,23 +474,18 @@ fn offer_handover(icons: StripIcons, owner_pid: u32) -> Result<()> {
 
 /// Make `child_pid` the owner of the strip before this process exits, so the TAP's owner watch
 /// does not revert it when we go. For `tray::restart_app`; the child then offers its own handover.
-pub fn transfer_owner(child_pid: u32, icons: StripIcons) {
-    match offer_handover(icons, child_pid) {
+pub fn transfer_owner(child_pid: u32, icons: StripIcons, config: &Config) {
+    match offer_handover(icons, child_pid, config) {
         Ok(()) => println!("taskbar: strip handed to pid {child_pid}"),
         Err(e) => eprintln!("taskbar: could not hand the strip to pid {child_pid} ({e:#}); it will be redrawn"),
     }
 }
-
-use tap_proto::WM_TAP_RESTYLE;
 
 /// Tell an injected TAP the devices changed (codepoint plus flag bits in each message param).
 /// Returns whether it was actually posted: the control window appears only after the TAP's first
 /// tree callback, and the caller must not remember an unsent restyle as sent.
 #[must_use]
 pub fn restyle(icons: StripIcons) -> bool {
-    use windows::Win32::Foundation::{LPARAM, WPARAM};
-    use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
-
     let Some(control) = control_window() else {
         return false;
     };
@@ -515,6 +518,8 @@ pub enum Action {
     OpenCalendar,
     /// A click on the bell beside it.
     OpenNotifications,
+    /// A click on Windows' battery icon.
+    OpenBatteries,
     /// Music transport. Codes 10+, deliberately far from the audio ones on the same window.
     MusicPrevious,
     MusicPlayPause,
@@ -530,6 +535,7 @@ impl Action {
             tap_proto::ACTION_OPEN_PANEL => Some(Self::OpenPanel),
             tap_proto::ACTION_OPEN_CALENDAR => Some(Self::OpenCalendar),
             tap_proto::ACTION_OPEN_NOTIFICATIONS => Some(Self::OpenNotifications),
+            tap_proto::ACTION_OPEN_BATTERIES => Some(Self::OpenBatteries),
             tap_proto::ACTION_MUSIC_PREVIOUS => Some(Self::MusicPrevious),
             tap_proto::ACTION_MUSIC_PLAY_PAUSE => Some(Self::MusicPlayPause),
             tap_proto::ACTION_MUSIC_NEXT => Some(Self::MusicNext),
@@ -546,6 +552,7 @@ impl Action {
             Self::OpenPanel => tap_proto::ACTION_OPEN_PANEL,
             Self::OpenCalendar => tap_proto::ACTION_OPEN_CALENDAR,
             Self::OpenNotifications => tap_proto::ACTION_OPEN_NOTIFICATIONS,
+            Self::OpenBatteries => tap_proto::ACTION_OPEN_BATTERIES,
             Self::MusicPrevious => tap_proto::ACTION_MUSIC_PREVIOUS,
             Self::MusicPlayPause => tap_proto::ACTION_MUSIC_PLAY_PAUSE,
             Self::MusicNext => tap_proto::ACTION_MUSIC_NEXT,
@@ -557,9 +564,6 @@ impl Action {
 /// synthesised). Exercises everything from [`WM_TASKBAR_ACTION`] inward, not the TAP's half.
 #[cfg(feature = "dev")]
 pub fn post_action(action: Action) -> Result<()> {
-    use windows::Win32::Foundation::{LPARAM, WPARAM};
-    use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
-
     let receiver = window_by_class(RECEIVER_CLASS_NAME)
         .context("no receiver window — audio-tray is not running")?;
     unsafe { PostMessageW(Some(receiver), WM_TASKBAR_ACTION, WPARAM(action.code()), LPARAM(0)) }
@@ -569,8 +573,7 @@ pub fn post_action(action: Action) -> Result<()> {
 /// Dev: post the scroll the TAP would send for `notches` (fractional allowed, as from a touchpad).
 #[cfg(feature = "dev")]
 pub fn post_scroll(flow: crate::audio::Flow, notches: f32) -> Result<()> {
-    use windows::Win32::Foundation::{LPARAM, WPARAM};
-    use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WHEEL_DELTA};
+    use windows::Win32::UI::WindowsAndMessaging::WHEEL_DELTA;
 
     let receiver = window_by_class(RECEIVER_CLASS_NAME)
         .context("no receiver window — audio-tray is not running")?;
@@ -589,9 +592,6 @@ pub fn post_scroll(flow: crate::audio::Flow, notches: f32) -> Result<()> {
 /// Post a progress-bar value (`None` clears) to the tray thread, whose STA owns `ITaskbarList3`
 /// (the music feed runs on an MTA).
 pub fn post_progress(fraction: Option<f64>, playing: bool) -> Result<()> {
-    use windows::Win32::Foundation::{LPARAM, WPARAM};
-    use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
-
     let receiver = receiver().context("no receiver window — the tray is not up")?;
     // `wParam`: the fraction in `PROGRESS_SCALE`ths, or `PROGRESS_NONE` to clear.
     let step = match fraction {
@@ -636,15 +636,6 @@ const PROGRESS_SCALE: usize = 1000;
 /// `wParam` value meaning "clear the bar" — outside the `0..=PROGRESS_SCALE` range a fraction uses.
 const PROGRESS_NONE: usize = usize::MAX;
 
-pub use tap_proto::WM_MUSIC_PROGRESS;
-
-#[cfg(feature = "dev")]
-use tap_proto::RECEIVER_CLASS as RECEIVER_CLASS_NAME;
-
-pub use tap_proto::WM_TASKBAR_ACTION;
-
-pub use tap_proto::WM_TASKBAR_SCROLL;
-
 /// Or-ed into a [`WM_TASKBAR_SCROLL`] flow code by the wheel hook for a mouse wheel's scroll (see
 /// [`crate::win::touchpad_delta`]); the TAP's scrolls reach it only where the hook passed them on.
 pub const SCROLL_FROM_WHEEL: usize = 0x100;
@@ -665,8 +656,6 @@ pub fn flow_from_code(code: usize) -> crate::audio::Flow {
     }
 }
 
-pub use tap_proto::WM_TASKBAR_RESTARTED;
-
 /// The shell's "the taskbar is back" broadcast, registered once.
 pub fn taskbar_created_message() -> u32 {
     use std::sync::OnceLock;
@@ -680,37 +669,37 @@ pub fn taskbar_created_message() -> u32 {
 
 /// Creates the hidden window the TAP posts to, with the tray's window procedure. Top-level, not
 /// message-only: the TAP finds it with `EnumWindows`, which skips message-only windows.
-pub fn create_receiver(proc: windows::Win32::UI::WindowsAndMessaging::WNDPROC) -> Result<windows::Win32::Foundation::HWND> {
+pub fn create_receiver(proc: windows::Win32::UI::WindowsAndMessaging::WNDPROC) -> Result<HWND> {
     use windows::Win32::UI::WindowsAndMessaging::WS_EX_TOOLWINDOW;
     let class = windows_core::HSTRING::from(tap_proto::RECEIVER_CLASS);
     let class = PCWSTR(class.as_ptr());
     let hwnd = crate::win::create_popup(class, class, proc, WS_EX_TOOLWINDOW, (0, 0, 0, 0))
         .context("create the taskbar IPC receiver window")?;
-    RECEIVER.store(hwnd.0 as isize, std::sync::atomic::Ordering::SeqCst);
+    RECEIVER.store(hwnd.0 as isize, SeqCst);
     Ok(hwnd)
 }
 
 /// This process's receiver window, once [`create_receiver`] has run.
-pub fn receiver() -> Option<windows::Win32::Foundation::HWND> {
-    let raw = RECEIVER.load(std::sync::atomic::Ordering::SeqCst);
-    (raw != 0).then_some(windows::Win32::Foundation::HWND(raw as *mut core::ffi::c_void))
+pub fn receiver() -> Option<HWND> {
+    let raw = RECEIVER.load(SeqCst);
+    (raw != 0).then_some(HWND(raw as *mut core::ffi::c_void))
 }
 
 /// Whether this process has already restarted Explorer to repair the strip. One restart per
 /// process, shared by both triggers: the failures can be permanent, and a loop would be worse.
-static HEALED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static HEALED: AtomicBool = AtomicBool::new(false);
 
 /// Restart Explorer for a clean injection, at most once per process; returns whether started. On a
 /// worker thread: the tray thread must keep pumping to receive the *sent* `TaskbarCreated`.
 fn heal_explorer(reason: &str) -> bool {
-    if HEALED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+    if HEALED.swap(true, SeqCst) {
         eprintln!("taskbar: {reason}, but Explorer has been restarted once already — leaving it");
         return false;
     }
     eprintln!("taskbar: {reason} — asking to restart Explorer for a clean injection");
     std::thread::spawn(|| {
         if !confirm_explorer_restart() {
-            eprintln!("taskbar: Explorer restart declined — using the plain tray icon until the next sign-in");
+            println!("taskbar: Explorer restart declined — using the plain tray icon until the next sign-in");
             return;
         }
         if let Err(e) = restart_explorer() {
@@ -734,8 +723,8 @@ fn confirm_explorer_restart() -> bool {
     let answer = unsafe {
         MessageBoxW(
             None,
-            windows_core::PCWSTR(text.as_ptr()),
-            windows_core::PCWSTR(title.as_ptr()),
+            PCWSTR(text.as_ptr()),
+            PCWSTR(title.as_ptr()),
             MB_YESNO | MB_ICONQUESTION | MB_SETFOREGROUND | MB_TOPMOST,
         )
     };
@@ -751,13 +740,13 @@ fn tap_already_present() -> bool {
 /// Attempts, and the gap between them, before an injection failure is treated as real: at
 /// sign-in audio-tray can beat Explorer's XAML runtime, and that must not trigger a restart.
 const ENABLE_TRIES: u32 = 3;
-const ENABLE_GAP: std::time::Duration = std::time::Duration::from_millis(750);
+const ENABLE_GAP: Duration = Duration::from_millis(750);
 
 /// [`enable`], retried — see [`ENABLE_TRIES`].
-fn enable_with_retries(icons: StripIcons) -> Result<()> {
+fn enable_with_retries(icons: StripIcons, config: &Config) -> Result<()> {
     let mut last = None;
     for attempt in 1..=ENABLE_TRIES {
-        match enable(icons) {
+        match enable(icons, config) {
             Ok(()) => return Ok(()),
             Err(e) => {
                 if attempt < ENABLE_TRIES {
@@ -771,16 +760,17 @@ fn enable_with_retries(icons: StripIcons) -> Result<()> {
     Err(last.expect("the loop runs at least once"))
 }
 
-/// Put the strip up at startup. Never fatal; restarts Explorer (see [`heal_explorer`]) only when a
-/// loaded TAP refuses the handover or injection keeps failing.
-pub fn apply_at_startup(icons: StripIcons) {
+/// Put the strip up at startup, as `config` asks. Never fatal; restarts Explorer (see
+/// [`heal_explorer`]) only when a loaded TAP refuses the handover or injection keeps failing.
+pub fn apply_at_startup(icons: StripIcons, config: &Config) {
+    BUTTONS_WANTED.store(config.strip.enabled, SeqCst);
     // Never inject beside a loaded TAP (its owner watch can undo ours): hand it over, or restart
     // Explorer for another build's TAP (which also lets `place_staged_tap` finish an update).
     if tap_already_present() {
-        match offer_handover(icons, std::process::id()) {
+        match offer_handover(icons, std::process::id(), config) {
             Ok(()) => {
-                STRIP_UP.store(true, std::sync::atomic::Ordering::SeqCst);
-                eprintln!("taskbar: controls handed over to the TAP already in Explorer");
+                STRIP_UP.store(true, SeqCst);
+                println!("taskbar: controls handed over to the TAP already in Explorer");
                 return;
             }
             Err(e) => {
@@ -790,8 +780,8 @@ pub fn apply_at_startup(icons: StripIcons) {
             }
         }
     }
-    match enable_with_retries(icons) {
-        Ok(()) => eprintln!("taskbar: controls enabled"),
+    match enable_with_retries(icons, config) {
+        Ok(()) => println!("taskbar: controls enabled"),
         Err(e) => {
             eprintln!("taskbar: integration unavailable, using the plain tray icon ({e:#})");
             // Not from `apply_at_restart`: never restart Explorer right after the user did.
@@ -801,14 +791,15 @@ pub fn apply_at_startup(icons: StripIcons) {
 }
 
 /// Re-inject after Explorer restarted (the TAP died with it). Tray thread; failure leaves the plain icon.
-pub fn apply_at_restart(icons: StripIcons) {
+pub fn apply_at_restart(icons: StripIcons, config: &Config) {
     // `TaskbarCreated` can land right after our own startup injection. Not "is a TAP loaded":
     // after a revert it still is, and that test would refuse a legitimate re-injection.
     if shell_pid().is_ok_and(just_injected) {
         return;
     }
-    match enable(icons) {
-        Ok(()) => eprintln!("taskbar: Explorer restarted — controls re-injected"),
+    BUTTONS_WANTED.store(config.strip.enabled, SeqCst);
+    match enable(icons, config) {
+        Ok(()) => println!("taskbar: Explorer restarted — controls re-injected"),
         Err(e) => eprintln!("taskbar: Explorer restarted, re-injection failed ({e:#})"),
     }
 }
@@ -834,7 +825,7 @@ pub fn restart_explorer() -> Result<()> {
     let shell = unsafe { OpenProcess(access, false, pid) }.context("open the shell process")?;
 
     // Every path below ends with this Explorer (and the strip) gone.
-    STRIP_UP.store(false, std::sync::atomic::Ordering::SeqCst);
+    STRIP_UP.store(false, SeqCst);
 
     let outcome = exit_and_relaunch_shell(shell);
     let _ = unsafe { windows::Win32::Foundation::CloseHandle(shell) };
@@ -843,9 +834,8 @@ pub fn restart_explorer() -> Result<()> {
 
 /// The body of [`restart_explorer`], split out so the process handle is closed on every path.
 fn exit_and_relaunch_shell(shell: windows::Win32::Foundation::HANDLE) -> Result<()> {
-    use windows::Win32::Foundation::{LPARAM, WAIT_OBJECT_0, WPARAM};
+    use windows::Win32::Foundation::WAIT_OBJECT_0;
     use windows::Win32::System::Threading::{TerminateProcess, WaitForSingleObject};
-    use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 
     // Ask nicely first, so Explorer saves its state.
     let asked = match window_by_class("Shell_TrayWnd") {
@@ -862,7 +852,7 @@ fn exit_and_relaunch_shell(shell: windows::Win32::Foundation::HANDLE) -> Result<
     let mut terminated = false;
     if !asked || !gone(SHELL_EXIT_WAIT_MS) {
         // The usual path when our TAP is loaded (and `WM_SHELL_EXIT` is undocumented anyway).
-        eprintln!("taskbar: Explorer did not exit on request — terminating it instead");
+        println!("taskbar: Explorer did not exit on request — terminating it instead");
         unsafe { TerminateProcess(shell, 1) }.context("terminate the shell process")?;
         terminated = true;
         if !gone(SHELL_EXIT_WAIT_MS) {
@@ -875,9 +865,9 @@ fn exit_and_relaunch_shell(shell: windows::Win32::Foundation::HANDLE) -> Result<
 
     // Launching explorer.exe beside a live shell opens a file window, so wait briefly in case one
     // restarts itself (in practice none does, so keep this short).
-    let budget = std::time::Duration::from_millis(if terminated { 1_500 } else { 500 });
+    let budget = Duration::from_millis(if terminated { 1_500 } else { 500 });
     if wait_for_shell(budget) {
-        eprintln!("taskbar: Explorer restarted itself");
+        println!("taskbar: Explorer restarted itself");
         return Ok(());
     }
     // Detached from our streams: the shell outlives us and would hold a console or file open.
@@ -897,7 +887,7 @@ fn exit_and_relaunch_shell(shell: windows::Win32::Foundation::HANDLE) -> Result<
         None => eprintln!("taskbar: no fresh user environment — Explorer inherits ours"),
     }
     shell.spawn().context("launch explorer.exe")?;
-    eprintln!("taskbar: Explorer restarted");
+    println!("taskbar: Explorer restarted");
     Ok(())
 }
 
@@ -948,18 +938,98 @@ unsafe fn parse_environment_block(block: *const u16) -> Vec<(String, String)> {
 }
 
 /// Whether a shell is up, waiting up to `budget` for one to appear.
-fn wait_for_shell(budget: std::time::Duration) -> bool {
-    const POLL: std::time::Duration = std::time::Duration::from_millis(100);
-    let deadline = std::time::Instant::now() + budget;
+fn wait_for_shell(budget: Duration) -> bool {
+    const POLL: Duration = Duration::from_millis(100);
+    let deadline = Instant::now() + budget;
     loop {
         if !unsafe { GetShellWindow() }.0.is_null() {
             return true;
         }
-        if std::time::Instant::now() >= deadline {
+        if Instant::now() >= deadline {
             return false;
         }
         std::thread::sleep(POLL);
     }
+}
+
+/// How the taskbar clock reads, for the TAP (see `tap_proto::CLOCK_MAGIC`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ClockText {
+    /// A `GetTimeFormatEx` pattern; empty: the locale's short time.
+    pub time: String,
+    /// A `GetDateFormatEx` pattern; empty: the locale's short date; `-`: hidden.
+    pub date: String,
+    pub one_line: bool,
+    /// How many notifications wait in Audio Tray's list (0: none).
+    pub badge: u32,
+    /// The badge drawn for it (`calendar::view::badge`): the PNG, its width in DIPs and the DPI it
+    /// was drawn for. Without one, the TAP puts an emoji dot and the count before the time.
+    pub badge_image: Option<crate::calendar::Badge>,
+    /// Windows keeps notifications quiet (Do not disturb, a focus session): the bell is crossed.
+    pub quiet: bool,
+    /// Anything waits in Audio Tray's list: the bell is filled (else not, whatever the shell
+    /// thinks is new: it counts as seen only what its own centre showed). `None`: the bell is the
+    /// shell's, its fill too.
+    pub waiting: Option<bool>,
+}
+
+/// An app-drawn badge picture's three init-data pairs: the PNG, its width in DIPs, its pixels per
+/// DIP; empty values without one.
+fn badge_pairs(badge: Option<&crate::calendar::Badge>) -> [(&'static str, String); 3] {
+    [
+        (key::BADGE_IMAGE, badge.map(|b| b.0.clone()).unwrap_or_default()),
+        (key::BADGE_WIDTH, badge.map(|b| b.1.to_string()).unwrap_or_default()),
+        (key::BADGE_SCALE, badge.map(|b| (b.2 as f32 / 96.0).to_string()).unwrap_or_default()),
+    ]
+}
+
+/// Tell the loaded TAP how the clock reads. `false` when no TAP took it.
+pub fn send_clock(text: &ClockText) -> bool {
+    let flag = |on: bool| u8::from(on).to_string();
+    let pairs = [
+        (key::TIME, text.time.clone()),
+        (key::DATE, text.date.clone()),
+        (key::ONE_LINE, flag(text.one_line)),
+        (key::BADGE, text.badge.to_string()),
+        (key::QUIET, flag(text.quiet)),
+        (key::WAITING, text.waiting.map_or_else(String::new, flag)),
+    ];
+    let data = tap_proto::encode_init(pairs.into_iter().chain(badge_pairs(text.badge_image.as_ref())));
+    send_data(tap_proto::CLOCK_MAGIC, &data)
+}
+
+/// What Windows' battery icon says, for the TAP (see `tap_proto::BATTERY_MAGIC`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BatteryLook {
+    /// Its tooltip, a line each; empty: the shell's own.
+    pub tip: String,
+    /// A dot at its upper right (a device runs low): the PNG, its width in DIPs, the DPI it was
+    /// drawn for.
+    pub dot: Option<crate::calendar::Badge>,
+}
+
+/// Tell the loaded TAP what the battery icon says. `false` when no TAP took it.
+pub fn send_battery(look: &BatteryLook) -> bool {
+    let data = tap_proto::encode_init(std::iter::once((key::TIP, look.tip.clone())).chain(badge_pairs(look.dot.as_ref())));
+    send_data(tap_proto::BATTERY_MAGIC, &data)
+}
+
+/// Hand the clock back to the shell: the TAP stops writing it and undoes what it changed.
+pub fn release_clock() -> bool {
+    send_data(tap_proto::CLOCK_MAGIC, &tap_proto::encode_init([(key::RELEASE, "1".to_string())]))
+}
+
+/// How long the tray waits on a busy Explorer for each message (the clock's, the battery's): a refusal
+/// is retried later, so the tray thread is not held for long.
+const SEND_WAIT_MS: u32 = 200;
+
+/// `data` to every loaded TAP by `WM_COPYDATA`, tagged `magic`. `true` if one took it.
+fn send_data(magic: usize, data: &str) -> bool {
+    let mut taken = false;
+    for control in crate::win::windows_by_class(TAP_CONTROL_CLASS) {
+        taken |= copy_data(control, magic, data, 0, SEND_WAIT_MS) == Some(1);
+    }
+    taken
 }
 
 #[cfg(test)]
@@ -994,73 +1064,4 @@ mod tests {
         let all = tap_proto::STATUS_NO_STRIP | tap_proto::STATUS_REORDER_FAILED | tap_proto::STATUS_SHAPE_CHANGED;
         assert_eq!(status_notice(all), status_notice(tap_proto::STATUS_SHAPE_CHANGED));
     }
-}
-
-/// How the taskbar clock reads, for the TAP (see `tap_proto::CLOCK_MAGIC`).
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct ClockText {
-    /// A `GetTimeFormatEx` pattern; empty: the locale's short time.
-    pub time: String,
-    /// A `GetDateFormatEx` pattern; empty: the locale's short date; `-`: hidden.
-    pub date: String,
-    pub one_line: bool,
-    /// How many notifications wait in Audio Tray's list (0: none).
-    pub badge: u32,
-    /// The badge drawn for it (`calendar::view::badge`): the PNG, its width in DIPs and the DPI it
-    /// was drawn for. Without one, the TAP puts an emoji dot and the count before the time.
-    pub badge_image: Option<crate::calendar::Badge>,
-    /// Windows keeps notifications quiet (Do not disturb, a focus session): the bell is crossed.
-    pub quiet: bool,
-    /// Anything waits in Audio Tray's list: the bell is filled (else not, whatever the shell
-    /// thinks is new: it counts as seen only what its own centre showed). `None`: the bell is the
-    /// shell's, its fill too.
-    pub waiting: Option<bool>,
-}
-
-/// Tell the loaded TAP how the clock reads. `false` when no TAP took it.
-pub fn send_clock(text: &ClockText) -> bool {
-    let flag = |on: bool| u8::from(on).to_string();
-    let data = tap_proto::encode_init([
-        ("time", text.time.clone()),
-        ("date", text.date.clone()),
-        ("oneline", flag(text.one_line)),
-        ("badge", text.badge.to_string()),
-        ("quiet", flag(text.quiet)),
-        ("waiting", text.waiting.map_or_else(String::new, flag)),
-        ("badge_image", text.badge_image.as_ref().map(|b| b.0.clone()).unwrap_or_default()),
-        ("badge_width", text.badge_image.as_ref().map(|b| b.1.to_string()).unwrap_or_default()),
-        ("badge_scale", text.badge_image.as_ref().map(|b| (b.2 as f32 / 96.0).to_string()).unwrap_or_default()),
-    ]);
-    send_clock_data(&data)
-}
-
-/// Hand the clock back to the shell: the TAP stops writing it and undoes what it changed.
-pub fn release_clock() -> bool {
-    send_clock_data(&tap_proto::encode_init([("release", "1".to_string())]))
-}
-
-/// How long the tray waits on a busy Explorer for each clock: a refusal is retried 5 s later
-/// ([`crate::calendar::schedule::tick`]), so the tray thread is not held for long.
-const SEND_WAIT_MS: u32 = 200;
-
-fn send_clock_data(data: &str) -> bool {
-    use windows::Win32::Foundation::{LPARAM, WPARAM};
-    use windows::Win32::System::DataExchange::COPYDATASTRUCT;
-    use windows::Win32::UI::WindowsAndMessaging::{SendMessageTimeoutW, SMTO_ABORTIFHUNG, WM_COPYDATA};
-
-    let payload = crate::win::wide(data);
-    let copy = COPYDATASTRUCT {
-        dwData: tap_proto::CLOCK_MAGIC,
-        cbData: (payload.len() * 2) as u32,
-        lpData: payload.as_ptr() as *mut core::ffi::c_void,
-    };
-    let mut taken = false;
-    for control in crate::win::windows_by_class(TAP_CONTROL_CLASS) {
-        let mut result = 0usize;
-        let sent = unsafe {
-            SendMessageTimeoutW(control, WM_COPYDATA, WPARAM(0), LPARAM(&copy as *const COPYDATASTRUCT as isize), SMTO_ABORTIFHUNG, SEND_WAIT_MS, Some(&mut result))
-        };
-        taken |= sent.0 != 0 && result == 1;
-    }
-    taken
 }

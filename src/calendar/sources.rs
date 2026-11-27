@@ -13,6 +13,7 @@ use serde_json::Value;
 use super::model::{Calendar, Details, Event, Source, When};
 use super::oauth::{self, Client};
 use super::time::{self, Zone};
+use super::lock;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Provider {
@@ -87,7 +88,7 @@ fn load_grant(provider: Provider) -> Option<Grant> {
 fn save_grant(provider: Provider, grant: Option<&Grant>) {
     let text = grant.and_then(|g| serde_json::to_string(g).ok());
     crate::secrets::set(provider.secret_name(), text.as_deref());
-    let mut known = SIGNED_IN.lock().unwrap_or_else(|e| e.into_inner());
+    let mut known = lock(&SIGNED_IN);
     known.retain(|(p, _)| *p != provider);
     known.push((provider, grant.map(|g| g.email.clone())));
 }
@@ -98,11 +99,11 @@ static SIGNED_IN: Mutex<Vec<(Provider, Option<String>)>> = Mutex::new(Vec::new()
 
 /// The address of the account signed in with `provider`, if any.
 pub fn signed_in(provider: Provider) -> Option<String> {
-    if let Some((_, email)) = SIGNED_IN.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|(p, _)| *p == provider) {
+    if let Some((_, email)) = lock(&SIGNED_IN).iter().find(|(p, _)| *p == provider) {
         return email.clone();
     }
     let email = load_grant(provider).map(|g| g.email);
-    SIGNED_IN.lock().unwrap_or_else(|e| e.into_inner()).push((provider, email.clone()));
+    lock(&SIGNED_IN).push((provider, email.clone()));
     email
 }
 
@@ -111,12 +112,12 @@ static ACCESS: Mutex<Vec<(Provider, String, i64)>> = Mutex::new(Vec::new());
 
 fn cached_access(provider: Provider) -> Option<String> {
     let now = time::now();
-    let access = ACCESS.lock().unwrap_or_else(|e| e.into_inner());
+    let access = lock(&ACCESS);
     access.iter().find(|(p, _, expires)| *p == provider && *expires > now + 60).map(|(_, token, _)| token.clone())
 }
 
 fn keep_access(provider: Provider, token: &str, expires: i64) {
-    let mut access = ACCESS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut access = lock(&ACCESS);
     access.retain(|(p, ..)| *p != provider);
     access.push((provider, token.to_string(), expires));
 }
@@ -197,7 +198,7 @@ pub fn sign_in(provider: Provider, setup: &Setup, cancel: &AtomicBool) -> Result
 /// Forget `provider`'s account.
 pub fn sign_out(provider: Provider) {
     save_grant(provider, None);
-    ACCESS.lock().unwrap_or_else(|e| e.into_inner()).retain(|(p, ..)| *p != provider);
+    lock(&ACCESS).retain(|(p, ..)| *p != provider);
 }
 
 /// Why an account needs the user: signed out on the provider's side.
@@ -243,7 +244,7 @@ pub fn fetch(provider: Provider, setup: &Setup, range: (i64, i64), zone: &dyn Zo
     match run(&token) {
         // The token was revoked early: one fresh try.
         Err(e) if oauth::unauthorized(&e) => {
-            ACCESS.lock().unwrap_or_else(|e| e.into_inner()).retain(|(p, ..)| *p != provider);
+            lock(&ACCESS).retain(|(p, ..)| *p != provider);
             run(&access(provider, setup)?)
         }
         done => done,
@@ -447,9 +448,9 @@ pub fn fetch_link(index: usize, link: &Link, days: (i32, i32), zone: &dyn Zone) 
     let calendar = Calendar { key: key.clone(), name: link.name.clone(), color, source: Source::Link(index) };
     // The same feed for the same days, unchanged on the server: its events as last read (a feed
     // can be megabytes, fetched every quarter hour).
-    let known = FEEDS.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|f| f.url == feed && f.days == days && f.index == index).map(|f| f.validators.clone());
+    let known = lock(&FEEDS).iter().find(|f| f.url == feed && f.days == days && f.index == index).map(|f| f.validators.clone());
     let Some((text, validators)) = oauth::get_text_since(&feed, &known.unwrap_or_default())? else {
-        let held = FEEDS.lock().unwrap_or_else(|e| e.into_inner());
+        let held = lock(&FEEDS);
         if let Some(f) = held.iter().find(|f| f.url == feed && f.days == days && f.index == index) {
             return Ok((f.events.iter().map(|e| Event { color, ..e.clone() }).collect(), calendar));
         }
@@ -473,7 +474,7 @@ pub fn fetch_link(index: usize, link: &Link, days: (i32, i32), zone: &dyn Zone) 
         })
         .collect();
     if validators.etag.is_some() || validators.modified.is_some() {
-        let mut held = FEEDS.lock().unwrap_or_else(|e| e.into_inner());
+        let mut held = lock(&FEEDS);
         held.retain(|f| f.url != feed);
         held.push(Feed { url: feed, index, days, validators, events: events.clone() });
     }

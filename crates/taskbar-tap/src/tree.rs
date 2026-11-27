@@ -226,6 +226,120 @@ pub fn parent_of(handle: u64) -> Option<u64> {
     tree.nodes.get(&handle).map(|node| node.parent)
 }
 
+// Walkers over the recorded tree (and one over the live one).
+
+/// Climbs the recorded tree looking for an ancestor of a given XAML type.
+pub fn ancestor_of_type(start: u64, wanted: &str, max_up: usize) -> Option<u64> {
+    let mut handle = start;
+    for _ in 0..max_up {
+        handle = parent_of(handle)?;
+        if type_of(handle).as_deref() == Some(wanted) {
+            return Some(handle);
+        }
+    }
+    None
+}
+
+/// The first element named `name` under `root`, nearest first.
+pub fn named(root: u64, name: &str) -> Option<u64> {
+    descendants(root).into_iter().find(|h| name_of(*h).as_deref() == Some(name))
+}
+
+/// Every recorded element under `root`, nearest first (bounded: a tray button holds a few dozen).
+pub fn descendants(root: u64) -> Vec<u64> {
+    // Kept until the tree grows: each clock tick asks for the same few (the bell's, a section's)
+    // several times, and a walk locks the tree and sorts at every node. A handle gone since is
+    // harmless (reading through it finds nothing); a part rebuilt adds elements, so a new walk.
+    /// The tree's version, then each root walked and what was under it.
+    type Found = (u64, Vec<(u64, Vec<u64>)>);
+    static FOUND: Mutex<Found> = Mutex::new((u64::MAX, Vec::new()));
+    let version = version();
+    let mut found = crate::lock(&FOUND);
+    if found.0 != version {
+        *found = (version, Vec::new());
+    }
+    if let Some((_, kept)) = found.1.iter().find(|(r, _)| *r == root) {
+        return kept.clone();
+    }
+    let walked = walk(root);
+    found.1.push((root, walked.clone()));
+    walked
+}
+
+/// Every element under `root`, breadth first (400 at most).
+fn walk(root: u64) -> Vec<u64> {
+    let mut found = Vec::new();
+    let mut queue = std::collections::VecDeque::from(children_of(root));
+    while let Some(handle) = queue.pop_front() {
+        if found.len() >= 400 {
+            break;
+        }
+        found.push(handle);
+        queue.extend(children_of(handle));
+    }
+    found
+}
+
+/// Nearest descendant of `icon` whose runtime class is `target`, walked in the **live** tree (the
+/// recorded one misses re-parented children; see FINDINGS.md, "The presenter must be found live").
+/// Breadth-first matters: for `Border` it must find the shell's `BackgroundBorder` before our
+/// (deeper) pill.
+///
+/// # Safety
+/// XAML UI thread only.
+pub unsafe fn descendant_of_class(diagnostics: &crate::xamlom::IXamlDiagnostics, icon: u64, target: &str) -> Option<u64> {
+    use crate::winrt::{IDependencyObject, IVisualTreeHelperStatics, VISUAL_TREE_HELPER};
+    use windows::Win32::Foundation::S_OK;
+    use windows_core::{IInspectable, Interface};
+    /// Bounds the work done on the shell's UI thread (the presenter is two levels down).
+    const MAX_DEPTH: usize = 6;
+    /// Hard stop, so an unexpected tree cannot spin inside Explorer.
+    const MAX_VISITED: usize = 256;
+
+    let statics: IVisualTreeHelperStatics = crate::xaml::factory(VISUAL_TREE_HELPER)?;
+    // Must be a `DependencyObject`, not the plain `IInspectable` (wrong vtable).
+    let root = crate::xaml::element::<IDependencyObject>(diagnostics, icon)?;
+
+    let mut frontier = vec![root];
+    let mut visited = 0usize;
+    for _ in 0..MAX_DEPTH {
+        let mut next: Vec<IDependencyObject> = Vec::new();
+        for parent in &frontier {
+            let mut count = 0i32;
+            if statics.GetChildrenCount(parent.as_raw(), &mut count) != S_OK {
+                continue;
+            }
+            for index in 0..count {
+                if visited >= MAX_VISITED {
+                    logf!("descendant_of_class: gave up after {MAX_VISITED} elements");
+                    return None;
+                }
+                visited += 1;
+                let mut raw: *mut core::ffi::c_void = core::ptr::null_mut();
+                if statics.GetChild(parent.as_raw(), index, &mut raw) != S_OK || raw.is_null() {
+                    continue;
+                }
+                // Owned: dropping it releases `GetChild`'s reference.
+                let child = IInspectable::from_raw(raw);
+                if child.GetRuntimeClassName().is_ok_and(|name| name == target) {
+                    let mut handle = 0u64;
+                    if diagnostics.GetHandleFromIInspectable(child.as_raw(), &mut handle) == S_OK && handle != 0 {
+                        return Some(handle);
+                    }
+                }
+                if let Ok(node) = child.cast::<IDependencyObject>() {
+                    next.push(node);
+                }
+            }
+        }
+        if next.is_empty() {
+            break;
+        }
+        frontier = next;
+    }
+    None
+}
+
 /// Starts the dump watchdog exactly once, in verbose mode only (a diagnostic aid, and the bulk
 /// of the log).
 pub fn start_watchdog() {

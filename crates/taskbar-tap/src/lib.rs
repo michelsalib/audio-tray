@@ -5,23 +5,28 @@
 //! `Add` mutations and then streams deltas. The callback only records the tree ([`tree`]); every
 //! edit is made from the timer-driven [`sweep`], which holds the rules for when a XAML call is safe.
 
+mod battery;
 mod budget;
 mod clock;
+mod config;
 mod decorate;
+mod indicators;
 mod interact;
 mod ipc;
 pub mod lifecycle;
 mod log;
+mod part;
 pub mod music;
 mod reorder;
 mod restore;
 mod tree;
 mod watch;
 mod winrt;
+mod xaml;
 pub mod xamlom;
 
 use core::ffi::c_void;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use windows::Win32::Foundation::{CLASS_E_CLASSNOTAVAILABLE, E_POINTER, S_FALSE, S_OK};
 use windows::Win32::System::Com::IClassFactory;
@@ -48,12 +53,21 @@ pub fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
-/// Runs a COM method body, turning a panic into `E_UNEXPECTED`: nothing may unwind into Explorer.
+/// Runs `body`, catching a panic: nothing may unwind into Explorer (a COM method, a XAML callback,
+/// the control window's procedure). A panic is logged as `"{what} panicked"` and gives `None`.
+pub(crate) fn guard<T>(what: &str, body: impl FnOnce() -> T) -> Option<T> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)) {
+        Ok(value) => Some(value),
+        Err(_) => {
+            logf!("{what} panicked");
+            None
+        }
+    }
+}
+
+/// Runs a COM method body under [`guard`], turning a panic into `E_UNEXPECTED`.
 fn guarded<T>(what: &str, body: impl FnOnce() -> Result<T>) -> Result<T> {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)).unwrap_or_else(|_| {
-        logf!("{what} panicked");
-        Err(windows::Win32::Foundation::E_UNEXPECTED.into())
-    })
+    guard(what, body).unwrap_or_else(|| Err(windows::Win32::Foundation::E_UNEXPECTED.into()))
 }
 
 /// Locks a mutex, taking the contents of a poisoned one rather than panicking (a panic would
@@ -81,8 +95,8 @@ struct Site {
 /// Each `SetSite` takes a fresh number from [`GENERATION`] and makes it [`CURRENT`];
 /// [`stand_down`] clears `CURRENT` to 0, and a handover ([`hand_over`]) makes the newest
 /// instance current again. An instance whose generation is not `CURRENT` drops its callbacks.
-static GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static CURRENT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static GENERATION: AtomicU64 = AtomicU64::new(0);
+static CURRENT: AtomicU64 = AtomicU64::new(0);
 
 /// The `(icon, ContentPresenter)` we last decorated. Not a one-shot flag: the icon can be
 /// rebuilt, and the shell data-binds `Content` and may overwrite our strip, so both are re-checked.
@@ -117,149 +131,12 @@ unsafe fn already_decorated(diagnostics: &xamlom::IXamlDiagnostics) -> bool {
 /// wires the new ones without double-wiring the old.
 static WIRED: Mutex<Vec<u64>> = Mutex::new(Vec::new());
 
-/// One of Explorer's own indicators that audio-tray hides (the volume glyph, the "microphone in
-/// use" icon, the keyboard-layout indicator): found by glyph or by content class within its tray
-/// section, collapsed with its slot, restorable. See FINDINGS "Telling the shell's tray icons apart".
-struct Indicator {
-    what: &'static str,
-    /// `x:Name` of the `SystemTrayFrameGrid` child it lives in. The same codepoint can mean
-    /// something else in another section.
-    section: &'static str,
-    /// Codepoints that identify it. Names are localised; glyphs are not. Empty for an indicator
-    /// found by [`Self::classes`].
-    glyphs: &'static [char],
-    /// Content classes (the `IconView`'s content, under `ContentGrid`) that identify it, for an
-    /// indicator with no glyph. Empty for one found by glyph.
-    classes: &'static [&'static str],
-    /// Hidden only once our strip is placed: the indicators the strip *replaces*. See FINDINGS
-    /// "Only touch the shell's UI once ours is up".
-    needs_strip: bool,
-    /// Whether audio-tray asked for this one to be hidden.
-    wanted: fn(&decorate::StripState) -> bool,
-    /// Where it was found, once found.
-    slot: Mutex<Option<Found>>,
-    /// Collapse re-applications for the current slot. Bounded, because a collapsed element keeps
-    /// reporting its old `ActualWidth`, so success cannot be read back.
-    retries: std::sync::atomic::AtomicU32,
-    /// Whether it has been logged as found.
-    announced: std::sync::atomic::AtomicBool,
-}
-
-/// An indicator's elements: what identified it (the glyph's `TextBlock`, re-read every sweep since
-/// the shell reuses an `IconView` for another indicator by changing its text; or the content
-/// element whose class matched), the `IconView`, and the container holding its slot.
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct Found {
-    marker: xamlom::InstanceHandle,
-    icon: xamlom::InstanceHandle,
-    slot: xamlom::InstanceHandle,
-}
-
-impl Indicator {
-    /// One the strip replaces, found by glyph.
-    const fn by_glyph(
-        what: &'static str,
-        section: &'static str,
-        glyphs: &'static [char],
-        wanted: fn(&decorate::StripState) -> bool,
-    ) -> Self {
-        Self::new(what, section, glyphs, &[], true, wanted)
-    }
-
-    const fn new(
-        what: &'static str,
-        section: &'static str,
-        glyphs: &'static [char],
-        classes: &'static [&'static str],
-        needs_strip: bool,
-        wanted: fn(&decorate::StripState) -> bool,
-    ) -> Self {
-        Self {
-            what,
-            section,
-            glyphs,
-            classes,
-            needs_strip,
-            wanted,
-            slot: Mutex::new(None),
-            retries: std::sync::atomic::AtomicU32::new(0),
-            announced: std::sync::atomic::AtomicBool::new(false),
-        }
-    }
-
-    fn recorded(&self) -> Option<Found> {
-        *lock(&self.slot)
-    }
-
-    /// Whether this text, read from an `IconView` in `section`, is this indicator: exactly one
-    /// character, one of ours. Anything else (longer text, an unknown glyph) is never hidden.
-    fn matches(&self, section: &str, text: &str) -> bool {
-        section == self.section && single_glyph(text).is_some_and(|glyph| self.glyphs.contains(&glyph))
-    }
-
-    /// Record where it is. A *different* element than last time restarts the retry budget (the
-    /// microphone indicator may be rebuilt per recording session).
-    fn record(&self, found: Found) {
-        let mut held = lock(&self.slot);
-        if *held != Some(found) {
-            self.retries.store(0, Ordering::SeqCst);
-        }
-        *held = Some(found);
-    }
-
-    fn forget(&self) {
-        *lock(&self.slot) = None;
-        self.retries.store(0, Ordering::SeqCst);
-        self.announced.store(false, Ordering::SeqCst);
-    }
-}
-
-/// Enough to cover the replay burst without re-applying for the process lifetime.
-const HIDE_MAX_RETRIES: u32 = 24;
-
-static SYSTEM_VOLUME: Indicator = Indicator::by_glyph(
-    "volume",
-    "ControlCenterButton",
-    decorate::VOLUME_GLYPHS,
-    |s| s.hide_system_volume,
-);
-static SYSTEM_MIC: Indicator =
-    Indicator::by_glyph("microphone", "MainStack", decorate::MIC_GLYPHS, |s| s.hide_system_mic);
-/// The keyboard-layout indicator ("FRA"). It has no glyph, so it is found by its content class;
-/// the IME mode icons beside it (`SystemTray.TextIconContent` / `ImageIconContent`) are left
-/// alone. Not replaced by the strip, so hidden whenever the TAP is active, `buttons=0` included.
-static SYSTEM_LANGUAGE: Indicator = Indicator::new(
-    "keyboard layout",
-    "NonActivatableStack",
-    &[],
-    LANGUAGE_CONTENT,
-    false,
-    |s| s.hide_system_language,
-);
-
-/// The content classes of the keyboard-layout indicator: as text, or drawn as an image.
-const LANGUAGE_CONTENT: &[&str] =
-    &["SystemTray.LanguageTextIconContent", "SystemTray.LanguageImageIconContent"];
-
-/// The text's only character, if it is exactly one (how the shell draws a system icon).
-fn single_glyph(text: &str) -> Option<char> {
-    let mut chars = text.chars();
-    match (chars.next(), chars.next()) {
-        (Some(glyph), None) => Some(glyph),
-        _ => None,
-    }
-}
-
-fn indicators() -> [&'static Indicator; 3] {
-    [&SYSTEM_VOLUME, &SYSTEM_MIC, &SYSTEM_LANGUAGE]
-}
-
 /// Set once the tray icons' automation names have been logged.
-static PROBED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static PROBED: AtomicBool = AtomicBool::new(false);
 
 /// Whether the strip is wanted at all. [`GENERATION`] says which instance may act; this says
 /// whether anything may, for the timer-driven sweep, which has no instance to compare.
-static ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static ACTIVE: AtomicBool = AtomicBool::new(false);
 
 pub(crate) fn tid() -> u32 {
     unsafe { windows::Win32::System::Threading::GetCurrentThreadId() }
@@ -272,18 +149,17 @@ pub(crate) fn diagnostics() -> Option<xamlom::IXamlDiagnostics> {
     if raw == 0 {
         return None;
     }
-    let stored = core::mem::ManuallyDrop::new(unsafe {
-        core::mem::transmute::<*mut c_void, xamlom::IXamlDiagnostics>(raw as *mut c_void)
-    });
-    Some((*stored).clone())
+    let raw = raw as *mut c_void;
+    // Borrowed: the stored reference stays [`DIAGNOSTICS`]'s; the clone is the caller's.
+    unsafe { xamlom::IXamlDiagnostics::from_raw_borrowed(&raw) }.cloned()
 }
 
 /// The live `IXamlDiagnostics` as a raw pointer, so other threads can reach it. Stored on every
 /// `SetSite`; the previous pointer is leaked on purpose (the TAP is pinned in Explorer anyway).
-static DIAGNOSTICS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static DIAGNOSTICS: AtomicUsize = AtomicUsize::new(0);
 
 /// Last thread the callback arrived on, so a change of thread gets logged.
-static CALLBACK_TID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static CALLBACK_TID: AtomicU32 = AtomicU32::new(0);
 
 /// The tooltip (substring) of the tray icon to decorate, from the init data; empty means the
 /// first icon. A mutex, not a `OnceLock`: every injection re-reads the init data.
@@ -291,7 +167,7 @@ static TARGET_TOOLTIP: Mutex<String> = Mutex::new(String::new());
 
 /// Whether to draw the audio buttons over our icon (`buttons=0` turns them off, leaving only the
 /// music tile). Absent means on, as before the switch existed.
-static BUTTONS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+static BUTTONS: AtomicBool = AtomicBool::new(true);
 
 /// What the strip renders, from the init data (re-read on every injection).
 static STRIP: Mutex<Option<decorate::StripState>> = Mutex::new(None);
@@ -304,64 +180,10 @@ fn strip_state() -> Option<decorate::StripState> {
     *lock(&STRIP)
 }
 
-/// Pulls one value out of the init payload (format: [`tap_proto::encode_init`]).
-fn value_from(data: &str, wanted: &str) -> Option<String> {
-    tap_proto::init_value(data, wanted)
-}
-
-/// Apply a `key=value;` init payload: what to decorate, what to draw, and whom to report to.
-/// Shared by `SetSite` and [`hand_over`]; touches no XAML, so it is safe in any message handler.
-fn configure(data: &str) {
-    log::set_verbose(value_from(data, "debug").as_deref() == Some("1"));
-    *lock(&TARGET_TOOLTIP) = value_from(data, "tooltip").unwrap_or_default();
-    *lock(&STRIP) = Some(decorate::StripState::parse(data));
-    // `tile=<app name>` names the taskbar button for the music tile; absent disables that half.
-    music::tile::set_host(value_from(data, "tile"));
-    if let Some(width) = value_from(data, "strip").and_then(|w| w.parse().ok()) {
-        music::layout::set_content_width(width);
-    }
-    if let Some(hwnd) = value_from(data, "hwnd").and_then(|h| h.parse::<isize>().ok()) {
-        ipc::set_receiver(hwnd);
-    }
-    // Whoever asked for the strip is also who we put it away for.
-    lifecycle::watch_owner(value_from(data, "pid"));
-    // Absent (an older app) means on, as before the switch existed.
-    reorder::set_enabled(value_from(data, "reorder").as_deref() != Some("0"));
-    BUTTONS.store(value_from(data, "buttons").as_deref() != Some("0"), Ordering::SeqCst);
-    // Absent (an older app, or the calendar off) leaves the clock to the shell.
-    clock::set_enabled(value_from(data, "clock").as_deref() == Some("1"));
-    // A new owner gets a fresh grace period and its own copy of the status.
-    *lock(&STOOD_UP) = Some(std::time::Instant::now());
-    LAST_STATUS.store(usize::MAX, Ordering::SeqCst);
-}
-
 /// The app version this DLL shipped with (stamped by build.rs from the root manifest).
 pub const APP_VERSION: &str = env!("AUDIO_TRAY_VERSION");
 
 pub use tap_proto::{HANDOVER_ACCEPTED, HANDOVER_DECLINED};
-
-/// Whether a new audio-tray may adopt this already-loaded TAP: the same app/TAP protocol (or, from
-/// an app that predates it, the same app version), and the same DLL file it would have injected.
-/// A routine update keeps the protocol, so it does not restart Explorer: the updated TAP loads
-/// with the next Explorer. Anything else needs a fresh Explorer.
-fn compatible(data: &str, own_path: Option<&str>) -> core::result::Result<(), String> {
-    let protocol = value_from(data, "proto").and_then(|p| p.parse::<u32>().ok());
-    let version = value_from(data, "ver");
-    if protocol != Some(tap_proto::PROTOCOL) && version.as_deref() != Some(APP_VERSION) {
-        return Err(format!(
-            "exe is v{} (protocol {}), TAP is v{APP_VERSION} (protocol {})",
-            version.unwrap_or_default(),
-            protocol.map_or_else(|| "none".to_string(), |p| p.to_string()),
-            tap_proto::PROTOCOL
-        ));
-    }
-    if let (Some(wanted), Some(own)) = (value_from(data, "tap"), own_path) {
-        if !wanted.eq_ignore_ascii_case(own) {
-            return Err(format!("exe wants {wanted}, TAP is {own}"));
-        }
-    }
-    Ok(())
-}
 
 /// A new audio-tray adopting this TAP instead of restarting Explorer: take its init data, make
 /// the newest instance current again and let the sweep re-apply whatever is missing.
@@ -369,13 +191,13 @@ fn compatible(data: &str, own_path: Option<&str>) -> core::result::Result<(), St
 /// Runs inside a cross-process `SendMessage`, so it only flips state; all XAML work is left to
 /// the sweep timer.
 pub(crate) fn hand_over(data: &str) -> isize {
-    if let Err(why) = compatible(data, lifecycle::own_module_path().as_deref()) {
+    if let Err(why) = config::compatible(data, lifecycle::own_module_path().as_deref()) {
         logf!("handover declined: {why}");
         return HANDOVER_DECLINED;
     }
     let before = strip_state();
     let reorder_before = reorder::enabled();
-    configure(data);
+    config::configure(data);
     // A revert still pending from the old owner is superseded: the new owner wants the strip.
     STAND_DOWN_PENDING.store(false, Ordering::SeqCst);
     let was_active = ACTIVE.swap(true, Ordering::SeqCst);
@@ -397,7 +219,7 @@ pub(crate) fn hand_over(data: &str) -> isize {
         *lock(&DECORATED) = None;
         lock(&WIRED).clear();
     }
-    requeue_tray_glyphs();
+    indicators::requeue_tray_glyphs();
     logf!("handover accepted (strip was {}): init data = {data:?}", if was_active { "up" } else { "reverted" });
     unsafe { lifecycle::set_sweep_pace(false) };
     HANDOVER_ACCEPTED
@@ -405,29 +227,7 @@ pub(crate) fn hand_over(data: &str) -> isize {
 
 /// Set by a handover whose switches remove an edit already applied; the next gated sweep reverts
 /// everything and applies the new configuration from scratch.
-static REAPPLY_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// The indicators are only ever found from an *add* event, which this Explorer will not replay
-/// (and a stand-down forgot them): offer the recorded tray-icon glyphs and language contents to
-/// the sweep again. Tray icons only: the queues are the tray island's, and other islands also
-/// have `InnerTextBlock`s.
-fn requeue_tray_glyphs() {
-    let in_tray = |handle: &xamlom::InstanceHandle| ancestor_of_type(*handle, ICON_VIEW, 8).is_some();
-    let glyphs: Vec<_> = tree::find_by_name("InnerTextBlock").into_iter().filter(in_tray).collect();
-    let contents: Vec<_> = LANGUAGE_CONTENT
-        .iter()
-        .flat_map(|class| tree::find_by_type(class))
-        .filter(in_tray)
-        .collect();
-    for (queue, found) in [(&PENDING_GLYPHS, glyphs), (&PENDING_CONTENTS, contents)] {
-        let mut queue = lock(queue);
-        for handle in found {
-            if !queue.contains(&handle) {
-                queue.push(handle);
-            }
-        }
-    }
-}
+static REAPPLY_PENDING: AtomicBool = AtomicBool::new(false);
 
 /// A raw COM pointer handed to the advise thread, used only for the one `AdviseVisualTreeChange`
 /// call (which marshals internally), as the known-good C++ TAPs do.
@@ -438,7 +238,7 @@ unsafe impl Send for SendPtr {}
 /// the previous site and the advise that follows must not reach the UI thread out of order, or the
 /// late unadvise could remove the new subscription (same service re-sited).
 fn off_thread_in_order(job: impl FnOnce() + Send + 'static) {
-    static ISSUED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static ISSUED: AtomicU64 = AtomicU64::new(0);
     static TURN: Mutex<u64> = Mutex::new(0);
     static NEXT: std::sync::Condvar = std::sync::Condvar::new();
 
@@ -473,7 +273,7 @@ fn advise_on_new_thread(service: &IVisualTreeService3, callback: &IVisualTreeSer
         let service = service_ref;
         let callback = callback_ref;
         let hr = unsafe {
-            let svc = core::mem::transmute::<*mut c_void, IVisualTreeService3>(service.0);
+            let svc = IVisualTreeService3::from_raw(service.0);
             let hr = svc.AdviseVisualTreeChange(callback.0);
             drop(svc); // releases our reference
             hr
@@ -481,7 +281,7 @@ fn advise_on_new_thread(service: &IVisualTreeService3, callback: &IVisualTreeSer
         logf!("AdviseVisualTreeChange -> 0x{:08x}", hr.0);
         if hr.is_err() {
             // Drop the callback reference too; nothing will call us.
-            drop(unsafe { core::mem::transmute::<*mut c_void, IVisualTreeServiceCallback2>(callback.0) });
+            drop(unsafe { IVisualTreeServiceCallback2::from_raw(callback.0) });
         }
     });
 }
@@ -495,8 +295,8 @@ fn unadvise_on_new_thread(service: &IVisualTreeService3, callback: &IVisualTreeS
         let service = service_ref;
         let callback = callback_ref;
         let hr = unsafe {
-            let svc = core::mem::transmute::<*mut c_void, IVisualTreeService3>(service.0);
-            let cb = core::mem::transmute::<*mut c_void, IVisualTreeServiceCallback2>(callback.0);
+            let svc = IVisualTreeService3::from_raw(service.0);
+            let cb = IVisualTreeServiceCallback2::from_raw(callback.0);
             let hr = svc.UnadviseVisualTreeChange(cb.as_raw());
             drop((svc, cb)); // releases both references taken above
             hr
@@ -582,7 +382,7 @@ impl Tap_Impl {
                 } else {
                     String::new()
                 };
-                configure(&data);
+                config::configure(&data);
                 logf!("SetSite: IXamlDiagnostics ok, init data = {data:?}");
             }
             Err(err) => logf!("SetSite: no IXamlDiagnostics ({err}) — continuing"),
@@ -623,8 +423,8 @@ impl IVisualTreeServiceCallback_Impl for Tap_Impl {
         element: VisualElement,
         mutation_type: VisualMutationType,
     ) -> HRESULT {
-        // Nothing may unwind into Explorer.
-        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // Nothing may unwind into Explorer: a panic drops the event.
+        guard("OnVisualTreeChange", || {
             let now = tid();
             if CALLBACK_TID.swap(now, Ordering::SeqCst) != now {
                 logf!("OnVisualTreeChange on thread {now}");
@@ -695,17 +495,15 @@ impl IVisualTreeServiceCallback_Impl for Tap_Impl {
             // A possible system indicator glyph (matched by codepoint in the sweep, since reading
             // `Text` is a XAML call). Fast pace: the microphone icon appears only when recording
             // starts, and must be collapsed before it is seen.
-            if added && name == "InnerTextBlock" {
-                enqueue(&PENDING_GLYPHS, element.handle);
-                if lifecycle::on_tray_thread() {
-                    lifecycle::set_sweep_pace(false);
-                }
+            if added && name == part::GLYPH_BLOCK {
+                enqueue(&indicators::PENDING_GLYPHS, element.handle);
+                lifecycle::set_sweep_pace(false);
             }
 
             // A keyboard-layout indicator's content, identified by its class alone (the type name
             // is in the event; the section is checked in the sweep, from the recorded tree).
-            if added && LANGUAGE_CONTENT.contains(&type_name.as_str()) {
-                enqueue(&PENDING_CONTENTS, element.handle);
+            if added && indicators::LANGUAGE_CONTENT.contains(&type_name.as_str()) {
+                enqueue(&indicators::PENDING_CONTENTS, element.handle);
                 lifecycle::set_sweep_pace(false);
             }
 
@@ -716,10 +514,7 @@ impl IVisualTreeServiceCallback_Impl for Tap_Impl {
                     enqueue(&PENDING_SEGMENTS, (segment, name.clone(), element.handle));
                 }
             }
-        }));
-        if caught.is_err() {
-            logf!("OnVisualTreeChange panicked — event dropped");
-        }
+        });
         S_OK
     }
 }
@@ -745,31 +540,24 @@ pub(crate) unsafe fn stand_down() {
             clock::release_text();
             clock::restore(&diagnostics);
             clock::unsplit(&diagnostics);
+            battery::restore(&diagnostics);
         }
         None => logf!("stand down: no IXamlDiagnostics — cannot revert"),
     }
 
     // Reset the "done yet?" state so the feature can be re-enabled without restarting Explorer.
     *lock(&DECORATED) = None;
-    for indicator in indicators() {
-        indicator.forget();
-    }
-    lock(&WATCHED).clear();
+    indicators::forget_all();
     lock(&WIRED).clear();
     reorder::forget();
     PROBED.store(false, Ordering::SeqCst);
     SLOT_METRICS_REPORTED.store(false, Ordering::SeqCst);
-    lock(&UNKNOWN_GLYPHS).clear();
     DECORATE_BUDGET.reset();
     *lock(&STOOD_UP) = None;
     logf!("stood down — the taskbar is as we found it");
 }
 
-/// Event handles the callback queued for the sweep (the callback may not touch XAML). Pushed only
-/// from the tray island's thread.
-static PENDING_GLYPHS: Mutex<Vec<xamlom::InstanceHandle>> = Mutex::new(Vec::new());
-/// Content elements whose class may identify an indicator ([`LANGUAGE_CONTENT`]).
-static PENDING_CONTENTS: Mutex<Vec<xamlom::InstanceHandle>> = Mutex::new(Vec::new());
+/// Our segments announced back, queued for the sweep to wire (the callback may not touch XAML).
 static PENDING_SEGMENTS: Mutex<Vec<(interact::Segment, String, xamlom::InstanceHandle)>> =
     Mutex::new(Vec::new());
 
@@ -784,7 +572,7 @@ fn enqueue<T>(queue: &Mutex<Vec<T>>, item: T) {
 
 /// Set while we are inside a XAML call. An STA pumps messages during outgoing COM calls, so a
 /// `WM_TIMER` or posted message can be dispatched inside `put_Content` on this same thread.
-static XAML_BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static XAML_BUSY: AtomicBool = AtomicBool::new(false);
 
 /// RAII claim on [`XAML_BUSY`]. `None` means someone else already holds it.
 struct BusyGuard;
@@ -818,6 +606,24 @@ pub(crate) unsafe fn sweep() {
     }
 }
 
+/// audio-tray opened a panel, swapped it, or closed it (`tap_proto::OPEN_*`): the button of the open
+/// card stays lit (the clock, the bell, the battery), and no tooltip of ours shows over the panel.
+/// The battery's tooltip, which waits while a panel is open, goes on only once the quieted ones are
+/// given back: one given back (a bare value is put back by `SetToolTip`) must not cover it.
+pub(crate) fn panel_changed(open: usize) {
+    clock::set_panel(open);
+    let Some(diagnostics) = diagnostics() else { return };
+    unsafe {
+        if open == tap_proto::OPEN_NONE {
+            clock::quiet_tooltips(&diagnostics, false, &[]);
+            battery::panel_changed(&diagnostics);
+        } else {
+            battery::panel_changed(&diagnostics);
+            clock::quiet_tooltips(&diagnostics, true, &battery::icons());
+        }
+    }
+}
+
 /// Whether the strip is still wanted. Checked between the sweep's phases: a revert pumped in
 /// during one of its XAML calls clears it, and nothing may be written after that.
 pub(crate) fn live() -> bool {
@@ -825,7 +631,7 @@ pub(crate) fn live() -> bool {
 }
 
 /// A revert that could not run because a XAML call was in flight; the sweep finishes it.
-static STAND_DOWN_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static STAND_DOWN_PENDING: AtomicBool = AtomicBool::new(false);
 
 /// Answer a revert request: stand down now, or, if a XAML call is in flight further up this
 /// stack, stop all writing at once and leave the restore to the sweep.
@@ -858,6 +664,7 @@ unsafe fn sweep_claimed() {
         let _phase = watch::enter("sweep: wire transport");
         wire_transport_now(&diagnostics);
         clock::wire(&diagnostics);
+        battery::wire(&diagnostics);
     }
 
     // **Do not remove.** `put_Content` while the event stream is still running never returns and
@@ -869,13 +676,13 @@ unsafe fn sweep_claimed() {
 
     // Order matters: record indicator slots (ungated), then decorate, then the edits gated on
     // `strip_placed()`.
-    for text_block in drain(&PENDING_GLYPHS) {
+    for text_block in drain(&indicators::PENDING_GLYPHS) {
         let _phase = watch::enter("sweep: note indicator");
-        note_system_indicator(&diagnostics, text_block);
+        indicators::note_system_indicator(&diagnostics, text_block);
     }
-    for content in drain(&PENDING_CONTENTS) {
+    for content in drain(&indicators::PENDING_CONTENTS) {
         let _phase = watch::enter("sweep: note indicator");
-        note_content_indicator(&diagnostics, content);
+        indicators::note_content_indicator(&diagnostics, content);
     }
 
     if REAPPLY_PENDING.swap(false, Ordering::SeqCst) {
@@ -890,7 +697,7 @@ unsafe fn sweep_claimed() {
         CURRENT.store(GENERATION.load(Ordering::SeqCst), Ordering::SeqCst);
         *lock(&STOOD_UP) = Some(std::time::Instant::now());
         LAST_STATUS.store(usize::MAX, Ordering::SeqCst);
-        requeue_tray_glyphs();
+        indicators::requeue_tray_glyphs();
         lifecycle::set_sweep_pace(false);
         return;
     }
@@ -919,8 +726,8 @@ unsafe fn sweep_claimed() {
 
     {
         let _phase = watch::enter("sweep: hide indicators");
-        recheck_indicators(&diagnostics);
-        enforce_hidden(&diagnostics);
+        indicators::recheck_indicators(&diagnostics);
+        indicators::enforce_hidden(&diagnostics);
     }
     if !live() {
         return;
@@ -957,7 +764,7 @@ unsafe fn sweep_claimed() {
     // hover preview's buttons are rebuilt per hover and must be wired within it.
     // Without the audio buttons there is no strip to wait for.
     let strip_settled = !BUTTONS.load(Ordering::SeqCst) || (strip_placed() && reorder::settled() && segments_wired());
-    let settled = strip_settled && music::tile::host().is_none() && clock::settled();
+    let settled = strip_settled && music::tile::host().is_none() && clock::settled() && battery::settled();
     lifecycle::set_sweep_pace(settled);
     report_status();
 }
@@ -1091,7 +898,7 @@ pub(crate) unsafe fn repin() -> bool {
 /// As for [`sweep`].
 pub(crate) unsafe fn timed_sweep() {
     static STATS: Mutex<(u32, u128, u128)> = Mutex::new((0, 0, 0));
-    static REPORTS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    static REPORTS: AtomicU32 = AtomicU32::new(0);
     let started = std::time::Instant::now();
     sweep();
     let micros = started.elapsed().as_micros();
@@ -1116,7 +923,7 @@ const SWEEP_REPORT_FIRST: u32 = 120;
 const QUIET_BEFORE_MUTATING: std::time::Duration = std::time::Duration::from_millis(400);
 
 /// Set once [`report_slot_metrics`] has logged.
-static SLOT_METRICS_REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static SLOT_METRICS_REPORTED: AtomicBool = AtomicBool::new(false);
 
 /// Logs, once, the shell's icon slot and hover plate sizes against our pill (diagnostic for how
 /// evenly the shell's hover plate surrounds the strip). Retries each tick until layout has run.
@@ -1130,7 +937,7 @@ unsafe fn report_slot_metrics(diagnostics: &xamlom::IXamlDiagnostics) {
     let Some((icon, presenter)) = decorated_pair() else {
         return;
     };
-    let Some((slot_w, slot_h)) = decorate::actual_size(diagnostics, icon) else {
+    let Some((slot_w, slot_h)) = xaml::actual_size(diagnostics, icon) else {
         return;
     };
     if slot_w <= 0.0 || slot_h <= 0.0 {
@@ -1152,8 +959,8 @@ unsafe fn report_slot_metrics(diagnostics: &xamlom::IXamlDiagnostics) {
 
     // The visible hover highlight is a Border inside the icon (only its opacity depends on hover).
     // Breadth-first finds it before our pill, a level deeper.
-    match decorate::descendant_of_class(diagnostics, icon, "Windows.UI.Xaml.Controls.Border")
-        .and_then(|plate| decorate::actual_size(diagnostics, plate).map(|size| (plate, size)))
+    match tree::descendant_of_class(diagnostics, icon, winrt::BORDER)
+        .and_then(|plate| xaml::actual_size(diagnostics, plate).map(|size| (plate, size)))
     {
         Some((plate, (plate_w, plate_h))) => logf!(
             "hover plate 0x{plate:x} {plate_w}x{plate_h} \
@@ -1164,21 +971,6 @@ unsafe fn report_slot_metrics(diagnostics: &xamlom::IXamlDiagnostics) {
         None => logf!("hover plate: no Border found under the icon"),
     }
     SLOT_METRICS_REPORTED.store(true, Ordering::SeqCst);
-}
-
-/// The shell's own tray icons (volume, mic, wifi…), as opposed to notify icons and our strip.
-pub(crate) const ICON_VIEW: &str = "SystemTray.IconView";
-
-/// Climbs the recorded tree looking for an ancestor of a given XAML type.
-pub(crate) fn ancestor_of_type(start: xamlom::InstanceHandle, wanted: &str, max_up: usize) -> Option<u64> {
-    let mut handle = start;
-    for _ in 0..max_up {
-        handle = tree::parent_of(handle)?;
-        if tree::type_of(handle).as_deref() == Some(wanted) {
-            return Some(handle);
-        }
-    }
-    None
 }
 
 /// Wires pointer handlers onto one of our segments, once per element handle (a tray rebuild
@@ -1206,315 +998,6 @@ unsafe fn attach_segment(
         return;
     };
     interact::attach(diagnostics, segment, element, plate);
-}
-
-/// Note one of Explorer's own indicators if this text block is it.
-///
-/// Only *records* the slot, ungated; collapsing it is [`enforce_hidden`]'s job, gated on the
-/// strip for the indicators it replaces. (The glyph is announced during the replay, long before
-/// our icon is decorated.)
-///
-/// # Safety
-/// XAML UI thread only, and only once the event stream is quiet — see [`sweep`].
-unsafe fn note_system_indicator(
-    diagnostics: &xamlom::IXamlDiagnostics,
-    text_block: xamlom::InstanceHandle,
-) {
-    let Some(state) = strip_state() else {
-        return;
-    };
-    // Only the shell's glyphs sit in a `SystemTray.IconView`; our own strip's, and other islands',
-    // fall out here — before the XAML read, which is only valid on this island's elements.
-    let Some(icon) = ancestor_of_type(text_block, ICON_VIEW, 8) else {
-        return;
-    };
-    let Some(section) = section_of(icon) else {
-        logf!("tray IconView 0x{icon:x} is in no recorded tray section — not matching it");
-        return;
-    };
-    // Only sections we hide a glyph from are worth the read (the language indicator's "FRA" is
-    // found by class, not text).
-    if !indicators().iter().any(|i| i.section == section && !i.glyphs.is_empty()) {
-        return;
-    }
-    let Some(text) = decorate::text_of(diagnostics, text_block) else {
-        lock(&WATCHED).retain(|&known| known != text_block);
-        return;
-    };
-    let found = indicators()
-        .into_iter()
-        .find(|i| (i.wanted)(&state) && i.matches(&section, &text));
-    let Some(wanted) = found else {
-        // In a section we hide a glyph from, it may turn into one of ours later without a tree
-        // event.
-        {
-            let mut watched = lock(&WATCHED);
-            if !watched.contains(&text_block) {
-                watched.push(text_block);
-            }
-        }
-        note_unknown_glyph(&section, &text);
-        return;
-    };
-    lock(&WATCHED).retain(|&known| known != text_block);
-    let glyph = single_glyph(&text).unwrap_or_default();
-    let slot = slot_of(icon);
-    if !wanted.announced.swap(true, Ordering::SeqCst) {
-        logf!(
-            "system {} indicator found: glyph {:04X} in {section} IconView 0x{icon:x}, slot 0x{slot:x}{}",
-            wanted.what,
-            glyph as u32,
-            gate_note(wanted)
-        );
-    }
-    // Remembered so it can be re-applied: a collapse before layout has measured it frees nothing.
-    wanted.record(Found { marker: text_block, icon, slot });
-    enforce_hidden(diagnostics);
-}
-
-/// The container to collapse with an `IconView`: the generated `ContentPresenter` around it keeps
-/// its layout box, so it must be collapsed too or a hole remains.
-fn slot_of(icon: xamlom::InstanceHandle) -> xamlom::InstanceHandle {
-    tree::parent_of(icon)
-        .filter(|&parent| {
-            tree::type_of(parent).as_deref() == Some("Windows.UI.Xaml.Controls.ContentPresenter")
-        })
-        .unwrap_or(icon)
-}
-
-/// When a found indicator gets hidden, for its "found" log line.
-fn gate_note(indicator: &Indicator) -> &'static str {
-    if indicator.needs_strip {
-        " (hidden only once our strip is placed)"
-    } else {
-        ""
-    }
-}
-
-/// The indicator a content element identifies by its recorded class, with its `IconView`, if the
-/// view sits in that indicator's section. Reads only the recorded tree: no XAML call.
-fn content_indicator(
-    content: xamlom::InstanceHandle,
-) -> Option<(&'static Indicator, xamlom::InstanceHandle, String)> {
-    let class = tree::type_of(content)?;
-    let indicator = indicators().into_iter().find(|i| i.classes.contains(&class.as_str()))?;
-    // IconView > ContainerGrid > ContentPresenter > ContentGrid > content.
-    let icon = ancestor_of_type(content, ICON_VIEW, 6)?;
-    let section = section_of(icon)?;
-    (section == indicator.section).then_some((indicator, icon, section))
-}
-
-/// Note an indicator found by its content class (the keyboard-layout indicator) if this element is
-/// one. Like [`note_system_indicator`], it records, and [`enforce_hidden`] collapses.
-///
-/// # Safety
-/// XAML UI thread only, and only once the event stream is quiet — see [`sweep`].
-unsafe fn note_content_indicator(
-    diagnostics: &xamlom::IXamlDiagnostics,
-    content: xamlom::InstanceHandle,
-) {
-    let Some(state) = strip_state() else {
-        return;
-    };
-    let Some((indicator, icon, section)) = content_indicator(content) else {
-        logf!(
-            "content 0x{content:x} ({}) is not in its indicator's tray section — not hiding it",
-            tree::type_of(content).unwrap_or_default()
-        );
-        return;
-    };
-    if !(indicator.wanted)(&state) {
-        return;
-    }
-    let slot = slot_of(icon);
-    if !indicator.announced.swap(true, Ordering::SeqCst) {
-        logf!(
-            "system {} indicator found: {} in {section} IconView 0x{icon:x}, slot 0x{slot:x}{}",
-            indicator.what,
-            tree::type_of(content).unwrap_or_default(),
-            gate_note(indicator)
-        );
-    }
-    indicator.record(Found { marker: content, icon, slot });
-    enforce_hidden(diagnostics);
-}
-
-/// Put a found indicator's elements back and forget it: it no longer is what we hide.
-///
-/// # Safety
-/// XAML UI thread only, and only once the event stream is quiet — see [`sweep`].
-unsafe fn put_back_indicator(
-    diagnostics: &xamlom::IXamlDiagnostics,
-    indicator: &Indicator,
-    found: Found,
-    now: &str,
-) {
-    let icon = restore::put_back_layout(diagnostics, found.icon);
-    let slot = if found.slot != found.icon {
-        restore::put_back_layout(diagnostics, found.slot)
-    } else {
-        None
-    };
-    let show = |outcome: Option<decorate::Restored>| match outcome {
-        Some(restored) => restored.to_string(),
-        None => "never hidden".to_owned(),
-    };
-    logf!(
-        "system {} indicator 0x{:x} now {now} — no longer ours to hide: icon {}, slot {}",
-        indicator.what,
-        found.icon,
-        show(icon),
-        show(slot)
-    );
-    indicator.forget();
-}
-
-/// The `x:Name` of the `SystemTrayFrameGrid` child an element sits in (`MainStack`,
-/// `ControlCenterButton`, …), from the recorded tree.
-fn section_of(start: xamlom::InstanceHandle) -> Option<String> {
-    let mut handle = start;
-    for _ in 0..24 {
-        let parent = tree::parent_of(handle)?;
-        if tree::name_of(parent).as_deref() == Some(reorder::FRAME_GRID) {
-            return tree::name_of(handle);
-        }
-        handle = parent;
-    }
-    None
-}
-
-/// Tray text blocks in an indicator's section that did not match when last read. Re-read every
-/// sweep by [`recheck_indicators`]: a text change raises no tree event.
-static WATCHED: Mutex<Vec<xamlom::InstanceHandle>> = Mutex::new(Vec::new());
-
-/// Re-reads each found indicator's glyph. The shell reuses an `IconView` for another indicator by
-/// changing its text (microphone → microphone + location → location), which raises no tree event,
-/// so this runs every sweep. A view that no longer matches is put back, forgotten and watched;
-/// watched views are offered to [`note_system_indicator`] again, so one that turns (back) into an
-/// indicator is hidden. Empty text (the icon is going away) decides nothing.
-///
-/// # Safety
-/// XAML UI thread only, and only once the event stream is quiet — see [`sweep`].
-unsafe fn recheck_indicators(diagnostics: &xamlom::IXamlDiagnostics) {
-    for indicator in indicators() {
-        let Some(found) = indicator.recorded() else {
-            continue;
-        };
-        if !indicator.classes.is_empty() {
-            recheck_by_class(diagnostics, indicator, found);
-            continue;
-        }
-        let Some(text) = decorate::text_of(diagnostics, found.marker) else {
-            // Gone from the tree: nothing to put back.
-            indicator.forget();
-            continue;
-        };
-        if text.is_empty() || indicator.matches(indicator.section, &text) {
-            continue;
-        }
-        put_back_indicator(diagnostics, indicator, found, &format!("shows {}", describe_text(&text)));
-        let mut watched = lock(&WATCHED);
-        if !watched.contains(&found.marker) {
-            watched.push(found.marker);
-        }
-    }
-
-    let watched = lock(&WATCHED).clone();
-    for text_block in watched {
-        note_system_indicator(diagnostics, text_block);
-    }
-}
-
-/// [`recheck_indicators`] for an indicator found by content class, from the recorded tree alone
-/// (no XAML read): the `IconView` must still hold a content of one of its classes. A new content
-/// of the right class (the shell rebuilt it) is adopted; any other content puts the view back.
-/// The view coming back as the indicator later raises an add event, which finds it again.
-///
-/// # Safety
-/// XAML UI thread only, and only once the event stream is quiet — see [`sweep`].
-unsafe fn recheck_by_class(diagnostics: &xamlom::IXamlDiagnostics, indicator: &Indicator, found: Found) {
-    if tree::type_of(found.icon).is_none() {
-        // The view itself is gone: nothing to put back.
-        indicator.forget();
-        return;
-    }
-    let still = |content: xamlom::InstanceHandle| {
-        content_indicator(content).is_some_and(|(i, icon, _)| core::ptr::eq(i, indicator) && icon == found.icon)
-    };
-    if still(found.marker) {
-        return;
-    }
-    let replacement = indicator
-        .classes
-        .iter()
-        .flat_map(|class| tree::find_by_type(class))
-        .filter(|&content| still(content))
-        .max_by_key(|&content| tree::seq_of(content));
-    match replacement {
-        Some(content) => indicator.record(Found { marker: content, ..found }),
-        None => put_back_indicator(diagnostics, indicator, found, "holds other content"),
-    }
-}
-
-/// A tray text for the log: codepoints, since most are private-use glyphs.
-fn describe_text(text: &str) -> String {
-    let codes: Vec<String> = text.chars().take(8).map(|c| format!("{:04X}", c as u32)).collect();
-    format!("[{}]", codes.join(" "))
-}
-
-/// Logs a tray text we do not hide, once per section and text: the diagnostic for a Windows build
-/// whose "microphone in use" glyph is missing from [`decorate::MIC_GLYPHS`].
-fn note_unknown_glyph(section: &str, text: &str) {
-    /// Cap on distinct texts logged.
-    const MAX_SEEN: usize = 48;
-
-    let key = format!("{section} {}", describe_text(text));
-    let mut seen = lock(&UNKNOWN_GLYPHS);
-    if seen.contains(&key) || seen.len() >= MAX_SEEN {
-        return;
-    }
-    logf!("tray glyph {key} is not one we hide");
-    seen.push(key);
-}
-
-/// Section-and-text keys [`note_unknown_glyph`] has already reported.
-static UNKNOWN_GLYPHS: Mutex<Vec<String>> = Mutex::new(Vec::new());
-
-/// Re-applies each indicator's collapse (bounded by [`HIDE_MAX_RETRIES`]) once layout has measured it.
-///
-/// # Safety
-/// XAML UI thread only, and only once the event stream is quiet — see [`sweep`].
-unsafe fn enforce_hidden(diagnostics: &xamlom::IXamlDiagnostics) {
-    // Every caller runs behind the sweep's `live()` check; the strip gate is per indicator.
-    let placed = strip_placed();
-    for indicator in indicators() {
-        if indicator.needs_strip && !placed {
-            continue;
-        }
-        if indicator.retries.load(Ordering::SeqCst) >= HIDE_MAX_RETRIES {
-            continue;
-        }
-        let Some(Found { icon, slot, .. }) = indicator.recorded() else {
-            continue;
-        };
-        // Zero means layout has not run yet, and a collapse now would do nothing.
-        if decorate::actual_width(diagnostics, slot).is_none_or(|width| width <= 0.0) {
-            continue;
-        }
-        // Before the collapse, never after (we would record our own zero width).
-        restore::remember_layout(diagnostics, icon);
-        decorate::collapse(diagnostics, icon);
-        if slot != icon {
-            restore::remember_layout(diagnostics, slot);
-            decorate::collapse(diagnostics, slot);
-        }
-        if indicator.retries.fetch_add(1, Ordering::SeqCst) + 1 == HIDE_MAX_RETRIES {
-            logf!(
-                "system {} collapse re-applied {HIDE_MAX_RETRIES}x — stopping",
-                indicator.what
-            );
-        }
-    }
 }
 
 /// Find the tray icon we were asked to decorate and replace its content. Icons come from the
@@ -1640,7 +1123,7 @@ static STOOD_UP: Mutex<Option<std::time::Instant>> = Mutex::new(None);
 const STATUS_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// The status last posted to the app (`usize::MAX`: none yet for this owner).
-static LAST_STATUS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(usize::MAX);
+static LAST_STATUS: AtomicUsize = AtomicUsize::new(usize::MAX);
 
 /// The `STATUS_*` bits for what is not working. Tree-only.
 fn status_bits() -> usize {
@@ -1687,11 +1170,11 @@ fn report_status() {
 
 /// Bumped on every strip state change. [`decorate_icon`] only records the strip as drawn if no
 /// change landed while it was drawing (an STA pumps messages inside the `put_Content` call).
-static STRIP_REVISION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static STRIP_REVISION: AtomicU64 = AtomicU64::new(0);
 
 /// A restyle that only changes glyphs, mute or recording, for the next sweep to apply to the
 /// existing strip with property sets instead of a rebuild.
-static RESTYLE_IN_PLACE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static RESTYLE_IN_PLACE: AtomicBool = AtomicBool::new(false);
 
 impl xamlom::IVisualTreeServiceCallback2_Impl for Tap_Impl {
     unsafe fn OnElementStateChanged(
@@ -1700,12 +1183,9 @@ impl xamlom::IVisualTreeServiceCallback2_Impl for Tap_Impl {
         element_state: xamlom::VisualElementState,
         _context: *const u16,
     ) -> HRESULT {
-        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        guard("OnElementStateChanged", || {
             logf!("OnElementStateChanged 0x{element:x} state={}", element_state.0);
-        }));
-        if caught.is_err() {
-            logf!("OnElementStateChanged panicked");
-        }
+        });
         S_OK
     }
 }
@@ -1751,7 +1231,7 @@ pub unsafe extern "system" fn DllGetClassObject(
     riid: *const GUID,
     ppv: *mut *mut c_void,
 ) -> HRESULT {
-    let caught = std::panic::catch_unwind(|| {
+    guard("DllGetClassObject", || {
         if rclsid.is_null() || riid.is_null() || ppv.is_null() {
             return E_POINTER;
         }
@@ -1762,46 +1242,12 @@ pub unsafe extern "system" fn DllGetClassObject(
         logf!("DllGetClassObject: handing out the TAP factory");
         let factory: IClassFactory = Factory.into();
         factory.query(riid, ppv)
-    });
-    caught.unwrap_or(E_POINTER)
+    })
+    .unwrap_or(E_POINTER)
 }
 
 /// Never unloadable: Explorer may still hold callbacks into our code.
 #[no_mangle]
 pub extern "system" fn DllCanUnloadNow() -> HRESULT {
     S_FALSE
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn handover_needs_the_same_version_and_dll() {
-        let own = r"C:\App\audio_tray_tap.dll";
-        let ok = format!(r"ver={APP_VERSION};tap=c:\app\AUDIO_TRAY_TAP.dll;pid=1");
-        assert!(compatible(&ok, Some(own)).is_ok());
-        // No path to compare (older payload, or the module path unreadable) still matches on version.
-        assert!(compatible(&format!("ver={APP_VERSION}"), Some(own)).is_ok());
-        assert!(compatible(&ok, None).is_ok());
-        assert!(compatible("ver=0.0.1;pid=1", Some(own)).is_err());
-        // An exe that predates the handover sends no version at all.
-        assert!(compatible("pid=1", Some(own)).is_err());
-        let other = format!(r"ver={APP_VERSION};tap=D:\dev\audio_tray_tap.dll");
-        assert!(compatible(&other, Some(own)).is_err());
-    }
-
-    /// An update keeps the protocol: another version is adopted without an Explorer restart, but
-    /// still only from the same DLL path, and never across a protocol change.
-    #[test]
-    fn handover_across_versions_needs_the_same_protocol() {
-        let own = r"C:\App\audio_tray_tap.dll";
-        let proto = tap_proto::PROTOCOL;
-        let newer = format!(r"ver=99.0.0;proto={proto};tap=C:\App\audio_tray_tap.dll");
-        assert!(compatible(&newer, Some(own)).is_ok());
-        let changed = format!(r"ver=99.0.0;proto={};tap=C:\App\audio_tray_tap.dll", proto + 1);
-        assert!(compatible(&changed, Some(own)).is_err());
-        let elsewhere = format!(r"ver=99.0.0;proto={proto};tap=D:\dev\audio_tray_tap.dll");
-        assert!(compatible(&elsewhere, Some(own)).is_err());
-    }
 }

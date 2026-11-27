@@ -1658,3 +1658,58 @@ the track's `Width` to about the fill's length and back within ~70 ms (filmed at
 stock 39-epx bar shows nothing). `hold_track` sets the track's `MinWidth` to the bar's width, which
 outranks the transient `Width`; filmed after, 437 frames over 8 manual updates and 200 frames of
 playback, the track never shortened.
+
+## Windows' battery icon — taken like the clock (2026-11-27, 26300)
+
+`battery=1` in the init data hands the battery icon's click to audio-tray's Batteries card
+(`battery.rs`). Measured on this build:
+
+```
+SystemTray.OmniButton#ControlCenterButton > Grid > ContentPresenter > ItemsPresenter > StackPanel
+  ContentPresenter > SystemTray.IconView#SystemTrayIcon           ← network (TextIconContent)
+  ContentPresenter > SystemTray.IconView#SystemTrayIcon           ← volume  (TextIconContent)
+  ContentPresenter > SystemTray.IconView#SystemTrayIcon           ← battery
+      > ContainerGrid > ContentGrid > SystemTray.BatteryIconContent
+          > ContainerGrid > StackPanel#BatteryStackPanel
+              > TextBlock#BatteryTextBlock, Grid#BatteryGlyphGrid > TextBlock (unnamed)
+```
+
+- The battery is found by its content class, `SystemTray.BatteryIconContent` (fallback: the icon
+  view whose text blocks are all unnamed; network and volume draw in `InnerTextBlock`s). Its glyphs
+  are AXPIcons' `F8DB` outline and `F8DE` fill. UI Automation names it with a localised
+  "Puissance Statut de la batterie : 43% disponible (branché)": never matched on.
+- Same route as the clock: `ControlCenterButton` opens Quick Settings whatever its handlers say,
+  so the TAP reports enter/leave on the battery's icon view (`WM_TASKBAR_BATTERY_HOVER`) and the
+  app's mouse hook swallows the click and posts `ACTION_OPEN_BATTERIES`.
+- **Two buttons, the shell's plate kept for the rest.** Unlike the clock split (both parts get
+  plates of their own), network and volume keep the shell's `BackgroundBorder`: its right margin
+  grows until it ends `PLATE_GAP` before the battery, and the battery's `ContainerGrid` becomes a
+  plate. Where the battery sits comes from `IUIElement10::get_ActualOffset` summed up to the
+  section (IID `d531c629-…`, first own slot; much safer than counting `TransformToVisual`'s place
+  in `IUIElement`). The margin is computed from the plate's *parent* and the battery's offset,
+  neither of which moves with that margin, so writing it again is idempotent. As the battery is
+  the last icon, its distance from the right edge does not change when volume is collapsed later.
+  First split: plate 92 DIP wide, battery at x 60.
+- The shell's plate lights over the whole button: while the pointer is on the battery it is set
+  to opacity 0 and its look (read through the same `BackgroundProperty` callback as the clock's)
+  is copied onto the battery's grid.
+- Tooltip: a `ToolTip` element from `XamlReader` (`Content` attribute, lines as `&#10;`) replaces
+  the shell's on the element that carried it; the shell's is kept and given back on revert. It
+  waits while any panel is open, and goes on only after `quiet_tooltips` has given the quieted
+  ones back (one given back, a bare value, would cover it).
+- Live check 2026-11-27: own plate on hover, tooltip with this PC and the G705, click opens and
+  toggles the card, network still opens Quick Settings (user confirmed each).
+
+### After the review (2026-11-27)
+
+- What the clock, the bell and the battery share now lives in `part.rs`: tree lookups, the shell's
+  plate (`plate_shape`, `dress_like_plate`, `watch_plate` with a callback per caller), its `Look`,
+  and `image_brush` for the badges. `clock.rs` no longer calls into `battery.rs`: the panel message
+  is ordered in `lib.rs` (`panel_changed`), and the battery reads which panel is open from
+  `clock::open_panel` instead of mirroring it (a revert that resets the clock resets it too).
+- A battery icon rebuilt in a button split before is put back, then measured at a later sweep: in
+  the same call its widths were still the shrunk plate's, and the plate ended far too early.
+- A button never laid out (zero widths) is retried for 20 sweeps of an unchanged tree, then left
+  whole: before, `settled()` stayed false and the sweep never dropped to its idle pace.
+- The app measures the battery's screen rectangle with UI Automation on entering, as it does the
+  clock's and the bell's (`PART_BATTERY`, app-internal): a press beside it is never taken.

@@ -1,7 +1,8 @@
 //! A custom Windows-11-style flyout, modelled on the system sound flyout: an
 //! acrylic-blurred, rounded, dark surface with an accent "pill" on the selected row.
 //!
-//! Volume sliders, mute toggles, device switching and a footer (settings, update, quit),
+//! Volume sliders, mute toggles, device switching and a footer (Windows' sound settings, Audio
+//! Tray's settings, a staged update's restart; Quit is in Settings),
 //! hand-painted into a layered window and hit-tested by hand. Modal via mouse
 //! capture, like a menu.
 //!
@@ -39,7 +40,6 @@ use window::Surface;
 /// What the caller must do after the flyout closes.
 #[derive(Default)]
 pub struct Outcome {
-    pub quit: bool,
     /// Relaunch the already-updated exe and exit.
     pub restart: bool,
     /// Open the settings window.
@@ -106,20 +106,12 @@ pub fn show(
     config: &mut Config,
     anchor: Option<Anchor>,
 ) -> Outcome {
-    unsafe { show_inner(backend, config, anchor) }
-}
-
-unsafe fn show_inner(
-    backend: &WasapiBackend,
-    config: &mut Config,
-    anchor: Option<Anchor>,
-) -> Outcome {
     // Centred above the tray icon, else at the cursor; that monitor sets scale and work area.
     let (cx, bottom) = match anchor {
         Some(a) => (a.cx, a.bottom),
         None => {
             let mut cur = POINT::default();
-            let _ = GetCursorPos(&mut cur);
+            let _ = unsafe { GetCursorPos(&mut cur) };
             (cur.x, cur.y)
         }
     };
@@ -172,15 +164,18 @@ unsafe fn show_inner(
 
     fly.render_base();
     fly.compose();
-    let _ = ShowWindow(fly.surface.hwnd, SW_SHOWNA);
+    let hwnd = fly.surface.hwnd;
+    let _ = unsafe { ShowWindow(hwnd, SW_SHOWNA) };
     fly.surface.animate_in(fly.scale);
-    // Foreground + capture, like a menu: an outside click dismisses it.
-    let _ = SetForegroundWindow(fly.surface.hwnd);
-    SetCapture(fly.surface.hwnd);
-    // No WM_SETCURSOR arrives under capture, so force the arrow.
-    let _ = SetCursor(LoadCursorW(None, IDC_ARROW).ok());
+    unsafe {
+        // Foreground + capture, like a menu: an outside click dismisses it.
+        let _ = SetForegroundWindow(hwnd);
+        SetCapture(hwnd);
+        // No WM_SETCURSOR arrives under capture, so force the arrow.
+        let _ = SetCursor(LoadCursorW(None, IDC_ARROW).ok());
+    }
     fly.setup_watches();
-    let _ = SetTimer(Some(fly.surface.hwnd), METER_TIMER_ID, METER_INTERVAL_MS, None);
+    let _ = unsafe { SetTimer(Some(hwnd), METER_TIMER_ID, METER_INTERVAL_MS, None) };
 
     let mut msg = MSG::default();
     let mut quit = false;
@@ -210,11 +205,9 @@ unsafe fn show_inner(
                         }
                         _ => {}
                     }
-                    fly.compose();
-                    fly.surface.flush();
+                    fly.repaint(false);
                 } else if fly.set_hover(mx, my) {
-                    fly.compose();
-                    fly.surface.flush();
+                    fly.repaint(false);
                 }
             }
             WM_LBUTTONDOWN => {
@@ -274,25 +267,24 @@ unsafe fn show_inner(
             WM_TIMER if msg.hwnd == fly.surface.hwnd => fly.tick_meters(),
             WM_KEYDOWN if msg.wParam.0 as u16 == VK_ESCAPE.0 => break 'pump,
             WM_FLYOUT_CLOSE => break 'pump, // lost capture (Start menu, Alt-Tab, …)
-            _ => {
+            _ => unsafe {
                 let _ = TranslateMessage(&msg);
                 DispatchMessageW(&msg);
-            }
+            },
         }
     }
 
-    let _ = KillTimer(Some(fly.surface.hwnd), METER_TIMER_ID);
+    let _ = unsafe { KillTimer(Some(hwnd), METER_TIMER_ID) };
     fly.watches.clear(); // unregister the volume callbacks before the window goes away
     fly.meters.clear(); // release the peak-meter interfaces too
-    let _ = ReleaseCapture();
+    let _ = unsafe { ReleaseCapture() };
     fly.surface.animate_out(fly.scale);
-    let _ = DestroyWindow(fly.surface.hwnd);
+    let _ = unsafe { DestroyWindow(hwnd) };
     // The outer loop must still see the quit this pump took.
     if quit {
-        windows::Win32::UI::WindowsAndMessaging::PostQuitMessage(0);
+        unsafe { windows::Win32::UI::WindowsAndMessaging::PostQuitMessage(0) };
     }
     Outcome {
-        quit: fly.model.quit,
         restart: fly.model.restart,
         settings: fly.model.settings,
     }
@@ -325,7 +317,7 @@ impl Flyout<'_> {
                     self.model.apps = apps;
                 }
                 self.model.voice = voice;
-                if self.config.batteries.enabled {
+                if self.config.levels_in_audio() {
                     model::follow_batteries(&mut self.model, self.config, &state.batteries);
                 }
                 self.hub_seen = generation;
@@ -349,9 +341,7 @@ impl Flyout<'_> {
         if self.load_hub() {
             self.resize();
         } else {
-            self.render_base();
-            self.compose();
-            self.surface.flush();
+            self.repaint(true);
         }
     }
 
@@ -383,21 +373,20 @@ impl Flyout<'_> {
 
     /// A press on an app's row: its glyph toggles the mute, the rest starts a drag.
     fn press_app(&mut self, elem: usize, app: usize, mx: i32) {
-        if (mx as f32) < (theme::TEXT_X - 10.0) * self.scale {
+        let on_glyph = (mx as f32) < (theme::TEXT_X - 10.0) * self.scale;
+        if on_glyph {
             let row = &mut self.model.apps[app];
             row.muted = !row.muted;
             if let Err(e) = crate::audio::sessions::set_muted(&row.app, row.muted) {
                 eprintln!("flyout: could not mute {} ({e:#})", row.app);
             }
             crate::audio::sessions::CHANGED.post();
-            self.render_base();
         } else if (mx as f32) >= (theme::APP_TRACK_X0 - 10.0) * self.scale {
             self.hit.drag = Some(elem);
             let level = layout::app_level_from_x(self.surface.width, self.scale, mx);
             self.set_app_level(app, level);
         }
-        self.compose();
-        self.surface.flush();
+        self.repaint(on_glyph);
     }
 
     /// The wheel over a carousel turns its page; over an apps list cut short, it scrolls the
@@ -410,10 +399,10 @@ impl Flyout<'_> {
             self.hit.wheel = 0;
             return false;
         }
-        const NOTCH: i32 = 120; // WHEEL_DELTA
+        let notch = WHEEL_DELTA as i32;
         self.hit.wheel += raw;
-        let steps = self.hit.wheel / NOTCH;
-        self.hit.wheel %= NOTCH;
+        let steps = self.hit.wheel / notch;
+        self.hit.wheel %= notch;
         // Wheel down (negative) goes forward: the next card, the rows below.
         if pages {
             let n = self.model.now_playing.len() as i32;
@@ -441,15 +430,13 @@ impl Flyout<'_> {
                 *index = page;
             }
         }
-        self.render_base();
-        self.compose();
-        self.surface.flush();
+        self.repaint(true);
     }
 
     /// Size the panel, lay it out and allocate buffers; clears hit state.
     fn rebuild_layout(&mut self) {
         self.reset_hover();
-        self.surface.width = layout::content_width(&self.model, self.scale);
+        self.surface.width = layout::content_width(self.scale);
         // Room above the anchor, down from the work area's top.
         let max_h = self.surface.base_bottom - (self.surface.wa.top + self.surface.margin);
         let (elems, height) = layout::fit(&mut self.model, self.scale, max_h);
@@ -494,8 +481,7 @@ impl Flyout<'_> {
             }
             self.set_group_level(group, level);
         }
-        self.compose();
-        self.surface.flush();
+        self.repaint(false);
     }
 
     /// The slider under the cursor, else the first output slider; `None` when there is none.
@@ -541,8 +527,6 @@ impl Flyout<'_> {
         };
     }
 
-    /// Fold each endpoint's live peak into the smoothed `peak` (muted reads as silent) and
-    /// repaint if anything moved.
     /// Move each slider's springs on to now; whether one is still moving.
     fn step_sliders(&mut self) -> bool {
         let now = std::time::Instant::now();
@@ -567,6 +551,8 @@ impl Flyout<'_> {
         }
     }
 
+    /// The meter timer's tick: follow the hub, move the sliders' springs, fold each endpoint's
+    /// live peak into the smoothed `peak` (muted reads as silent), and repaint if anything moved.
     fn tick_meters(&mut self) {
         // The hub's rows ride the meter tick too: a generation compare, nothing more when idle.
         self.follow_hub();
@@ -600,11 +586,7 @@ impl Flyout<'_> {
             }
         }
         if changed || base_changed {
-            if base_changed {
-                self.render_base();
-            }
-            self.compose();
-            self.surface.flush();
+            self.repaint(base_changed);
         }
     }
 
@@ -638,13 +620,9 @@ impl Flyout<'_> {
             }
         }
         // Only a mute flip touches `base` (the glyph); volume ticks (frequent with mic auto-gain) just recompose.
-        if mute_changed {
-            self.render_base();
-        }
         if mute_changed || vol_changed {
             self.animate();
-            self.compose();
-            self.surface.flush();
+            self.repaint(mute_changed);
         }
     }
 
@@ -660,16 +638,13 @@ impl Flyout<'_> {
                 self.model.groups[group].muted = muted;
                 self.sync_strip();
                 self.animate();
-                self.render_base();
-                self.compose();
-                self.surface.flush();
+                self.repaint(true);
             }
         } else {
             self.hit.drag = Some(elem);
             let level = layout::level_from_x(self.surface.width, self.scale, mx);
             self.set_group_level(group, level);
-            self.compose();
-            self.surface.flush();
+            self.repaint(false);
         }
     }
 
@@ -701,7 +676,7 @@ impl Flyout<'_> {
                 };
                 // The cover brings the app or tab to the front, and the panel steps aside.
                 if (mx as f32) < (theme::ART_X + model::ART_DIP) * self.scale {
-                    crate::tray::perform(crate::pill::Action::Focus(app_id));
+                    crate::tray::perform(crate::hub::Action::Focus(app_id));
                     return true;
                 }
                 let live = !self.model.now_playing.get(index).is_some_and(|np| np.skip);
@@ -713,28 +688,24 @@ impl Flyout<'_> {
                     Some(_) => Command::Next,
                     None => return false,
                 };
-                crate::tray::perform(crate::pill::Action::Media(app_id, command));
+                crate::tray::perform(crate::hub::Action::Media(app_id, command));
                 // Show the toggle at once; the hub confirms it a moment later.
                 if command == Command::TogglePlayPause {
                     if let Some(np) = self.model.now_playing.get_mut(index) {
                         np.playing = !np.playing;
                     }
-                    self.render_base();
-                    self.compose();
-                    self.surface.flush();
+                    self.repaint(true);
                 }
                 false
             }
             Elem::Voice => {
                 if layout::over_voice_button(self.surface.width, self.scale, mx) {
-                    let app = self.model.voice.as_ref().and_then(|v| v.app);
-                    crate::tray::perform(crate::pill::Action::ToggleMute(app));
+                    let app = self.model.voice.as_ref().and_then(|v| v.call.app);
+                    crate::tray::perform(crate::hub::Action::ToggleMute(app));
                     if let Some(voice) = self.model.voice.as_mut() {
                         voice.muted = !voice.muted;
                     }
-                    self.render_base();
-                    self.compose();
-                    self.surface.flush();
+                    self.repaint(true);
                 }
                 false
             }
@@ -753,9 +724,7 @@ impl Flyout<'_> {
                     self.model.groups[group].default_id = Some(id);
                     self.rewatch(group); // follow volume/mute of the new default
                     self.sync_strip();
-                    self.render_base();
-                    self.compose();
-                    self.surface.flush();
+                    self.repaint(true);
                 }
                 false
             }
@@ -829,6 +798,16 @@ impl Flyout<'_> {
         let mut base = vec![0u8; (self.surface.width * self.surface.height * 4) as usize];
         render::render_page(&self.ctx(), &self.surface.elems, &mut base);
         self.surface.base = base;
+    }
+
+    /// Paint the panel again and put it on screen: the static layer too when `base` (a glyph, a
+    /// label or a row changed), else only the overlays (a slider, a hover).
+    fn repaint(&mut self, base: bool) {
+        if base {
+            self.render_base();
+        }
+        self.compose();
+        self.surface.flush();
     }
 
     /// Copy the static base, then draw the dynamic overlays (see [`render::compose`]).

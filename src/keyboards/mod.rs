@@ -9,9 +9,6 @@
 //! - **Switching** posts `WM_INPUTLANGCHANGEREQUEST` to the foreground thread's focus window; never a
 //!   blocking `SendMessage`.
 
-// Device naming and the layout list serve the dev spike now, and the settings page next.
-#![cfg_attr(not(feature = "dev"), allow(dead_code))]
-
 #[cfg(feature = "dev")]
 pub mod spike;
 mod switcher;
@@ -21,10 +18,7 @@ pub use switcher::{cancel_capture, capture, take_captured, Switcher};
 use core::ffi::c_void;
 
 use windows::core::{GUID, PCWSTR};
-use windows::Win32::Devices::DeviceAndDriverInstallation::{
-    CM_Get_DevNode_PropertyW, CM_Get_Parent, CM_Locate_DevNodeW, CM_LOCATE_DEVNODE_NORMAL, CR_SUCCESS,
-};
-use windows::Win32::Devices::Properties::{DEVPROPTYPE, DEVPROP_TYPE_STRING};
+use windows::Win32::Devices::DeviceAndDriverInstallation::{CM_Get_Parent, CR_SUCCESS};
 use windows::Win32::Foundation::{DEVPROPKEY, HANDLE, HWND, LPARAM, WPARAM};
 use windows::Win32::Globalization::{GetLocaleInfoEx, LCIDToLocaleName, LOCALE_SLOCALIZEDDISPLAYNAME};
 use windows::Win32::System::Registry::{
@@ -48,6 +42,8 @@ use crate::win::wide;
 /// stable across reconnects (a Bluetooth one carries the MAC) and is what the config stores.
 #[derive(Clone, Debug)]
 pub struct Keyboard {
+    /// Only the dev spike shows it, beside the devices it hears typing.
+    #[cfg(feature = "dev")]
     pub handle: usize,
     pub path: String,
 }
@@ -69,7 +65,11 @@ pub fn keyboards() -> Vec<Keyboard> {
         .filter(|device| device.dwType == RIM_TYPEKEYBOARD)
         .filter_map(|device| {
             let handle = device.hDevice.0 as usize;
-            Some(Keyboard { handle, path: device_path(handle)? })
+            Some(Keyboard {
+                #[cfg(feature = "dev")]
+                handle,
+                path: device_path(handle)?,
+            })
         })
         .collect()
 }
@@ -106,16 +106,14 @@ pub fn device_names(path: &str, depth: usize) -> Vec<String> {
     let Some(id) = instance_id(path) else {
         return Vec::new();
     };
-    let id = wide(&id);
-    let mut node = 0u32;
-    if unsafe { CM_Locate_DevNodeW(&mut node, PCWSTR(id.as_ptr()), CM_LOCATE_DEVNODE_NORMAL) } != CR_SUCCESS {
+    let Some(mut node) = crate::win::devnode(&id.encode_utf16().collect::<Vec<u16>>()) else {
         return Vec::new();
-    }
+    };
     let friendly = devpkey(0xa45c254e_df1c_4efd_8020_67d146a850e0, 14);
     let description = devpkey(0xa45c254e_df1c_4efd_8020_67d146a850e0, 2);
     let mut names = Vec::new();
     for _ in 0..depth {
-        if let Some(name) = unsafe { string_prop(node, &friendly) }.or_else(|| unsafe { string_prop(node, &description) }) {
+        if let Some(name) = crate::win::devnode_string(node, &friendly).or_else(|| crate::win::devnode_string(node, &description)) {
             names.push(name);
         }
         let mut parent = 0u32;
@@ -199,26 +197,6 @@ fn devpkey(fmtid: u128, pid: u32) -> DEVPROPKEY {
     DEVPROPKEY { fmtid: GUID::from_u128(fmtid), pid }
 }
 
-/// A string devnode property.
-unsafe fn string_prop(node: u32, key: &DEVPROPKEY) -> Option<String> {
-    let mut kind = DEVPROPTYPE(0);
-    let mut size = 0u32;
-    CM_Get_DevNode_PropertyW(node, key, &mut kind, None, &mut size, 0);
-    if size == 0 {
-        return None;
-    }
-    let mut buf = vec![0u8; size as usize];
-    if CM_Get_DevNode_PropertyW(node, key, &mut kind, Some(buf.as_mut_ptr()), &mut size, 0) != CR_SUCCESS
-        || kind != DEVPROP_TYPE_STRING
-    {
-        return None;
-    }
-    let units: Vec<u16> = buf.as_chunks::<2>().0.iter().map(|&pair| u16::from_le_bytes(pair)).collect();
-    let text = String::from_utf16_lossy(&units);
-    let text = text.trim_end_matches('\0');
-    (!text.is_empty()).then(|| text.to_owned())
-}
-
 /// Start or stop hearing which keyboard types, at `target` (keyboards: usage page 1, usage 6). In
 /// the background too (`RIDEV_INPUTSINK`), with arrivals and removals (`RIDEV_DEVNOTIFY`). A
 /// process has one registration per usage: a second one replaces the first.
@@ -255,8 +233,6 @@ pub fn source(lparam: LPARAM) -> Option<usize> {
 pub struct Layout {
     /// The full handle: what is stored and switched to.
     pub hkl: u64,
-    /// The layout id (`KLID`, e.g. `00000409`) if it could be worked out.
-    pub klid: Option<String>,
     /// "US", "Français", … in the display language.
     pub name: String,
     /// "Français (France)", … the language it is installed under.
@@ -292,10 +268,9 @@ pub fn layouts() -> Vec<Layout> {
 
 /// What a layout handle is, from the registry and the locale API.
 pub fn describe(hkl: u64) -> Layout {
-    let klid = klid(hkl);
-    let name = klid.as_deref().and_then(layout_name).unwrap_or_else(|| format!("{hkl:08X}"));
+    let name = klid(hkl).as_deref().and_then(layout_name).unwrap_or_else(|| format!("{hkl:08X}"));
     let language = language_name((hkl & 0xFFFF) as u16).unwrap_or_else(|| format!("{:04X}", hkl & 0xFFFF));
-    Layout { hkl, klid, name, language }
+    Layout { hkl, name, language }
 }
 
 /// The layout id behind a handle. The high word is the layout's device id: a plain one is the
@@ -396,7 +371,10 @@ fn hklm_string(subkey: &str, name: &str) -> Option<String> {
 pub struct Foreground {
     /// The foreground thread's focus window, or the foreground window itself.
     pub target: HWND,
+    /// The foreground window and its process, which the dev spike names.
+    #[cfg(feature = "dev")]
     pub window: HWND,
+    #[cfg(feature = "dev")]
     pub pid: u32,
     /// [`Self::target`]'s thread.
     pub thread: u32,
@@ -423,7 +401,15 @@ pub fn foreground() -> Option<Foreground> {
     let focus_thread = unsafe { GetWindowThreadProcessId(target, None) };
     let thread = if focus_thread != 0 { focus_thread } else { thread };
     let layout = unsafe { GetKeyboardLayout(thread) }.0 as usize as u64;
-    Some(Foreground { target, window, pid, thread, layout })
+    Some(Foreground {
+        target,
+        #[cfg(feature = "dev")]
+        window,
+        #[cfg(feature = "dev")]
+        pid,
+        thread,
+        layout,
+    })
 }
 
 /// Ask the foreground window to switch to `hkl` (posted, so a hung window cannot block us). An

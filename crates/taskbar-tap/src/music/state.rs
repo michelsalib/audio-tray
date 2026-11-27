@@ -144,22 +144,6 @@ impl Strip {
     }
 }
 
-/// Escape text for XAML markup; an unescaped `&` or quote fails the whole `XamlReader.Load`.
-pub fn escape(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    for ch in text.chars() {
-        match ch {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&apos;"),
-            _ => out.push(ch),
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -197,12 +181,5 @@ mod tests {
     #[test]
     fn no_title_means_nothing_to_draw() {
         assert!(!Strip::parse("artist=someone").has_track());
-    }
-
-    #[test]
-    fn markup_special_characters_are_escaped() {
-        assert_eq!(escape("Sturm & Drang"), "Sturm &amp; Drang");
-        assert_eq!(escape("<tag>"), "&lt;tag&gt;");
-        assert_eq!(escape("say \"hi\""), "say &quot;hi&quot;");
     }
 }

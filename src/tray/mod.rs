@@ -12,113 +12,56 @@
 //! is borrowed across its modal loop, so draining is re-enabled for it, and [`next_message`] holds
 //! back what has to wait for it to close.
 //!
-//! Left click on a strip segment opens the flyout ([`on_action`]), as does a right click or either
-//! click on the plain icon when there is no strip; a middle click mutes that endpoint or switches
-//! it to its next device, as `[strip] middle_click` says ([`on_middle_click`]). Scrolling a button
-//! changes that endpoint's volume: the wheel through [`hook`], a precision touchpad through the
-//! TAP, both as [`WM_TASKBAR_SCROLL`]; the level is shown by [`crate::osd`].
+//! Left click on a strip segment opens the flyout ([`clicks::on_action`]), as does a right click or
+//! either click on the plain icon when there is no strip; a middle click mutes that endpoint or
+//! switches it to its next device, as `[strip] middle_click` says ([`clicks::on_middle_click`]).
+//! Scrolling a button changes that endpoint's volume: the wheel through [`hook`], a precision
+//! touchpad through the TAP, both as [`WM_TASKBAR_SCROLL`]; the level is shown by [`crate::osd`].
+//!
+//! The rest is split by subject: [`messages`] (ids, timers), [`clicks`], [`endpoints`] (the
+//! defaults, the strip, the mute watches), [`icon`] (the notification icon), [`battery`] (the
+//! batteries' icon) and [`hook`] (the mouse and keyboard hooks).
 
+mod clicks;
+pub(crate) mod endpoints;
 mod hook;
+mod icon;
+mod messages;
+pub(crate) mod battery;
 
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+use std::sync::atomic::Ordering::SeqCst;
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
-use windows::Win32::UI::WindowsAndMessaging::{
-    DefWindowProcW, KillTimer, PostMessageW, PostQuitMessage, SetTimer,
-    WHEEL_DELTA, WM_APP, WM_TIMER,
-};
+use tray_icon::{TrayIcon, TrayIconEvent};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::UI::WindowsAndMessaging::{DefWindowProcW, PostMessageW, PostQuitMessage, WHEEL_DELTA, WM_TIMER};
 
 use crate::audio::wasapi::WasapiBackend;
 use crate::audio::{mic, notify, sessions, Flow};
-use crate::config::{Config, MiddleClick};
+use crate::config::Config;
 use crate::flyout;
-use crate::icons::IconId;
 use crate::osd::Osd;
-use crate::taskbar::{
-    self, Action, StripIcons, WM_MUSIC_PROGRESS, WM_TASKBAR_ACTION, WM_TASKBAR_RESTARTED,
-    WM_TASKBAR_SCROLL,
+use crate::taskbar::{self, Action, StripIcons, WM_MUSIC_PROGRESS, WM_TASKBAR_ACTION, WM_TASKBAR_RESTARTED, WM_TASKBAR_SCROLL};
+
+use messages::{
+    is_ours, kill_timer, set_timer, BATTERY_RETRY_TIMER, CALENDAR_TIMER, PREWARM_TIMER, WM_APPLY_SCROLL, WM_BATTERY_SYNC, WM_BELL_MIDDLE, WM_DISPLAY_CHANGED,
+    WM_ENDPOINT_VOLUME, WM_ICON_CHECK, WM_ICON_RECT_CHECK, WM_POWER_CHANGED, WM_STRIP_MIDDLE, WM_TRAY_CLICK,
 };
+
+pub use icon::TRAY_MARKER;
+pub(crate) use endpoints::restyle_strip;
+pub(crate) use messages::WM_BANNER_LISTENING;
 
 /// Volume change per wheel notch — 2%, the step Windows' own volume keys take.
 pub(crate) const SCROLL_STEP: f32 = 0.02;
 
-/// Stable marker appended to the tray icon's tooltip, which is also its accessible name: the only
-/// thing the TAP can pick *our* icon out by. Keep in step with `tooltip=` in [`crate::taskbar`].
-pub const TRAY_MARKER: &str = "Audio Tray";
-
-fn tooltip_for(device: &str) -> String {
-    format!("{device} — {TRAY_MARKER}")
-}
-
-/// The tooltip Windows shows holds 127 UTF-16 units (the rest of its 128 is cut, with no NUL).
-const TOOLTIP_MAX: usize = 127;
-
-/// The tooltip: the device and the marker on the first line, then a line per battery while they
-/// fit. Lowest first, so the one that needs charging is the one that shows.
-fn tooltip_text(device: &str, batteries: &[crate::hub::Battery]) -> String {
-    let mut text = tooltip_for(device);
-    let mut by_level: Vec<&crate::hub::Battery> = batteries.iter().collect();
-    by_level.sort_by_key(|b| b.level);
-    for b in by_level {
-        let line = format!("\n{}: {}%", b.name, b.level);
-        if text.encode_utf16().count() + line.encode_utf16().count() > TOOLTIP_MAX {
-            break;
-        }
-        text.push_str(&line);
-    }
-    text
-}
-
-/// The tooltip the icon is *registered* with. **Do not change it**: Windows keys the icon's
-/// "always show on the taskbar" choice on the exe path plus this string, and a new string drops
-/// every user's icon (and with it the strip) into the overflow. See docs/NOTES.md.
-const INITIAL_TOOLTIP: &str = "Audio output";
-
-/// Apply the scroll folded so far; self-posted once per batch ([`ScrollTotals`]).
-const WM_APPLY_SCROLL: u32 = WM_APP + 30;
-/// A click on the plain icon, from tray-icon's handler: `wParam` 1 = left, 2 = right; `lParam` the
-/// anchor (icon centre x, icon top), packed by [`pack_point`].
-const WM_TRAY_CLICK: u32 = WM_APP + 31;
-/// A default endpoint's volume or mute changed, from anywhere (media keys, another app). Only a
-/// mute change matters to the icon and the strip; see [`Tray::check_mutes`].
-const WM_ENDPOINT_VOLUME: u32 = WM_APP + 32;
-/// Check that the icon survived an Explorer restart (`wParam`: attempt number); see
-/// [`Tray::ensure_icon`].
-const WM_ICON_CHECK: u32 = WM_APP + 33;
-/// From the wheel hook: a wheel over the taskbar missed the icon slot, which may have moved;
-/// re-read it. (`WM_APP + 40` is the TAP's.)
-const WM_ICON_RECT_CHECK: u32 = WM_APP + 41;
-/// From the mouse hook: a middle click on the strip (`wParam`: the flow code); see
-/// [`on_middle_click`]. (`WM_APP + 42` is the calendar's.)
-pub(super) const WM_STRIP_MIDDLE: u32 = WM_APP + 43;
-/// From the mouse hook: a middle click on the bell; see [`on_bell_middle_click`].
-pub(super) const WM_BELL_MIDDLE: u32 = WM_APP + 44;
-/// A banner's word on an app listening (`crate::calendar::listening`): `wParam` 1, the microphone
-/// muted (a click), 0, only the alert dismissed (a right click).
-pub(crate) const WM_BANNER_LISTENING: u32 = WM_APP + 45;
-/// The display changed (resolution, scale, work area): posted by [`wndproc`] so it is handled with
-/// the queue; the banners move.
-const WM_DISPLAY_CHANGED: u32 = WM_APP + 46;
-
-/// The receiver window's timer for the next timed notice (`osd::TIMER_ID` is the other one).
-const NOTICE_TIMER: usize = 0x4E54;
-/// The receiver window's timer for the calendar's next moment ([`crate::calendar::schedule`]).
-const CALENDAR_TIMER: usize = 0x4341;
-/// The receiver window's timer for drawing the closed panel ahead ([`crate::calendar::prewarm`]),
-/// once a burst of notifications has settled.
-const PREWARM_TIMER: usize = 0x5057;
-/// How long a burst has to settle.
+/// How long a burst of notifications has to settle before the closed panel is drawn ahead.
 const PREWARM_AFTER_MS: u32 = 2000;
-
-/// Re-registration checks after a restart, and the first gap (doubling): ~1 min in all.
-const ICON_CHECKS: usize = 6;
-const ICON_CHECK_FIRST: Duration = Duration::from_secs(1);
 
 /// After the flyout closes, ignore clicks for this long: the dismissing click's release half
 /// arrives as a strip `Tapped` or tray-icon click after the panel has gone.
@@ -135,7 +78,7 @@ pub(crate) fn bell_point() -> Option<windows::Win32::Foundation::POINT> {
 /// Post to the tray's message window from any thread. `false` when there is no tray (the dev CLI
 /// modes) or the post failed.
 pub(crate) fn post(message: u32, wparam: usize, lparam: isize) -> bool {
-    let raw = WINDOW.load(Ordering::SeqCst);
+    let raw = WINDOW.load(SeqCst);
     raw != 0
         && unsafe { PostMessageW(Some(HWND(raw as *mut _)), message, WPARAM(wparam), LPARAM(lparam)) }.is_ok()
 }
@@ -166,14 +109,14 @@ impl Wake {
     }
 
     fn post_with(&self, send: impl FnOnce(u32) -> bool) {
-        if !self.queued.swap(true, Ordering::SeqCst) && !send(self.message) {
-            self.queued.store(false, Ordering::SeqCst);
+        if !self.queued.swap(true, SeqCst) && !send(self.message) {
+            self.queued.store(false, SeqCst);
         }
     }
 
     /// Called by the handler, before it reads the state.
     pub(crate) fn take(&self) {
-        self.queued.store(false, Ordering::SeqCst);
+        self.queued.store(false, SeqCst);
     }
 }
 
@@ -222,9 +165,9 @@ struct Tray {
     /// Volume/mute subscriptions on the current default output and input, with the mute last
     /// seen: a mute toggled outside the app (a media key) must reach the icon and the strip.
     /// Re-armed by [`Tray::refresh`] when a default changes.
-    mute_watches: Vec<MuteWatch>,
+    mute_watches: Vec<endpoints::MuteWatch>,
     /// Coalesces [`WM_ENDPOINT_VOLUME`]: a slider drag or mic auto-gain fires tens per second.
-    mute_pending: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    mute_pending: std::sync::Arc<AtomicBool>,
     /// What every source has reported, folded; the surfaces render it.
     hub: crate::hub::State,
     /// Session-created notifications on the default output, and which output that is.
@@ -235,12 +178,8 @@ struct Tray {
     batteries: Option<crate::batteries::Watch>,
     /// The default output's name, the tooltip's first line.
     tooltip_device: String,
-}
-
-struct MuteWatch {
-    id: crate::audio::DeviceId,
-    watch: crate::audio::wasapi::VolumeWatch,
-    muted: bool,
+    /// The batteries' icon on the taskbar: Windows' own, or Audio Tray's.
+    battery: battery::BatteryIcons,
 }
 
 thread_local! {
@@ -282,7 +221,7 @@ pub fn run(backend: WasapiBackend, settings: bool) -> Result<()> {
 
     // First: everything below posts here, and the TAP needs a receiver before the strip exists.
     let window = taskbar::create_receiver(Some(wndproc))?;
-    WINDOW.store(window.0 as isize, Ordering::SeqCst);
+    WINDOW.store(window.0 as isize, SeqCst);
     println!("taskbar: click receiver window {:?}", window.0);
     mic::in_use(); // start the watcher, so a recording that starts during startup is heard
 
@@ -292,17 +231,17 @@ pub fn run(backend: WasapiBackend, settings: bool) -> Result<()> {
     // the set-aside rename works on a loaded DLL, so this needs no Explorer restart.
     crate::update::place_staged_tap();
     if config.injects() {
-        taskbar::apply_at_startup(strip_icons(&backend, &config));
+        taskbar::apply_at_startup(endpoints::current_strip_icons(&backend, &config), &config);
     } else {
         // Opt-in: a strip left by an earlier run (or another build) comes off.
         taskbar::revert(0);
     }
 
     // At logon audio-tray can start ahead of `explorer.exe`; `build_tray` retries until it takes.
-    let icon = build_tray(&backend, &config)?;
-    TrayIconEvent::set_event_handler(Some(on_tray_event));
+    let icon = icon::build_tray(&backend, &config)?;
+    TrayIconEvent::set_event_handler(Some(clicks::on_tray_event));
     let _notifications = notify::register()?;
-    let _wheel = hook::Hooks::spawn();
+    let _hooks = hook::Hooks::spawn();
 
     let devices = backend.enumerate_flow(Flow::Output).map(|d| d.len()).unwrap_or(0);
     let gestures = if taskbar::buttons_up() {
@@ -313,7 +252,7 @@ pub fn run(backend: WasapiBackend, settings: bool) -> Result<()> {
     println!("tray: created ({devices} output device(s)); {gestures}.");
 
     // The passive surface; the app works without it.
-    if let Err(e) = crate::pill::create(&pill_config(&config)) {
+    if let Err(e) = crate::pill::create(&config.pill) {
         eprintln!("pill: unavailable ({e:#})");
     }
 
@@ -326,10 +265,18 @@ pub fn run(backend: WasapiBackend, settings: bool) -> Result<()> {
 
     let keyboards = config.keyboards.enabled.then(|| crate::keyboards::Switcher::spawn(&config.keyboards)).flatten();
     let batteries = if config.batteries.enabled { crate::batteries::Watch::spawn() } else { None };
-    crate::pill::set_batteries(config.batteries.enabled && config.batteries.pill_alert, config.batteries.enabled && config.batteries.pill_card);
     let mut hub = crate::hub::State::default();
     hub.set_low_battery_at(config.batteries.warn_at());
-    hub.merges_notices = crate::calendar::merges_notices(&config);
+
+    crate::calendar::focus::recover();
+    follow_config(None, &config);
+    if crate::calendar::takes_clock_button(&config) {
+        // The first open finds its fonts loaded and its pictures decoded.
+        prewarm_later(10_000);
+    }
+    // Windows says when the charge, the power source or the energy saver changes.
+    crate::batteries::watch_power(window);
+    let integrations = config.clone();
 
     TRAY.with(|cell| {
         *cell.borrow_mut() = Some(Tray {
@@ -343,43 +290,24 @@ pub fn run(backend: WasapiBackend, settings: bool) -> Result<()> {
             flyout_open: false,
             scroll: ScrollTotals::default(),
             mute_watches: Vec::new(),
-            mute_pending: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            mute_pending: std::sync::Arc::new(AtomicBool::new(false)),
             hub,
             sessions: None,
             keyboards,
             batteries,
             tooltip_device: String::new(),
+            battery: battery::BatteryIcons::default(),
         })
     });
     with_tray(Tray::refresh);
-    crate::calendar::focus::recover();
-    if with_tray(|tray| tray.config.calendar.enabled).unwrap_or(false) {
-        crate::calendar::notifications::start();
-        crate::calendar::focus::watch();
-        // The first open finds its fonts loaded and its pictures decoded.
-        prewarm_later(10_000);
-    }
-    crate::calendar::set_shortcut(with_tray(|tray| tray.config.calendar.enabled && tray.config.calendar.shortcut).unwrap_or(false));
-    let (calendar, notifications) = with_tray(|tray| (tray.config.calendar.enabled, tray.config.calendar.notifications)).unwrap_or_default();
-    hook::set_clock_taken(calendar, notifications);
-    hook::set_bell_middle_taken(with_tray(|tray| bell_middle_taken(&tray.config)).unwrap_or(false));
-    if calendar && notifications {
-        crate::calendar::show_bell();
-    }
-    // Windows' banners taken (or given back after a crash), as Settings says.
-    if let Some(config) = with_tray(|tray| tray.config.clone()) {
-        crate::calendar::follow_takeover(&config);
-    }
-    let audio_shortcut = with_tray(|tray| tray.config.strip.shortcut).unwrap_or(false);
-    hook::AUDIO_SHORTCUT.store(audio_shortcut, Ordering::SeqCst);
-    hook::want_keys(crate::calendar::SHORTCUT.load(Ordering::SeqCst) || audio_shortcut);
+    post(WM_BATTERY_SYNC, 0, 0);
     reschedule();
     if settings {
         post(crate::settings::WM_OPEN_SETTINGS, 0, 0);
     }
 
     // The integrations' handles are waited on beside the message queue (see `wait`).
-    crate::integrations::start(&with_tray(|tray| tray.config.clone()).unwrap_or_default());
+    crate::integrations::start(&integrations);
     crate::wait::run();
     crate::integrations::stop();
 
@@ -393,9 +321,38 @@ pub fn run(backend: WasapiBackend, settings: bool) -> Result<()> {
     // The progress bar sits on *another app's* button, so it has to come off here, while this
     // thread still pumps; dropping the music handle below is what stops the feed re-adding it.
     taskbar::clear_player_progress();
-    WINDOW.store(0, Ordering::SeqCst);
+    WINDOW.store(0, SeqCst);
     drop(TRAY.with(|cell| cell.borrow_mut().take()));
     Ok(())
+}
+
+/// What follows the config outside the tray's own state: the hooks (which clicks and shortcuts are
+/// Audio Tray's), the notifications' reader and the focus watch, Windows' bell and banners. At
+/// startup (`before` is `None`) everything is set; after Settings, what only needs doing on a
+/// change (showing the bell, taking the banners) is done only when it changed.
+fn follow_config(before: Option<&Config>, now: &Config) {
+    let clock_button = crate::calendar::takes_clock_button(now);
+    if clock_button {
+        crate::calendar::notifications::start();
+        crate::calendar::focus::watch();
+    } else if before.is_some() {
+        crate::calendar::notifications::stop();
+    }
+    let calendar_shortcut = clock_button && now.calendar.shortcut;
+    crate::calendar::set_shortcut(calendar_shortcut);
+    hook::set_clock_taken(now.calendar.enabled, now.calendar.bell);
+    hook::set_bell_middle_taken(clicks::bell_middle_taken(now));
+    hook::set_battery_taken(now.uses_windows_battery_icon());
+    use crate::calendar::{handed_over, merges_notices};
+    if merges_notices(now) && !before.is_some_and(merges_notices) {
+        crate::calendar::show_bell();
+    }
+    // Windows' banners taken (or given back after a crash), as Settings says.
+    if before.is_none_or(|before| handed_over(before) != handed_over(now)) {
+        crate::calendar::follow_takeover(now);
+    }
+    hook::AUDIO_SHORTCUT.store(now.strip.shortcut, SeqCst);
+    hook::want_keys(calendar_shortcut || now.strip.shortcut);
 }
 
 /// The message window's procedure: app messages are queued and drained, the rest is default.
@@ -408,6 +365,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
     // A plain store, read when the flyout opens: nothing to queue.
     if msg == tap_proto::WM_TASKBAR_STATUS {
         taskbar::set_status(wparam.0);
+        // The TAP reported in: what Windows' battery icon says can be told now.
+        let _ = unsafe { PostMessageW(Some(hwnd), WM_BATTERY_SYNC, WPARAM(0), LPARAM(0)) };
         return LRESULT(0);
     }
     // A plain store too, read by the mouse hook on its own thread.
@@ -422,6 +381,23 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
     if msg == tap_proto::WM_TASKBAR_CLOCK_RECT {
         hook::set_part_rect(wparam.0, lparam.0);
         return LRESULT(0);
+    }
+    // A plain store, read by the mouse hook.
+    if msg == tap_proto::WM_TASKBAR_BATTERY_HOVER {
+        let over = wparam.0 == tap_proto::BATTERY_HOVER_OVER;
+        hook::set_battery_hover(over);
+        if over {
+            // Where it is, so a press beside it is never taken.
+            hook::measure_parts();
+        }
+        return LRESULT(0);
+    }
+    // Sent by Windows: answered at once, acted on from the queue.
+    if msg == crate::batteries::WM_POWERBROADCAST {
+        if wparam.0 == crate::batteries::PBT_POWERSETTINGCHANGE {
+            let _ = unsafe { PostMessageW(Some(hwnd), WM_POWER_CHANGED, WPARAM(0), LPARAM(0)) };
+        }
+        return LRESULT(1);
     }
     // Windows is signing out or shutting down: the process may end as soon as this returns, so
     // Windows' banners are given back now (taken again at the next start).
@@ -449,32 +425,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         DRAINING.with(|draining| draining.set(false));
     }
     LRESULT(0)
-}
-
-fn is_ours(msg: u32, wparam: usize) -> bool {
-    matches!(
-        msg,
-        notify::WM_AUDIO_REFRESH
-            | mic::WM_MIC_CHANGED
-            | WM_TASKBAR_ACTION
-            | WM_TASKBAR_RESTARTED
-            | WM_TASKBAR_SCROLL
-            | WM_MUSIC_PROGRESS
-            | WM_APPLY_SCROLL
-            | WM_TRAY_CLICK
-            | WM_STRIP_MIDDLE
-            | WM_BELL_MIDDLE
-            | WM_BANNER_LISTENING
-            | WM_DISPLAY_CHANGED
-            | WM_ENDPOINT_VOLUME
-            | WM_ICON_CHECK
-            | crate::hub::WM_HUB_EVENTS
-            | sessions::WM_SESSIONS_CHANGED
-            | crate::pill::WM_PILL_ACTION
-            | crate::settings::WM_SETTINGS
-            | crate::settings::WM_OPEN_SETTINGS
-            | crate::calendar::WM_CALENDAR
-    ) || (msg == WM_TIMER && (wparam == crate::osd::TIMER_ID || wparam == NOTICE_TIMER || wparam == CALENDAR_TIMER || wparam == PREWARM_TIMER))
 }
 
 /// Handle queued messages, oldest first, unless a handler further up the stack already is.
@@ -539,12 +489,12 @@ fn handle(msg: Queued) {
                     tray.set_microphone_muted(true);
                 }
                 // Said: the alert goes (until another app starts listening).
-                tray.hub.acknowledge(&crate::hub::Notice::Listening { app: String::new(), user: String::new() });
+                tray.hub.acknowledge_listening();
                 tray.hub_changed();
             });
         }
         crate::calendar::WM_CALENDAR if msg.wparam == crate::calendar::CLOSE => {
-            let (x, y) = (msg.lparam as u16 as i16, (msg.lparam >> 16) as u16 as i16);
+            let (x, y) = messages::unpack_point(msg.lparam);
             println!("calendar: closed by a click outside it, at {x},{y}");
             crate::calendar::close()
         }
@@ -566,16 +516,33 @@ fn handle(msg: Queued) {
             reschedule();
         }
         WM_TIMER if msg.wparam == CALENDAR_TIMER => reschedule(),
+        WM_POWER_CHANGED => {
+            // Whether this PC has a battery can come late after sign-in: which battery icon is the
+            // batteries' home changes with it (Windows' takes the TAP's init data).
+            let presence_changed = crate::batteries::refresh_presence();
+            crate::calendar::power_changed();
+            with_tray(|tray| {
+                if presence_changed {
+                    println!("batteries: this PC's battery is now {:?}", crate::batteries::presence());
+                    tray.apply_taskbar();
+                    hook::set_battery_taken(tray.config.uses_windows_battery_icon());
+                    tray.apply_tooltip();
+                }
+                tray.battery.sync(&tray.config, &tray.hub.batteries);
+            });
+        }
+        WM_BATTERY_SYNC => {
+            with_tray(|tray| tray.battery.sync(&tray.config, &tray.hub.batteries));
+        }
+        WM_TIMER if msg.wparam == BATTERY_RETRY_TIMER => {
+            kill_timer(BATTERY_RETRY_TIMER);
+            with_tray(|tray| tray.battery.sync(&tray.config, &tray.hub.batteries));
+        }
         WM_TIMER if msg.wparam == PREWARM_TIMER => {
-            if let Some(window) = taskbar::receiver() {
-                let _ = unsafe { KillTimer(Some(window), PREWARM_TIMER) };
-            }
-            if let Some(config) = with_tray(|tray| tray.config.clone()).filter(|c| c.calendar.enabled) {
+            kill_timer(PREWARM_TIMER);
+            if let Some(config) = with_tray(|tray| tray.config.clone()).filter(crate::calendar::takes_clock_button) {
                 crate::calendar::prewarm(&config);
             }
-        }
-        WM_TIMER if msg.wparam == NOTICE_TIMER => {
-            with_tray(Tray::expire_notices);
         }
         sessions::WM_SESSIONS_CHANGED => {
             sessions::CHANGED.take();
@@ -609,17 +576,18 @@ fn handle(msg: Queued) {
             with_tray(|tray| tray.refresh_icon_rect());
             hook::rect_checked();
         }
+        // The only timer left: the scroll readout's (`osd::TIMER_ID`).
         WM_TIMER => {
             with_tray(|tray| tray.osd.tick());
         }
         WM_TASKBAR_ACTION => {
             if let Some(action) = Action::from_code(msg.wparam) {
-                on_action(action);
+                clicks::on_action(action);
             }
         }
-        WM_TRAY_CLICK => on_tray_click(msg.wparam, msg.lparam),
-        WM_STRIP_MIDDLE => on_middle_click(if msg.wparam == taskbar::flow_code(Flow::Input) { Flow::Input } else { Flow::Output }),
-        WM_BELL_MIDDLE => on_bell_middle_click(),
+        WM_TRAY_CLICK => clicks::on_tray_click(msg.wparam, msg.lparam),
+        WM_STRIP_MIDDLE => clicks::on_middle_click(taskbar::flow_from_code(msg.wparam)),
+        WM_BELL_MIDDLE => clicks::on_bell_middle_click(),
         WM_TASKBAR_RESTARTED => {
             // The clock the TAP said the pointer was over is gone with the old shell.
             hook::forget_clock();
@@ -629,301 +597,12 @@ fn handle(msg: Queued) {
     }
 }
 
-/// Whether a click may act: not while the flyout is open or settling, since then it is the
-/// click that dismissed it. Hides the readout either way — the click supersedes it.
-fn click_allowed(what: &dyn std::fmt::Debug) -> bool {
-    with_tray(|tray| {
-        tray.osd.hide();
-        let allowed = !tray.flyout_open && Instant::now() >= tray.reopen_guard;
-        if !allowed {
-            println!("tray: {what:?} ignored — that click dismissed the panel");
-        }
-        allowed
-    })
-    .unwrap_or(false)
-}
-
-/// A gesture on the injected strip, relayed by the TAP.
-fn on_action(action: Action) {
-    let panel = match action {
-        Action::OpenCalendar => Some(crate::calendar::Panel::Calendar),
-        Action::OpenNotifications => Some(crate::calendar::Panel::Notifications),
-        _ => None,
-    };
-    if let Some(panel) = panel {
-        // One click can arrive twice (the mouse hook and the TAP's tap handler, for touch or pen):
-        // opening toggles, so the second would close what the first opened.
-        let now = std::time::Instant::now();
-        let echo = LAST_OPEN.with(|last| last.replace(Some((now, panel)))).is_some_and(|(at, was)| was == panel && now - at < std::time::Duration::from_millis(300));
-        if echo {
-            return;
-        }
-        // The clock's click never reaches the audio panel (the hook takes it, or the shell's own
-        // calendar would open), so it is not the click that closed it: the panel gives way and the
-        // calendar opens once it has ([`open_flyout`]).
-        if with_tray(|tray| tray.flyout_open).unwrap_or(false) {
-            CALENDAR_NEXT.with(|next| next.set(Some(panel)));
-            // The panel closes on losing the capture (same thread).
-            let _ = unsafe { windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture() };
-            return;
-        }
-        if let Some(config) = with_tray(|tray| {
-            tray.osd.hide();
-            tray.config.clone()
-        }) {
-            crate::calendar::open(&config, panel);
-        }
-        return;
-    }
-    if !click_allowed(&action) {
-        return;
-    }
-    // A segment's left click opens the panel (its middle click does what `[strip] middle_click`
-    // says: [`on_middle_click`]).
-    if matches!(action, Action::OpenPanel | Action::CycleOutput | Action::CycleInput) {
-        // No anchor: the strip's rect is not ours to know; the flyout uses its default place.
-        return open_flyout(None);
-    }
-    with_tray(|tray| {
-        // Never propagated: COM against a session that can vanish mid-click must not end the loop.
-        if let Err(e) = tray.taskbar_action(action) {
-            eprintln!("taskbar: {action:?} failed ({e:#})");
-        }
-    });
-}
-
-/// A notice, while Audio Tray shows every notification: a Windows notification of Audio Tray's
-/// own (listed with the others, and shown by the banners as they are), or for a layout switch a
-/// glance that is not kept.
-fn hand_over(notice: &crate::hub::Notice, config: &Config) {
-    use crate::hub::Notice;
-    // Battery alerts as Settings has them: either of its alerts (pill or notification) asks for it.
-    let b = &config.batteries;
-    if matches!(notice, Notice::LowBattery { .. }) && !(b.enabled && (b.toast || b.pill_alert)) {
-        return;
-    }
-    use crate::lang::{french, tr};
-    use crate::toast::{Outgoing, TAG};
-    let plain = |title: String, body: String, tag: String| Outgoing { title, body, link: None, reminder: false, tag };
-    let outgoing = match notice {
-        Notice::KeyboardSwitched { keyboard, layout } => {
-            crate::calendar::glance(layout, keyboard);
-            return;
-        }
-        // Each tagged with what it is (`toast::TAG`), for the banner that draws it.
-        Notice::AudioMoved { to, from } => plain(
-            if french() { format!("Son sur {to}") } else { format!("Sound now on {to}") },
-            if french() { format!("{from} est déconnecté.") } else { format!("{from} disconnected.") },
-            format!("{TAG}audio"),
-        ),
-        Notice::LowBattery { name, level, .. } => low_battery(name, *level),
-        Notice::Meeting { title, line, url, lasts } => {
-            // When it starts (its notice lasts until two minutes past): its banner counts down.
-            let start = crate::calendar::time::now() + *lasts as i64 - 120;
-            Outgoing {
-                title: title.clone(),
-                body: line.clone(),
-                link: url.clone().map(|url| (tr("Join", "Rejoindre").to_string(), url)),
-                reminder: true,
-                tag: format!("{TAG}meeting/{start}"),
-            }
-        }
-        Notice::FocusDone { minutes } => plain(
-            tr("Focus done", "Concentration terminée").to_string(),
-            if french() { format!("{minutes} min de concentration. Faites une pause.") } else { format!("{minutes} minutes of focus. Take a break.") },
-            format!("{TAG}focus/{minutes}"),
-        ),
-        Notice::NewTrack { .. } | Notice::Listening { .. } => return,
-    };
-    // Off the tray thread: Windows' notification platform can take its time.
-    crate::toast::send(outgoing);
-}
-
-/// A device's low battery, as a notification in Windows' language: tagged (`toast::TAG`) so the
-/// banner draws its battery, one per device (two low at once are two notifications), a device's
-/// next warning replacing its last (the level is in the words, not the tag).
-fn low_battery(name: &str, level: u8) -> crate::toast::Outgoing {
-    use crate::lang::french;
-    let device = name.bytes().fold(0u32, |h, b| h.wrapping_mul(31).wrapping_add(b as u32));
-    crate::toast::Outgoing {
-        title: if french() { format!("Batterie faible : {name}") } else { format!("{name} battery low") },
-        body: if french() { format!("Il reste {level} %. Pensez à la recharger.") } else { format!("{level}% left. Time to charge it.") },
-        link: None,
-        reminder: false,
-        tag: format!("{}battery/{device:x}", crate::toast::TAG),
-    }
-}
-
-/// The pill's settings as the pill takes them: its alert for an app listening goes to the banners
-/// while the bell is Audio Tray's (one kind of notice, one look).
-fn pill_config(config: &Config) -> crate::config::Pill {
-    let mut pill = config.pill.clone();
-    pill.listening_alerts &= !crate::calendar::merges_notices(config);
-    pill
-}
-
-/// Whether a middle click on the bell is Audio Tray's: its notifications are on, and the click does
-/// something (else it is Windows').
-fn bell_middle_taken(config: &Config) -> bool {
-    crate::calendar::merges_notices(config) && config.calendar.bell_middle_click != crate::config::BellMiddleClick::Nothing
-}
-
-/// A middle click on the bell (the hook's, [`WM_BELL_MIDDLE`]): Do not disturb on or off, or every
-/// notification cleared, as `[calendar] bell_middle_click` says.
-fn on_bell_middle_click() {
-    let Some(click) = with_tray(|tray| tray.config.calendar.bell_middle_click) else { return };
-    match click {
-        crate::config::BellMiddleClick::DoNotDisturb => {
-            let on = crate::calendar::focus::toggle();
-            println!("calendar: Do not disturb {} by a middle click on the bell", if on { "on" } else { "off" });
-            // The bell's cross and the panel's moon follow.
-            crate::calendar::quiet_changed();
-            reschedule();
-        }
-        crate::config::BellMiddleClick::ClearAll => {
-            crate::calendar::notifications::clear();
-            if let Some(config) = with_tray(|tray| tray.config.clone()) {
-                crate::calendar::notifications_changed(&config);
-            }
-            reschedule();
-        }
-        crate::config::BellMiddleClick::Nothing => {}
-    }
-}
-
-/// A middle click on the strip's output or input button (the hook's, [`WM_STRIP_MIDDLE`]): mute
-/// it, or switch it to its next device, with or without a muted stop, as `[strip] middle_click`
-/// says.
-fn on_middle_click(flow: Flow) {
-    if !click_allowed(&"middle click") {
-        return;
-    }
-    with_tray(|tray| {
-        let done = match tray.config.strip.middle_click {
-            MiddleClick::Mute => tray.toggle_endpoint_mute(flow),
-            MiddleClick::Switch => tray.cycle(flow, false),
-            MiddleClick::SwitchMute => tray.cycle(flow, true),
-        };
-        // Never propagated: COM against endpoints that can vanish mid-click must not end the loop.
-        if let Err(e) = done {
-            eprintln!("taskbar: middle click on {flow:?} failed ({e:#})");
-            // The strip may be previewing a switch that failed: put the truth back.
-            tray.strip = None;
-            tray.refresh();
-        }
-    });
-}
-
-/// A click on the plain notification icon. Right click opens the menu ([`context_menu`]); left
-/// click opens the flyout, unless a strip is up — the shell invokes the icon under the strip, so a
-/// segment's click also arrives here, and the strip's own handler is the one that opens it.
-fn on_tray_click(button: usize, packed: isize) {
-    if button == 1 && taskbar::buttons_up() {
-        println!("tray: left click on the strip — its own handler opens the panel");
-        return;
-    }
-    if !click_allowed(&"tray click") {
-        return;
-    }
-    let (cx, bottom) = unpack_point(packed);
-    if button == 2 {
-        // A right click is a menu, as on Windows' own buttons beside it (the clock, the bell).
-        return context_menu();
-    }
-    open_flyout(Some(flyout::Anchor { cx, bottom }));
-}
-
-/// The strip's (and the plain icon's) right-click menu, at the pointer: Windows' sound settings,
-/// Audio Tray's, and Quit (no longer in the panel's footer).
-fn context_menu() {
-    use crate::lang::tr;
-    use windows::core::{HSTRING, PCWSTR};
-    use windows::Win32::UI::WindowsAndMessaging::{
-        AppendMenuW, CreatePopupMenu, DestroyMenu, GetCursorPos, SetForegroundWindow, TrackPopupMenu, MF_SEPARATOR, MF_STRING,
-        TPM_BOTTOMALIGN, TPM_CENTERALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON,
-    };
-    const SOUND: usize = 1;
-    const SETTINGS: usize = 2;
-    const QUIT: usize = 3;
-    thread_local! {
-        /// The menu is up: a second right click meanwhile opens no second one.
-        static MENU_OPEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    }
-    let Some(owner) = taskbar::receiver() else { return };
-    if MENU_OPEN.with(|open| open.replace(true)) {
-        return;
-    }
-    // In Windows' language, as the panels and Settings.
-    let items = [
-        (SOUND, HSTRING::from(tr("Sound settings", "Paramètres du son"))),
-        (SETTINGS, HSTRING::from(tr("Audio Tray settings", "Paramètres d'Audio Tray"))),
-        (QUIT, HSTRING::from(tr("Quit Audio Tray", "Quitter Audio Tray"))),
-    ];
-    let chosen = unsafe {
-        let Ok(menu) = CreatePopupMenu() else { return };
-        for (id, label) in &items {
-            if *id == QUIT {
-                let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
-            }
-            let _ = AppendMenuW(menu, MF_STRING, *id, PCWSTR(label.as_ptr()));
-        }
-        let mut at = windows::Win32::Foundation::POINT::default();
-        let _ = GetCursorPos(&mut at);
-        // Without the foreground, the menu would not close on a click elsewhere.
-        let _ = SetForegroundWindow(owner);
-        // Its modal loop drains the queue as the panel's does: the strip, the banners and the
-        // hub stay live while it is open.
-        let was_draining = DRAINING.with(|draining| draining.replace(false));
-        let chosen = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_BOTTOMALIGN | TPM_CENTERALIGN, at.x, at.y, None, owner, None);
-        DRAINING.with(|draining| draining.set(was_draining));
-        // Windows' advice for a menu of a window in the background: a message after it, so the
-        // next click opens it again rather than only dismissing it.
-        let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(Some(owner), windows::Win32::UI::WindowsAndMessaging::WM_NULL, Default::default(), Default::default());
-        let _ = DestroyMenu(menu);
-        chosen.0 as usize
-    };
-    MENU_OPEN.with(|open| open.set(false));
-    match chosen {
-        SOUND => {
-            crate::win::shell_open("ms-settings:sound", None);
-        }
-        SETTINGS => {
-            post(crate::settings::WM_OPEN_SETTINGS, crate::settings::OPEN_TASKBAR, 0);
-        }
-        QUIT => quit(),
-        _ => {}
-    }
-}
-
-/// tray-icon's event handler (called on this thread, from its own window's procedure): turn an
-/// icon click into a message, so it is handled — or dropped — like every other gesture.
-fn on_tray_event(event: TrayIconEvent) {
-    if let TrayIconEvent::Click { button, button_state: MouseButtonState::Up, rect, .. } = event {
-        let code = match button {
-            MouseButton::Left => 1,
-            MouseButton::Right => 2,
-            _ => return,
-        };
-        let cx = (rect.position.x + rect.size.width as f64 / 2.0) as i32;
-        post(WM_TRAY_CLICK, code, pack_point(cx, rect.position.y as i32));
-    }
-}
-
-/// Two signed 16-bit screen coordinates in one `LPARAM` (multi-monitor coordinates can be negative).
-fn pack_point(x: i32, y: i32) -> isize {
-    (x as u16 as u32 | (y as u16 as u32) << 16) as isize
-}
-
-fn unpack_point(packed: isize) -> (i32, i32) {
-    ((packed & 0xFFFF) as u16 as i16 as i32, ((packed >> 16) & 0xFFFF) as u16 as i16 as i32)
-}
-
 /// Show the flyout and apply its outcome.
 ///
 /// No tray state is borrowed while it runs: it gets its own handle on the backend and a copy of
 /// the config, adopted back when it closes. Draining is re-enabled for its modal loop, so the
 /// microphone dot, scrolls and the progress bar stay live; refreshes wait for it (see
-/// [`waits_for_flyout`]) and clicks are dropped ([`click_allowed`]).
+/// [`waits_for_flyout`]) and clicks are dropped (`clicks::click_allowed`).
 fn open_flyout(anchor: Option<flyout::Anchor>) {
     // One flyout at a time: the calendar goes before the panel takes the mouse.
     crate::calendar::close();
@@ -957,38 +636,25 @@ fn open_flyout(anchor: Option<flyout::Anchor>) {
             restart_app(&tray.backend, &tray.config);
         }
     });
-    if outcome.quit {
-        quit();
-        return;
-    }
     if outcome.settings {
         // The audio panel's gear: the Taskbar page, its buttons'.
         open_settings();
         crate::settings::show_page(crate::settings::OPEN_TASKBAR);
     }
     // The clock (or the bell) was clicked while the panel was open: the card it asked for.
-    if let Some(panel) = CALENDAR_NEXT.with(|next| next.take()) {
+    if let Some(panel) = clicks::CALENDAR_NEXT.with(|next| next.take()) {
         if let Some(config) = with_tray(|tray| tray.config.clone()) {
             crate::calendar::open(&config, panel);
         }
     }
 }
 
-thread_local! {
-    /// The calendar's card to open as soon as the audio panel has closed.
-    static CALENDAR_NEXT: std::cell::Cell<Option<crate::calendar::Panel>> = const { std::cell::Cell::new(None) };
-    /// When the clock or the bell last asked for a card, and which, to drop the same click's echo.
-    static LAST_OPEN: std::cell::Cell<Option<(std::time::Instant, crate::calendar::Panel)>> = const { std::cell::Cell::new(None) };
+/// Draw the closed panel ahead in `ms` (a call meanwhile pushes it back).
+fn prewarm_later(ms: u32) {
+    set_timer(PREWARM_TIMER, ms);
 }
 
 /// Have the calendar look again now (the focus timer started, a setting changed).
-/// Draw the closed panel ahead in `ms` (a call meanwhile pushes it back).
-fn prewarm_later(ms: u32) {
-    if let Some(window) = taskbar::receiver() {
-        unsafe { SetTimer(Some(window), PREWARM_TIMER, ms, None) };
-    }
-}
-
 pub(crate) fn wake_calendar() {
     post(WM_TIMER, CALENDAR_TIMER, 0);
 }
@@ -996,9 +662,7 @@ pub(crate) fn wake_calendar() {
 /// Let the calendar do what is due, and set its timer for the next moment.
 fn reschedule() {
     let Some(delay) = with_tray(|tray| crate::calendar::schedule::tick(&tray.config)) else { return };
-    if let Some(window) = taskbar::receiver() {
-        unsafe { SetTimer(Some(window), CALENDAR_TIMER, delay.as_millis().min(u32::MAX as u128) as u32, None) };
-    }
+    set_timer(CALENDAR_TIMER, delay.as_millis().min(u32::MAX as u128) as u32);
 }
 
 /// Put the taskbar back and end the message loop. The TAP's owner watch would revert it too, but
@@ -1019,26 +683,20 @@ fn open_settings() {
 }
 
 impl Tray {
-    /// Update the strip, the icon slot and the tray icon from the current defaults.
+    /// Update the strip, the icon slot and the tray icon from the current defaults, read once.
     ///
-    /// Strip first: it is drawn over the icon, so it is what the user is watching. Failure to set
-    /// the icon is non-fatal — the shell refuses icons while it restarts, and `TaskbarCreated`
-    /// brings us back here.
+    /// Strip first: it is drawn over the icon, so it is what the user is watching.
     fn refresh(&mut self) {
-        let state = Current::read(&self.backend, &self.config);
-        self.rearm_mute_watches();
-        self.push_strip(state.strip_icons());
+        let endpoints = endpoints::read(&self.backend, &self.config);
+        self.rearm_mute_watches(&endpoints);
+        self.push_strip(endpoints::strip_icons(&endpoints));
         self.refresh_icon_rect();
-        self.tooltip_device = state.output.name.clone();
-        if let Err(e) = state.output.apply_to(&self.icon, &self.tooltip()) {
-            eprintln!("tray: could not update the icon, will retry when the taskbar is back ({e:#})");
-        }
-        self.report_endpoints();
+        self.show_output(endpoints.output.as_ref());
+        self.report_endpoints(endpoints);
         crate::settings::devices_changed();
     }
 
-    /// Take the settings window's config: save it first (the TAP's init data is read from the
-    /// file), then bring along only what changed.
+    /// Take the settings window's config: save it, then bring along only what changed.
     fn adopt_settings(&mut self) {
         let Some(mut config) = crate::settings::take_pending() else {
             return;
@@ -1060,7 +718,7 @@ impl Tray {
         if connectors(&before) != connectors(c) {
             crate::integrations::reconfigure(&before, c);
         }
-        crate::pill::configure(&pill_config(c));
+        crate::pill::configure(&c.pill);
         if before.motion != c.motion {
             crate::config::set_motion(c.motion);
             crate::pill::motion_changed();
@@ -1068,7 +726,7 @@ impl Tray {
         // The strip and the tile need a fresh injection.
         let drawn = |c: &Config| {
             let s = &c.strip;
-            (s.enabled, s.next_to_wifi, s.hide_windows_volume, s.hide_windows_mic, s.hide_windows_language, c.music.enabled, c.music.tile_style, c.calendar.enabled, c.injects())
+            (s.enabled, s.next_to_wifi, s.hide_windows_volume, s.hide_windows_mic, s.hide_windows_language, c.music.enabled, c.music.tile_style, crate::calendar::takes_clock_button(c), c.uses_windows_battery_icon(), c.injects())
         };
         if drawn(&before) != drawn(c) {
             self.apply_taskbar();
@@ -1076,27 +734,9 @@ impl Tray {
         if before.calendar.links != self.config.calendar.links {
             crate::calendar::links_changed();
         }
-        if self.config.calendar.enabled {
-            crate::calendar::notifications::start();
-            crate::calendar::focus::watch();
-        } else {
-            crate::calendar::notifications::stop();
-        }
-        crate::calendar::set_shortcut(self.config.calendar.enabled && self.config.calendar.shortcut);
-        hook::set_clock_taken(self.config.calendar.enabled, self.config.calendar.notifications);
-        hook::set_bell_middle_taken(bell_middle_taken(&self.config));
-        use crate::calendar::merges_notices;
-        if merges_notices(&self.config) && !merges_notices(&before) {
-            crate::calendar::show_bell();
-        }
-        self.hub.merges_notices = merges_notices(&self.config);
-        if crate::calendar::handed_over(&before) != crate::calendar::handed_over(&self.config) {
-            crate::calendar::follow_takeover(&self.config);
-        }
-        hook::AUDIO_SHORTCUT.store(self.config.strip.shortcut, Ordering::SeqCst);
-        hook::want_keys((self.config.calendar.enabled && self.config.calendar.shortcut) || self.config.strip.shortcut);
+        follow_config(Some(&before), &self.config);
         if before.calendar != self.config.calendar || before.clock != self.config.clock {
-            post(WM_TIMER, CALENDAR_TIMER, 0);
+            wake_calendar();
         }
         if before.icons != self.config.icons {
             self.refresh();
@@ -1138,22 +778,22 @@ impl Tray {
         hook::forget_clock();
         self.strip = None;
         crate::calendar::schedule::forget_clock();
+        // Windows' battery icon is told again once the TAP has taken the revert.
+        self.battery.forget_windows();
+        set_timer(BATTERY_RETRY_TIMER, 1500);
         if self.config.injects() {
-            taskbar::apply_at_startup(Current::read(&self.backend, &self.config).strip_icons());
+            taskbar::apply_at_startup(endpoints::current_strip_icons(&self.backend, &self.config), &self.config);
         }
         // The revert dropped the clock's text: say it again once the TAP has taken the revert
         // (posted, so a text sent at once would be taken first and then wiped by it).
-        if let Some(window) = taskbar::receiver() {
-            unsafe { SetTimer(Some(window), CALENDAR_TIMER, 1500, None) };
-        }
+        set_timer(CALENDAR_TIMER, 1500);
         self.music = None;
         self.music = crate::music::spawn(&self.config.music, self.config.tile_shown());
     }
 
     /// The endpoint source: tell the hub the defaults, and follow the default output with the
     /// session watch (a session manager belongs to one endpoint).
-    fn report_endpoints(&mut self) {
-        let endpoints = read_endpoints(&self.backend, &self.config);
+    fn report_endpoints(&mut self, endpoints: crate::hub::Endpoints) {
         let output = endpoints.output.as_ref().map(|e| e.id.clone());
         if self.sessions.as_ref().map(|(id, _)| id) != output.as_ref() {
             self.sessions = output.and_then(|id| match sessions::Watch::new() {
@@ -1201,41 +841,39 @@ impl Tray {
             self.follow_batteries();
         }
         for notice in std::mem::take(&mut self.hub.outbox) {
-            hand_over(&notice, &self.config);
+            if let crate::hub::Notice::NewTrack { app_id, title, artist } = &notice {
+                self.announce_song(app_id, title, artist);
+                continue;
+            }
+            crate::hub::hand_over(&notice, &self.config);
         }
         if changed {
             self.hub_changed();
         }
     }
 
+    /// A new song, when Settings asks for it: a glance of Audio Tray's over the bell, its cover in
+    /// the disc, "artist · player" under the title. Never on the pill (it is about what plays, not
+    /// news), never in the list.
+    fn announce_song(&self, app_id: &str, title: &str, artist: &str) {
+        if !self.config.pill.announce_tracks {
+            return;
+        }
+        let media = self.hub.all_media().into_iter().find(|m| m.app_id == app_id).cloned();
+        let player = media.as_ref().map_or_else(String::new, |m| m.app.clone());
+        let body = [artist.trim(), player.trim()].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join(" · ");
+        // Keyed by the song, so its decoded picture is drawn again only for another song.
+        let cover = media.and_then(|m| m.cover).map(|bytes| (format!("cover:{app_id}:{title}"), bytes));
+        crate::calendar::now_playing(title, &body, cover, app_id);
+    }
+
     /// The levels moved: the tooltip follows, and a battery that just went low gets its Windows
     /// notification.
     fn follow_batteries(&mut self) {
         self.apply_tooltip();
-        let low = std::mem::take(&mut self.hub.fresh_low);
-        let b = &self.config.batteries;
-        if !(b.enabled && b.toast) || self.hub.merges_notices {
-            return;
-        }
-        for battery in low {
-            crate::toast::send(low_battery(&battery.name, battery.level));
-        }
-    }
-
-    /// The tooltip as it stands: the default output, then the levels when they are shown there.
-    fn tooltip(&self) -> String {
-        let b = &self.config.batteries;
-        let shown: &[crate::hub::Battery] = if b.enabled && b.tooltip { &self.hub.batteries } else { &[] };
-        tooltip_text(&self.tooltip_device, shown)
-    }
-
-    fn apply_tooltip(&self) {
-        if self.tooltip_device.is_empty() {
-            return; // not read yet: `refresh` sets it with the icon
-        }
-        if let Err(e) = self.icon.set_tooltip(Some(&self.tooltip())) {
-            eprintln!("tray: could not update the tooltip ({e:#})");
-        }
+        // The batteries' card, and their icon.
+        crate::calendar::set_batteries(self.hub.batteries.clone());
+        self.battery.sync(&self.config, &self.hub.batteries);
     }
 
     /// Start or stop the battery source, and carry the battery settings to the hub and the pill.
@@ -1252,47 +890,30 @@ impl Tray {
             }
             _ => {}
         }
-        crate::pill::set_batteries(b.enabled && b.pill_alert, b.enabled && b.pill_card);
         self.hub.set_low_battery_at(b.warn_at());
-        // Warned under the new threshold: the pill shows it; no toast for a settings change.
-        self.hub.fresh_low.clear();
+        // Warned under the new threshold: no notification for a settings change.
+        self.hub.outbox.retain(|n| !matches!(n, crate::hub::Notice::LowBattery { .. }));
         self.apply_tooltip();
+        crate::calendar::set_batteries(self.hub.batteries.clone());
+        // Their icon says it (a new low level moves its dot, a new style redraws it).
+        self.battery.sync(&self.config, &self.hub.batteries);
         self.hub_changed();
     }
 
-    /// The hub state changed: bring the surfaces in line, and arm the next notice's expiry.
+    /// The hub state changed: bring the surfaces in line.
     fn hub_changed(&mut self) {
-        HUB_GENERATION.fetch_add(1, Ordering::SeqCst);
+        HUB_GENERATION.fetch_add(1, SeqCst);
         // A call starting or ending can turn Do not disturb on or off.
         let in_call = self.hub.call().is_some() || self.hub.mic_users.iter().any(|u| crate::hub::names::is_meeting_app(&crate::hub::names::app_name(u)));
         if crate::calendar::schedule::set_in_call(in_call) {
-            post(WM_TIMER, CALENDAR_TIMER, 0);
+            wake_calendar();
         }
-        let (_, next) = self.hub.expire(Instant::now());
         crate::pill::update(&self.hub);
-        // An app listening: the banners' red alert while the bell is Audio Tray's (the pill's otherwise).
-        let listening = (self.config.pill.listening_alerts && crate::calendar::merges_notices(&self.config))
-            .then(|| self.hub.notices.iter().rev().find_map(|(n, _)| match n {
-                crate::hub::Notice::Listening { app, user } => Some((app.clone(), user.clone())),
-                _ => None,
-            }))
-            .flatten();
+        // An app listening: a red banner of Audio Tray's, whatever the bell (never the pill's: it is
+        // about audio activity alone).
+        let listening = self.config.pill.listening_alerts.then(|| self.hub.listening.last().map(|l| (l.app.clone(), l.user.clone()))).flatten();
         crate::calendar::listening(listening);
         crate::settings::follow(&self.hub);
-        if let (Some(next), Some(window)) = (next, taskbar::receiver()) {
-            // One-shot: the handler re-arms for whatever is due next.
-            unsafe { SetTimer(Some(window), NOTICE_TIMER, next.as_millis() as u32 + 1, None) };
-        }
-    }
-
-    /// A notice's time is up.
-    fn expire_notices(&mut self) {
-        if let Some(window) = taskbar::receiver() {
-            unsafe {
-                let _ = KillTimer(Some(window), NOTICE_TIMER);
-            }
-        }
-        self.hub_changed();
     }
 
     /// Carry out what the pill was clicked for.
@@ -1304,8 +925,8 @@ impl Tray {
     }
 
     /// One action from a surface (the pill or the flyout).
-    fn perform(&mut self, action: crate::pill::Action) {
-        use crate::pill::Action;
+    fn perform(&mut self, action: crate::hub::Action) {
+        use crate::hub::Action;
         match action {
             Action::Media(app_id, command) => {
                 if let Some(tab) = app_id.strip_prefix(crate::integrations::browser::APP_ID_PREFIX) {
@@ -1323,7 +944,6 @@ impl Tray {
             Action::Unmute(Some(app)) => crate::integrations::set_muted(app, false),
             Action::Unmute(None) => self.set_microphone_muted(false),
             Action::LeaveCall(app) => crate::integrations::leave_call(app),
-            Action::MuteMicrophone => self.set_microphone_muted(true),
             Action::Focus(app_id) => {
                 if let Some(tab) = app_id.strip_prefix(crate::integrations::browser::APP_ID_PREFIX) {
                     // The browser raises its own window: let it take the foreground we were given.
@@ -1341,54 +961,17 @@ impl Tray {
                     }
                 }
             }
-            Action::CycleDevice(flow) => {
-                let action = match flow {
-                    Flow::Output => taskbar::Action::CycleOutput,
-                    Flow::Input => taskbar::Action::CycleInput,
-                };
-                if let Err(e) = self.taskbar_action(action) {
-                    eprintln!("pill: could not switch the {flow:?} device ({e:#})");
-                }
-            }
-            Action::SetDevice(flow, id) => {
-                if let Err(e) = self.switch_to(flow, &id) {
-                    eprintln!("pill: could not switch the {flow:?} device ({e:#})");
-                }
-            }
-            Action::Volume(flow, notches) => {
-                if let Err(e) = self.backend.nudge_volume(flow, notches * SCROLL_STEP) {
-                    eprintln!("pill: could not change the {flow:?} volume ({e:#})");
-                }
-            }
-            Action::Acknowledge(notice) => {
-                self.hub.acknowledge(&notice);
-                self.hub_changed();
-            }
-            Action::Open(url) => {
-                crate::win::shell_open(&url, None);
-            }
             Action::DisplaysChanged => {
                 if self.config.pill.recall(&crate::win::displays()) {
                     println!("pill: back where it was on these displays");
                     if let Err(e) = self.config.save() {
                         eprintln!("pill: could not save its place ({e:#})");
                     }
-                    crate::pill::configure(&pill_config(&self.config));
+                    crate::pill::configure(&self.config.pill);
                     crate::settings::sync(&self.config);
                 }
             }
         }
-    }
-
-    /// Make `id` the default for `flow`, as picked on the pill. Its mute is left as it is.
-    fn switch_to(&mut self, flow: Flow, id: &crate::audio::DeviceId) -> Result<()> {
-        let devices = self.backend.enumerate_flow(flow)?;
-        // Unplugged since the pill listed it: nothing to switch to.
-        let Some(device) = devices.iter().find(|d| &d.id == id) else { return Ok(()) };
-        self.preview_strip(flow, Some(self.config.icon_of(device)), false);
-        self.backend.set_default_of(id)?;
-        self.refresh();
-        Ok(())
     }
 
     /// Mute or unmute the default microphone. Its volume watch brings the change back round.
@@ -1402,109 +985,6 @@ impl Tray {
             }
             _ => eprintln!("pill: no default microphone to mute"),
         }
-    }
-
-    /// Watch the current defaults' volume and mute, keeping existing subscriptions whose endpoint
-    /// is still the default. A failure leaves that flow unwatched (the next refresh retries).
-    fn rearm_mute_watches(&mut self) {
-        let receiver = taskbar::receiver().map_or(0, |hwnd| hwnd.0 as isize);
-        if receiver == 0 {
-            return;
-        }
-        let defaults: Vec<crate::audio::DeviceId> = [Flow::Output, Flow::Input]
-            .into_iter()
-            .filter_map(|flow| self.backend.default_of(flow).ok().flatten())
-            .collect();
-        self.mute_watches.retain(|w| defaults.contains(&w.id));
-        for id in defaults {
-            if self.mute_watches.iter().any(|w| w.id == id) {
-                continue;
-            }
-            match self.backend.watch_volume(&id, receiver, WM_ENDPOINT_VOLUME, self.mute_pending.clone()) {
-                Ok(watch) => {
-                    let muted = watch.read().is_some_and(|(_, muted)| muted);
-                    self.mute_watches.push(MuteWatch { id, watch, muted });
-                }
-                Err(e) => eprintln!("tray: cannot watch the volume of {} ({e:#})", id.0),
-            }
-        }
-    }
-
-    /// After a volume notification: refresh only if a watched mute flipped. Volume-only changes
-    /// cost one read each and nothing else.
-    fn check_mutes(&mut self) {
-        self.mute_pending.store(false, std::sync::atomic::Ordering::SeqCst);
-        let mut flipped = false;
-        for w in &mut self.mute_watches {
-            if let Some((_, muted)) = w.watch.read() {
-                flipped |= muted != w.muted;
-                w.muted = muted;
-            }
-        }
-        if flipped {
-            AUDIO_CHANGED.post();
-        }
-    }
-
-    /// Tell the strip what to draw unless it already is. Returns whether it can be taken to show
-    /// `icons` now; a restyle that could not be posted (no control window yet) is not remembered.
-    fn push_strip(&mut self, icons: StripIcons) -> bool {
-        if self.strip == Some(icons) {
-            return true;
-        }
-        if taskbar::restyle(icons) {
-            self.strip = Some(icons);
-            return true;
-        }
-        false
-    }
-
-    /// Put the recording dot on (or off) without re-reading the devices. `false`: nothing recorded
-    /// to amend, or the restyle did not go out — the caller falls back to a full refresh.
-    fn push_mic_state(&mut self, recording: bool) -> bool {
-        let Some(mut icons) = self.strip else {
-            return false;
-        };
-        icons.input_recording = recording;
-        self.push_strip(icons)
-    }
-
-    /// Show where a strip click lands before doing the (slow) audio work behind it. `None` for
-    /// `icon` keeps the glyph and changes only the mute. A no-op until a refresh recorded a state.
-    fn preview_strip(&mut self, flow: Flow, icon: Option<IconId>, muted: bool) {
-        let Some(mut icons) = self.strip else {
-            return;
-        };
-        let glyph = icon.map(taskbar::strip_glyph);
-        match flow {
-            Flow::Output => {
-                icons.output = glyph.unwrap_or(icons.output);
-                icons.output_muted = muted;
-            }
-            Flow::Input => {
-                icons.input = glyph.unwrap_or(icons.input);
-                icons.input_muted = muted;
-            }
-        }
-        self.push_strip(icons);
-    }
-
-    /// Ask the shell where our icon is (it moves with every tray change and Explorer restart),
-    /// record it for the wheel hook, and return it for placing the readout. `None` while the icon
-    /// is not on the taskbar.
-    fn refresh_icon_rect(&self) -> Option<RECT> {
-        let rect = self.icon.rect()?;
-        let (left, top) = (rect.position.x as i32, rect.position.y as i32);
-        let slot = RECT {
-            left,
-            top,
-            right: left + rect.size.width as i32,
-            bottom: top + rect.size.height as i32,
-        };
-        if hook::set_icon_rect(Some(slot)) {
-            println!("tray: icon slot at {left},{top} {}x{}", rect.size.width, rect.size.height);
-        }
-        Some(slot)
     }
 
     /// Apply the folded scroll: nudge each endpoint, and show the level beside the buttons
@@ -1528,9 +1008,12 @@ impl Tray {
     fn taskbar_restarted(&mut self) {
         self.strip = None;
         crate::calendar::schedule::forget_clock();
-        post(WM_TIMER, CALENDAR_TIMER, 0);
+        // Both battery icons went with the old shell: shown and told again.
+        self.battery.taskbar_restarted();
+        post(WM_BATTERY_SYNC, 0, 0);
+        wake_calendar();
         if self.config.injects() {
-            taskbar::apply_at_restart(Current::read(&self.backend, &self.config).strip_icons());
+            taskbar::apply_at_restart(endpoints::current_strip_icons(&self.backend, &self.config), &self.config);
         }
         if let Some(music) = self.music.as_ref() {
             music.taskbar_restarted();
@@ -1541,141 +1024,8 @@ impl Tray {
         // tray-icon re-registered the icon with its build-time defaults; put ours back.
         self.refresh();
         // ...unless that re-registration failed: see `ensure_icon`.
-        post_after(WM_ICON_CHECK, 0, ICON_CHECK_FIRST);
+        post_after(WM_ICON_CHECK, 0, icon::ICON_CHECK_FIRST);
     }
-
-    /// tray-icon re-adds the icon on `TaskbarCreated` but ignores the result, and a shell that is
-    /// not taking icons yet (two restarts in a row) refuses it: the icon is then simply gone.
-    /// `rect()` is `None` only for an unregistered icon (an overflowed one reports the chevron),
-    /// so a missing one is rebuilt, retrying with a doubling gap.
-    fn ensure_icon(&mut self, attempt: usize) {
-        if self.icon.rect().is_some() {
-            if attempt > 0 {
-                println!("tray: icon back after an Explorer restart (check {attempt})");
-            }
-            return;
-        }
-        let rebuilt = icon_image(Endpoint::read(&self.backend, &self.config, Flow::Output).icon)
-            .and_then(|image| {
-                TrayIconBuilder::new()
-                    .with_tooltip(INITIAL_TOOLTIP)
-                    .with_icon(image)
-                    .build()
-                    .map_err(anyhow::Error::from)
-            });
-        match rebuilt {
-            Ok(icon) => {
-                // The old one is already gone from the shell; dropping it only frees its window.
-                self.icon = icon;
-                println!("tray: the icon did not survive the Explorer restart — registered it again");
-                self.refresh();
-            }
-            Err(e) => println!("tray: icon still missing after an Explorer restart ({e:#})"),
-        }
-        if attempt + 1 < ICON_CHECKS {
-            post_after(WM_ICON_CHECK, attempt + 1, ICON_CHECK_FIRST * 2u32.pow(attempt as u32 + 1));
-        }
-    }
-
-    /// Mute or unmute `flow`'s default device: a segment's middle click under
-    /// [`MiddleClick::Mute`]. Like the cycle, the strip shows it before the audio work.
-    fn toggle_endpoint_mute(&mut self, flow: Flow) -> Result<()> {
-        let Some(id) = self.backend.default_of(flow)? else { return Ok(()) };
-        let muted = !self.backend.is_muted(&id)?;
-        self.preview_strip(flow, None, muted);
-        self.backend.set_muted(&id, muted)?;
-        // A mute raises no endpoint notification: this is the strip's update.
-        self.refresh();
-        Ok(())
-    }
-
-    /// Act on a gesture from the injected strip that is not a panel's (those are `on_action`'s): the
-    /// music tile's transport.
-    fn taskbar_action(&mut self, action: Action) -> Result<()> {
-        use crate::music::smtc::Command;
-        // Handed to the feed thread and not awaited: a slow media session must not stall this
-        // thread. The strip catches up on the next poll.
-        let command = match action {
-            Action::MusicPrevious => Command::Previous,
-            Action::MusicNext => Command::Next,
-            Action::MusicPlayPause => Command::TogglePlayPause,
-            _ => return Ok(()),
-        };
-        let Some(music) = self.music.as_ref() else {
-            println!("taskbar: {action:?} ignored — the music half is not running");
-            return Ok(());
-        };
-        music.command(command);
-        Ok(())
-    }
-
-    /// Switch `flow` to its next device (a segment's middle click), around a cycle of the active
-    /// devices, each unmuted, plus (`mute_stop`) one muted stop on the last device before the wrap:
-    ///
-    /// ```text
-    /// device 1 → device 2 → … → device N → device N, muted → device 1 → …
-    /// ```
-    ///
-    /// Without `mute_stop`, device N wraps to device 1. Every device stop is unmuted: arriving on a
-    /// muted device unmutes it, and stepping off the muted stop takes the mute with it, so the cycle
-    /// never leaves a muted device behind.
-    fn cycle(&mut self, flow: Flow, mute_stop: bool) -> Result<()> {
-        let devices = self.backend.enumerate_flow(flow)?;
-        if devices.is_empty() {
-            return Ok(());
-        }
-        let current = self.backend.default_of(flow)?;
-        let at = current.as_ref().and_then(|id| devices.iter().position(|d| &d.id == id));
-        let muted = current.as_ref().and_then(|id| self.backend.is_muted(id).ok()).unwrap_or(false);
-
-        // Which device the click lands on, or `None` for the muted stop.
-        let next = match at {
-            Some(i) if muted => Some((i + 1) % devices.len()),
-            Some(i) if i + 1 == devices.len() && mute_stop => None,
-            Some(i) => Some((i + 1) % devices.len()),
-            None => Some(0),
-        };
-
-        match next {
-            Some(next) => self.preview_strip(flow, Some(self.config.icon_of(&devices[next])), false),
-            None => self.preview_strip(flow, None, true),
-        }
-
-        match next {
-            Some(next) => {
-                let id = &devices[next].id;
-                if current.as_ref() != Some(id) {
-                    self.backend.set_default_of(id)?;
-                }
-                // Unmute the device we left *after* the switch, so it makes no sound.
-                if muted {
-                    if let Some(left) = current.as_ref().filter(|left| *left != id) {
-                        self.backend.set_muted(left, false)?;
-                    }
-                }
-                if self.backend.is_muted(id).unwrap_or(false) {
-                    self.backend.set_muted(id, false)?;
-                }
-            }
-            None => {
-                if let Some(id) = &current {
-                    self.backend.set_muted(id, true)?;
-                }
-            }
-        }
-
-        // Confirms the preview, and is the only strip update after a mute (which raises no
-        // endpoint notification).
-        self.refresh();
-        Ok(())
-    }
-}
-
-/// Push the current defaults to the strip, for the flyout's live changes. A no-op outside the
-/// tray (the `--flyout` preview).
-pub(crate) fn restyle_strip(backend: &WasapiBackend, config: &Config) {
-    let icons = strip_icons(backend, config);
-    with_tray(|tray| tray.push_strip(icons));
 }
 
 /// Ask a running tray (another process) to open its settings window, letting it come to the front.
@@ -1706,7 +1056,7 @@ fn restart_app(backend: &WasapiBackend, config: &Config) {
     match std::process::Command::new(exe).arg(crate::instance::RELAUNCHED).spawn() {
         Ok(child) => {
             if taskbar::strip_is_up() {
-                taskbar::transfer_owner(child.id(), strip_icons(backend, config));
+                taskbar::transfer_owner(child.id(), endpoints::current_strip_icons(backend, config), config);
             }
             unsafe { PostQuitMessage(0) }
         }
@@ -1714,116 +1064,11 @@ fn restart_app(backend: &WasapiBackend, config: &Config) {
     }
 }
 
-/// Register the tray icon, retrying until the shell actually accepts it.
-///
-/// At logon audio-tray can start before Explorer takes icons, and a failed add is terminal
-/// (`TaskbarCreated` has already been and gone). `build` reports success even when the add did
-/// not land, so setting a property is the real test. Retries without a deadline: an audio-tray
-/// with no icon has nothing to offer, so waiting beats quitting.
-fn build_tray(backend: &WasapiBackend, config: &Config) -> Result<TrayIcon> {
-    const FIRST_GAP: Duration = Duration::from_millis(500);
-    const MAX_GAP: Duration = Duration::from_secs(5);
-    const NAG_EVERY: u32 = 12;
-
-    let initial_icon = Endpoint::read(backend, config, Flow::Output).icon;
-    let mut gap = FIRST_GAP;
-    for attempt in 1.. {
-        let built = TrayIconBuilder::new()
-            .with_tooltip(INITIAL_TOOLTIP)
-            .with_icon(icon_image(initial_icon)?)
-            .build();
-        let failure = match built {
-            // Before the hub has any battery: the device alone, until the first `refresh`.
-            Ok(tray) => match Endpoint::read(backend, config, Flow::Output).apply_with_name(&tray) {
-                Ok(()) => {
-                    if attempt > 1 {
-                        println!("tray: registered on attempt {attempt}");
-                    }
-                    return Ok(tray);
-                }
-                Err(e) => e,
-            },
-            Err(e) => e.into(),
-        };
-        if attempt == 1 || attempt % NAG_EVERY == 0 {
-            println!("tray: the shell is not taking icons yet, retrying… ({failure:#})");
-        }
-        std::thread::sleep(gap);
-        gap = (gap * 2).min(MAX_GAP);
-    }
-    unreachable!("the retry loop only exits by returning")
-}
-
-/// The current default of one flow, as both surfaces need it.
-struct Endpoint {
-    name: String,
-    icon: IconId,
-    muted: bool,
-}
-
-impl Endpoint {
-    /// One `enumerate_flow`, one `default_of` and one `is_muted`.
-    fn read(backend: &WasapiBackend, config: &Config, flow: Flow) -> Self {
-        let default = backend.default_of(flow).ok().flatten();
-        let Some(id) = default else {
-            return Self { name: "Audio output".to_string(), icon: IconId::Unknown, muted: false };
-        };
-        let muted = backend.is_muted(&id).unwrap_or(false);
-        let device = backend
-            .enumerate_flow(flow)
-            .ok()
-            .and_then(|devices| devices.into_iter().find(|d| d.id == id));
-        match device {
-            Some(d) => Self { icon: config.icon_of(&d), name: d.friendly_name, muted },
-            None => Self { name: "Audio output".to_string(), icon: IconId::Unknown, muted },
-        }
-    }
-
-    /// [`Self::apply_to`] with its name alone as the tooltip.
-    fn apply_with_name(&self, tray: &TrayIcon) -> Result<()> {
-        self.apply_to(tray, &tooltip_for(&self.name))
-    }
-
-    /// Put this endpoint on the notification icon: its glyph, and `tooltip` (its name and the rest).
-    fn apply_to(&self, tray: &TrayIcon, tooltip: &str) -> Result<()> {
-        tray.set_icon(Some(icon_image(self.icon)?))?;
-        tray.set_tooltip(Some(tooltip))?;
-        println!("refresh: default \"{}\" -> icon {:?}", self.name, self.icon);
-        Ok(())
-    }
-}
-
-/// Both defaults at once — what the strip draws, and what the tray icon shows.
-struct Current {
-    output: Endpoint,
-    input: Endpoint,
-}
-
-impl Current {
-    fn read(backend: &WasapiBackend, config: &Config) -> Self {
-        Self {
-            output: Endpoint::read(backend, config, Flow::Output),
-            input: Endpoint::read(backend, config, Flow::Input),
-        }
-    }
-
-    fn strip_icons(&self) -> StripIcons {
-        StripIcons {
-            output: taskbar::strip_glyph(self.output.icon),
-            input: taskbar::strip_glyph(self.input.icon),
-            output_muted: self.output.muted,
-            input_muted: self.input.muted,
-            // A property of the microphone, not of an endpoint; a cached atomic, not COM.
-            input_recording: mic::in_use(),
-        }
-    }
-}
-
 /// Bumped on every hub change, so the open flyout can tell when to re-read.
-static HUB_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+static HUB_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 pub(crate) fn hub_generation() -> u64 {
-    HUB_GENERATION.load(Ordering::SeqCst)
+    HUB_GENERATION.load(SeqCst)
 }
 
 /// The hub state and its generation, for the flyout; `None` outside the tray (the previews).
@@ -1832,7 +1077,7 @@ pub(crate) fn hub_snapshot() -> Option<(u64, crate::hub::State)> {
 }
 
 /// Carry out a surface's action from outside a tray handler (the flyout's modal loop).
-pub(crate) fn perform(action: crate::pill::Action) {
+pub(crate) fn perform(action: crate::hub::Action) {
     with_tray(|tray| tray.perform(action));
 }
 
@@ -1848,88 +1093,9 @@ pub(crate) fn set_teams_token(token: String) {
     });
 }
 
-
-/// The defaults and every active device, for the hub.
-fn read_endpoints(backend: &WasapiBackend, config: &Config) -> crate::hub::Endpoints {
-    let read = |flow: Flow| -> (Option<crate::hub::Endpoint>, Vec<crate::hub::Choice>) {
-        let devices = backend.enumerate_flow(flow).unwrap_or_default();
-        let choices = devices
-            .iter()
-            .map(|d| crate::hub::Choice { id: d.id.clone(), name: d.friendly_name.clone(), icon: config.icon_of(d) })
-            .collect();
-        let default = backend.default_of(flow).ok().flatten().and_then(|id| {
-            let device = devices.iter().find(|d| d.id == id)?;
-            let muted = backend.is_muted(&id).unwrap_or(false);
-            Some(crate::hub::Endpoint { icon: config.icon_of(device), name: device.friendly_name.clone(), muted, id })
-        });
-        (default, choices)
-    };
-    let (output, outputs) = read(Flow::Output);
-    let (input, inputs) = read(Flow::Input);
-    crate::hub::Endpoints { output, input, outputs, inputs }
-}
-
-/// The glyphs for the current defaults.
-pub(crate) fn strip_icons(backend: &WasapiBackend, config: &Config) -> StripIcons {
-    Current::read(backend, config).strip_icons()
-}
-
-fn icon_image(id: IconId) -> Result<Icon> {
-    // Monochrome like the shell's own tray icons, at the exact small-icon size.
-    let tint = if taskbar_is_light() { [0x20, 0x20, 0x20] } else { [0xff, 0xff, 0xff] };
-    let (rgba, w, h) = id.render(crate::win::small_icon_size(), tint)?;
-    Ok(Icon::from_rgba(rgba, w, h)?)
-}
-
-/// Whether the taskbar uses the light theme (`SystemUsesLightTheme`); absent means dark.
-fn taskbar_is_light() -> bool {
-    use windows::core::w;
-
-    crate::win::hkcu_dword(
-        w!(r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"),
-        w!("SystemUsesLightTheme"),
-    ) == Some(1)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Every message the receiver window handles, the TAP's included: a shared id would route one
-    /// as the other (a status report swallowed scroll-to-volume before this test existed).
-    #[test]
-    fn receiver_message_ids_are_distinct() {
-        let ids = [
-            notify::WM_AUDIO_REFRESH,
-            mic::WM_MIC_CHANGED,
-            WM_APPLY_SCROLL,
-            WM_TRAY_CLICK,
-            WM_ENDPOINT_VOLUME,
-            WM_ICON_CHECK,
-            crate::hub::WM_HUB_EVENTS,
-            sessions::WM_SESSIONS_CHANGED,
-            crate::pill::WM_PILL_ACTION,
-            crate::settings::WM_SETTINGS,
-            crate::settings::WM_OPEN_SETTINGS,
-            WM_ICON_RECT_CHECK,
-            WM_STRIP_MIDDLE,
-            WM_BELL_MIDDLE,
-            WM_BANNER_LISTENING,
-            WM_DISPLAY_CHANGED,
-            crate::calendar::WM_CALENDAR,
-            tap_proto::WM_TASKBAR_ACTION,
-            tap_proto::WM_TASKBAR_RESTARTED,
-            tap_proto::WM_TASKBAR_SCROLL,
-            tap_proto::WM_MUSIC_PROGRESS,
-            tap_proto::WM_TASKBAR_STATUS,
-            tap_proto::WM_TASKBAR_CLOCK_HOVER,
-            tap_proto::WM_TASKBAR_CLOCK_RECT,
-            tap_proto::WM_TAP_PANEL,
-        ];
-        for (i, a) in ids.iter().enumerate() {
-            assert!(ids[i + 1..].iter().all(|b| a != b), "0x{a:x} is used twice");
-        }
-    }
 
     #[test]
     fn wake_posts_once_until_taken() {
@@ -1974,25 +1140,6 @@ mod tests {
         assert_eq!(scroll.take(), [0.0, 0.0]);
         assert!(scroll.add(5, 120), "a new batch after the apply; unknown codes count as input");
         assert_eq!(scroll.take(), [0.0, 1.0]);
-    }
-
-    #[test]
-    fn the_tooltip_keeps_its_marker_and_lists_the_lowest_battery_first_while_it_fits() {
-        let battery = |name: &str, level: u8| crate::hub::Battery { id: name.into(), name: name.into(), kind: crate::hub::BatteryKind::Other, level };
-        let text = tooltip_text("Speakers", &[battery("Keyboard", 96), battery("Mouse", 12)]);
-        assert_eq!(text, "Speakers — Audio Tray\nMouse: 12%\nKeyboard: 96%");
-        let many: Vec<_> = (0..20).map(|i| battery(&format!("A device with a long name {i}"), i)).collect();
-        let text = tooltip_text("Speakers", &many);
-        assert!(text.starts_with("Speakers — Audio Tray\n"));
-        assert!(text.encode_utf16().count() <= TOOLTIP_MAX);
-        assert!(text.contains("name 0: 0%"), "the lowest is kept");
-    }
-
-    #[test]
-    fn points_survive_packing_including_negative_coordinates() {
-        for (x, y) in [(0, 0), (1919, 1032), (-1280, 1400), (-1, -32768), (32767, 5)] {
-            assert_eq!(unpack_point(pack_point(x, y)), (x, y));
-        }
     }
 
     #[test]

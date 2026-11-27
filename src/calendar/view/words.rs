@@ -75,6 +75,39 @@ pub struct Words {
     /// A meeting's countdown, and once it has begun.
     pub starts_in: fn(i64) -> String,
     pub started: fn(i64) -> String,
+    /// The batteries' card: its title, this PC's line, the footer's link, and with no device.
+    pub batteries: &'static str,
+    pub this_pc: &'static str,
+    pub charging: &'static str,
+    pub plugged_in: &'static str,
+    pub on_battery: &'static str,
+    pub energy_saver: &'static str,
+    pub power_settings: &'static str,
+    pub no_devices: &'static str,
+    /// A level at or under the low one, said in words (not by its colour alone).
+    pub low: &'static str,
+    pub fully_charged: &'static str,
+    /// The footer's link on a PC without a battery: the devices' own page.
+    pub bluetooth_settings: &'static str,
+    /// Audio Tray's own battery icon's menu.
+    pub show_batteries: &'static str,
+    pub battery_settings: &'static str,
+    /// "2 h 05 min left", from minutes.
+    pub time_left: fn(u32) -> String,
+    /// "43%" (French puts a space before it).
+    pub percent: fn(u8) -> String,
+    /// "Name: 43%" (French puts a space before the colon).
+    pub labelled: fn(&str, &str) -> String,
+    /// A reminder's "in 5 min".
+    pub in_minutes: fn(i64) -> String,
+    /// An event's length, from minutes: "45 min", "2 h", "1 h 30".
+    pub duration: fn(i64) -> String,
+    /// A source that failed, said over the list ("Outlook: sign in again"): a link without a name,
+    /// and what is wrong.
+    pub a_calendar_link: &'static str,
+    pub sign_in_again: &'static str,
+    pub offline: &'static str,
+    pub could_not_refresh: &'static str,
 }
 
 static EN: Words = Words {
@@ -135,6 +168,28 @@ static EN: Words = Words {
     click_to_mute: "Click to mute",
     starts_in: |s| format!("Starts in {}:{:02}", s / 60, s % 60),
     started: |m| if m < 1 { "Starting now".into() } else { format!("Started {m} min ago") },
+    batteries: "Batteries",
+    this_pc: "This PC",
+    charging: "Charging",
+    plugged_in: "Plugged in",
+    on_battery: "On battery",
+    energy_saver: "Energy saver on",
+    power_settings: "Power & battery",
+    no_devices: "No connected device reports its battery",
+    low: "low",
+    fully_charged: "Fully charged",
+    bluetooth_settings: "Bluetooth & devices",
+    show_batteries: "Show batteries",
+    battery_settings: "Battery settings",
+    time_left: |m| if m < 60 { format!("{m} min left") } else { format!("{} h {:02} min left", m / 60, m % 60) },
+    percent: |n| format!("{n}%"),
+    labelled: |name, value| format!("{name}: {value}"),
+    in_minutes: |m| format!("in {m} min"),
+    duration: duration_words,
+    a_calendar_link: "A calendar link",
+    sign_in_again: "sign in again",
+    offline: "offline",
+    could_not_refresh: "could not refresh",
 };
 
 static FR: Words = Words {
@@ -195,7 +250,73 @@ static FR: Words = Words {
     click_to_mute: "Cliquer pour couper le micro",
     starts_in: |s| format!("Commence dans {}:{:02}", s / 60, s % 60),
     started: |m| if m < 1 { "Commence maintenant".into() } else { format!("Commencée il y a {m} min") },
+    batteries: "Batteries",
+    this_pc: "Ce PC",
+    charging: "En charge",
+    plugged_in: "Branché",
+    on_battery: "Sur batterie",
+    energy_saver: "Économiseur d'énergie activé",
+    power_settings: "Alimentation et batterie",
+    no_devices: "Aucun appareil connecté n'indique sa batterie",
+    low: "faible",
+    fully_charged: "Entièrement chargée",
+    bluetooth_settings: "Bluetooth et appareils",
+    show_batteries: "Afficher les batteries",
+    battery_settings: "Paramètres des batteries",
+    time_left: |m| if m < 60 { format!("{m} min restantes") } else { format!("{} h {:02} min restantes", m / 60, m % 60) },
+    percent: |n| format!("{n}\u{a0}%"),
+    labelled: |name, value| format!("{name}\u{a0}: {value}"),
+    in_minutes: |m| format!("dans {m} min"),
+    duration: duration_words,
+    a_calendar_link: "Un lien d'agenda",
+    sign_in_again: "reconnectez-vous",
+    offline: "hors ligne",
+    could_not_refresh: "actualisation impossible",
 };
+
+/// "1 h 30", "45 min", "2 h": the same in both languages.
+fn duration_words(minutes: i64) -> String {
+    match (minutes / 60, minutes % 60) {
+        (0, m) => format!("{m} min"),
+        (h, 0) => format!("{h} h"),
+        (h, m) => format!("{h} h {m:02}"),
+    }
+}
+
+impl Words {
+    /// A battery's level, "low" said in words where it is ("12% (low)"): not by its colour alone.
+    pub fn level(&self, level: u8, low: bool) -> String {
+        if low {
+            format!("{} ({})", (self.percent)(level), self.low)
+        } else {
+            (self.percent)(level)
+        }
+    }
+
+    /// This PC's battery's state, each part that holds ("Charging · Energy saver on").
+    pub fn pc_state(&self, pc: &crate::batteries::SystemBattery) -> String {
+        let first = if pc.charging {
+            self.charging.to_string()
+        } else if pc.plugged && pc.level >= 100 {
+            self.fully_charged.to_string()
+        } else if pc.plugged {
+            self.plugged_in.to_string()
+        } else {
+            pc.left.map_or_else(|| self.on_battery.to_string(), |secs| (self.time_left)(secs / 60))
+        };
+        if pc.saver {
+            format!("{first} · {}", self.energy_saver)
+        } else {
+            first
+        }
+    }
+}
+
+/// The English words, for tests that check a wording.
+#[cfg(test)]
+pub fn english() -> &'static Words {
+    &EN
+}
 
 /// The words in Windows' display language (French for any French, else English).
 pub fn words() -> &'static Words {
@@ -215,6 +336,9 @@ mod tests {
             assert!(!words.join.is_empty() && !words.clear_all.is_empty());
             assert!((words.next_in)(125).contains("2 h 05"));
             assert!((words.cleared)(3).contains('3'));
+            assert!((words.in_minutes)(5).contains("5 min"));
+            assert_eq!((words.duration)(90), "1 h 30");
+            assert!(!words.sign_in_again.is_empty() && !words.offline.is_empty() && !words.could_not_refresh.is_empty());
         }
     }
 }

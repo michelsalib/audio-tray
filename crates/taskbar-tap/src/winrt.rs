@@ -510,7 +510,9 @@ pub struct Thickness {
 
 /// `Windows.UI.Xaml.Controls.IBorder`. `Border.Child` (single-valued, so not refused like
 /// `Panel.Children`) on a `TaskListButton`'s `Border#BackgroundElement` is how the music tile is
-/// hosted. Uncalled slots take `*mut c_void`; only their position matters.
+/// hosted; its brushes, border width and corners are the look of the shell's plate behind a tray
+/// button, which the clock's, the bell's and the battery's own plates copy. Every slot is typed
+/// as in the header (struct properties by value, out-parameters as pointers to them).
 #[interface("797c4539-45bd-4633-a044-bfb02ef5170f")]
 pub unsafe trait IBorder: IUnknown {
     pub fn GetIids(&self, count: *mut u32, iids: *mut *mut windows_core::GUID) -> HRESULT;
@@ -518,14 +520,14 @@ pub unsafe trait IBorder: IUnknown {
     pub fn GetTrustLevel(&self, level: *mut i32) -> HRESULT;
     pub fn get_BorderBrush(&self, value: *mut *mut c_void) -> HRESULT;
     pub fn put_BorderBrush(&self, value: *mut c_void) -> HRESULT;
-    pub fn get_BorderThickness(&self, value: *mut c_void) -> HRESULT;
-    pub fn put_BorderThickness(&self, value: *mut c_void) -> HRESULT;
+    pub fn get_BorderThickness(&self, value: *mut Thickness) -> HRESULT;
+    pub fn put_BorderThickness(&self, value: Thickness) -> HRESULT;
     pub fn get_Background(&self, value: *mut *mut c_void) -> HRESULT;
     pub fn put_Background(&self, value: *mut c_void) -> HRESULT;
-    pub fn get_CornerRadius(&self, value: *mut c_void) -> HRESULT;
-    pub fn put_CornerRadius(&self, value: *mut c_void) -> HRESULT;
-    pub fn get_Padding(&self, value: *mut c_void) -> HRESULT;
-    pub fn put_Padding(&self, value: *mut c_void) -> HRESULT;
+    pub fn get_CornerRadius(&self, value: *mut CornerRadius) -> HRESULT;
+    pub fn put_CornerRadius(&self, value: CornerRadius) -> HRESULT;
+    pub fn get_Padding(&self, value: *mut Thickness) -> HRESULT;
+    pub fn put_Padding(&self, value: Thickness) -> HRESULT;
     pub fn get_Child(&self, value: *mut *mut c_void) -> HRESULT;
     pub fn put_Child(&self, value: *mut c_void) -> HRESULT;
 }
@@ -560,7 +562,10 @@ pub const VISUAL_TREE_HELPER: &str = "Windows.UI.Xaml.Media.VisualTreeHelper";
 pub const GRID: &str = "Windows.UI.Xaml.Controls.Grid";
 pub const XAML_READER: &str = "Windows.UI.Xaml.Markup.XamlReader";
 pub const AUTOMATION_PROPERTIES: &str = "Windows.UI.Xaml.Automation.AutomationProperties";
-
+/// Runtime classes looked for in the recorded tree (and `TextBlock`'s statics).
+pub const CONTENT_PRESENTER: &str = "Windows.UI.Xaml.Controls.ContentPresenter";
+pub const STACK_PANEL: &str = "Windows.UI.Xaml.Controls.StackPanel";
+pub const TEXT_BLOCK: &str = "Windows.UI.Xaml.Controls.TextBlock";
 
 /// `Windows.UI.Xaml.Input.ITappedRoutedEventArgs`, for `put_Handled` on a transport tap (so it
 /// does not also activate the app).
@@ -611,8 +616,9 @@ pub unsafe trait IGrid2: IUnknown {
     pub fn put_CornerRadius(&self, value: CornerRadius) -> HRESULT;
 }
 
-/// `Windows.UI.Xaml.Controls.IBorderStatics`: the shell's plate's `Background` property, watched
-/// so the clock's and the bell's plates take its brush as it changes (rest, pointer over).
+/// `Windows.UI.Xaml.Controls.IBorderStatics`: the shell's plate's `Background` and `BorderBrush`
+/// properties, watched so the clock's, the bell's and the battery's plates take its brushes as they
+/// change (rest, pointer over, pressed).
 #[interface("b81d1639-e911-4fd7-a4c4-b9c7f008b7fc")]
 pub unsafe trait IBorderStatics: IUnknown {
     pub fn GetIids(&self, count: *mut u32, iids: *mut *mut windows_core::GUID) -> HRESULT;
@@ -692,4 +698,23 @@ pub unsafe trait IStackPanel2: IUnknown {
     pub fn _reserved11(&self) -> HRESULT;
     pub fn get_Padding(&self, value: *mut Thickness) -> HRESULT;
     pub fn put_Padding(&self, value: Thickness) -> HRESULT;
+}
+
+/// `Windows.Foundation.Numerics.Vector3`.
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug)]
+pub struct Vector3 {
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+}
+
+/// `Windows.UI.Xaml.IUIElement10`: `ActualOffset`, where an element was arranged in its parent (the
+/// battery's place in the Quick Settings button, for the shell's plate to stop short of it).
+#[interface("d531c629-ad2c-5f6b-adcf-fb87287d18d7")]
+pub unsafe trait IUIElement10: IUnknown {
+    pub fn GetIids(&self, count: *mut u32, iids: *mut *mut windows_core::GUID) -> HRESULT;
+    pub fn GetRuntimeClassName(&self, name: *mut *mut c_void) -> HRESULT;
+    pub fn GetTrustLevel(&self, level: *mut i32) -> HRESULT;
+    pub fn get_ActualOffset(&self, value: *mut Vector3) -> HRESULT;
 }

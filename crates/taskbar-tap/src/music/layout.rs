@@ -116,7 +116,7 @@ pub const COVER_HOST: &str = "MusicTileCoverHost";
 /// than property-set because a new `Image.Source` needs a fresh `BitmapImage` (no binding here,
 /// and it caches by URI).
 pub fn cover_markup(strip: &super::state::Strip, cover_px: u32, gap: u32) -> String {
-    use super::state::escape;
+    use crate::part::xml_attr;
 
     format!(
         r#"<Grid xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
@@ -142,7 +142,7 @@ pub fn cover_markup(strip: &super::state::Strip, cover_px: u32, gap: u32) -> Str
         source = match strip.cover.as_deref() {
             Some(path) => format!(
                 r#"<Image.Source><BitmapImage UriSource="file:///{}"/></Image.Source>"#,
-                escape(&path.replace('\\', "/"))
+                xml_attr(&path.replace('\\', "/"))
             ),
             None => String::new(),
         },
@@ -150,7 +150,7 @@ pub fn cover_markup(strip: &super::state::Strip, cover_px: u32, gap: u32) -> Str
 }
 
 pub fn now_playing_markup(strip: &super::state::Strip) -> String {
-    use super::state::escape;
+    use crate::part::xml_attr;
 
     let l = layout();
 
@@ -180,8 +180,8 @@ pub fn now_playing_markup(strip: &super::state::Strip) -> String {
            </Border>"#,
         text_px = l.text,
         text_visibility = if l.shows_text() { "Visible" } else { "Collapsed" },
-        title = escape(&super::ticker::window(strip.display_title(), l.title_chars, 0)),
-        artist = escape(&super::ticker::window(strip.display_artist(), l.artist_chars, 0)),
+        title = xml_attr(&super::ticker::window(strip.display_title(), l.title_chars, 0)),
+        artist = xml_attr(&super::ticker::window(strip.display_artist(), l.artist_chars, 0)),
     );
 
     // Both namespaces and the transparent background are load-bearing (see `decorate::strip_markup`).

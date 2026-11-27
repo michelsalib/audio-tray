@@ -20,9 +20,12 @@ mod sources;
 pub mod takeover;
 pub mod time;
 mod view;
+pub use view::words::{words, Words};
+#[cfg(test)]
+pub use view::words::english;
 
-pub use view::{Badge, Panel};
-pub use view::banner::{display_changed, glance, listening};
+pub use view::{battery_dot, power_changed, set_batteries, Badge, Panel};
+pub use view::banner::{display_changed, glance, listening, now_playing};
 pub mod zones;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -106,7 +109,7 @@ struct State {
     /// A fetch asked for while one was running: done next.
     again: Option<(Setup, (i32, i32))>,
     /// Problems by source, from the last fetch.
-    problems: Vec<(Source, String)>,
+    problems: Vec<(Source, Problem)>,
     /// Sign-ins in progress, each with its way to give up.
     signing_in: Vec<(Provider, Arc<AtomicBool>)>,
     sign_in_problems: Vec<(Provider, String)>,
@@ -132,7 +135,13 @@ static STATE: Mutex<State> = Mutex::new(State {
 });
 
 fn state() -> std::sync::MutexGuard<'static, State> {
-    STATE.lock().unwrap_or_else(|e| e.into_inner())
+    lock(&STATE)
+}
+
+/// `mutex` locked, even poisoned: a panic elsewhere (caught, on another thread) leaves the data as
+/// whole as it ever is here, and the calendar goes on with it.
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 fn notify() {
@@ -225,9 +234,14 @@ pub fn preview_banners(count: usize, seconds: u64) {
 
 /// Audio Tray's own notices (batteries, keyboards, audio devices, reminders, focus) are
 /// notifications, listed under the bell with every app's, not the pill's: whenever the bell is
-/// Audio Tray's.
+/// Audio Tray's (with the calendar on the clock or not).
 pub fn merges_notices(config: &crate::config::Config) -> bool {
-    config.calendar.enabled && config.calendar.notifications
+    config.calendar.bell
+}
+
+/// Whether the clock's button is Audio Tray's in any part: the clock (the calendar) or the bell.
+pub fn takes_clock_button(config: &crate::config::Config) -> bool {
+    config.calendar.enabled || config.calendar.bell
 }
 
 /// Audio Tray shows every notification itself: the bell's list is on, and Settings' take-over.
@@ -268,17 +282,46 @@ pub fn events() -> (Vec<Event>, Option<(i32, i32)>) {
     (state.events.clone(), state.range)
 }
 
-/// The first source that failed, in a few words for the panel (`Outlook: sign in again`).
+/// What kind of trouble a source is in: what the panel says of it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Trouble {
+    /// Its account must sign in again.
+    SignIn,
+    /// The service could not be reached.
+    Offline,
+    Other,
+}
+
+/// A source's problem: its kind, and in a few words (Settings shows those).
+#[derive(Clone, Debug, PartialEq)]
+struct Problem {
+    trouble: Trouble,
+    text: String,
+}
+
+impl Problem {
+    fn new(trouble: Trouble, text: impl Into<String>) -> Self {
+        Problem { trouble, text: text.into() }
+    }
+}
+
+/// The first source that failed, in a few words for the panel in Windows' language (`Outlook:
+/// sign in again`).
 pub fn problem(setup: &Setup) -> Option<String> {
     let state = state();
     let (source, why) = state.problems.first()?;
+    let t = words();
     let name = match source {
         Source::Google => "Google".to_string(),
         Source::Microsoft => "Outlook".to_string(),
-        Source::Link(i) => setup.links.get(*i).map_or_else(|| "A calendar link".into(), |l| l.name.clone()),
+        Source::Link(i) => setup.links.get(*i).map_or_else(|| t.a_calendar_link.into(), |l| l.name.clone()),
     };
-    let short = if why.contains("sign in again") { "sign in again" } else if why.starts_with("Offline") { "offline" } else { "could not refresh" };
-    Some(format!("{name}: {short}"))
+    let short = match why.trouble {
+        Trouble::SignIn => t.sign_in_again,
+        Trouble::Offline => t.offline,
+        Trouble::Other => t.could_not_refresh,
+    };
+    Some((t.labelled)(&name, short))
 }
 
 /// When events were last fetched.
@@ -310,11 +353,11 @@ pub fn status(setup: &Setup) -> Status {
             .iter()
             .find(|(p, _)| *p == provider)
             .map(|(_, why)| why.clone())
-            .or_else(|| state.problems.iter().find(|(s, _)| *s == provider.source()).map(|(_, why)| why.clone()))
+            .or_else(|| state.problems.iter().find(|(s, _)| *s == provider.source()).map(|(_, why)| why.text.clone()))
             .filter(|_| !account.signing_in);
     }
     status.links = (0..setup.links.len())
-        .map(|i| state.problems.iter().find(|(s, _)| *s == Source::Link(i)).map(|(_, why)| why.clone()))
+        .map(|i| state.problems.iter().find(|(s, _)| *s == Source::Link(i)).map(|(_, why)| why.text.clone()))
         .collect();
     status
 }
@@ -412,7 +455,7 @@ fn spawn_fetch(setup: Setup, days: (i32, i32)) {
 /// calendars.
 struct Fetched {
     events: Vec<Event>,
-    problems: Vec<(Source, String)>,
+    problems: Vec<(Source, Problem)>,
     done: Vec<Source>,
     calendars: Vec<Calendar>,
 }
@@ -457,31 +500,31 @@ fn fetch_all(setup: &Setup, days: (i32, i32)) -> Fetched {
 }
 
 /// A link's problem: there is no account to sign in again with, only the address to fix.
-fn describe_link(error: &anyhow::Error) -> String {
+fn describe_link(error: &anyhow::Error) -> Problem {
     match error.downcast_ref::<oauth::Refused>().map(|r| r.0) {
-        Some(401 | 403) => "Refused: use the calendar's secret iCal address".into(),
-        _ if format!("{error:#}").contains("not a calendar") => "Not a calendar: use its iCal (.ics) address".into(),
+        Some(401 | 403) => Problem::new(Trouble::Other, "Refused: use the calendar's secret iCal address"),
+        _ if format!("{error:#}").contains("not a calendar") => Problem::new(Trouble::Other, "Not a calendar: use its iCal (.ics) address"),
         _ => describe(error),
     }
 }
 
-/// A problem in a few words, for Settings and the calendar's footer.
-fn describe(error: &anyhow::Error) -> String {
+/// A problem, by kind and in a few words, for Settings and the calendar's list.
+fn describe(error: &anyhow::Error) -> Problem {
     if error.chain().any(|e| e.is::<sources::SignInAgain>()) {
-        return "Signed out: sign in again".into();
+        return Problem::new(Trouble::SignIn, "Signed out: sign in again");
     }
     if let Some(refused) = error.downcast_ref::<oauth::Refused>() {
         return match refused.0 {
-            401 | 403 => "Access refused: sign in again".into(),
-            404 => "Not found: check the address".into(),
-            code => format!("The server answered {code}"),
+            401 | 403 => Problem::new(Trouble::SignIn, "Access refused: sign in again"),
+            404 => Problem::new(Trouble::Other, "Not found: check the address"),
+            code => Problem::new(Trouble::Other, format!("The server answered {code}")),
         };
     }
     let text = format!("{error:#}");
     if text.contains("could not reach") {
-        return "Offline, or the service could not be reached".into();
+        return Problem::new(Trouble::Offline, "Offline, or the service could not be reached");
     }
-    text.chars().take(120).collect()
+    Problem::new(Trouble::Other, text.chars().take(120).collect::<String>())
 }
 
 /// Sign in with `provider` in the browser, on a thread of its own.
@@ -540,7 +583,7 @@ fn describe_sign_in(error: &anyhow::Error) -> String {
     if text.contains("access_denied") {
         return "Access was not allowed".into();
     }
-    describe(error)
+    describe(error).text
 }
 
 /// Give up a sign-in waiting on the browser.

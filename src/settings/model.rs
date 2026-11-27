@@ -49,6 +49,17 @@ impl Status {
             batteries: state.batteries.clone(),
         }
     }
+
+    /// Whether the connector `name` ([`crate::integrations`]' names) is connected.
+    pub(super) fn connected(&self, name: &str) -> bool {
+        self.integrations.iter().any(|(n, on)| *n == name && *on)
+    }
+}
+
+/// A secret's last characters: it is never shown whole.
+pub(super) fn masked_tail(secret: &str) -> String {
+    let tail: String = secret.chars().rev().take(4).collect::<Vec<_>>().into_iter().rev().collect();
+    format!("••••{tail}")
 }
 
 pub(super) struct Model {
@@ -119,12 +130,9 @@ impl Model {
         self.layouts.iter().map(|(hkl, _)| *hkl).find(|hkl| !used.contains(hkl)).or_else(|| self.layouts.first().map(|(hkl, _)| *hkl))
     }
 
-    /// The secret's last characters, when there is one: it is never shown whole.
-    pub(super) fn secret_tail(&self) -> Option<String> {
-        self.config.discord.client_secret.as_deref().map(|s| {
-            let tail: String = s.chars().rev().take(4).collect::<Vec<_>>().into_iter().rev().collect();
-            format!("••••{tail}")
-        })
+    /// The one-off message shown in place of `button`'s value, if it is that button's.
+    pub(super) fn hint_for(&self, button: Button) -> Option<(String, Tone)> {
+        self.hint.filter(|(b, _, _)| *b == button).map(|(_, hint, tone)| (hint.to_string(), tone))
     }
 
     /// Read the output and input devices again, keeping the open one open.
@@ -154,11 +162,11 @@ pub(super) fn paste_key(button: Button, text: &str) -> Result<(), &'static str> 
     let secret_like = (24..=64).contains(&text.len()) && text.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
     match button {
         Button::DiscordId if id_like => Ok(()),
-        Button::DiscordId if secret_like => Err(tr("That is the secret: copy the client ID", "C'est le secret : copiez l'ID client")),
-        Button::DiscordId => Err(tr("Copy the client ID first, then paste", "Copiez d'abord l'ID client, puis collez")),
-        _ if id_like => Err(tr("That is the ID: copy the client secret", "C'est l'ID : copiez le secret client")),
+        Button::DiscordId if secret_like => Err(tr("That is the secret: copy the client ID", "C’est le secret : copiez l’ID client")),
+        Button::DiscordId => Err(tr("Copy the client ID first, then paste", "Copiez d’abord l’ID client, puis collez")),
+        _ if id_like => Err(tr("That is the ID: copy the client secret", "C’est l’ID : copiez le secret client")),
         _ if secret_like => Ok(()),
-        _ => Err(tr("Copy the client secret first, then paste", "Copiez d'abord le secret client, puis collez")),
+        _ => Err(tr("Copy the client secret first, then paste", "Copiez d’abord le secret client, puis collez")),
     }
 }
 
@@ -185,17 +193,17 @@ pub(super) fn paste_calendar(key: CalendarKey, text: &str) -> Result<String, &'s
     };
     match key {
         CalendarKey::GoogleId if google_id => Ok(text.to_string()),
-        CalendarKey::GoogleId if google_secret => Err(tr("That is the secret: copy the client ID", "C'est le secret : copiez l'ID client")),
-        CalendarKey::GoogleId => Err(tr("Copy the client ID (…apps.googleusercontent.com) first", "Copiez d'abord l'ID client (…apps.googleusercontent.com)")),
+        CalendarKey::GoogleId if google_secret => Err(tr("That is the secret: copy the client ID", "C’est le secret : copiez l’ID client")),
+        CalendarKey::GoogleId => Err(tr("Copy the client ID (…apps.googleusercontent.com) first", "Copiez d’abord l’ID client (…apps.googleusercontent.com)")),
         CalendarKey::GoogleSecret if google_secret => Ok(text.to_string()),
-        CalendarKey::GoogleSecret if google_id => Err(tr("That is the ID: copy the client secret", "C'est l'ID : copiez le secret client")),
-        CalendarKey::GoogleSecret => Err(tr("Copy the client secret (GOCSPX-…) first", "Copiez d'abord le secret client (GOCSPX-…)")),
+        CalendarKey::GoogleSecret if google_id => Err(tr("That is the ID: copy the client secret", "C’est l’ID : copiez le secret client")),
+        CalendarKey::GoogleSecret => Err(tr("Copy the client secret (GOCSPX-…) first", "Copiez d’abord le secret client (GOCSPX-…)")),
         CalendarKey::MicrosoftId if guid => Ok(text.to_ascii_lowercase()),
-        CalendarKey::MicrosoftId => Err(tr("Copy the Application (client) ID from its Overview first", "Copiez d'abord l'ID d'application (client) depuis sa Vue d'ensemble")),
+        CalendarKey::MicrosoftId => Err(tr("Copy the Application (client) ID from its Overview first", "Copiez d’abord l’ID d’application (client) depuis sa Vue d’ensemble")),
         // Google's and Outlook's calendar pages (embed, HTML) are not feeds.
-        CalendarKey::Link if link && !looks_like_feed(text) => Err(tr("That is a web page: copy the calendar's secret iCal (.ics) address", "C'est une page web : copiez l'adresse secrète iCal (.ics) de l'agenda")),
+        CalendarKey::Link if link && !looks_like_feed(text) => Err(tr("That is a web page: copy the calendar's secret iCal (.ics) address", "C’est une page web : copiez l’adresse secrète iCal (.ics) de l’agenda")),
         CalendarKey::Link if link => Ok(text.to_string()),
-        CalendarKey::Link => Err(tr("Copy the calendar's address (https:// or webcal://) first", "Copiez d'abord l'adresse de l'agenda (https:// ou webcal://)")),
+        CalendarKey::Link => Err(tr("Copy the calendar's address (https:// or webcal://) first", "Copiez d’abord l’adresse de l’agenda (https:// ou webcal://)")),
     }
 }
 
@@ -255,9 +263,7 @@ mod tests {
 
     #[test]
     fn the_secret_shows_only_its_end() {
-        let mut m = Model::new(Config::default());
-        assert_eq!(m.secret_tail(), None);
-        m.config.discord.client_secret = Some("abcdefghWXYZ".into());
-        assert_eq!(m.secret_tail().as_deref(), Some("••••WXYZ"));
+        assert_eq!(masked_tail("abcdefghWXYZ"), "••••WXYZ");
+        assert_eq!(masked_tail("ab"), "••••ab");
     }
 }

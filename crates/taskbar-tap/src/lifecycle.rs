@@ -29,15 +29,20 @@ pub use tap_proto::WM_TAP_WIRE_TRANSPORT;
 
 pub use tap_proto::WM_TAP_REPIN;
 
+// The control window's timers.
+/// The periodic check that the strip is still there.
+const SWEEP_TIMER: usize = 1;
 /// Retries a re-pin that met a busy thread or a stream that was not yet quiet.
 const REPIN_TIMER: usize = 2;
+/// Updates the clock's text, at each minute (each second with seconds shown).
+const TEXT_TIMER: usize = 3;
+/// Steps the bell's ring.
+const RING_TIMER: usize = 4;
+
 const REPIN_RETRY_MS: u32 = 16;
 /// About a second of retries; past that the sweep (the safety net) takes over.
 const REPIN_MAX_TRIES: u32 = 60;
 static REPIN_TRIES: AtomicU32 = AtomicU32::new(0);
-
-/// Timer id for the periodic check that the strip is still there.
-const SWEEP_TIMER: usize = 1;
 
 /// Sweep interval while there is work outstanding. The sweep is the only mutator, so this bounds
 /// how fast the strip appears or a declined redraw lands (user-visible).
@@ -52,6 +57,12 @@ static SWEEP_INTERVAL: AtomicU32 = AtomicU32::new(0);
 
 /// The control window, or 0 before it exists. Also the "already created" flag.
 static WINDOW: AtomicIsize = AtomicIsize::new(0);
+
+/// The control window, once created.
+fn window() -> Option<HWND> {
+    let hwnd = WINDOW.load(Ordering::SeqCst);
+    (hwnd != 0).then_some(HWND(hwnd as *mut core::ffi::c_void))
+}
 
 /// The thread that owns the taskbar's XAML island (Explorer calls back on several islands'
 /// threads), learned from `SystemTray.*` events by [`adopt_tray_thread`].
@@ -87,9 +98,10 @@ unsafe extern "system" fn control_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    // Inside Explorer's message pump: nothing may unwind, so every arm runs under `crate::guard`.
+    use crate::guard;
     if msg == WM_TAP_REVERT {
-        // Inside Explorer's message pump: nothing may unwind.
-        let caught = std::panic::catch_unwind(|| {
+        guard("revert handler", || {
             let from = wparam.0 as u32;
             if !revert_is_current(from) {
                 logf!("revert from pid {from} ignored — pid {} owns the strip now", OWNER_PID.load(Ordering::SeqCst));
@@ -98,13 +110,10 @@ unsafe extern "system" fn control_proc(
             logf!("revert requested — on thread {}", crate::tid());
             unsafe { crate::revert() };
         });
-        if caught.is_err() {
-            logf!("revert handler panicked");
-        }
         return LRESULT(0);
     }
     if msg == WM_TAP_RESTYLE {
-        let caught = std::panic::catch_unwind(|| {
+        guard("restyle handler", || {
             // Unpack: codepoint in the low 24 bits, muted at bit 24, and — the input's
             // alone — "an app is recording" at bit 25.
             let glyph = |packed: usize| {
@@ -118,50 +127,50 @@ unsafe extern "system" fn control_proc(
             let (input, in_muted, in_recording) = glyph(lparam.0 as usize);
             unsafe { crate::restyle(out, out_muted, input, in_muted, in_recording) };
         });
-        if caught.is_err() {
-            logf!("restyle handler panicked");
-        }
         return LRESULT(0);
     }
     if msg == tap_proto::WM_TAP_PROGRESS_WINDOW {
-        crate::music::set_progress_window(wparam.0 as isize);
+        guard("progress window handler", || crate::music::set_progress_window(wparam.0 as isize));
         return LRESULT(0);
     }
     if msg == tap_proto::WM_TAP_MUSIC_CHANGED {
-        crate::music::state::mark_changed();
+        guard("music handler", crate::music::state::mark_changed);
         return LRESULT(0);
     }
     if msg == tap_proto::WM_TAP_BELL_RING {
-        crate::clock::ring();
-        unsafe { SetTimer(Some(hwnd), crate::clock::RING_TIMER, crate::clock::RING_MS, None) };
+        guard("bell ring handler", || {
+            crate::clock::ring();
+            unsafe { SetTimer(Some(hwnd), RING_TIMER, crate::clock::RING_MS, None) };
+        });
         return LRESULT(0);
     }
-    if msg == WM_TIMER && wparam.0 == crate::clock::RING_TIMER {
-        let more = std::panic::catch_unwind(|| unsafe { crate::clock::ring_step() }).unwrap_or(false);
+    if msg == WM_TIMER && wparam.0 == RING_TIMER {
+        let more = guard("bell ring step", || unsafe { crate::clock::ring_step() }).unwrap_or(false);
         if !more {
-            let _ = unsafe { KillTimer(Some(hwnd), crate::clock::RING_TIMER) };
+            let _ = unsafe { KillTimer(Some(hwnd), RING_TIMER) };
         }
         return LRESULT(0);
     }
     if msg == tap_proto::WM_TAP_PANEL {
-        if std::panic::catch_unwind(|| crate::clock::set_panel(wparam.0)).is_err() {
-            logf!("panel handler panicked");
-        }
+        guard("panel handler", || crate::panel_changed(wparam.0));
         return LRESULT(0);
     }
     if msg == WM_TAP_WIRE_TRANSPORT {
         // Cleared before the work, so buttons announced meanwhile get another pass.
         WIRE_PENDING.store(false, Ordering::SeqCst);
-        let caught = std::panic::catch_unwind(|| unsafe { crate::wire_transport() });
-        if caught.is_err() {
-            logf!("transport wiring panicked");
-        }
+        guard("transport wiring", || unsafe { crate::wire_transport() });
         return LRESULT(0);
     }
     if msg == WM_COPYDATA {
-        let caught = std::panic::catch_unwind(|| {
-            let copy = unsafe { (lparam.0 as *const COPYDATASTRUCT).as_ref() }?;
-            if (copy.dwData != HANDOVER_MAGIC && copy.dwData != tap_proto::CLOCK_MAGIC) || copy.lpData.is_null() {
+        let copy = unsafe { (lparam.0 as *const COPYDATASTRUCT).as_ref() };
+        let what = match copy.map(|c| c.dwData) {
+            Some(tap_proto::CLOCK_MAGIC) => "clock text handler",
+            Some(tap_proto::BATTERY_MAGIC) => "battery look handler",
+            _ => "handover handler",
+        };
+        let answered = guard(what, || {
+            let copy = copy?;
+            if ![HANDOVER_MAGIC, tap_proto::CLOCK_MAGIC, tap_proto::BATTERY_MAGIC].contains(&copy.dwData) || copy.lpData.is_null() {
                 return None;
             }
             let units = unsafe { core::slice::from_raw_parts(copy.lpData as *const u16, copy.cbData as usize / 2) };
@@ -171,15 +180,16 @@ unsafe extern "system" fn control_proc(
                 crate::clock::set_text(data);
                 return Some(1);
             }
+            if copy.dwData == tap_proto::BATTERY_MAGIC {
+                crate::battery::set_look(data);
+                return Some(1);
+            }
             Some(crate::hand_over(data))
         });
-        match caught {
-            Ok(Some(code)) => return LRESULT(code),
-            Ok(None) => {}
-            Err(_) => {
-                logf!("handover handler panicked");
-                return LRESULT(0);
-            }
+        match answered {
+            Some(Some(code)) => return LRESULT(code),
+            Some(None) => {}
+            None => return LRESULT(0),
         }
     }
     if msg == WM_TAP_REPIN || (msg == WM_TIMER && wparam.0 == REPIN_TIMER) {
@@ -187,10 +197,7 @@ unsafe extern "system" fn control_proc(
             REPIN_PENDING.store(false, Ordering::SeqCst);
             REPIN_TRIES.store(0, Ordering::SeqCst);
         }
-        let done = std::panic::catch_unwind(|| unsafe { crate::repin() }).unwrap_or_else(|_| {
-            logf!("re-pin panicked");
-            true
-        });
+        let done = guard("re-pin", || unsafe { crate::repin() }).unwrap_or(true);
         if done || REPIN_TRIES.fetch_add(1, Ordering::SeqCst) >= REPIN_MAX_TRIES {
             let _ = unsafe { KillTimer(Some(hwnd), REPIN_TIMER) };
         } else {
@@ -198,25 +205,19 @@ unsafe extern "system" fn control_proc(
         }
         return LRESULT(0);
     }
-    if msg == WM_TIMER && wparam.0 == crate::clock::TEXT_TIMER {
-        let next = std::panic::catch_unwind(|| unsafe { crate::clock::tick() }).unwrap_or_else(|_| {
-            logf!("clock tick panicked");
-            None
-        });
-        match next {
-            Some(ms) => unsafe { SetTimer(Some(hwnd), crate::clock::TEXT_TIMER, ms, None) },
+    if msg == WM_TIMER && wparam.0 == TEXT_TIMER {
+        // A panic stops the timer, as `None` does.
+        match guard("clock tick", || unsafe { crate::clock::tick() }).flatten() {
+            Some(ms) => unsafe { SetTimer(Some(hwnd), TEXT_TIMER, ms, None) },
             None => {
-                let _ = unsafe { KillTimer(Some(hwnd), crate::clock::TEXT_TIMER) };
+                let _ = unsafe { KillTimer(Some(hwnd), TEXT_TIMER) };
                 0
             }
         };
         return LRESULT(0);
     }
     if msg == WM_TIMER && wparam.0 == SWEEP_TIMER {
-        let caught = std::panic::catch_unwind(|| unsafe { crate::timed_sweep() });
-        if caught.is_err() {
-            logf!("sweep panicked");
-        }
+        guard("sweep", || unsafe { crate::timed_sweep() });
         return LRESULT(0);
     }
     unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
@@ -246,21 +247,13 @@ static WIRE_PENDING: AtomicBool = AtomicBool::new(false);
 /// wired, a press goes to the player's window and does nothing). Safe from any thread, including
 /// inside the visual-tree callback: it only posts.
 pub fn nudge_transport() {
-    let hwnd = WINDOW.load(Ordering::SeqCst);
-    if hwnd == 0 {
+    let Some(hwnd) = window() else {
         return;
-    }
+    };
     if WIRE_PENDING.swap(true, Ordering::SeqCst) {
         return;
     }
-    let posted = unsafe {
-        PostMessageW(
-            Some(HWND(hwnd as *mut core::ffi::c_void)),
-            WM_TAP_WIRE_TRANSPORT,
-            WPARAM(0),
-            LPARAM(0),
-        )
-    };
+    let posted = unsafe { PostMessageW(Some(hwnd), WM_TAP_WIRE_TRANSPORT, WPARAM(0), LPARAM(0)) };
     if posted.is_err() {
         // Nothing else clears the flag; the sweep is the fallback.
         WIRE_PENDING.store(false, Ordering::SeqCst);
@@ -273,11 +266,13 @@ static REPIN_PENDING: AtomicBool = AtomicBool::new(false);
 /// Ask for the music tile's indicators to be re-pinned as soon as the stream allows. Safe from inside
 /// the visual-tree callback and from any thread: it only posts.
 pub fn nudge_repin() {
-    let hwnd = WINDOW.load(Ordering::SeqCst);
-    if hwnd == 0 || REPIN_PENDING.swap(true, Ordering::SeqCst) {
+    let Some(hwnd) = window() else {
+        return;
+    };
+    if REPIN_PENDING.swap(true, Ordering::SeqCst) {
         return;
     }
-    let posted = unsafe { PostMessageW(Some(HWND(hwnd as *mut core::ffi::c_void)), WM_TAP_REPIN, WPARAM(0), LPARAM(0)) };
+    let posted = unsafe { PostMessageW(Some(hwnd), WM_TAP_REPIN, WPARAM(0), LPARAM(0)) };
     if posted.is_err() {
         REPIN_PENDING.store(false, Ordering::SeqCst);
     }
@@ -285,15 +280,14 @@ pub fn nudge_repin() {
 
 /// (Re)start the clock text timer to fire in `ms`. Tray thread only.
 pub fn arm_clock_timer(ms: u32) {
-    let hwnd = WINDOW.load(Ordering::SeqCst);
-    if hwnd != 0 {
-        unsafe { SetTimer(Some(HWND(hwnd as *mut core::ffi::c_void)), crate::clock::TEXT_TIMER, ms, None) };
+    if let Some(hwnd) = window() {
+        unsafe { SetTimer(Some(hwnd), TEXT_TIMER, ms, None) };
     }
 }
 
 /// Creates the control window, once, on the calling thread. Call only on the tray thread.
 pub fn ensure_window() {
-    if WINDOW.load(Ordering::SeqCst) != 0 {
+    if window().is_some() {
         return;
     }
     let class = crate::wide(CONTROL_CLASS);
@@ -354,18 +348,10 @@ pub unsafe fn set_sweep_pace(settled: bool) {
     if SWEEP_INTERVAL.swap(wanted, Ordering::SeqCst) == wanted {
         return;
     }
-    let hwnd = WINDOW.load(Ordering::SeqCst);
-    if hwnd == 0 {
+    let Some(hwnd) = window() else {
         return;
-    }
-    unsafe {
-        SetTimer(
-            Some(HWND(hwnd as *mut core::ffi::c_void)),
-            SWEEP_TIMER,
-            wanted,
-            None,
-        )
     };
+    unsafe { SetTimer(Some(hwnd), SWEEP_TIMER, wanted, None) };
     logf!("sweeping every {wanted}ms");
 }
 
@@ -409,22 +395,14 @@ pub fn watch_owner(pid: Option<String>) {
 
 /// Posts (never sends: do not block on the shell's UI thread) a revert to the control window.
 pub fn request_revert(pid: u32) {
-    let hwnd = WINDOW.load(Ordering::SeqCst);
-    if hwnd == 0 {
+    let Some(hwnd) = window() else {
         // Nowhere to post it yet: left for the next tray callback.
         PENDING_REVERT_PID.store(pid, Ordering::SeqCst);
         PENDING_REVERT.store(true, Ordering::SeqCst);
         logf!("revert requested before the control window existed — deferred");
         return;
-    }
-    let posted = unsafe {
-        PostMessageW(
-            Some(HWND(hwnd as *mut core::ffi::c_void)),
-            WM_TAP_REVERT,
-            WPARAM(pid as usize),
-            LPARAM(0),
-        )
     };
+    let posted = unsafe { PostMessageW(Some(hwnd), WM_TAP_REVERT, WPARAM(pid as usize), LPARAM(0)) };
     if let Err(err) = posted {
         logf!("posting the revert failed: {err}");
     }

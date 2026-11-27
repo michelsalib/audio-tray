@@ -89,10 +89,9 @@ fn app_icon(pid: u32, px: u32) -> Option<std::sync::Arc<Vec<u8>>> {
 /// The voice panel: a call an integration reports, or a meeting app holding the microphone.
 #[derive(Clone, PartialEq)]
 pub(super) struct Voice {
-    pub app: Option<crate::hub::VoiceApp>,
+    /// The call, as every surface sums it up.
+    pub call: crate::hub::CallSummary,
     pub title: String,
-    /// (name, speaking, muted), at most a handful.
-    pub members: Vec<(String, bool, bool)>,
     pub muted: bool,
 }
 
@@ -131,7 +130,6 @@ pub(super) struct Model {
     /// The Batteries section: every connected device that reports one, when it is shown.
     pub batteries: Vec<crate::hub::Battery>,
     // outcome, accumulated while the flyout is open
-    pub quit: bool,
     pub restart: bool,
     /// Open the settings window once the flyout has closed.
     pub settings: bool,
@@ -152,7 +150,6 @@ impl Model {
             page: 0,
             apps_scroll: 0,
             batteries: Vec::new(),
-            quit: false,
             restart: false,
             settings: false,
         }
@@ -188,55 +185,31 @@ pub(super) fn from_hub(state: &crate::hub::State, art_px: u32, icon_px: u32, old
             art,
         }
     }).collect();
-    // Cards already shown keep their place; one whose session went away stays, paused, so the
-    // next card never slides under the pointer while the panel is open. The same track coming
-    // back from another source (Edge's SMTC session giving way to the extension's tab) takes
-    // that card over rather than show twice.
-    let mut fresh: Vec<NowPlaying> = now_playing;
-    let mut now_playing: Vec<NowPlaying> = Vec::with_capacity(old.len() + fresh.len());
-    for o in old {
-        let new_source = |n: &NowPlaying| !old.iter().any(|o| o.app_id == n.app_id) && crate::hub::names::same_title(&n.title, &o.title);
-        let card = match fresh.iter().position(|n| n.app_id == o.app_id).or_else(|| fresh.iter().position(new_source)) {
-            Some(i) => fresh.remove(i),
-            None => NowPlaying { playing: false, ..o.clone() },
-        };
-        now_playing.push(card);
-    }
-    now_playing.extend(fresh);
+    // Cards already shown keep their place, so the next card never slides under the pointer while
+    // the panel is open (see `hub::keep_places`).
+    let now_playing = crate::hub::keep_places(old, now_playing, |c| c.app_id.as_str(), |c| c.title.as_str(), |c| NowPlaying { playing: false, ..c.clone() });
     let apps = state
         .sessions
         .iter()
         .map(|s| AppRow::of(s, icon_px))
         .collect();
-    let voice = match state.call() {
-        Some((app, call)) => Some(Voice {
-            app: Some(app),
-            title: match &call.channel {
-                Some(channel) => format!("{} · {channel}", app.label()),
-                None => app.label().to_string(),
-            },
-            members: call.members.iter().map(|m| (m.name.clone(), m.speaking, m.muted)).collect(),
-            muted: call.self_muted,
-        }),
-        None => state
-            .mic_users
-            .iter()
-            .map(|u| crate::hub::names::app_name(u))
-            .find(|name| crate::hub::names::is_meeting_app(name))
-            .map(|name| Voice {
-                app: None,
-                title: format!("{name} is using the microphone"),
-                members: Vec::new(),
-                muted: state.endpoints.input.as_ref().is_some_and(|e| e.muted),
-            }),
-    };
+    let voice = state.call_summary().map(|call| {
+        // A call an integration reports is muted as the app says; a meeting app only seen on the
+        // microphone, as the microphone is.
+        let (title, muted) = match (&call.app, &call.holder) {
+            (None, Some(name)) => (crate::tf!("{name} is using the microphone", "{name} utilise le micro"), call.mic_muted),
+            _ => (call.title(), call.self_muted),
+        };
+        Voice { call, title, muted }
+    });
     (now_playing, apps, voice)
 }
 
 /// The batteries as the hub has them, or (the `--flyout` preview, no tray) as read now. None while
-/// they are not followed.
+/// they are not followed, or while Windows' battery icon is their home (no section, no level on a
+/// device's row).
 pub(super) fn batteries_now(config: &Config) -> Vec<crate::hub::Battery> {
-    if !config.batteries.enabled {
+    if !config.levels_in_audio() {
         return Vec::new();
     }
     match crate::tray::hub_snapshot() {

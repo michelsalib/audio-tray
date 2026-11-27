@@ -47,6 +47,8 @@ mod pill;
 mod secrets;
 mod settings;
 mod taskbar;
+mod text;
+mod theme;
 mod toast;
 mod tray;
 mod update;
@@ -100,6 +102,11 @@ fn main() -> Result<()> {
             println!("taskbar: controls removed.");
         }
         _ => {
+            // Only the tray's own options start it: a mistyped mode must not start (or forward to)
+            // a tray. (The browser's native-host launch was told apart above, by its origin.)
+            if let Some(unknown) = args.iter().find(|arg| arg.starts_with('-') && !TRAY_OPTIONS.contains(&arg.as_str())) {
+                anyhow::bail!("unknown option {unknown:?}; the modes are listed at the top of main.rs (and dev.rs in a dev build)");
+            }
             // Launched again (the Start menu): the running tray opens its settings. Not a relaunch,
             // which is waiting for this tray to go.
             if !args.iter().any(|arg| arg == instance::RELAUNCHED) && tray::forward_open_settings() {
@@ -107,13 +114,19 @@ fn main() -> Result<()> {
             }
             // One tray per session. A second launch exits quietly once the wait runs out.
             let Some(_instance) = instance::acquire(instance::wait_budget(&args)) else {
-                eprintln!("audio-tray: already running — exiting");
+                println!("audio-tray: already running — exiting");
                 return Ok(());
             };
             // Background self-update, applied on next launch. No-op in debug builds.
             update::spawn_background_check();
-            tray::run(backend, args.iter().any(|arg| arg == "--settings"))?;
+            tray::run(backend, args.iter().any(|arg| arg == SETTINGS))?;
         }
     }
     Ok(())
 }
+
+/// Opens the settings window once the tray is up.
+const SETTINGS: &str = "--settings";
+
+/// The options the tray itself takes; any other is refused.
+const TRAY_OPTIONS: [&str; 2] = [SETTINGS, instance::RELAUNCHED];

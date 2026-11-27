@@ -106,7 +106,7 @@ unsafe fn container(path: &[u16]) -> Option<String> {
     if CM_Locate_DevNodeW(&mut devinst, PCWSTR(instance.as_ptr()), CM_LOCATE_DEVNODE_NORMAL) != CR_SUCCESS {
         return None;
     }
-    super::guid_prop(devinst, &DEVPKEY_Device_ContainerId).map(|g| super::guid_string(&g))
+    crate::win::devnode_guid(devinst, &DEVPKEY_Device_ContainerId).map(|g| super::guid_string(&g))
 }
 
 #[cfg(test)]

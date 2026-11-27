@@ -3,11 +3,11 @@
 //! DIPs into composition surfaces; DWM composes and animates them, so a still pill costs nothing.
 
 use anyhow::{Context, Result};
-use windows::core::{w, Interface, PCWSTR};
+use windows::core::{w, Interface};
 use windows::Win32::Foundation::{HMODULE, HWND, POINT};
 use windows::Win32::Graphics::Direct2D::Common::{
     D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_BORDER_MODE_HARD, D2D1_COLOR_F, D2D1_FIGURE_BEGIN_HOLLOW, D2D1_FIGURE_END_CLOSED,
-    D2D1_FIGURE_END_OPEN, D2D1_PIXEL_FORMAT, D2D_RECT_F, D2D_SIZE_U,
+    D2D1_FIGURE_END_OPEN, D2D1_PIXEL_FORMAT, D2D_RECT_F,
 };
 use windows::Win32::Graphics::Direct2D::Common::{D2D1_FIGURE_BEGIN_FILLED, D2D1_GRADIENT_STOP};
 use windows::Win32::Graphics::Direct2D::{
@@ -21,7 +21,6 @@ use windows::Win32::Graphics::Direct2D::{
     D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION, D2D1_INTERPOLATION_MODE_LINEAR, D2D1_PROPERTY_TYPE_ENUM,
     D2D1_PROPERTY_TYPE_FLOAT,
     D2D1CreateFactory, ID2D1Bitmap1, ID2D1Device, ID2D1DeviceContext, ID2D1Factory1, ID2D1RenderTarget,
-    D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, D2D1_BITMAP_PROPERTIES,
     ID2D1SolidColorBrush, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1_BITMAP_BRUSH_PROPERTIES1,
     D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_ELLIPSE, D2D1_EXTEND_MODE_CLAMP, D2D1_FACTORY_OPTIONS,
     D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC, D2D1_ROUNDED_RECT,
@@ -35,11 +34,8 @@ use windows::Win32::Graphics::DirectComposition::{
     IDCompositionVisual2,
 };
 use windows::Win32::Graphics::DirectWrite::{
-    DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat, DWRITE_FACTORY_TYPE_SHARED,
-    DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT, DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_WEIGHT_NORMAL,
-    DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_MEASURING_MODE_NATURAL, DWRITE_PARAGRAPH_ALIGNMENT_CENTER,
-    DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_TEXT_METRICS, DWRITE_TRIMMING, DWRITE_TRIMMING_GRANULARITY_CHARACTER,
-    DWRITE_WORD_WRAPPING_NO_WRAP,
+    DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat, DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_WEIGHT_BOLD,
+    DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_MEASURING_MODE_NATURAL,
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_ALPHA_MODE_PREMULTIPLIED, DXGI_FORMAT_B8G8R8A8_UNORM};
 use windows::Win32::Graphics::Dxgi::IDXGIDevice;
@@ -77,7 +73,7 @@ impl Rgba {
 }
 
 /// Which text style.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Font {
     Title,
     Body,
@@ -89,6 +85,29 @@ pub enum Font {
     Initial,
     /// The LIVE badge: tiny, bold, centred.
     Badge,
+}
+
+impl Font {
+    /// Every font, in its own order: [`Gfx`] makes their formats in this order and finds each by
+    /// its value.
+    const ALL: [Font; 7] = [Font::Title, Font::Body, Font::Small, Font::Icons, Font::IconsSmall, Font::Initial, Font::Badge];
+
+    /// Its family, weight, size and flow.
+    fn spec(self) -> crate::text::Spec {
+        use crate::text::{Flow, Spec};
+        let text = w!("Segoe UI Variable Text");
+        let icons = w!("Segoe Fluent Icons");
+        let (family, weight, size, flow) = match self {
+            Font::Title => (text, DWRITE_FONT_WEIGHT_SEMI_BOLD, 13.0, Flow::Line),
+            Font::Body => (text, DWRITE_FONT_WEIGHT_NORMAL, 12.0, Flow::Line),
+            Font::Small => (text, DWRITE_FONT_WEIGHT_SEMI_BOLD, 11.0, Flow::Line),
+            Font::Icons => (icons, DWRITE_FONT_WEIGHT_NORMAL, 16.0, Flow::Centred),
+            Font::IconsSmall => (icons, DWRITE_FONT_WEIGHT_NORMAL, 12.0, Flow::Centred),
+            Font::Initial => (text, DWRITE_FONT_WEIGHT_SEMI_BOLD, 15.0, Flow::Centred),
+            Font::Badge => (text, DWRITE_FONT_WEIGHT_BOLD, 8.0, Flow::Centred),
+        };
+        Spec { family, weight, size, flow }
+    }
 }
 
 pub struct Gfx {
@@ -197,40 +216,8 @@ impl Gfx {
                 offscreen,
                 colours: Default::default(),
             };
-            gfx.formats = vec![
-                gfx.format(w!("Segoe UI Variable Text"), DWRITE_FONT_WEIGHT_SEMI_BOLD, 13.0, false)?,
-                gfx.format(w!("Segoe UI Variable Text"), DWRITE_FONT_WEIGHT_NORMAL, 12.0, false)?,
-                gfx.format(w!("Segoe UI Variable Text"), DWRITE_FONT_WEIGHT_SEMI_BOLD, 11.0, false)?,
-                gfx.format(w!("Segoe Fluent Icons"), DWRITE_FONT_WEIGHT_NORMAL, 16.0, true)?,
-                gfx.format(w!("Segoe Fluent Icons"), DWRITE_FONT_WEIGHT_NORMAL, 12.0, true)?,
-                gfx.format(w!("Segoe UI Variable Text"), DWRITE_FONT_WEIGHT_SEMI_BOLD, 15.0, true)?,
-                gfx.format(w!("Segoe UI Variable Text"), DWRITE_FONT_WEIGHT_BOLD, 8.0, true)?,
-            ];
+            gfx.formats = Font::ALL.iter().map(|font| crate::text::format(&gfx.dwrite, font.spec(), w!("en-us"))).collect::<Result<_>>()?;
             Ok(gfx)
-        }
-    }
-
-    fn format(&self, family: PCWSTR, weight: DWRITE_FONT_WEIGHT, size: f32, centred: bool) -> Result<IDWriteTextFormat> {
-        unsafe {
-            let format = self.dwrite.CreateTextFormat(
-                family,
-                None,
-                weight,
-                DWRITE_FONT_STYLE_NORMAL,
-                DWRITE_FONT_STRETCH_NORMAL,
-                size,
-                w!("en-us"),
-            )?;
-            format.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
-            format.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
-            if centred {
-                format.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)?;
-            } else {
-                let sign = self.dwrite.CreateEllipsisTrimmingSign(&format)?;
-                let trimming = DWRITE_TRIMMING { granularity: DWRITE_TRIMMING_GRANULARITY_CHARACTER, delimiter: 0, delimiterCount: 0 };
-                format.SetTrimming(&trimming, &sign)?;
-            }
-            Ok(format)
         }
     }
 
@@ -240,17 +227,7 @@ impl Gfx {
 
     /// The width of `text` in `font`, in DIPs.
     pub fn measure(&self, font: Font, text: &str) -> f32 {
-        let wide: Vec<u16> = text.encode_utf16().collect();
-        unsafe {
-            let Ok(layout) = self.dwrite.CreateTextLayout(&wide, self.text_format(font), 4096.0, 100.0) else {
-                return 0.0;
-            };
-            let mut metrics = DWRITE_TEXT_METRICS::default();
-            if layout.GetMetrics(&mut metrics).is_err() {
-                return 0.0;
-            }
-            metrics.widthIncludingTrailingWhitespace
-        }
+        crate::text::width(&self.dwrite, self.text_format(font), text)
     }
 
     /// A visual showing a fresh surface of `w` × `h` DIPs drawn by `draw`, which works in DIPs.
@@ -510,37 +487,6 @@ impl Painter<'_> {
         Ok(true)
     }
 
-    /// A device icon in white, `size` DIPs square, centred on `(cx, cy)`: rendered as the tray
-    /// renders it, for the icons no font has.
-    pub fn icon(&mut self, icon: crate::icons::IconId, cx: f32, cy: f32, size: f32) -> Result<()> {
-        let px = (size * self.gfx.scale).round() as u32;
-        let (rgba, w, h) = icon.render(px, [0xFF, 0xFF, 0xFF])?;
-        // Straight RGBA to premultiplied BGRA.
-        let bgra: Vec<u8> = rgba
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .flat_map(|p| {
-                let m = |c: u8| ((c as u32 * p[3] as u32 + 127) / 255) as u8;
-                [m(p[2]), m(p[1]), m(p[0]), p[3]]
-            })
-            .collect();
-        let dpi = 96.0 * self.gfx.scale;
-        let props = D2D1_BITMAP_PROPERTIES {
-            pixelFormat: D2D1_PIXEL_FORMAT { format: DXGI_FORMAT_B8G8R8A8_UNORM, alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED },
-            dpiX: dpi,
-            dpiY: dpi,
-        };
-        unsafe {
-            let target: ID2D1RenderTarget = self.dc.cast()?;
-            let bitmap = target.CreateBitmap(D2D_SIZE_U { width: w, height: h }, Some(bgra.as_ptr() as *const _), w * 4, &props)?;
-            let (bw, bh) = (w as f32 / self.gfx.scale, h as f32 / self.gfx.scale);
-            let at = rect(cx - bw / 2.0, cy - bh / 2.0, bw, bh);
-            target.DrawBitmap(&bitmap, Some(&at), 1.0, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, None);
-        }
-        Ok(())
-    }
-
     /// `text` in `font`, left-aligned in the box `(x, y, w, h)` (or centred, for the centred
     /// fonts), vertically centred, cut with an ellipsis.
     pub fn text(&mut self, text: &str, font: Font, (x, y, w, h): (f32, f32, f32, f32), color: Rgba) -> Result<()> {
@@ -661,4 +607,18 @@ fn rect(x: f32, y: f32, w: f32, h: f32) -> D2D_RECT_F {
 
 fn ellipse(cx: f32, cy: f32, r: f32) -> D2D1_ELLIPSE {
     D2D1_ELLIPSE { point: Vector2 { X: cx, Y: cy }, radiusX: r, radiusY: r }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Font;
+
+    /// A font's format is found by its value: [`Font::ALL`] lists every font, each at its value.
+    #[test]
+    fn every_font_is_listed_at_its_own_place() {
+        for (i, font) in Font::ALL.iter().enumerate() {
+            assert_eq!(*font as usize, i, "{font:?}");
+        }
+        assert_eq!(Font::ALL.len(), Font::Badge as usize + 1);
+    }
 }

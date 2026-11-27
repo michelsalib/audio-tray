@@ -1,12 +1,16 @@
-//! Design tokens for the flyout: layout dimensions (DIPs), palette, Fluent glyphs, UI fonts
-//! and the accent colour. The `pub(crate)` ones are shared with [`crate::osd`].
+//! Design tokens for the flyout: layout dimensions (DIPs), palette, Fluent glyphs and fonts. The
+//! look every panel shares (the mode, the accent, the panel's ground) is [`crate::theme`]'s,
+//! re-exported here for the flyout and Settings.
 
 use std::sync::OnceLock;
 
 use ab_glyph::FontVec;
-use windows::core::w;
 
-use crate::canvas::{Canvas, Rect};
+use crate::icons::glyph;
+pub(crate) use crate::theme::{
+    accent_rgb, accent_shade, endpoint_glyph, light, panel_accent, recording_dot, refresh_mode, text, tint, tint_a, ui_font, DIVIDER_A,
+    FOOTER_SHADE_A, PANEL_W, TRACK_H,
+};
 
 // Layout, in DIPs (scaled by the monitor DPI at show time). Tuned to the native Win11
 // sound flyout: roomy rows, a semibold section header, an accent selection pill.
@@ -21,10 +25,6 @@ pub(super) const ICON_PX: f32 = 20.0; // leading icon glyph size
 pub(super) const TEXT_X: f32 = 48.0; // left inset of a row's label
 pub(super) const HEADER_X: f32 = 15.0; // left inset of a section-header label
 pub(super) const RIGHT_PAD: f32 = 16.0;
-pub(super) const MIN_W: f32 = PANEL_W; // every panel is as wide: this one, the calendar, the notifications
-pub(super) const MAX_W: f32 = PANEL_W; // long device names are cut with "…"
-/// Every panel's width (the calendar's and the notifications' cards take it too).
-pub(crate) const PANEL_W: f32 = 380.0;
 pub(super) const ROW_MARGIN: f32 = 4.0; // side margin of the row highlight/pill
 pub(super) const ROW_RADIUS: f32 = 4.0; // corner radius of the row highlight
 pub(super) const PILL_W: f32 = 3.0; // accent selection-indicator pill width
@@ -33,7 +33,6 @@ pub(super) const BATTERY_W: f32 = 80.0; // right-hand space reserved on battery 
 // slider geometry
 pub(super) const TRACK_X0: f32 = 52.0; // track left edge
 pub(super) const VALUE_W: f32 = 46.0; // reserved right area for the percentage
-pub(crate) const TRACK_H: f32 = 4.0;
 pub(super) const THUMB_R: f32 = 7.0;
 // footer bar: hairline, a labelled action on the left, round icon buttons on the right
 pub(super) const FOOTER_TOP_GAP: f32 = 6.0; // standoff above the hairline (the panel's old closing pad)
@@ -53,117 +52,24 @@ pub(super) const FOOTER_BTN_GAP: f32 = 4.0; // gap between two icon buttons
 pub(super) const FOOTER_CTA_A: f32 = 0.20; // accent disc under a call-to-action button (idle)
 pub(super) const FOOTER_CTA_HOVER_A: f32 = 0.34; // …and under the pointer
 pub(super) const FOOTER_GAP: f32 = 8.0; // minimum gap between the left item and the button
-pub(crate) const DIVIDER_A: f32 = 0.14; // footer hairline (below ~0.1 it vanishes into the acrylic)
 pub(super) const FOOTER_SHADE: [u8; 3] = [0x00, 0x00, 0x00]; // the strip sits a shade darker than the body
-pub(crate) const FOOTER_SHADE_A: f32 = 0.18;
 
 // Fluent glyphs painted directly (not from the built-in IconId set).
-const GLYPH_VOLUME: char = '\u{E767}';
-const GLYPH_MUTE: char = '\u{E74F}';
-pub(super) const GLYPH_MIC: char = '\u{E720}';
-pub(super) const GLYPH_MIC_OFF: char = '\u{EC54}';
-pub(super) const GLYPH_SETTINGS: char = '\u{E713}';
-pub(super) const GLYPH_SOUND: char = '\u{E767}'; // Volume — the footer's link to Windows' sound settings
-pub(super) const GLYPH_UPDATE: char = '\u{E72C}'; // Refresh (circular arrow) — restart-to-update button
+pub(super) const GLYPH_MIC: char = glyph::MIC;
+pub(super) const GLYPH_MIC_OFF: char = glyph::MIC_OFF;
+pub(super) const GLYPH_SETTINGS: char = glyph::SETTINGS;
+pub(super) const GLYPH_SOUND: char = glyph::VOLUME; // the footer's link to Windows' sound settings
+pub(super) const GLYPH_UPDATE: char = glyph::UPDATE; // restart-to-update button
 
-// Colours (RGB); alpha applied at blend time.
-pub(crate) const RECORDING: [u8; 3] = [0xE8, 0x11, 0x23]; // the "an app is recording" dot
-pub(crate) const DARK_TINT: [u8; 3] = [0x2C, 0x2C, 0x2C]; // panel base (semi-transparent, acrylic shows through)
-pub(crate) const DARK_TINT_A: f32 = 0.82;
 /// The footer strip's darkening, the same on every panel: the calendar's light palette takes 0.04
 /// too ([`FOOTER_SHADE_A`] on the dark one).
 pub(super) fn footer_shade_a() -> f32 {
     if light() { 0.04 } else { FOOTER_SHADE_A }
 }
 
-/// The light panel's base: the calendar's and the notifications' light ground too.
-pub(crate) const LIGHT_TINT: [u8; 3] = [0xEE, 0xEE, 0xEE];
-pub(crate) const LIGHT_TINT_A: f32 = 0.86;
-
-/// The panels follow Windows' light or dark mode (the system's, as the taskbar), as the calendar
-/// and the notifications do. Read when a panel shows ([`refresh_mode`]), not on every paint.
-static LIGHT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// Read Windows' mode again (a panel is about to show).
-pub(crate) fn refresh_mode() {
-    let light = crate::win::hkcu_dword(w!(r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"), w!("SystemUsesLightTheme")) == Some(1);
-    #[cfg(feature = "dev")]
-    let light = std::env::var("AUDIO_TRAY_THEME").map_or(light, |t| t == "light");
-    LIGHT.store(light, std::sync::atomic::Ordering::Relaxed);
-}
-
-fn light() -> bool {
-    LIGHT.load(std::sync::atomic::Ordering::Relaxed)
-}
-
-/// Primary text and glyphs; also what hover and selection washes are made of (at a low alpha).
-pub(crate) fn text() -> [u8; 3] {
-    if light() { [0x00, 0x00, 0x00] } else { [0xFF, 0xFF, 0xFF] }
-}
-
-/// The panel's base, translucent over the acrylic.
-pub(crate) fn tint() -> [u8; 3] {
-    if light() { LIGHT_TINT } else { DARK_TINT }
-}
-
-pub(crate) fn tint_a() -> f32 {
-    if light() { LIGHT_TINT_A } else { DARK_TINT_A }
-}
-
-/// The accent a panel paints with: Windows' lighter shade on the dark panel, its darker on the
-/// light one (as the calendar's).
-pub(crate) fn panel_accent() -> [u8; 3] {
-    if light() { accent_shade(4).unwrap_or([0x00, 0x5F, 0xB8]) } else { accent_rgb() }
-}
 pub(super) const DARK_GLYPH: [u8; 3] = [0x12, 0x16, 0x1C]; // glyph colour on a solid accent disc
 pub(super) const HOVER_A: f32 = 0.06; // white overlay for hover
 pub(super) const SEL_A: f32 = 0.09; // white overlay for the selected row
-
-// The recording dot, as fractions of the mic glyph's box: disc radius, white ring, centre.
-// Top-right is the one corner the mic glyph (and its mute variant) leaves free; the ring must clear it.
-const REC_R: f32 = 0.15;
-const REC_BORDER: f32 = 0.05;
-const REC_CX: f32 = 0.87;
-const REC_CY: f32 = 0.14;
-
-/// Stamp the recording dot on a mic glyph drawn at `(x, y)` in a `size`-pixel box. Shared by
-/// the flyout and the OSD; the taskbar strip draws its own in the TAP.
-pub(crate) fn recording_dot(cv: &mut Canvas, x: i32, y: i32, size: u32) {
-    let box_px = size as f32;
-    let r = box_px * REC_R;
-    let cx = x as f32 + box_px * REC_CX;
-    let cy = y as f32 + box_px * REC_CY;
-    // The ring is a white disc under the red one, at least 1px so it survives 100% DPI.
-    let ring = (box_px * REC_BORDER).max(1.0);
-    let outer = r + ring;
-    let disc = |cv: &mut Canvas, r: f32, col: [u8; 3]| {
-        cv.fill_round_rect(Rect::new(cx - r, cy - r, cx + r, cy + r), r, col, 1.0);
-    };
-    disc(cv, outer, [0xFF, 0xFF, 0xFF]);
-    disc(cv, r, RECORDING);
-}
-
-/// The glyph for an endpoint's direction and mute state, shared by the flyout and the OSD
-/// (colour stays at the call site).
-pub(crate) fn endpoint_glyph(flow: crate::audio::Flow, muted: bool) -> char {
-    use crate::audio::Flow;
-
-    match (flow, muted) {
-        (Flow::Output, false) => GLYPH_VOLUME,
-        (Flow::Output, true) => GLYPH_MUTE,
-        (Flow::Input, false) => GLYPH_MIC,
-        (Flow::Input, true) => GLYPH_MIC_OFF,
-    }
-}
-
-pub(crate) fn ui_font() -> Option<&'static FontVec> {
-    static FONT: OnceLock<Option<FontVec>> = OnceLock::new();
-    FONT.get_or_init(|| {
-        let bytes = std::fs::read(r"C:\Windows\Fonts\segoeui.ttf").ok()?;
-        FontVec::try_from_vec(bytes).ok()
-    })
-    .as_ref()
-}
 
 /// Segoe UI Semibold — the weight Windows uses for the flyout's section captions
 /// ("BodyStrong"). Falls back to the regular UI font at the call site if absent.
@@ -174,42 +80,6 @@ pub(super) fn ui_font_semibold() -> Option<&'static FontVec> {
         FontVec::try_from_vec(bytes).ok()
     })
     .as_ref()
-}
-
-/// The accent colour to paint: the palette's Light2 shade (what Windows uses on dark
-/// surfaces), else the DWM accent, else the Win11 default.
-pub(crate) fn accent_rgb() -> [u8; 3] {
-    accent_shade(1).unwrap_or_else(dwm_accent_rgb)
-}
-
-/// Shade `index` of `Explorer\Accent\AccentPalette`, an 8-entry RGBA blob ordered
-/// lightest→darkest `[Light3, Light2, Light1, Accent, Dark1, Dark2, Dark3, …]`: Light2 (1) is what
-/// Windows paints on dark surfaces, Dark1 (4) on light ones.
-pub(crate) fn accent_shade(index: usize) -> Option<[u8; 3]> {
-    use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_BINARY};
-    let mut buf = [0u8; 32];
-    let mut size = buf.len() as u32;
-    let ok = unsafe {
-        RegGetValueW(
-            HKEY_CURRENT_USER,
-            w!(r"Software\Microsoft\Windows\CurrentVersion\Explorer\Accent"),
-            w!("AccentPalette"),
-            RRF_RT_REG_BINARY,
-            None,
-            Some(buf.as_mut_ptr() as *mut core::ffi::c_void),
-            Some(&mut size),
-        )
-    };
-    let at = index * 4;
-    (ok.0 == 0 && index < 8 && size as usize >= at + 4).then(|| [buf[at], buf[at + 1], buf[at + 2]])
-}
-
-/// The user's Windows accent colour from the DWM registry key (stored `AABBGGRR`).
-fn dwm_accent_rgb() -> [u8; 3] {
-    match crate::win::hkcu_dword(w!(r"Software\Microsoft\Windows\DWM"), w!("AccentColor")) {
-        Some(v) => [(v & 0xFF) as u8, ((v >> 8) & 0xFF) as u8, ((v >> 16) & 0xFF) as u8],
-        None => [0x60, 0xCD, 0xFF], // fallback Win11 accent
-    }
 }
 
 // The redesign's rows: Now Playing, the voice panel, the apps mixer and collapsible device lists.
@@ -228,14 +98,14 @@ pub(super) const PAGER_H: f32 = 16.0; // the carousel's pip row, under its card
 pub(super) const PIP_STEP: f32 = 16.0; // centre to centre, and each pip's click target
 pub(super) const PIP_D: f32 = 6.0; // a pip's diameter
 pub(super) const PIP_ON_W: f32 = 14.0; // the shown card's pip, drawn as a short accent bar
-pub(super) const GLYPH_PREVIOUS: char = '\u{E892}';
-pub(super) const GLYPH_PLAY: char = '\u{E768}';
-pub(super) const GLYPH_PAUSE: char = '\u{E769}';
-pub(super) const GLYPH_NEXT: char = '\u{E893}';
-pub(super) const GLYPH_DOWN: char = '\u{E70D}';
-pub(super) const GLYPH_UP: char = '\u{E70E}';
-pub(super) const GLYPH_MUSIC: char = '\u{EC4F}';
-pub(super) const GLYPH_VIDEO: char = '\u{E714}';
-pub(super) const GLYPH_APP: char = '\u{E7F5}';
-pub(super) const GLYPH_APP_MUTED: char = '\u{E74F}';
+pub(super) const GLYPH_PREVIOUS: char = glyph::PREVIOUS;
+pub(super) const GLYPH_PLAY: char = glyph::PLAY;
+pub(super) const GLYPH_PAUSE: char = glyph::PAUSE;
+pub(super) const GLYPH_NEXT: char = glyph::NEXT;
+pub(super) const GLYPH_DOWN: char = glyph::DOWN;
+pub(super) const GLYPH_UP: char = glyph::UP;
+pub(super) const GLYPH_MUSIC: char = glyph::MUSIC;
+pub(super) const GLYPH_VIDEO: char = glyph::VIDEO;
+pub(super) const GLYPH_APP: char = '\u{E7F5}'; // a speaker: an app in the mixer
+pub(super) const GLYPH_APP_MUTED: char = glyph::MUTE;
 pub(super) const SPEAKING: [u8; 3] = [0x3D, 0xD6, 0x8C]; // the speaking ring, as on the pill

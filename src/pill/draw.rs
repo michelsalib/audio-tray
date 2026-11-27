@@ -5,10 +5,10 @@
 use anyhow::Result;
 
 use super::gfx::{Font, Gfx, Painter, Rgba};
-use super::view::{BatteryChip, CallPill, Device, Devices, Fan, Level, SongNote, View};
-use crate::audio::Flow;
+use super::view::{CallPill, View};
 use crate::config::PillEdge;
-use crate::hub::Member;
+use crate::hub::{Member, VoiceApp};
+use crate::icons::glyph;
 use crate::music::smtc::Command;
 
 /// Clickable parts of a scene.
@@ -22,17 +22,7 @@ pub enum Hit {
     CallMute,
     /// The card's hang-up button: leave the voice channel (only for a call an app reports).
     CallLeave,
-    /// A new song's note: bring the player to the front.
-    Song,
-    /// A device button: hovered, fans its row out (see [`Hit::Choice`]); clicked with nothing to
-    /// fan (or on the card), switches that flow to its next device.
-    Device(crate::audio::Flow),
-    /// A disc of a fanned-out device row, by its place in [`super::view::Fan::choices`]: make it
-    /// the default.
-    Choice(crate::audio::Flow, usize),
-    /// The rest of a fanned-out row: keeps it open between its discs.
-    Fan(crate::audio::Flow),
-    /// Anywhere on the scene: the view's [`super::view::Action`], or the call's mute.
+    /// Anywhere on the scene: the muted warning's unmute.
     Whole,
 }
 
@@ -84,9 +74,6 @@ pub struct Bar {
 pub struct Scene {
     pub w: f32,
     pub h: f32,
-    /// How much of the start, along the edge, comes before what must not move (a song's note
-    /// before the pills): the window is centred on the rest.
-    pub lead: f32,
     pub content: windows::Win32::Graphics::DirectComposition::IDCompositionVisual2,
     pub rings: Vec<Ring>,
     /// The card's progress bars' moving parts (their tracks are in `content`).
@@ -107,11 +94,10 @@ const WARN_BG: Rgba = Rgba::hex(0xF7B32B, 1.0);
 const WARN_TEXT: Rgba = Rgba::hex(0x1A1A1A, 1.0);
 /// Windows' error red with white text: 5.9:1.
 const ALERT_BG: Rgba = Rgba::hex(0xC42B1C, 1.0);
-/// A notice: white text on 0x6B3FD4 is 6.5:1.
-const NOTICE_BG: Rgba = Rgba::hex(0x6B3FD4, 1.0);
 const SLIVER: Rgba = Rgba::hex(0x9A9A9A, 0.6);
 const SPEAKING: Rgba = Rgba::hex(0x3DD68C, 1.0);
 const LIVE_DOT: Rgba = Rgba::hex(0xFF4D4D, 1.0);
+/// The rest of a ring's or a bar's track, in every motion style.
 pub const TRACK: Rgba = Rgba::hex(0xFFFFFF, 0.22);
 /// A paused track's ring: the yellow of a paused progress bar on the taskbar.
 const RING_PAUSED: Rgba = Rgba::hex(0xFCE100, 1.0);
@@ -125,7 +111,7 @@ thread_local! {
 fn ring_playing() -> Rgba {
     ACCENT.with(|accent| {
         accent.get().unwrap_or_else(|| {
-            let [r, g, b] = crate::flyout::theme::accent_rgb();
+            let [r, g, b] = crate::theme::accent_rgb();
             let read = Rgba::hex(u32::from_be_bytes([0, r, g, b]), 1.0);
             accent.set(Some(read));
             read
@@ -161,12 +147,10 @@ pub const PULSE: Rgba = SPEAKING;
 /// so only the other side shows rounded.
 const TUCK: f32 = 16.0;
 
-/// What a scene is drawn for: the edge it hugs, and whether a song's note goes after the pills
-/// (at the start of an edge, where there is no room before them).
+/// What a scene is drawn for: the edge it hugs.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Place {
     pub edge: PillEdge,
-    pub note_after: bool,
 }
 
 /// The box `(x, y, w, h)` filled with its corners on the edge's side tucked past it.
@@ -226,20 +210,9 @@ impl Frame {
 /// A speaker's name tag's height.
 const TAG_H: f32 = 22.0;
 
-const GLYPH_PREVIOUS: char = '\u{E892}';
-const GLYPH_PLAY: char = '\u{E768}';
-const GLYPH_PAUSE: char = '\u{E769}';
-const GLYPH_NEXT: char = '\u{E893}';
-const GLYPH_MIC: char = '\u{E720}';
-const GLYPH_MIC_OFF: char = '\u{F781}';
-const GLYPH_HANG_UP: char = '\u{E778}';
-const GLYPH_MUSIC: char = '\u{EC4F}';
-const GLYPH_VIDEO: char = '\u{E714}';
-
 /// A transport button on the card: its glyph, its command, and whether it reaches the player.
 type Transport = (char, Command, bool);
 
-/// Paint `view`. `None` for [`View::Hidden`].
 /// The quiet column's dimensions at one pill size: [`BIG`], or [`SMALL`] at about half.
 #[derive(Clone, Copy)]
 struct Metrics {
@@ -250,12 +223,9 @@ struct Metrics {
     art: f32,
     ring_r: f32,
     ring_stroke: f32,
-    /// A device button's step down the column, radius and glyph font.
-    dev_step: f32,
-    dev_r: f32,
-    dev_font: Font,
-    /// A drawn device icon's size, matching `dev_font`'s glyphs.
-    dev_px: f32,
+    /// The call's microphone button: its radius and its glyph's font.
+    mic_r: f32,
+    mic_font: Font,
     /// A face's diameter and step in the call column.
     face: f32,
     face_step: f32,
@@ -269,10 +239,8 @@ const BIG: Metrics = Metrics {
     art: 30.0,
     ring_r: 19.5,
     ring_stroke: 3.0,
-    dev_step: 40.0,
-    dev_r: 16.0,
-    dev_font: Font::Icons,
-    dev_px: 16.0,
+    mic_r: 16.0,
+    mic_font: Font::Icons,
     face: 34.0,
     face_step: 26.0,
     words: true,
@@ -284,14 +252,23 @@ const SMALL: Metrics = Metrics {
     art: 16.0,
     ring_r: 10.5,
     ring_stroke: 2.0,
-    dev_step: 24.0,
-    dev_r: 10.0,
-    dev_font: Font::IconsSmall,
-    dev_px: 12.0,
+    mic_r: 10.0,
+    mic_font: Font::IconsSmall,
     face: 18.0,
     face_step: 14.0,
     words: false,
 };
+
+/// The quiet sliver's size on `edge`, in DIPs: 6 deep, 56 along it.
+pub fn sliver_size(edge: PillEdge) -> (f32, f32) {
+    if edge.vertical() { (6.0, 56.0) } else { (56.0, 6.0) }
+}
+
+/// The muted warning's words: who to unmute in (Windows' microphone when no voice app said).
+pub fn muted_text(app: Option<VoiceApp>) -> String {
+    let name = app.map_or("Windows", VoiceApp::label);
+    crate::tf!("You're muted in {name} · click to unmute", "Votre micro est coupé dans {name} · cliquez pour le réactiver")
+}
 
 /// Paint `view` for `place`, the quiet states `small` or not. `None` for [`View::Hidden`].
 pub fn scene(gfx: &Gfx, view: &View, small: bool, place: Place) -> Result<Option<Scene>> {
@@ -299,40 +276,30 @@ pub fn scene(gfx: &Gfx, view: &View, small: bool, place: Place) -> Result<Option
     let edge = place.edge;
     Ok(Some(match view {
         View::Hidden => return Ok(None),
-        View::Idle { call: None, devices: None } => {
-            let (w, h) = if edge.vertical() { (6.0, 56.0) } else { (56.0, 6.0) };
+        View::Idle { call: None } => {
+            let (w, h) = sliver_size(edge);
             let (content, _) = gfx.painted(w, h, |p| tucked(p, edge, [0.0, 0.0, w, h], 3.0, SLIVER))?;
-            Scene { w, h, lead: 0.0, content, rings: Vec::new(), bars: Vec::new(), pulses: Vec::new(), hits: Vec::new(), spots: Vec::new() }
+            Scene { w, h, content, rings: Vec::new(), bars: Vec::new(), pulses: Vec::new(), hits: Vec::new(), spots: Vec::new() }
         }
-        View::Idle { call, devices } => stack(gfx, m, &[], call.as_ref(), devices.as_ref(), None, place)?,
-        View::Music { media, card: false, call, devices, song, .. } => stack(gfx, m, media, call.as_ref(), devices.as_ref(), song.as_ref(), place)?,
-        View::Music { media, card: true, call, devices, batteries, .. } => {
-            // The call's row, one row per session with its own controls, a row of devices.
+        View::Idle { call } => stack(gfx, m, &[], call.as_ref(), place)?,
+        View::Music { media, card: false, call } => stack(gfx, m, media, call.as_ref(), place)?,
+        View::Music { media, card: true, call, .. } => {
+            // The call's row, one row per session with its own controls.
             const CALL_ROW: f32 = 60.0;
             /// A session's cover, and its margin all round: the row is the cover and its margins,
             /// the text, buttons and progress bar beside it.
             const ART: f32 = 80.0;
             const ART_MARGIN: f32 = 14.0;
             const ROW: f32 = ART + 2.0 * ART_MARGIN;
-            const DEVICES_ROW: f32 = 48.0;
             let w = 300.0;
-            // In the column's order: the sessions, the call, the devices.
+            // In the column's order: the sessions, then the call.
             let call_h = call.as_ref().map_or(0.0, |call| CALL_ROW + CALL_LINE * (face_lines(call) - 1) as f32);
             // Each session's row's top, just under its separator (the first, the card's top).
             let tops: Vec<f32> = (0..media.len()).map(|i| i as f32 * ROW).collect();
             let call_top = ROW * media.len() as f32;
             let row_end = |i: usize| tops.get(i + 1).copied().unwrap_or(call_top);
-            // After a call, its own bottom padding; right after a session, the devices' separator
-            // where the sessions' are (on the row's last line), or nothing, the card's end.
-            // The devices and the levels below follow the rows alike.
-            let follows = devices.is_some() || !batteries.is_empty();
-            let rows_h = match (call.is_some(), follows) {
-                (true, _) => call_top + call_h + 4.0,
-                (false, true) => call_top + 2.0,
-                (false, false) => call_top,
-            };
-            let batteries_top = rows_h + devices.as_ref().map_or(0.0, |_| DEVICES_ROW);
-            let h = batteries_top + if batteries.is_empty() { 0.0 } else { batteries.len().div_ceil(2) as f32 * BATTERY_LINE + 10.0 };
+            // After a call, its own bottom padding; else the card ends with the last session.
+            let h = if call.is_some() { call_top + call_h + 4.0 } else { call_top };
             let text_x = ART_MARGIN + ART + 12.0;
             let text_w = w - text_x - 16.0;
             // The three transport buttons always, in their places; previous/next greyed out where they
@@ -341,8 +308,8 @@ pub fn scene(gfx: &Gfx, view: &View, small: bool, place: Place) -> Result<Option
                 .iter()
                 .enumerate()
                 .map(|(i, m)| {
-                    let play = if m.playing { GLYPH_PAUSE } else { GLYPH_PLAY };
-                    let buttons = vec![(GLYPH_PREVIOUS, Command::Previous, m.skip), (play, Command::TogglePlayPause, true), (GLYPH_NEXT, Command::Next, m.skip)];
+                    let play = if m.playing { glyph::PAUSE } else { glyph::PLAY };
+                    let buttons = vec![(glyph::PREVIOUS, Command::Previous, m.skip), (play, Command::TogglePlayPause, true), (glyph::NEXT, Command::Next, m.skip)];
                     (tops[i], buttons)
                 })
                 .collect();
@@ -351,16 +318,19 @@ pub fn scene(gfx: &Gfx, view: &View, small: bool, place: Place) -> Result<Option
                 .iter()
                 .zip(&tops)
                 // A live stream's is full: no end to fill towards, moving while it plays.
-                .map(|(m, top)| Bar {
-                    x: text_x,
-                    y: top + ART_MARGIN + ART - 3.0,
-                    w: text_w,
-                    h: 3.0,
-                    fraction: if m.length_seconds().is_some() { m.fraction_now().unwrap_or(0.0) as f32 } else { 1.0 },
-                    rate: m.length_seconds().filter(|_| m.playing).map_or(0.0, |len| (1.0 / len) as f32),
-                    playing: m.playing,
-                    knob: m.length_seconds().is_some(),
-                    color: track_colour(gfx, m, crate::config::motion().bar),
+                .map(|(m, top)| {
+                    let progress = m.progress();
+                    Bar {
+                        x: text_x,
+                        y: top + ART_MARGIN + ART - 3.0,
+                        w: text_w,
+                        h: 3.0,
+                        fraction: progress.fraction,
+                        rate: progress.rate,
+                        playing: m.playing,
+                        knob: progress.knob,
+                        color: track_colour(gfx, m, crate::config::motion().bar),
+                    }
                 })
                 .collect();
             let mut hits: Vec<([f32; 4], Hit)> = rows
@@ -391,11 +361,7 @@ pub fn scene(gfx: &Gfx, view: &View, small: bool, place: Place) -> Result<Option
                 // Each section ends on the separator line below it, wherever that is drawn.
                 for (i, m) in media.iter().enumerate() {
                     let top = if i == 0 { 0.0 } else { tops[i] - 1.0 };
-                    let bottom = match (i + 1 == media.len(), call.is_some(), follows) {
-                        (false, ..) | (true, true, _) => row_end(i) - 1.0,
-                        (true, false, true) => rows_h - 3.0,
-                        (true, false, false) => h,
-                    };
+                    let bottom = if i + 1 < media.len() || call.is_some() { row_end(i) - 1.0 } else { h };
                     section_backdrop(p, edge, m, (top, bottom), [0.0, 0.0, w, h], 18.0)?;
                 }
                 // The bars, tracks and all, are visuals of their own (see `Scene::bars`).
@@ -426,166 +392,24 @@ pub fn scene(gfx: &Gfx, view: &View, small: bool, place: Place) -> Result<Option
                         p.text(&glyph.to_string(), Font::Icons, (x, top + 60.0, 32.0, 28.0), color)?;
                     }
                 }
-                if let Some(devices) = devices {
-                    p.round_rect(0.0, rows_h - 3.0, w, 1.0, 0.0, Rgba::hex(0xFFFFFF, 0.10))?;
-                    device_row(p, devices, rows_h, w, &mut hits)?;
-                }
-                if !batteries.is_empty() {
-                    // Under the devices, a separator; right after the rows, theirs.
-                    if devices.is_some() {
-                        p.round_rect(0.0, batteries_top - 1.0, w, 1.0, 0.0, Rgba::hex(0xFFFFFF, 0.10))?;
-                    } else {
-                        p.round_rect(0.0, rows_h - 3.0, w, 1.0, 0.0, Rgba::hex(0xFFFFFF, 0.10))?;
-                    }
-                    battery_lines(gfx, p, batteries, batteries_top + 4.0, w)?;
-                }
                 Ok(())
             })?;
-            Scene { w, h, lead: 0.0, content, rings: Vec::new(), bars, pulses: Vec::new(), hits, spots: Vec::new() }
+            Scene { w, h, content, rings: Vec::new(), bars, pulses: Vec::new(), hits, spots: Vec::new() }
         }
-        View::Banner { level, glyph, text, .. } => {
-            let (bg, fg) = match level {
-                Level::Alert => (ALERT_BG, WHITE),
-                Level::Warn => (WARN_BG, WARN_TEXT),
-                _ => (NOTICE_BG, WHITE),
-            };
-            let text_w = gfx.measure(Font::Title, text).min(360.0);
+        View::MutedWarning { app } => {
+            let text = muted_text(*app);
+            let text_w = gfx.measure(Font::Title, &text).min(360.0);
             let (w, h) = (16.0 + 20.0 + 10.0 + text_w + 18.0, 44.0);
             let (content, _) = gfx.painted(w, h, |p| {
-                tucked(p, edge, [0.0, 0.0, w, h], h / 2.0, bg)?;
-                p.text(&glyph.to_string(), Font::Icons, (14.0, 0.0, 22.0, h), fg)?;
-                p.text(text, Font::Title, (46.0, 0.0, text_w + 2.0, h), fg)
+                tucked(p, edge, [0.0, 0.0, w, h], h / 2.0, WARN_BG)?;
+                p.text(&glyph::MIC_OFF.to_string(), Font::Icons, (14.0, 0.0, 22.0, h), WARN_TEXT)?;
+                p.text(&text, Font::Title, (46.0, 0.0, text_w + 2.0, h), WARN_TEXT)
             })?;
-            Scene { w, h, lead: 0.0, content, rings: Vec::new(), bars: Vec::new(), pulses: Vec::new(), hits: vec![([0.0, 0.0, w, h], Hit::Whole)], spots: Vec::new() }
+            Scene { w, h, content, rings: Vec::new(), bars: Vec::new(), pulses: Vec::new(), hits: vec![([0.0, 0.0, w, h], Hit::Whole)], spots: Vec::new() }
         }
     }))
 }
 
-const GLYPH_VOLUME_MUTED: char = '\u{E74F}';
-
-fn device_count(devices: &Devices) -> usize {
-    usize::from(devices.output.is_some()) + usize::from(devices.input.is_some())
-}
-
-/// Where the output's then the input's row starts along the pill, from `start`.
-fn device_rows(devices: &Devices, start: f32, m: Metrics) -> impl Iterator<Item = (Flow, &Device, f32)> {
-    [(Flow::Output, &devices.output), (Flow::Input, &devices.input)]
-        .into_iter()
-        .filter_map(|(flow, device)| device.as_ref().map(|d| (flow, d)))
-        .enumerate()
-        .map(move |(i, (flow, device))| (flow, device, start + i as f32 * m.dev_step))
-}
-
-/// The output then the input, as round buttons along the pill from `start`; a fanned-out row is
-/// left to [`fan_row`].
-fn device_column(p: &mut Painter, frame: &Frame, devices: &Devices, start: f32, hits: &mut Vec<([f32; 4], Hit)>, m: Metrics) -> Result<()> {
-    let fanned = devices.fan.as_ref().map(|f| f.flow);
-    for (flow, device, along) in device_rows(devices, start, m) {
-        if Some(flow) == fanned {
-            continue;
-        }
-        let (cx, cy) = frame.pt(along + m.dev_step / 2.0, m.col / 2.0);
-        device_button(p, flow, device, cx, cy, m)?;
-        hits.push((frame.rect(along, 0.0, m.dev_step, m.col), Hit::Device(flow)));
-    }
-    Ok(())
-}
-
-/// How far a fanned-out row's discs reach from the edge (its name tag goes beyond).
-fn fan_depth(fan: &Fan, m: Metrics) -> f32 {
-    m.col + m.dev_step * (fan.choices.len() as f32 - 1.0)
-}
-
-/// A device row fanned out at `along`: every device of the flow on one capsule reaching away from
-/// the edge, the current one ringed in the accent, and the pointed one's name beyond the last.
-#[allow(clippy::too_many_arguments)]
-fn fan_row(p: &mut Painter, frame: &Frame, fan: &Fan, current: &Device, along: f32, tag_w: f32, m: Metrics, hits: &mut Vec<([f32; 4], Hit)>, spots: &mut Vec<(usize, [f32; 4])>) -> Result<()> {
-    let mid = m.col / 2.0;
-    let depth = fan_depth(fan, m);
-    let step = m.dev_step;
-    tucked(p, frame.edge, frame.rect(along, 0.0, step, depth), step / 2.0, NORMAL_BG)?;
-    for (k, choice) in fan.choices.iter().enumerate() {
-        let across = mid + k as f32 * step;
-        let (cx, cy) = frame.pt(along + step / 2.0, across);
-        let is_current = choice.id == fan.current;
-        let other = Device { icon: choice.icon, name: choice.name.clone(), muted: false, recording: false };
-        device_button(p, fan.flow, if is_current { current } else { &other }, cx, cy, m)?;
-        if is_current {
-            p.ring(cx, cy, m.dev_r + 2.5, 2.0, ring_playing())?;
-        }
-        // Tiled across the row, the first from the edge: no gap that would close the fan.
-        let from = if k == 0 { 0.0 } else { across - step / 2.0 };
-        hits.push((frame.rect(along, from, step, across + step / 2.0 - from), Hit::Choice(fan.flow, k)));
-        let r = m.dev_r + 2.0;
-        spots.push((hits.len() - 1, [cx - r, cy - r, 2.0 * r, 2.0 * r]));
-    }
-    hits.push((frame.rect(along, 0.0, step, depth), Hit::Fan(fan.flow)));
-    if let Some(choice) = fan.named.and_then(|i| fan.choices.get(i)).filter(|_| tag_w > 0.0) {
-        let [tx, ty, tw, th] = if frame.edge.vertical() {
-            frame.rect(along + (step - TAG_H) / 2.0, depth + 6.0, TAG_H, tag_w)
-        } else {
-            let (cx, _) = frame.pt(along + step / 2.0, 0.0);
-            [(cx - tag_w / 2.0).clamp(0.0, (frame.w - tag_w).max(0.0)), depth + 6.0, tag_w, TAG_H]
-        };
-        p.round_rect(tx, ty, tw, th, TAG_H / 2.0, NORMAL_BG)?;
-        p.text(&choice.name, Font::Small, (tx + 10.0, ty, tw - 20.0, th), WHITE)?;
-    }
-    Ok(())
-}
-
-/// The output and input side by side, each with its name, along the card's bottom.
-fn device_row(p: &mut Painter, devices: &Devices, top: f32, w: f32, hits: &mut Vec<([f32; 4], Hit)>) -> Result<()> {
-    let half = (w - 16.0) / 2.0;
-    for (i, (flow, device)) in [(Flow::Output, &devices.output), (Flow::Input, &devices.input)].into_iter().enumerate() {
-        let Some(device) = device else { continue };
-        let x = 8.0 + i as f32 * half;
-        device_button(p, flow, device, x + 20.0, top + 22.0, BIG)?;
-        p.text(&device.name, Font::Small, (x + 42.0, top + 8.0, half - 48.0, 28.0), DIM_WHITE)?;
-        hits.push(([x, top, half, 44.0], Hit::Device(flow)));
-    }
-    Ok(())
-}
-
-/// A line of battery levels on the card: two to a line.
-const BATTERY_LINE: f32 = 30.0;
-
-/// The battery levels, two to a line: the kind's glyph, the name, the level (amber when low).
-fn battery_lines(gfx: &Gfx, p: &mut Painter, batteries: &[BatteryChip], top: f32, w: f32) -> Result<()> {
-    let half = (w - 16.0) / 2.0;
-    for (i, battery) in batteries.iter().enumerate() {
-        let x = 8.0 + (i % 2) as f32 * half;
-        let y = top + (i / 2) as f32 * BATTERY_LINE;
-        let color = if battery.low { WARN_BG } else { DIM_WHITE };
-        p.text(&battery.glyph.to_string(), Font::IconsSmall, (x + 8.0, y, 20.0, BATTERY_LINE), color)?;
-        let level = format!("{}%", battery.level);
-        let level_w = gfx.measure(Font::Small, &level) + 2.0;
-        let level_x = x + half - 10.0 - level_w;
-        p.text(&battery.name, Font::Small, (x + 32.0, y, level_x - x - 38.0, BATTERY_LINE), DIM_WHITE)?;
-        p.text(&level, Font::Small, (level_x, y, level_w, BATTERY_LINE), if battery.low { WARN_BG } else { WHITE })?;
-    }
-    Ok(())
-}
-
-/// One device: its glyph on a disc (the mute glyph when muted), and the recording dot.
-fn device_button(p: &mut Painter, flow: Flow, device: &Device, cx: f32, cy: f32, m: Metrics) -> Result<()> {
-    let r = m.dev_r;
-    p.circle(cx, cy, r, if device.muted { Rgba::hex(0x5A5A5A, 1.0) } else { Rgba::hex(0x3A3A3A, 1.0) })?;
-    let glyph = match (flow, device.muted) {
-        (Flow::Output, true) => Some(GLYPH_VOLUME_MUTED),
-        (Flow::Input, true) => Some(GLYPH_MIC_OFF),
-        // No font has the earbuds: drawn as the tray and the strip draw them.
-        _ if device.icon.drawn() => None,
-        _ => Some(device.icon.glyph()),
-    };
-    match glyph {
-        Some(glyph) => p.text(&glyph.to_string(), m.dev_font, (cx - r, cy - r, 2.0 * r, 2.0 * r), WHITE)?,
-        None => p.icon(device.icon, cx, cy, m.dev_px)?,
-    }
-    if device.recording {
-        recording_dot(p, cx, cy, r, if device.muted { Rgba::hex(0x5A5A5A, 1.0) } else { Rgba::hex(0x3A3A3A, 1.0) })?;
-    }
-    Ok(())
-}
 /// The red recording dot, wholly inside a button's disc (radius `r`, colour `disc`) at its upper
 /// right, ringed in the disc's colour to stand off the glyph. On the rim it hung half off the
 /// button.
@@ -606,35 +430,25 @@ fn art(p: &mut Painter, cover: Option<&[u8]>, video: bool, x: f32, y: f32, size:
         Some(r) => p.round_rect(x, y, size, size, r, disc)?,
         None => p.circle(x + size / 2.0, y + size / 2.0, size / 2.0, disc)?,
     }
-    let glyph = if video { GLYPH_VIDEO } else { GLYPH_MUSIC };
-    p.text(&glyph.to_string(), Font::Icons, (x, y, size, size), DIM_WHITE)
+    let shown = if video { glyph::VIDEO } else { glyph::MUSIC };
+    p.text(&shown.to_string(), Font::Icons, (x, y, size, size), DIM_WHITE)
 }
 
 /// The gap between two pills of the column.
 const PILL_GAP: f32 = 6.0;
 
-/// The quiet column: separate pills for the playing sessions, the call and the devices, each
-/// only when there is one, along the edge with a gap between (a row on the top edge).
-fn stack(gfx: &Gfx, m: Metrics, media: &[crate::hub::Media], call: Option<&CallPill>, devices: Option<&Devices>, song: Option<&SongNote>, place: Place) -> Result<Scene> {
+/// The quiet column: separate pills for the playing sessions and the call, each only when there
+/// is one, along the edge with a gap between (a row on the top edge).
+fn stack(gfx: &Gfx, m: Metrics, media: &[crate::hub::Media], call: Option<&CallPill>, place: Place) -> Result<Scene> {
     let col = m.col;
     let mid = col / 2.0;
     let vertical = place.edge.vertical();
     let music_len = if media.is_empty() { 0.0 } else { col + m.disc_step * (media.len() as f32 - 1.0) };
     let call_layout = call.map(|c| CallLayout::of(gfx, c, m));
-    let pad = (col - 2.0 * m.dev_r) / 4.0;
-    let devices_len = devices.map_or(0.0, |d| 2.0 * pad + m.dev_step * device_count(d) as f32);
-    let lens = [music_len, call_layout.as_ref().map_or(0.0, |l| l.h), devices_len];
-    // A song's note sits before the pills, which keep their place (see [`Scene::lead`]), or after
-    // them at the start of the edge.
-    let (note_h, note_font) = if m.words { (40.0, Font::Title) } else { (30.0, Font::Body) };
-    let note_text_w = song.map_or(0.0, |s| gfx.measure(note_font, &s.text).min(320.0));
-    let note_w = 14.0 + 20.0 + 8.0 + note_text_w + 16.0;
-    let (note_len, note_depth) = if vertical { (note_h, note_w) } else { (note_w, note_h) };
-    let note_room = if song.is_some() { note_len + PILL_GAP } else { 0.0 };
-    let lead = if place.note_after { 0.0 } else { note_room };
+    let lens = [music_len, call_layout.as_ref().map_or(0.0, |l| l.h)];
     let starts: Vec<f32> = lens
         .iter()
-        .scan(lead, |at, &len| {
+        .scan(0.0, |at, &len| {
             let start = *at;
             if len > 0.0 {
                 *at += len + PILL_GAP;
@@ -643,39 +457,16 @@ fn stack(gfx: &Gfx, m: Metrics, media: &[crate::hub::Media], call: Option<&CallP
         })
         .collect();
     let pills_len = lens.iter().filter(|len| **len > 0.0).map(|len| len + PILL_GAP).sum::<f32>() - PILL_GAP;
-    let len = lead + pills_len + if place.note_after { note_room } else { 0.0 };
+    let len = pills_len;
     // A speaker's name tag goes beside a column, under a row.
     let tag = call_layout.as_ref().filter(|l| l.tag_w > 0.0).map_or(0.0, |l| if vertical { l.tag_w } else { TAG_H } + 6.0);
-    // A fanned-out device row reaches further, its pointed device's name beyond (as the speaker's).
-    let fan = devices.and_then(|d| d.fan.as_ref());
-    let fan_name = fan.filter(|_| m.words).and_then(|f| f.named.and_then(|i| f.choices.get(i)));
-    let fan_tag_w = fan_name.map_or(0.0, |c| gfx.measure(Font::Small, &c.name).min(220.0) + 20.0);
-    let fan_reach = fan.map_or(0.0, |f| fan_depth(f, m) + if fan_tag_w > 0.0 { 6.0 + if vertical { fan_tag_w } else { TAG_H } } else { 0.0 });
-    let depth = (col + tag).max(if song.is_some() { note_depth } else { 0.0 }).max(fan_reach);
+    let depth = col + tag;
     let (w, h) = if vertical { (depth, len) } else { (len, depth) };
     let frame = Frame { edge: place.edge, w };
     let mut hits = Vec::new();
     let mut pulses = Vec::new();
     let mut spots = Vec::new();
     let (content, _) = gfx.painted(w, h, |p| {
-        if let Some(song) = song {
-            let at = if place.note_after { len - note_len } else { 0.0 };
-            let [x, y, bw, bh] = frame.rect(at, 0.0, note_len, note_depth);
-            tucked(p, place.edge, [x, y, bw, bh], note_h / 2.0, NORMAL_BG)?;
-            // The cover where there is one, else the music glyph.
-            let size = note_h - 12.0;
-            // Ending where the glyph's slot ends, 8 before the text.
-            let (ix, iy) = (x + 34.0 - size, y + (bh - size) / 2.0);
-            let covered = match &song.cover {
-                Some(cover) => p.image(cover, ix, iy, size, Some(6.0))?,
-                None => false,
-            };
-            if !covered {
-                p.text(&super::view::GLYPH_SONG.to_string(), Font::Icons, (x + 12.0, y, 22.0, bh), WHITE)?;
-            }
-            p.text(&song.text, note_font, (x + 42.0, y, note_text_w + 2.0, bh), WHITE)?;
-            hits.push(([x, y, bw, bh], Hit::Song));
-        }
         if music_len > 0.0 {
             let start = starts[0];
             tucked(p, place.edge, frame.rect(start, 0.0, music_len, col), col / 2.0, QUIET_BG)?;
@@ -710,19 +501,9 @@ fn stack(gfx: &Gfx, m: Metrics, media: &[crate::hub::Media], call: Option<&CallP
             pulses.extend(paint_call(p, &frame, call, layout, m, starts[1]));
             hits.push((frame.rect(starts[1], 0.0, layout.h, col), Hit::CallMute));
             // Lit on the microphone, where paint_call draws it.
-            let (mx, my) = frame.pt(starts[1] + layout.h - m.dev_r - 6.0, mid);
-            let r = m.dev_r + 2.0;
+            let (mx, my) = frame.pt(starts[1] + layout.h - m.mic_r - 6.0, mid);
+            let r = m.mic_r + 2.0;
             spots.push((hits.len() - 1, [mx - r, my - r, 2.0 * r, 2.0 * r]));
-        }
-        if let Some(devices) = devices {
-            tucked(p, place.edge, frame.rect(starts[2], 0.0, devices_len, col), col / 2.0, QUIET_BG)?;
-            device_column(p, &frame, devices, starts[2] + pad, &mut hits, m)?;
-            if let Some(fan) = fan {
-                let row = device_rows(devices, starts[2] + pad, m).find(|(flow, ..)| *flow == fan.flow);
-                if let Some((_, current, along)) = row {
-                    fan_row(p, &frame, fan, current, along, fan_tag_w, m, &mut hits, &mut spots)?;
-                }
-            }
         }
         Ok(())
     })?;
@@ -732,20 +513,21 @@ fn stack(gfx: &Gfx, m: Metrics, media: &[crate::hub::Media], call: Option<&CallP
         // A live stream's ring is full: no end to fill towards, moving while it plays.
         .map(|(i, media)| {
             let (cx, cy) = frame.pt(starts[0] + mid + i as f32 * m.disc_step, mid);
+            let progress = media.progress();
             Ring {
                 cx,
                 cy,
                 r: m.ring_r,
                 stroke: m.ring_stroke,
-                fraction: if media.length_seconds().is_some() { media.fraction_now().unwrap_or(0.0) as f32 } else { 1.0 },
-                rate: media.length_seconds().filter(|_| media.playing).map_or(0.0, |len| (1.0 / len) as f32),
+                fraction: progress.fraction,
+                rate: progress.rate,
                 playing: media.playing,
-                knob: media.length_seconds().is_some(),
+                knob: progress.knob,
                 color: track_colour(gfx, media, crate::config::motion().ring),
             }
         })
         .collect();
-    Ok(Scene { w, h, lead, content, rings, bars: Vec::new(), pulses, hits, spots })
+    Ok(Scene { w, h, content, rings, bars: Vec::new(), pulses, hits, spots })
 }
 
 /// The call pill's geometry, measured before painting.
@@ -772,7 +554,7 @@ impl CallLayout {
         let speaker = call.members.iter().take(shown).position(|member| member.speaking);
         // Small has no room for the name: the lit face and its pulse say who.
         let tag_w = speaker.filter(|_| m.words).map_or(0.0, |i| gfx.measure(Font::Small, &call.members[i].name).min(160.0) + 20.0);
-        Self { h: 8.0 + faces_h + label_h + 2.0 * m.dev_r + 8.0, shown, speaker, tag_w }
+        Self { h: 8.0 + faces_h + label_h + 2.0 * m.mic_r + 8.0, shown, speaker, tag_w }
     }
 }
 
@@ -813,11 +595,12 @@ fn paint_call(p: &mut Painter, frame: &Frame, call: &CallPill, layout: &CallLayo
                 p.text(&app.chars().take(2).collect::<String>(), Font::Small, (x, y, w, h), DIM_WHITE)?;
             }
         }
-        let r = m.dev_r;
+        let r = m.mic_r;
+        let muted = call.muted();
         let (cx, cy) = frame.pt(start + layout.h - r - 6.0, mid);
-        p.circle(cx, cy, r, if call.muted { Rgba::hex(0x5A5A5A, 1.0) } else { Rgba::hex(0x3A3A3A, 1.0) })?;
-        p.text(&(if call.muted { GLYPH_MIC_OFF } else { GLYPH_MIC }).to_string(), m.dev_font, (cx - r, cy - r, 2.0 * r, 2.0 * r), WHITE)?;
-        if !call.muted {
+        p.circle(cx, cy, r, if muted { Rgba::hex(0x5A5A5A, 1.0) } else { Rgba::hex(0x3A3A3A, 1.0) })?;
+        p.text(&(if muted { glyph::MIC_OFF } else { glyph::MIC }).to_string(), m.mic_font, (cx - r, cy - r, 2.0 * r, 2.0 * r), WHITE)?;
+        if !muted {
             recording_dot(p, cx, cy, r, Rgba::hex(0x3A3A3A, 1.0))?;
         }
         Ok(())
@@ -841,16 +624,16 @@ fn face_lines(call: &CallPill) -> usize {
     call.members.len().div_ceil(CARD_FACES_PER_LINE).max(1)
 }
 
-/// The card's call row at `top`: overlapping faces (everyone, four to a line), the channel (or
-/// app) and who is talking, and the mute.
 /// How far left of the mute button the hang-up button sits.
 const LEAVE_STEP: f32 = 40.0;
 
 /// Whether the card offers to leave the call: only where the app can be told to (Discord).
 fn leaves(call: &CallPill) -> bool {
-    call.app == Some(crate::hub::VoiceApp::Discord)
+    call.app == Some(VoiceApp::Discord)
 }
 
+/// The card's call row at `top`: overlapping faces (everyone, four to a line), the channel (or
+/// app) and who is talking, and the mute.
 fn call_row(p: &mut Painter, call: &CallPill, w: f32, top: f32) -> Result<()> {
     const FACE: f32 = 28.0;
     for (line, members) in call.members.chunks(CARD_FACES_PER_LINE).enumerate() {
@@ -866,36 +649,25 @@ fn call_row(p: &mut Painter, call: &CallPill, w: f32, top: f32) -> Result<()> {
             Some(icon) => {
                 p.image(icon, 14.0, top + 12.0, FACE, Some(0.0))?;
             }
-            None => p.text(&GLYPH_MIC.to_string(), Font::Icons, (14.0, top + 12.0, FACE, FACE), WHITE)?,
+            None => p.text(&glyph::MIC.to_string(), Font::Icons, (14.0, top + 12.0, FACE, FACE), WHITE)?,
         }
     }
     let x = if call.members.is_empty() { x + FACE } else { x };
     let text_x = x + FACE * 0.3 + 8.0;
     let text_w = w - text_x - 62.0 - if leaves(call) { LEAVE_STEP } else { 0.0 };
-    let title = match (call.app, &call.channel) {
-        (Some(app), Some(channel)) => format!("{} · {channel}", app.label()),
-        (Some(app), None) => app.label().to_string(),
-        (None, _) => call.holder.clone().unwrap_or_else(|| "Call".to_string()),
-    };
-    let speaking: Vec<&str> = call.members.iter().filter(|m| m.speaking).map(|m| m.name.as_str()).collect();
-    let status = if !speaking.is_empty() {
-        format!("{} talking", speaking.join(", "))
-    } else if call.muted {
-        "You are muted".to_string()
-    } else {
-        format!("{} in the call", call.members.len().max(1))
-    };
-    p.text(&title, Font::Title, (text_x, top + 8.0, text_w, 20.0), WHITE)?;
-    p.text(&status, Font::Small, (text_x, top + 28.0, text_w, 16.0), DIM_WHITE)?;
+    let muted = call.muted();
+    p.text(&call.title(), Font::Title, (text_x, top + 8.0, text_w, 20.0), WHITE)?;
+    p.text(&call.status_text(muted), Font::Small, (text_x, top + 28.0, text_w, 16.0), DIM_WHITE)?;
     let (bx, by) = (w - 34.0, top + 28.0);
     if leaves(call) {
         let lx = bx - LEAVE_STEP;
         p.circle(lx, by, 16.0, ALERT_BG)?;
-        p.text(&GLYPH_HANG_UP.to_string(), Font::Icons, (lx - 16.0, by - 16.0, 32.0, 32.0), WHITE)?;
+        p.text(&glyph::HANG_UP.to_string(), Font::Icons, (lx - 16.0, by - 16.0, 32.0, 32.0), WHITE)?;
     }
-    p.circle(bx, by, 16.0, if call.muted { Rgba::hex(0x5A5A5A, 1.0) } else { Rgba::hex(0x3A3A3A, 1.0) })?;
-    p.text(&(if call.muted { GLYPH_MIC_OFF } else { GLYPH_MIC }).to_string(), Font::Icons, (bx - 16.0, by - 16.0, 32.0, 32.0), WHITE)
+    p.circle(bx, by, 16.0, if muted { Rgba::hex(0x5A5A5A, 1.0) } else { Rgba::hex(0x3A3A3A, 1.0) })?;
+    p.text(&(if muted { glyph::MIC_OFF } else { glyph::MIC }).to_string(), Font::Icons, (bx - 16.0, by - 16.0, 32.0, 32.0), WHITE)
 }
+
 /// One face: the avatar, or an initial on a colour from the name; dimmed unless speaking.
 fn face(p: &mut Painter, member: &Member, x: f32, y: f32, size: f32, lit: bool, badges: bool) -> Result<()> {
     let (cx, cy, r) = (x + size / 2.0, y + size / 2.0, size / 2.0);
@@ -906,9 +678,8 @@ fn face(p: &mut Painter, member: &Member, x: f32, y: f32, size: f32, lit: bool, 
         None => false,
     };
     if !drawn {
-        let hue = member.name.bytes().fold(0u32, |h, b| h.wrapping_mul(31).wrapping_add(b as u32));
-        const PALETTE: [u32; 6] = [0x5865F2, 0x2D7D9A, 0x8E44AD, 0xC0392B, 0x16A085, 0xD35400];
-        p.circle(cx, cy, r, Rgba::hex(PALETTE[hue as usize % PALETTE.len()], 1.0))?;
+        let [red, green, blue] = crate::icons::name_colour(&member.name);
+        p.circle(cx, cy, r, Rgba::hex(u32::from_be_bytes([0, red, green, blue]), 1.0))?;
         let initial: String = member.name.chars().next().map(|c| c.to_uppercase().collect()).unwrap_or_default();
         p.text(&initial, if badges { Font::Initial } else { Font::Badge }, (x, y, size, size), WHITE)?;
     }
@@ -919,7 +690,7 @@ fn face(p: &mut Painter, member: &Member, x: f32, y: f32, size: f32, lit: bool, 
     }
     if member.muted && badges {
         p.circle(cx + r * 0.7, cy + r * 0.7, 7.0, NORMAL_BG)?;
-        p.text(&GLYPH_MIC_OFF.to_string(), Font::IconsSmall, (cx + r * 0.7 - 7.0, cy + r * 0.7 - 7.0, 14.0, 14.0), WHITE)?;
+        p.text(&glyph::MIC_OFF.to_string(), Font::IconsSmall, (cx + r * 0.7 - 7.0, cy + r * 0.7 - 7.0, 14.0, 14.0), WHITE)?;
     }
     Ok(())
 }

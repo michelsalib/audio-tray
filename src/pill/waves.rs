@@ -11,6 +11,7 @@ use std::f32::consts::{PI, TAU};
 use anyhow::Result;
 use windows_numerics::Vector2;
 
+use super::draw::TRACK;
 use super::gfx::{Painter, Rgba};
 
 /// One wave: its length (DIPs along a bar; on a ring, a share of the circle, see [`RING_PERIODS`]),
@@ -36,9 +37,6 @@ const LAYERS: [Layer; 4] = [
 
 /// On a ring, each layer's periods to a turn: whole numbers, so each keeps its shape all round.
 const RING_PERIODS: [f32; 4] = [3.0, 5.0, 8.0, 13.0];
-
-/// The rest of the track.
-const TRACK: Rgba = Rgba(1.0, 1.0, 1.0, 0.2);
 
 /// Layer `layer`'s height `u` along a played part `span` long, `length` to a period, at most
 /// `room`, `t` seconds in, raised by `amp` (0 paused, 1 playing); thinning to nothing at both ends

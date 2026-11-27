@@ -16,6 +16,7 @@
 //! banner, then its key is taken at the next read.
 
 use std::sync::Mutex;
+use super::lock;
 
 use windows::core::PCWSTR;
 use windows::Win32::System::Registry::{RegCloseKey, RegDeleteKeyValueW, RegOpenKeyExW, RegSetKeyValueW, HKEY, HKEY_CURRENT_USER, KEY_READ, REG_DWORD};
@@ -61,7 +62,7 @@ fn kept() -> std::sync::MutexGuard<'static, Option<Vec<Kept>>> {
 
 /// [`KEPT`] as it is (not read from the file).
 fn kept_lock() -> std::sync::MutexGuard<'static, Option<Vec<Kept>>> {
-    KEPT.lock().unwrap_or_else(|e| e.into_inner())
+    lock(&KEPT)
 }
 
 /// A walk of every app's key is owed whatever the watch says (the last could not note its work).
@@ -137,7 +138,7 @@ fn settings_changed() -> bool {
     use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
     /// The watched key and its event, as raw values (made once, kept for the process).
     static WATCH: Mutex<Option<(isize, isize)>> = Mutex::new(None);
-    let mut watch = WATCH.lock().unwrap_or_else(|e| e.into_inner());
+    let mut watch = lock(&WATCH);
     let arm = |key: isize, event: isize| unsafe {
         RegNotifyChangeKeyValue(HKEY(key as *mut _), true, REG_NOTIFY_CHANGE_NAME | REG_NOTIFY_CHANGE_LAST_SET, Some(HANDLE(event as *mut _)), true).is_ok()
     };

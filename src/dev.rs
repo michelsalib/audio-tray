@@ -2,25 +2,41 @@
 //!
 //! The release binary keeps just what users, the installer and the updater run (see `main`).
 //!
+//! Any mode also takes `volume=`, `ring=`, `bar=` (`none`, `google` or `samsung`) and
+//! `colour=cover`: the motion to show, over the saved one, for this run.
+//!
 //!   --list                         defaults by role, and every active device
 //!   --set <q> / --set-icon <q> <IconId>
 //!                                  switch the default output / store a device's icon
-//!   --flyout [update] [volume=…]    preview the panel (update = fake a staged update; volume = the
-//!                                  sliders' style: none, google or samsung)
-//!   --pill-preview <left|right|top> <start|center|end> [secs] [small] [earbuds] [live] [shots] [call] [toggle] [card]
-//!                                  [ring=<none|google|samsung>] [bar=…] [colour=cover]
+//!   --flyout [update]              preview the panel (update = fake a staged update)
+//!   --pill-preview <left|right|top> <start|center|end> [secs] [small] [earbuds] [live] [shots]
+//!                  [call] [crowd] [cover] [paused] [toggle] [card]
 //!                                  the edge pill alone there, with a song and the devices
 //!   --settings-preview [page]      the settings window alone (taskbar, pill, devices, connectors,
 //!                                  about); changes are not applied, there is no tray to apply them
-//!   --calendar [bell] [ics-url …]  the calendar flyout alone (with `bell`: the notifications),
-//!                                  on the config's accounts and links plus these links (this run only)
+//!   --calendar [bell|batteries] [ics-url …]
+//!                                  the calendar flyout alone (with `bell`: the notifications; with
+//!                                  `batteries`: the batteries, read once), on the config's accounts
+//!                                  and links plus these links (this run only)
+//!   --activator <aumid>            where an app's notification buttons and replies go
+//!   --payloads [count]             the newest notifications in Windows' store, as their apps sent them
+//!   --click-notification <id> [dry]
+//!                                  a listed notification's banner clicked (dry: not launched)
+//!   --banners [count] [secs]       banners of what is listed
+//!   --banner-sim                   the banners' simulation, failing when a check does
+//!   --listening-preview            the "an app is listening" banner, for a few seconds
+//!   --digest [secs]                the digest's banner over everything listed now
 //!   --vol <up|down|get>            nudge or read the default output volume by one scroll notch
 //!   --osd [out|in] [level%]        preview the scroll readout beside the cursor until it fades
 //!   --mic [secs]                   who holds the microphone, then watch it change
 //!   --batteries [secs]             the connected devices' battery levels, then each change
-//!   --battery-toast               the low-battery Windows notification, with a made-up device
+//!   --battery-icon [dir]           Audio Tray's own battery icon in each style, as raw RGBA files
+//!   --battery-toast                the low-battery Windows notification, with a made-up device
+//!   --own-toast [battery|audio|meeting|focus|call|clear]
+//!                                  one of Audio Tray's own notifications, tagged as the tray sends
+//!                                  it (call: an incoming call; clear: Audio Tray's taken off the list)
 //!   --meter                        sample the default output+input peak meters for 4 s
-//!   --taskbar-click <out|in|panel|clock|bell>
+//!   --taskbar-click <out|in|panel|clock|bell|battery>
 //!                                  post a strip gesture to the running tray (clicks on the
 //!                                  taskbar cannot be synthesised)
 //!   --taskbar-scroll <out|in> [notches]
@@ -48,38 +64,34 @@ use crate::{flyout, music, osd, taskbar, tray, update};
 
 /// Run a dev mode. `Ok(false)`: `args` names none, so `main` carries on.
 pub fn run(args: &[String], backend: &WasapiBackend) -> Result<bool> {
-    // The saved motion; `volume=<none|google|samsung>` shows the flyout's and the readout's sliders
-    // in another style.
-    let mut motion = Config::load().motion;
-    for (key, value) in args.iter().filter_map(|a| a.split_once('=')) {
-        let style = crate::config::MotionStyle::ALL.into_iter().find(|s| format!("{s:?}").eq_ignore_ascii_case(value));
-        if let ("volume", Some(style)) = (key, style) {
-            motion.volume = style;
-        }
-    }
-    crate::config::set_motion(motion);
+    crate::config::set_motion(motion_from(args));
     match args.first().map(String::as_str) {
         Some("--flyout") => {
             // `update` fakes a staged update.
-            let mut config = Config::load();
-            let outcome = match args.get(1).map(String::as_str) {
-                Some("update") => {
-                    update::set_pending_version("9.9.9");
-                    flyout::show(backend, &mut config, None)
-                }
-                _ => flyout::show(backend, &mut config, None),
-            };
-            println!("flyout: closed (quit={}, restart={})", outcome.quit, outcome.restart);
+            if args.get(1).is_some_and(|a| a == "update") {
+                update::set_pending_version("9.9.9");
+            }
+            let outcome = flyout::show(backend, &mut Config::load(), None);
+            println!("flyout: closed (restart={}, settings={})", outcome.restart, outcome.settings);
         }
         Some("--pill-preview") => pill_preview(backend, &args[1..])?,
         Some("--calendar") => {
             // Extra calendar links for this run only (nothing is saved).
             let mut config = Config::load();
             let bell = args.get(1).is_some_and(|a| a == "bell");
-            for url in &args[1 + usize::from(bell)..] {
+            let batteries = args.get(1).is_some_and(|a| a == "batteries");
+            for url in &args[1 + usize::from(bell || batteries)..] {
                 config.calendar.links.push(crate::calendar::Link { name: crate::calendar::link_name(url), url: url.clone() });
             }
-            let panel = if bell { crate::calendar::Panel::Notifications } else { crate::calendar::Panel::Calendar };
+            let panel = if bell {
+                crate::calendar::Panel::Notifications
+            } else if batteries {
+                // The levels read once, as the tray's source would report them.
+                crate::calendar::set_batteries(crate::batteries::read());
+                crate::calendar::Panel::Batteries
+            } else {
+                crate::calendar::Panel::Calendar
+            };
             crate::calendar::preview(&config, panel);
         }
         Some("--activator") => crate::calendar::rich::print_activator(args.get(1).map_or("", String::as_str)),
@@ -193,7 +205,8 @@ pub fn run(args: &[String], backend: &WasapiBackend) -> Result<bool> {
                 Some("panel") => taskbar::Action::OpenPanel,
                 Some("clock") => taskbar::Action::OpenCalendar,
                 Some("bell") => taskbar::Action::OpenNotifications,
-                other => bail!("usage: audio-tray --taskbar-click <out|in|panel|clock|bell> (got {other:?})"),
+                Some("battery") => taskbar::Action::OpenBatteries,
+                other => bail!("usage: audio-tray --taskbar-click <out|in|panel|clock|bell|battery> (got {other:?})"),
             };
             taskbar::post_action(action)?;
             println!("taskbar: posted {action:?} to the running tray.");
@@ -217,6 +230,21 @@ pub fn run(args: &[String], backend: &WasapiBackend) -> Result<bool> {
             println!("taskbar: posted a {notches} notch {flow:?} scroll to the running tray.");
         }
         Some("--batteries") => crate::batteries::trace(args.get(1).and_then(|s| s.parse().ok()).unwrap_or(0)),
+        Some("--battery-icon") => {
+            // Audio Tray's own battery icon (a desktop's), each style for one, two and three devices,
+            // as raw RGBA files: <dir>/battery-<style>-<n>-<size>.rgba
+            use crate::tray::battery::render::Style;
+            let dir = std::path::PathBuf::from(args.get(1).map_or(".", String::as_str));
+            let cases: [&[u8]; 3] = [&[78], &[35, 78], &[12, 35, 78]];
+            for (style, label) in [(Style::Bars, "bars"), (Style::Rings, "rings")] {
+                for levels in cases {
+                    let (rgba, size) = crate::tray::battery::icon_pixels(style, levels, 20);
+                    let name = format!("battery-{label}-{}-{size}.rgba", levels.len());
+                    std::fs::write(dir.join(&name), rgba)?;
+                    println!("{name}");
+                }
+            }
+        }
         Some("--battery-toast") => crate::toast::show("G705 Mouse battery low", "12% left. Time to charge it.")?,
         // Audio Tray's own notices as the tray sends them (tagged), and a call and a chat.
         Some("--own-toast") => {
@@ -320,6 +348,22 @@ pub fn run(args: &[String], backend: &WasapiBackend) -> Result<bool> {
     Ok(true)
 }
 
+/// The saved motion, with the styles `args` name over it: `volume=` (the flyout's and the readout's
+/// sliders), `ring=` and `bar=` (the pill's) as `none`, `google` or `samsung`, and `colour=cover`.
+fn motion_from(args: &[String]) -> crate::config::Motion {
+    let mut motion = Config::load().motion;
+    for (key, value) in args.iter().filter_map(|a| a.split_once('=')) {
+        let style = crate::config::MotionStyle::ALL.into_iter().find(|s| format!("{s:?}").eq_ignore_ascii_case(value));
+        match (key, style) {
+            ("volume", Some(style)) => motion.volume = style,
+            ("ring", Some(style)) => motion.ring = style,
+            ("bar", Some(style)) => motion.bar = style,
+            ("colour", _) if value == "cover" => motion.colour = crate::config::WaveColour::Cover,
+            _ => {}
+        }
+    }
+    motion
+}
 
 fn list(backend: &WasapiBackend) -> Result<()> {
     for (flow, title) in [(Flow::Output, "output"), (Flow::Input, "input")] {
@@ -360,12 +404,11 @@ fn find_device<'a>(devices: &'a [Device], query: &str) -> Result<&'a Device> {
     }
 }
 
-/// The edge pill at a place, showing a song and the default devices, for `secs` (default 20).
+/// The edge pill at a place, showing a song, for `secs` (default 20).
 fn pill_preview(backend: &WasapiBackend, args: &[String]) -> Result<()> {
     use crate::config::{PillAlign, PillEdge, PillSize};
     let mut config = Config::load().pill;
     config.enabled = true;
-    config.devices = true;
     config.monitor = None;
     config.edge = match args.first().map(String::as_str) {
         Some("right") => PillEdge::Right,
@@ -378,34 +421,17 @@ fn pill_preview(backend: &WasapiBackend, args: &[String]) -> Result<()> {
         _ => PillAlign::Center,
     };
     config.size = if args.iter().any(|a| a == "small") { PillSize::Small } else { PillSize::Big };
-    config.announce_tracks |= args.iter().any(|a| a == "note");
     let secs: u64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(20);
-    // `ring=<none|google|samsung>`, `bar=…`, `colour=cover`: the motion to show, over the saved one.
-    let mut motion = Config::load().motion;
-    for (key, value) in args.iter().filter_map(|a| a.split_once('=')) {
-        let style = crate::config::MotionStyle::ALL.into_iter().find(|s| format!("{s:?}").eq_ignore_ascii_case(value));
-        match (key, style) {
-            ("ring", Some(style)) => motion.ring = style,
-            ("bar", Some(style)) => motion.bar = style,
-            ("colour", _) if value == "cover" => motion.colour = crate::config::WaveColour::Cover,
-            _ => {}
-        }
-    }
-    crate::config::set_motion(motion);
+    // The motion (`ring=`, `bar=`, `colour=`) is `run`'s.
     crate::pill::create(&config)?;
-    let endpoint = |flow: Flow| -> Option<crate::hub::Endpoint> {
-        let id = backend.default_of(flow).ok().flatten()?;
-        let device = backend.enumerate_flow(flow).ok()?.into_iter().find(|d| d.id == id)?;
-        // `earbuds`: the hand-drawn icon, whatever the device.
-        let earbuds = args.iter().any(|a| a == "earbuds") && flow == Flow::Output;
-        let icon = if earbuds { IconId::RoundEarbuds } else { Config::load().icon_of(&device) };
-        Some(crate::hub::Endpoint { id, name: device.friendly_name, muted: false, icon })
-    };
     let now = music::smtc::now_ticks();
     let live = args.iter().any(|a| a == "live");
     let mut state = crate::hub::State::default();
-    state.endpoints.output = endpoint(Flow::Output);
-    state.endpoints.input = endpoint(Flow::Input);
+    // The defaults as the tray reads them, unmuted; `earbuds`: the output's hand-drawn icon,
+    // whatever the device.
+    let read = tray::endpoints::read(backend, &Config::load());
+    state.endpoints.output = read.output.map(|e| crate::hub::Endpoint { muted: false, icon: if args.iter().any(|a| a == "earbuds") { IconId::RoundEarbuds } else { e.icon }, ..e });
+    state.endpoints.input = read.input.map(|e| crate::hub::Endpoint { muted: false, ..e });
     state.media.push(crate::hub::Media {
         app_id: "preview".into(),
         // `live`: a stream, as a Twitch tab reports it (no end, no previous or next).
@@ -425,15 +451,10 @@ fn pill_preview(backend: &WasapiBackend, args: &[String]) -> Result<()> {
         state.calls.push((crate::hub::VoiceApp::Teams, call));
         state.media.clear();
     }
-    // `cover`: the song's cover from %TEMP%\audio-tray-shots\cover1.png; `paused`: paused; `note`:
-    // its new-song note up.
+    // `cover`: the song's cover from %TEMP%\audio-tray-shots\cover1.png; `paused`: paused.
     if let Some(song) = state.media.first_mut() {
         if args.iter().any(|a| a == "cover") {
             song.cover = std::fs::read(std::env::temp_dir().join("audio-tray-shots").join("cover1.png")).ok().map(std::sync::Arc::new);
-        }
-        if args.iter().any(|a| a == "note") {
-            let notice = crate::hub::Notice::NewTrack { app_id: song.app_id.clone(), title: song.title.clone(), artist: song.artist.clone() };
-            state.notices.push((notice, std::time::Instant::now()));
         }
     }
     // A paused session shows only beside a playing one: a second session, playing, under it.
@@ -498,7 +519,6 @@ fn pill_preview(backend: &WasapiBackend, args: &[String]) -> Result<()> {
     // `toggle`: pause and resume the first song every 3 s, to watch its ripple settle and rise.
     let toggle = args.iter().any(|a| a == "toggle");
     let mut flip_at = std::time::Instant::now() + std::time::Duration::from_secs(3);
-    let mut msg = windows::Win32::UI::WindowsAndMessaging::MSG::default();
     while std::time::Instant::now() < until {
         if toggle && std::time::Instant::now() >= flip_at {
             if let Some(song) = state.media.first_mut() {
@@ -510,12 +530,7 @@ fn pill_preview(backend: &WasapiBackend, args: &[String]) -> Result<()> {
             crate::pill::update(&state);
             flip_at += std::time::Duration::from_secs(3);
         }
-        unsafe {
-            while windows::Win32::UI::WindowsAndMessaging::PeekMessageW(&mut msg, None, 0, 0, windows::Win32::UI::WindowsAndMessaging::PM_REMOVE).as_bool() {
-                let _ = windows::Win32::UI::WindowsAndMessaging::TranslateMessage(&msg);
-                windows::Win32::UI::WindowsAndMessaging::DispatchMessageW(&msg);
-            }
-        }
+        crate::win::pump_messages();
         std::thread::sleep(std::time::Duration::from_millis(15));
     }
     crate::pill::destroy();

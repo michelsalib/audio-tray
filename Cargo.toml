@@ -56,7 +56,7 @@ serde = { version = "1.0.229", features = ["derive"] }
 # Hashes the TAP's update archive (update.rs); same major as self_update's checksums feature.
 sha2 = "0.11"
 toml = "1.2.1"
-tray-icon = "0.26.1"
+tray-icon = "0.27"
 windows-core = "0.61"
 # IIterable, the form the battery watcher's property list takes (src/batteries.rs); the version
 # `windows` 0.61 uses, already built as its dependency.
@@ -71,7 +71,7 @@ tungstenite = { version = "0.30", default-features = false, features = ["handsha
 ureq = { version = "3", default-features = false, features = ["native-tls"] }
 # Reads Windows' notification store (wpndatabase.db) for what the listener leaves out: pictures,
 # the reply box and the buttons. Bundled: no system SQLite on Windows.
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.43", features = ["bundled"] }
 
 [dependencies.windows]
 version = "0.61"

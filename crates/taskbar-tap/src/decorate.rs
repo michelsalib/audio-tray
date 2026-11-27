@@ -1,4 +1,5 @@
-//! Putting our own visuals into a tray icon, plus the XAML helpers the rest of the TAP shares.
+//! Putting our own visuals into a tray icon (the strip), and taking the shell's indicators out of
+//! the way. The XAML accessors the rest of the TAP shares are in [`crate::xaml`].
 //!
 //! The tree shape is never changed; we *set a property*:
 //! `XamlReader.Load(markup)` → live element → `ContentPresenter.Content = it`
@@ -10,13 +11,12 @@
 use crate::log::logf;
 use crate::winrt::{
     IAutomationPropertiesStatics, IContentPresenter, IDependencyObject, IFrameworkElement,
-    ITextBlock, IUIElement, IVisualTreeHelperStatics, IXamlReaderStatics, AUTOMATION_PROPERTIES,
-    VISIBILITY_COLLAPSED, VISUAL_TREE_HELPER, XAML_READER,
+    IUIElement, AUTOMATION_PROPERTIES, VISIBILITY_COLLAPSED,
 };
+use crate::xaml::{element, factory, hstring_abi, load_xaml, object_from_handle, set_visible};
 use crate::xamlom::{IXamlDiagnostics, InstanceHandle};
 use core::ffi::c_void;
 use windows::Win32::Foundation::S_OK;
-use windows::Win32::System::WinRT::RoGetActivationFactory;
 use windows_core::{IInspectable, Interface, HSTRING};
 
 /// Segoe Fluent mute glyphs; match the flyout's so the two agree on how "muted" looks.
@@ -142,20 +142,21 @@ impl StripState {
                     .and_then(char::from_u32)
             };
             let flag = || matches!(value.trim(), "1" | "true");
+            use tap_proto::key;
             match key.trim() {
-                "out" => state.output_glyph = glyph().unwrap_or(state.output_glyph),
-                "in" => state.input_glyph = glyph().unwrap_or(state.input_glyph),
-                "outmuted" => state.output_muted = flag(),
-                "inmuted" => state.input_muted = flag(),
-                "inrec" => state.input_recording = flag(),
-                "accent" => state.accent = parse_rgb(value.trim()),
-                "alpha" => {
+                key::OUT => state.output_glyph = glyph().unwrap_or(state.output_glyph),
+                key::IN => state.input_glyph = glyph().unwrap_or(state.input_glyph),
+                key::OUT_MUTED => state.output_muted = flag(),
+                key::IN_MUTED => state.input_muted = flag(),
+                key::IN_RECORDING => state.input_recording = flag(),
+                key::ACCENT => state.accent = parse_rgb(value.trim()),
+                key::ALPHA => {
                     state.accent_alpha =
                         u8::from_str_radix(value.trim(), 16).unwrap_or(state.accent_alpha)
                 }
-                "hidevolume" => state.hide_system_volume = flag(),
-                "hidemic" => state.hide_system_mic = flag(),
-                "hidelanguage" => state.hide_system_language = flag(),
+                key::HIDE_VOLUME => state.hide_system_volume = flag(),
+                key::HIDE_MIC => state.hide_system_mic = flag(),
+                key::HIDE_LANGUAGE => state.hide_system_language = flag(),
                 _ => {}
             }
         }
@@ -628,29 +629,6 @@ fn on_accent(rgb: [u8; 3], alpha: u8) -> &'static str {
     }
 }
 
-/// A WinRT activation factory, cached per class on the XAML thread (the sweep asks often).
-/// Thread-local because interfaces are not `Send`.
-pub(crate) fn factory<I: Interface>(class: &'static str) -> Option<I> {
-    thread_local! {
-        static CACHE: std::cell::RefCell<Vec<(&'static str, windows_core::IUnknown)>> = const { std::cell::RefCell::new(Vec::new()) };
-    }
-    let cached = CACHE.with(|cache| cache.borrow().iter().find(|(name, _)| *name == class).map(|(_, f)| f.clone()));
-    let unknown = match cached {
-        Some(unknown) => unknown,
-        None => match unsafe { RoGetActivationFactory::<windows_core::IUnknown>(&HSTRING::from(class)) } {
-            Ok(unknown) => {
-                CACHE.with(|cache| cache.borrow_mut().push((class, unknown.clone())));
-                unknown
-            }
-            Err(err) => {
-                logf!("RoGetActivationFactory({class}) failed: {err}");
-                return None;
-            }
-        },
-    };
-    unknown.cast().ok()
-}
-
 /// An element's automation name (for tray icons, the tooltip), used to identify icons.
 /// `GetName` takes an `IDependencyObject*`; passing the plain `IInspectable` yields "".
 ///
@@ -748,68 +726,7 @@ pub unsafe fn descendant_presenter(
     diagnostics: &IXamlDiagnostics,
     icon: InstanceHandle,
 ) -> Option<InstanceHandle> {
-    descendant_of_class(diagnostics, icon, "Windows.UI.Xaml.Controls.ContentPresenter")
-}
-
-/// Nearest descendant of `icon` whose runtime class is `target`. Breadth-first matters:
-/// for `Border` it must find the shell's `BackgroundBorder` before our (deeper) pill.
-///
-/// # Safety
-/// XAML UI thread only.
-pub unsafe fn descendant_of_class(
-    diagnostics: &IXamlDiagnostics,
-    icon: InstanceHandle,
-    target: &str,
-) -> Option<InstanceHandle> {
-    /// Bounds the work done on the shell's UI thread (the presenter is two levels down).
-    const MAX_DEPTH: usize = 6;
-    /// Hard stop, so an unexpected tree cannot spin inside Explorer.
-    const MAX_VISITED: usize = 256;
-
-    let statics: IVisualTreeHelperStatics = factory(VISUAL_TREE_HELPER)?;
-    // Must be a `DependencyObject`, not the plain `IInspectable` (wrong vtable).
-    let root = element::<IDependencyObject>(diagnostics, icon)?;
-
-    let mut frontier = vec![root];
-    let mut visited = 0usize;
-    for _ in 0..MAX_DEPTH {
-        let mut next: Vec<IDependencyObject> = Vec::new();
-        for parent in &frontier {
-            let mut count = 0i32;
-            if statics.GetChildrenCount(parent.as_raw(), &mut count) != S_OK {
-                continue;
-            }
-            for index in 0..count {
-                if visited >= MAX_VISITED {
-                    logf!("descendant_presenter: gave up after {MAX_VISITED} elements");
-                    return None;
-                }
-                visited += 1;
-                let mut raw: *mut c_void = core::ptr::null_mut();
-                if statics.GetChild(parent.as_raw(), index, &mut raw) != S_OK || raw.is_null() {
-                    continue;
-                }
-                // Owned: dropping it releases `GetChild`'s reference.
-                let child = core::mem::transmute::<*mut c_void, IInspectable>(raw);
-                if child.GetRuntimeClassName().is_ok_and(|name| name == target) {
-                    let mut handle: InstanceHandle = 0;
-                    if diagnostics.GetHandleFromIInspectable(child.as_raw(), &mut handle) == S_OK
-                        && handle != 0
-                    {
-                        return Some(handle);
-                    }
-                }
-                if let Ok(node) = child.cast::<IDependencyObject>() {
-                    next.push(node);
-                }
-            }
-        }
-        if next.is_empty() {
-            break;
-        }
-        frontier = next;
-    }
-    None
+    crate::tree::descendant_of_class(diagnostics, icon, crate::winrt::CONTENT_PRESENTER)
 }
 
 /// Whether `presenter` currently holds *our* strip. The shell data-binds `Content` and can
@@ -828,7 +745,8 @@ pub unsafe fn holds_our_strip(
     if iface.get_Content(&mut raw) != S_OK || raw.is_null() {
         return false;
     }
-    let content = core::mem::transmute::<*mut c_void, IInspectable>(raw);
+    // Owned: dropping it releases `get_Content`'s reference.
+    let content = IInspectable::from_raw(raw);
     // Identity (automation name), not shape: the shell can put its own `Border` here.
     let mut handle: InstanceHandle = 0;
     if diagnostics.GetHandleFromIInspectable(content.as_raw(), &mut handle) != S_OK || handle == 0 {
@@ -850,20 +768,6 @@ pub const VOLUME_GLYPHS: &[char] = &[
 /// "Microphone + location" (`F47F`) is deliberately absent: hiding it would hide the location
 /// warning too. `note_unknown_glyph` logs unrecognised tray glyphs if this needs extending.
 pub const MIC_GLYPHS: &[char] = &['\u{E361}', '\u{E720}', '\u{EC71}', '\u{F12E}', '\u{E1D6}'];
-
-/// Reads a `TextBlock`'s `Text`.
-///
-/// # Safety
-/// XAML UI thread only.
-pub unsafe fn text_of(diagnostics: &IXamlDiagnostics, handle: InstanceHandle) -> Option<String> {
-    let text_block = element::<ITextBlock>(diagnostics, handle)?;
-    let mut raw: *mut c_void = core::ptr::null_mut();
-    if text_block.get_Text(&mut raw) != S_OK || raw.is_null() {
-        return None;
-    }
-    let text = core::mem::transmute::<*mut c_void, HSTRING>(raw);
-    Some(text.to_string())
-}
 
 /// Collapse one of the shell's own elements. Callers must save it with [`layout_of`] first
 /// so [`restore_layout`] can put it back.
@@ -1022,49 +926,6 @@ pub unsafe fn set_content_raw(
     Restored::Done
 }
 
-/// Sets an element's opacity — how the hover plate is lit and dimmed.
-///
-/// # Safety
-/// XAML UI thread only.
-pub unsafe fn set_opacity(
-    diagnostics: &IXamlDiagnostics,
-    handle: InstanceHandle,
-    opacity: f64,
-) -> bool {
-    let Some(element) = element::<IUIElement>(diagnostics, handle) else {
-        return false;
-    };
-    let hr = element.put_Opacity(opacity);
-    if hr != S_OK {
-        logf!("put_Opacity({opacity}) on 0x{handle:x} -> 0x{:08x}", hr.0);
-    }
-    hr == S_OK
-}
-
-/// The element's laid-out width. Zero is ambiguous (removed, or not laid out yet): trust it
-/// only after having seen a non-zero.
-///
-/// # Safety
-/// XAML UI thread only.
-pub unsafe fn actual_width(diagnostics: &IXamlDiagnostics, handle: InstanceHandle) -> Option<f64> {
-    actual_size(diagnostics, handle).map(|(width, _)| width)
-}
-
-/// Laid-out size of an element, once layout has actually run.
-///
-/// # Safety
-/// XAML UI thread only.
-pub unsafe fn actual_size(
-    diagnostics: &IXamlDiagnostics,
-    handle: InstanceHandle,
-) -> Option<(f64, f64)> {
-    let framework = element::<IFrameworkElement>(diagnostics, handle)?;
-    let mut width = 0.0f64;
-    let mut height = 0.0f64;
-    (framework.get_ActualWidth(&mut width) == S_OK && framework.get_ActualHeight(&mut height) == S_OK)
-        .then_some((width, height))
-}
-
 /// Laid-out size of a presenter's content (our pill); the presenter itself always fills the slot.
 ///
 /// # Safety
@@ -1079,58 +940,13 @@ pub unsafe fn content_size(
         return None;
     }
     // Owned: dropping it releases `get_Content`'s reference.
-    let content = core::mem::transmute::<*mut c_void, IInspectable>(raw);
+    let content = IInspectable::from_raw(raw);
     let framework = content.cast::<IFrameworkElement>().ok()?;
     let mut width = 0.0f64;
     let mut height = 0.0f64;
     (framework.get_ActualWidth(&mut width) == S_OK
         && framework.get_ActualHeight(&mut height) == S_OK)
         .then_some((width, height))
-}
-
-/// Turn a recorded handle back into the live XAML object.
-///
-/// # Safety
-/// XAML UI thread only.
-pub(crate) unsafe fn object_from_handle(
-    diagnostics: &IXamlDiagnostics,
-    handle: InstanceHandle,
-) -> Option<IInspectable> {
-    let mut raw: *mut c_void = core::ptr::null_mut();
-    if diagnostics.GetIInspectableFromHandle(handle, &mut raw) != S_OK || raw.is_null() {
-        return None;
-    }
-    Some(core::mem::transmute::<*mut c_void, IInspectable>(raw))
-}
-
-/// The live object behind `handle`, as interface `I`.
-///
-/// # Safety
-/// XAML UI thread only.
-pub(crate) unsafe fn element<I: Interface>(diagnostics: &IXamlDiagnostics, handle: InstanceHandle) -> Option<I> {
-    object_from_handle(diagnostics, handle)?.cast().ok()
-}
-
-/// An `HSTRING` as the raw handle our hand-rolled vtables take. `HSTRING` is repr(transparent) over
-/// the handle; `as_ptr` would hand over the UTF-16 buffer instead. `value` must outlive the call.
-pub(crate) fn hstring_abi(value: &HSTRING) -> *mut c_void {
-    unsafe { core::mem::transmute_copy::<HSTRING, *mut c_void>(value) }
-}
-
-/// `XamlReader.Load`: a live element built from markup.
-///
-/// # Safety
-/// XAML UI thread only.
-pub(crate) unsafe fn load_xaml(markup: &str) -> Option<IInspectable> {
-    let reader: IXamlReaderStatics = factory(XAML_READER)?;
-    let markup = HSTRING::from(markup);
-    let mut created: *mut c_void = core::ptr::null_mut();
-    let hr = reader.Load(hstring_abi(&markup), &mut created);
-    if hr != S_OK || created.is_null() {
-        logf!("XamlReader.Load failed: 0x{:08x}", hr.0);
-        return None;
-    }
-    Some(core::mem::transmute::<*mut c_void, IInspectable>(created))
 }
 
 /// Set a `FontIcon`'s `Glyph` in place.
@@ -1143,28 +959,4 @@ pub unsafe fn set_glyph(diagnostics: &IXamlDiagnostics, handle: InstanceHandle, 
     };
     let value = HSTRING::from(glyph.to_string());
     icon.put_Glyph(hstring_abi(&value)) == S_OK
-}
-
-/// Show or collapse an element.
-///
-/// # Safety
-/// XAML UI thread only.
-pub unsafe fn set_visible(diagnostics: &IXamlDiagnostics, handle: InstanceHandle, visible: bool) -> bool {
-    let Some(element) = element::<IUIElement>(diagnostics, handle) else {
-        return false;
-    };
-    let value = if visible { crate::winrt::VISIBILITY_VISIBLE } else { VISIBILITY_COLLAPSED };
-    element.put_Visibility(value) == S_OK
-}
-
-/// Set a `TextBlock`'s `Text`: updates text in place without rebuilding (and re-wiring) the tile.
-///
-/// # Safety
-/// XAML UI thread only.
-pub unsafe fn set_text(diagnostics: &IXamlDiagnostics, handle: InstanceHandle, text: &str) -> bool {
-    let Some(block) = element::<ITextBlock>(diagnostics, handle) else {
-        return false;
-    };
-    let value = HSTRING::from(text);
-    block.put_Text(hstring_abi(&value)) == S_OK
 }

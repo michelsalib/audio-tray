@@ -11,7 +11,7 @@ use std::sync::Mutex;
 use windows::Win32::Foundation::S_OK;
 use windows_core::{IInspectable, Interface};
 
-use crate::decorate::{element, object_from_handle};
+use crate::xaml::{element, object_from_handle};
 use crate::log::logf;
 use crate::winrt::{
     IBorder, IFrameworkElement, IGridStatics, Thickness, GRID, HORIZONTAL_ALIGNMENT_LEFT,
@@ -109,7 +109,7 @@ unsafe fn remember(diagnostics: &IXamlDiagnostics, handle: InstanceHandle) {
 /// XAML UI thread only.
 pub unsafe fn restore(diagnostics: &IXamlDiagnostics) {
     let spans = std::mem::take(&mut *crate::lock(&SPANS));
-    if let Some(grid) = crate::decorate::factory::<IGridStatics>(GRID) {
+    if let Some(grid) = crate::xaml::factory::<IGridStatics>(GRID) {
         for (handle, span) in spans {
             if let Some(framework) = element::<IFrameworkElement>(diagnostics, handle) {
                 let ok = grid.SetColumnSpan(framework.as_raw(), span) == S_OK;
@@ -173,7 +173,7 @@ pub unsafe fn clear_child(diagnostics: &IXamlDiagnostics, handle: InstanceHandle
 }
 
 unsafe fn load_markup(markup: &str) -> Option<IInspectable> {
-    crate::decorate::load_xaml(markup)
+    crate::xaml::load_xaml(markup)
 }
 
 /// Widen the host `Border` **and every ancestor below the `ItemsRepeater`** (each parent clips to
@@ -302,7 +302,7 @@ pub unsafe fn update_in_place(
         let text = super::ticker::window(now, character_budget(name, &l), 0);
         let mut wrote = false;
         for node in crate::tree::find_by_name(name) {
-            wrote |= crate::decorate::set_text(diagnostics, node, &text);
+            wrote |= crate::xaml::set_text(diagnostics, node, &text);
         }
         ok &= wrote;
         wrote_anything |= wrote;
@@ -364,7 +364,7 @@ pub unsafe fn place_button_state(diagnostics: &IXamlDiagnostics, button: Instanc
                 // Flush with the plate's left edge.
                 Some(_) => 0.0,
                 None => {
-                    let width = crate::decorate::actual_width(diagnostics, child).unwrap_or(0.0);
+                    let width = crate::xaml::actual_width(diagnostics, child).unwrap_or(0.0);
                     (layout::icon_centre() - width / 2.0).max(0.0)
                 }
             };
@@ -420,7 +420,7 @@ static SPANS: Mutex<Vec<(InstanceHandle, i32)>> = Mutex::new(Vec::new());
 /// # Safety
 /// XAML UI thread only.
 unsafe fn span_like_plate(diagnostics: &IXamlDiagnostics, panel: InstanceHandle, bar: InstanceHandle) {
-    let Some(grid) = crate::decorate::factory::<IGridStatics>(GRID) else {
+    let Some(grid) = crate::xaml::factory::<IGridStatics>(GRID) else {
         return;
     };
     let span_of = |handle: InstanceHandle| {
@@ -465,7 +465,7 @@ pub unsafe fn show_app_icon(diagnostics: &IXamlDiagnostics, button: InstanceHand
             if !HIDE.contains(&name.as_str()) {
                 continue;
             }
-            crate::decorate::set_visible(diagnostics, child, true);
+            crate::xaml::set_visible(diagnostics, child, true);
             if let Some(framework) = element::<IFrameworkElement>(diagnostics, child) {
                 // Auto, as the template has it.
                 let _ = framework.put_Width(f64::NAN);

@@ -72,10 +72,11 @@ fn remind_now(start: i64, ahead: i64, now: i64) -> bool {
     start - ahead <= now && now < start + 60
 }
 
-/// A reminder's line: "in 5 min · Room 1", "now".
+/// A reminder's line, in Windows' language: "in 5 min · Room 1", "now".
 fn reminder_line(start: i64, now: i64, location: &str) -> String {
     let minutes = ((start - now) + 59) / 60;
-    let mut line = if minutes > 0 { format!("in {minutes} min") } else { "now".to_string() };
+    let t = super::words();
+    let mut line = if minutes > 0 { (t.in_minutes)(minutes) } else { t.now.to_string() };
     if !location.is_empty() {
         line.push_str(&format!(" · {location}"));
     }
@@ -136,140 +137,161 @@ fn locale_string(what: u32) -> Option<String> {
     (n > 1).then(|| String::from_utf16_lossy(&buf[..n as usize - 1]))
 }
 
-/// Do the work due now, and say when to look again.
+/// Do the work due now, and say when to look again: the soonest any of its jobs wants to.
 pub fn tick(config: &Config) -> Duration {
     let now = time::now();
     let calendar = &config.calendar;
+    let fetch_next = fetch_if_due(config, now);
+    let events = if calendar.enabled { visible(config) } else { Vec::new() };
+    let next = STATE.with(|cell| {
+        let mut s = cell.borrow_mut();
+        // In this order: the quiet and the clock follow the focus timer as it stands now.
+        [focus_timer(&mut s, now), remind(&mut s, config, &events, now), keep_quiet(&mut s, config, &events, now), show_clock(&mut s, config, now)]
+            .into_iter()
+            .flatten()
+            .fold(fetch_next, i64::min)
+    });
+    Duration::from_secs((next - now).clamp(1, REFRESH_EVERY) as u64)
+}
+
+/// The events fetched in the background every quarter hour (the panel opening refreshes sooner).
+/// Its next wake: the next quarter hour.
+fn fetch_if_due(config: &Config, now: i64) -> i64 {
+    let calendar = &config.calendar;
     let setup = calendar.setup();
-    // In the background every quarter hour (the panel opening refreshes sooner).
     let due = super::fetched_at().is_none_or(|at| now - at >= REFRESH_EVERY);
     if calendar.enabled && due && super::has_sources(&setup) {
         let (y, m, _) = time::civil_from_days(time::today());
         super::fetch(&setup, super::days_around(y, m), false);
     }
-    let events = if calendar.enabled { visible(config) } else { Vec::new() };
-    let mut next = now + REFRESH_EVERY;
+    now + REFRESH_EVERY
+}
 
-    STATE.with(|cell| {
-        let mut s = cell.borrow_mut();
+/// The focus timer, ended by time, or stopped from outside (the moon, Windows' own toggle): only
+/// one that ran its course says so. Its next wake: its end, while it runs.
+fn focus_timer(s: &mut State, now: i64) -> Option<i64> {
+    let (end, minutes, held) = s.focus?;
+    if now >= end {
+        s.focus = None;
+        focus::stop(Why::Timer);
+        crate::hub::emit(crate::hub::Event::Notice(crate::hub::Notice::FocusDone { minutes }));
+        None
+    } else if held && !focus::active() {
+        s.focus = None;
+        focus::stop(Why::Timer);
+        None
+    } else {
+        Some(end)
+    }
+}
 
-        // The focus timer, ended by time, or stopped from outside (the moon, Windows' own toggle):
-        // only one that ran its course says so.
-        if let Some((end, minutes, held)) = s.focus {
-            if now >= end {
-                s.focus = None;
-                focus::stop(Why::Timer);
-                crate::hub::emit(crate::hub::Event::Notice(crate::hub::Notice::FocusDone { minutes }));
-            } else if held && !focus::active() {
-                s.focus = None;
-                focus::stop(Why::Timer);
-            } else {
-                next = next.min(end);
-            }
+/// The meetings' reminders, each once. Its next wake: the next reminder.
+fn remind(s: &mut State, config: &Config, events: &[Event], now: i64) -> Option<i64> {
+    let ahead = config.calendar.remind_minutes as i64 * 60;
+    if ahead <= 0 {
+        return None;
+    }
+    let mut next = None::<i64>;
+    for event in events {
+        let Some((start, _)) = span(event) else { continue };
+        let key = (event.title.clone(), start);
+        if remind_now(start, ahead, now) && !s.reminded.contains(&key) {
+            s.reminded.insert(key);
+            let line = reminder_line(start, now, &event.location);
+            let url = event.join.clone().or_else(|| event.link.clone());
+            crate::hub::emit(crate::hub::Event::Notice(crate::hub::Notice::Meeting { title: event.title.clone(), line, url, start }));
+        } else if start - ahead > now {
+            next = Some(next.map_or(start - ahead, |n| n.min(start - ahead)));
         }
+    }
+    s.reminded.retain(|(_, start)| *start + 3600 > now);
+    next
+}
 
-        // Reminders.
-        let ahead = calendar.remind_minutes as i64 * 60;
-        if ahead > 0 {
-            for event in &events {
-                let Some((start, _)) = span(event) else { continue };
-                let key = (event.title.clone(), start);
-                if remind_now(start, ahead, now) && !s.reminded.contains(&key) {
-                    s.reminded.insert(key);
-                    let line = reminder_line(start, now, &event.location);
-                    let url = event.join.clone().or_else(|| event.link.clone());
-                    let lasts = (start - now).max(0) as u64 + 120;
-                    crate::hub::emit(crate::hub::Event::Notice(crate::hub::Notice::Meeting { title: event.title.clone(), line, url, lasts }));
-                } else if start - ahead > now {
-                    next = next.min(start - ahead);
-                }
-            }
-            s.reminded.retain(|(_, start)| *start + 3600 > now);
-        }
-
-        // Quiet: during a meeting, or a call.
-        let in_call = calendar.quiet_in_calls && s.in_call;
-        let quiet_until = quiet_until(&events, now, calendar.quiet_in_meetings, in_call);
-        match quiet_until {
-            Some(until) if s.focus.is_none() => {
-                let ours = focus::still_ours();
-                if s.quiet_held && ours.is_none() {
-                    // Ended by the user: theirs until this meeting or call is over.
-                    s.quiet_held = false;
-                    s.quiet_off = Some(meeting_quiet(&events, now, calendar.quiet_in_meetings));
-                    println!("calendar: quiet switched off by hand, left off until this {} ends", if s.quiet_off == Some(None) { "call" } else { "meeting" });
-                }
-                // A call's end moves with every tick: extended only when it gained a while.
-                if !quiet_overridden(s.quiet_off, until, in_call) && ours.is_none_or(|(why, end)| why == Why::Quiet && end + QUIET_SLACK < until) {
-                    s.quiet_held = focus::start(Why::Quiet, until) || s.quiet_held;
-                }
-            }
-            Some(_) => {}
-            None => {
-                focus::stop(Why::Quiet);
+/// Do not disturb during a meeting, or a call. Its next wake: the next meeting's start or end.
+fn keep_quiet(s: &mut State, config: &Config, events: &[Event], now: i64) -> Option<i64> {
+    let calendar = &config.calendar;
+    let in_call = calendar.quiet_in_calls && s.in_call;
+    match quiet_until(events, now, calendar.quiet_in_meetings, in_call) {
+        Some(until) if s.focus.is_none() => {
+            let ours = focus::still_ours();
+            if s.quiet_held && ours.is_none() {
+                // Ended by the user: theirs until this meeting or call is over.
                 s.quiet_held = false;
-                s.quiet_off = None;
+                s.quiet_off = Some(meeting_quiet(events, now, calendar.quiet_in_meetings));
+                println!("calendar: quiet switched off by hand, left off until this {} ends", if s.quiet_off == Some(None) { "call" } else { "meeting" });
+            }
+            // A call's end moves with every tick: extended only when it gained a while.
+            if !quiet_overridden(s.quiet_off, until, in_call) && ours.is_none_or(|(why, end)| why == Why::Quiet && end + QUIET_SLACK < until) {
+                s.quiet_held = focus::start(Why::Quiet, until) || s.quiet_held;
             }
         }
-        for (start, end) in events.iter().filter_map(span) {
-            for at in [start, end] {
-                if at > now {
-                    next = next.min(at);
-                }
-            }
+        Some(_) => {}
+        None => {
+            focus::stop(Why::Quiet);
+            s.quiet_held = false;
+            s.quiet_off = None;
         }
+    }
+    events.iter().filter_map(span).flat_map(|(start, end)| [start, end]).filter(|at| *at > now).min()
+}
 
-        // The clock says the time, nothing more: what waits and the focus timer are the bell's.
-        let bell = super::merges_notices(config);
-        let count = if bell { super::notifications::count() } else { 0 };
-        // How many wait, as the notification card's header says. Only with the notification list
-        // on: a badge pointing at nothing helps no one.
-        let unread = if config.clock.unread { count } else { 0 };
-        // With none waiting, a running focus timer shows as a pie on the bell, filling as it goes.
-        let focus_done = s.focus.filter(|_| bell && unread == 0).map(|(end, minutes, _)| {
-            let length = (minutes as i64 * 60).max(60);
-            (1.0 - (end - now) as f32 / length as f32).clamp(0.0, 1.0)
-        });
-        if focus_done.is_some() {
-            // The pie moves with the minute.
-            next = next.min(now - now % 60 + 60);
-        }
-        let (time_pattern, date_pattern) = patterns(&config.clock);
-        let badge_image = match focus_done {
-            Some(done) => super::view::focus_pie(done),
-            None if unread > 0 => super::view::badge(unread as u32),
-            None => None,
-        };
-        // The bell crossed while Windows keeps notifications quiet, when it is the notifications' button.
-        let quiet = bell && focus::active();
-        // The bell filled while anything waits in Audio Tray's list, whatever its count badge: the
-        // shell's fill says what *it* has not shown, never seen now that its centre stays shut.
-        let waiting = bell.then_some(count > 0);
-        let text = ClockText { time: time_pattern, date: date_pattern, one_line: config.clock.one_line, badge: unread as u32, badge_image, quiet, waiting };
-        // Nothing to say: the shell's clock is the shell's (handed back if the TAP had it). While
-        // the bell is Audio Tray's, the TAP keeps it (its fill follows Audio Tray's list).
-        let wanted = config.clock.styled() || bell || text.badge > 0 || text.badge_image.is_some() || text.quiet;
-        if !wanted {
-            if s.sent.is_some() {
-                if crate::taskbar::release_clock() {
-                    println!("calendar: the clock is the shell's again");
-                    s.sent = None;
-                } else {
-                    next = next.min(now + 5);
-                }
-            }
-        } else if s.sent.as_ref() != Some(&text) {
-            if crate::taskbar::send_clock(&text) {
-                println!("calendar: the clock's bell now has {} waiting", text.badge);
-                s.sent = Some(text);
-            } else {
-                // The TAP is busy or reloading: soon again, not at the next quarter hour.
-                eprintln!("calendar: the TAP did not take the clock's text");
-                next = next.min(now + 5);
-            }
-        }
+/// The clock's text and the bell's badge, told to the TAP when they change. Its next wake: the
+/// focus pie's next minute, or a retry soon when the TAP did not take it.
+fn show_clock(s: &mut State, config: &Config, now: i64) -> Option<i64> {
+    let mut next = None;
+    // The clock says the time, nothing more: what waits and the focus timer are the bell's.
+    let bell = super::merges_notices(config);
+    let count = if bell { super::notifications::count() } else { 0 };
+    // How many wait, as the notification card's header says. Only with the notification list
+    // on: a badge pointing at nothing helps no one.
+    let unread = if config.clock.unread { count } else { 0 };
+    // With none waiting, a running focus timer shows as a pie on the bell, filling as it goes.
+    let focus_done = s.focus.filter(|_| bell && unread == 0).map(|(end, minutes, _)| {
+        let length = (minutes as i64 * 60).max(60);
+        (1.0 - (end - now) as f32 / length as f32).clamp(0.0, 1.0)
     });
-    Duration::from_secs((next - now).clamp(1, REFRESH_EVERY) as u64)
+    if focus_done.is_some() {
+        // The pie moves with the minute.
+        next = Some(now - now % 60 + 60);
+    }
+    let (time_pattern, date_pattern) = patterns(&config.clock);
+    let badge_image = match focus_done {
+        Some(done) => super::view::focus_pie(done),
+        None if unread > 0 => super::view::badge(unread as u32),
+        None => None,
+    };
+    // The bell crossed while Windows keeps notifications quiet, when it is the notifications' button.
+    let quiet = bell && focus::active();
+    // The bell filled while anything waits in Audio Tray's list, whatever its count badge: the
+    // shell's fill says what *it* has not shown, never seen now that its centre stays shut.
+    let waiting = bell.then_some(count > 0);
+    let text = ClockText { time: time_pattern, date: date_pattern, one_line: config.clock.one_line, badge: unread as u32, badge_image, quiet, waiting };
+    // Nothing to say: the shell's clock is the shell's (handed back if the TAP had it). While
+    // the bell is Audio Tray's, the TAP keeps it (its fill follows Audio Tray's list).
+    let wanted = config.clock.styled() || bell || text.badge > 0 || text.badge_image.is_some() || text.quiet;
+    // Not taken: soon again, not at the next quarter hour.
+    let retry = |next: Option<i64>| Some(next.map_or(now + 5, |n| n.min(now + 5)));
+    if !wanted {
+        if s.sent.is_some() {
+            if crate::taskbar::release_clock() {
+                println!("calendar: the clock is the shell's again");
+                s.sent = None;
+            } else {
+                return retry(next);
+            }
+        }
+    } else if s.sent.as_ref() != Some(&text) {
+        if crate::taskbar::send_clock(&text) {
+            println!("calendar: the clock's bell now has {} waiting", text.badge);
+            s.sent = Some(text);
+        } else {
+            // The TAP is busy or reloading.
+            eprintln!("calendar: the TAP did not take the clock's text");
+            return retry(next);
+        }
+    }
+    next
 }
 
 /// The TAP was reloaded (an Explorer restart, a fresh injection): it must be told again.

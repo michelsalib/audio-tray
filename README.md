@@ -19,11 +19,16 @@ A tiny Windows app for **audio awareness without opening anything** — a pill o
     site and transport controls when you point at the edge;
   - in a call, the faces in it with the speaker lit green, and your mic with its live dot; click
     it to mute;
-  - amber when you talk while muted, or when audio moved because a device disconnected; red when
-    an app starts listening outside a known call (click to mute, right-click to dismiss).
+  - amber when you talk while muted in a call.
 
-  It never takes focus, lets clicks through while quiet, hides behind fullscreen apps (except
-  red), and costs nothing while still: it is drawn with DirectComposition and the progress ring
+  It is about audio activity alone. An app that starts listening outside a known call raises a
+  red banner of Audio Tray's (click to mute, right-click to dismiss), whatever the bell; everything
+  else Audio Tray tells you (a device that disconnected, a battery running low, a keyboard layout,
+  a meeting) is a notification: Audio Tray's own under the bell when it shows them, Windows'
+  otherwise.
+
+  It never takes focus, lets clicks through while quiet, hides behind fullscreen apps, and costs
+  nothing while still: it is drawn with DirectComposition and the progress ring
   is animated by the compositor, not the app.
 - **Integrations** (optional, each can be off): Discord through its own local RPC with your own
   Discord application, no client mod (who is in the call with their avatars, who is talking, your
@@ -61,7 +66,7 @@ A tiny Windows app for **audio awareness without opening anything** — a pill o
   AZERTY and it is AZERTY, pick up a QWERTY keyboard and the next keys are QWERTY, even when both
   layouts belong to the same language. Add a keyboard by pressing a key on it; one that also
   connects by cable, receiver or Bluetooth gets each way added to its card, as Windows sees
-  each as a different keyboard. The pill shows
+  each as a different keyboard. A small banner shows
   each change, Win+Space included, and Windows' own layout icon can be hidden from the taskbar.
   - *Privacy:* only which keyboard a key comes from is read (Raw Input's device handle), never
     the key itself; nothing is hooked, injected or logged.
@@ -70,10 +75,18 @@ A tiny Windows app for **audio awareness without opening anything** — a pill o
     switch it); the lock screen is not covered.
 - **Battery levels** of your keyboard, mouse, headset and other wireless devices (Settings >
   Batteries) — every connected Bluetooth device that reports one, the devices paired to a
-  Logitech receiver (LIGHTSPEED, Unifying, Bolt) and a Razer BlackShark V2 Pro on its receiver, in
-  a Batteries section of the flyout and under
-  the tray icon's tooltip. When one runs low (20% by default), the pill warns in amber and Windows
-  shows a notification, once until it is charged again. Each of these can be turned off. Windows
+  Logitech receiver (LIGHTSPEED, Unifying, Bolt) and a Razer BlackShark V2 Pro on its receiver.
+  They live at the taskbar's battery icon. On a laptop that is Windows' own: its click opens a
+  Batteries card (this PC's charge and state, then every device's level; the rest of Quick
+  Settings stays Windows'), its tooltip lists them all, and it wears a red dot while one runs low.
+  On a desktop, which Windows gives no battery icon, Audio Tray shows one of its own while a device
+  reports a battery: a bar or a ring per device (the lowest three, Settings > Batteries chooses),
+  green, amber or red by level, with the same tooltip and card; its right click offers the
+  batteries, their settings and Windows' Bluetooth page. The laptop's takeover needs the taskbar
+  integration on for something else (the audio buttons, the music tile or the calendar). Windows
+  shows a notification when one runs low (20% by default), once until it is charged again. With
+  the battery icon turned off, they show in the audio panel and under the audio icon's tooltip
+  instead. Windows
   says when a Bluetooth level changes or a device connects; a receiver's devices are asked every
   two minutes while it is plugged in.
   - *Limits:* devices on a vendor's own USB receiver (Logitech Bolt/Unifying, most gaming
@@ -113,7 +126,7 @@ input:
 | Right-click a button | A menu: Windows' sound settings, Audio Tray's settings, Quit |
 | Middle-click a button | Mute/unmute that endpoint, switch it to the next device, or switch and stop once on the last device muted before wrapping (Settings > Taskbar, `[strip] middle_click = "mute"`, `"switch"` or `"switch_mute"`, the default) |
 | Win+Ctrl+V | Open the flyout (Windows' shortcut for its sound output; `[strip] shortcut`) |
-| Click the clock / the bell | Audio Tray's calendar / notifications, when on (Settings > Taskbar); Win+Alt+D and Win+N open them too |
+| Click the clock / the bell | Audio Tray's calendar / notifications, each on its own (Settings > Taskbar for the clock, `[calendar] enabled`; Settings > Notifications for the bell, `[calendar] bell`); Win+Alt+D and Win+N open them too |
 | Middle-click the bell | Do not disturb on/off, or clear every notification, or nothing (`[calendar] bell_middle_click = "do_not_disturb"`, `"clear_all"` or `"nothing"`) |
 | Scroll a button (wheel or touchpad) | Adjust that endpoint's volume, 2% per notch, with a level bar beside the buttons |
 | Scroll elsewhere on the taskbar | Adjust the output volume |
@@ -172,8 +185,7 @@ tile_style = "off"        # what it shows: "off", "cover" (cover + progress) or 
 
 [pill]
 enabled = true              # the edge pill
-listening_alerts = true     # the red alert when an app records outside a known call
-devices = true              # the output and input on the pill, clicked to switch
+listening_alerts = true     # a red banner when an app records outside a known call (never on the pill)
 size = "big"                # at rest: "hidden" (the sliver), "small" or "big"; hover shows all
 edge = "left"               # the screen edge it hugs: "left", "right" or "top"
 align = "center"            # where along it: "start" (top, or left), "center" or "end"
@@ -183,10 +195,10 @@ align = "center"            # where along it: "start" (top, or left), "center" o
 enabled = true              # follow the battery levels of wireless devices
 flyout = true               # a Batteries section in the flyout
 tooltip = true              # the levels under the tray icon's tooltip
-pill_card = true            # the levels on the pill's card, when you hover it
-pill_alert = true           # an amber warning on the pill when one runs low
-toast = true                # a Windows notification when one runs low
+toast = true                # a notification when one runs low
 low_at = 20                 # low is at or under this (%)
+taskbar_icon = true         # they live at the battery icon (Windows' on a laptop, ours on a desktop)
+icon_style = "bars"         # our own icon (a desktop): "bars" or "rings", one per device
 
 [discord]
 enabled = true              # Discord: RPC when client_id/client_secret are set, and the Vencord pipe

@@ -1,7 +1,8 @@
 //! The settings window: a normal, resizable app window (it stays open when clicked away from,
-//! unlike the flyout), in Windows 11's settings style. A navigation pane on the left — Taskbar,
-//! Edge pill, Devices, Connectors, About — and the page on the right, drawn with Direct2D
-//! ([`paint`]) from a pure layout ([`layout`]).
+//! unlike the flyout), in Windows 11's settings style. A navigation pane on the left — Home, Taskbar,
+//! Calendar, Notifications, Edge pill, Motion, Audio devices, Batteries, Keyboards, Connectors,
+//! About ([`layout::Page`]) — and the page on the right, drawn with Direct2D ([`paint`]) from a
+//! pure layout ([`layout`]).
 //!
 //! **Its own copy of the config.** Each change is made to the copy, then handed to the tray as
 //! [`take_pending`] behind a posted [`WM_SETTINGS`]: the tray applies it (saves, re-places the
@@ -35,8 +36,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::audio::wasapi::WasapiBackend;
-use crate::config::{Config, PillSize, TileStyle};
+use crate::config::Config;
 use crate::lang::tr;
+use crate::tf;
 use layout::{Button, Choice, Laid, Page, Target, Toggle};
 use model::{Model, Status};
 use paint::{Font, Gfx, Palette, Pointer};
@@ -55,6 +57,7 @@ pub const RESTART: usize = 2;
 pub const OPEN_CALENDAR: usize = 1;
 pub const OPEN_TASKBAR: usize = 2;
 pub const OPEN_NOTIFICATIONS: usize = 3;
+pub const OPEN_BATTERIES: usize = 4;
 
 /// Posted to this window: something in [`INBOX`] to read.
 const WM_FOLLOW: u32 = WM_APP + 1;
@@ -71,7 +74,7 @@ const OPEN_SIZE: (f32, f32) = (1040.0, 760.0);
 const MIN_SIZE: (f32, f32) = (720.0, 480.0);
 /// How far one wheel notch scrolls the page.
 const SCROLL_STEP: f32 = 64.0;
-/// Repeating while a page shows moving pictures (Home, Look & motion): each tick repaints them.
+/// Repeating while a page shows moving pictures (Home, Motion): each tick repaints them.
 const ANIMATION_TIMER: usize = 1;
 const ANIMATION_MS: u32 = 33;
 
@@ -174,15 +177,10 @@ pub fn show_page(code: usize) {
         OPEN_CALENDAR => Page::Calendar,
         OPEN_TASKBAR => Page::Taskbar,
         OPEN_NOTIFICATIONS => Page::Notifications,
+        OPEN_BATTERIES => Page::Batteries,
         _ => return,
     };
-    with_window(|w| {
-        w.model.page = page;
-        w.model.calendar = crate::calendar::status(&w.model.config.calendar.setup());
-        w.scroll = 0.0;
-        w.relayout();
-        w.invalidate();
-    });
+    with_window(|w| w.go_to(page));
 }
 
 /// The config this window changed, for the tray to apply ([`WM_SETTINGS`]).
@@ -231,7 +229,7 @@ fn create(config: &Config) -> Result<()> {
     let h = ((OPEN_SIZE.1 * scale) as i32).min(wh * 9 / 10);
     let (x, y) = (work.left + (ww - w) / 2, work.top + (wh - h) / 2);
     let hwnd = unsafe {
-        CreateWindowExW(WINDOW_EX_STYLE(0), CLASS, &windows::core::HSTRING::from(tr("Audio Tray Settings", "Paramètres d'Audio Tray")), WS_OVERLAPPEDWINDOW, x, y, w, h, None, None, Some(instance.into()), None)
+        CreateWindowExW(WINDOW_EX_STYLE(0), CLASS, &windows::core::HSTRING::from(tr("Audio Tray Settings", "Paramètres d’Audio Tray")), WS_OVERLAPPEDWINDOW, x, y, w, h, None, None, Some(instance.into()), None)
     }
     .context("CreateWindowExW")?;
 
@@ -300,6 +298,29 @@ fn client_size(hwnd: HWND) -> (u32, u32) {
 /// Work to do once the window's state is released: it may pump messages.
 type After = Box<dyn FnOnce()>;
 
+/// Open `url` (a web page, or one of Windows' settings), once the window's state is released.
+fn open_page(url: &'static str) -> Option<After> {
+    Some(Box::new(move || {
+        crate::win::shell_open(url, None);
+    }))
+}
+
+/// The page outside Settings `button` opens, when that is all it does.
+fn web_page(button: Button) -> Option<&'static str> {
+    use layout::Cal;
+    Some(match button {
+        Button::SoundSettings => "ms-settings:sound",
+        Button::QuietRules => "ms-settings:notifications",
+        Button::AllowNotifications => "ms-settings:privacy-notifications",
+        Button::DiscordPortal => "https://discord.com/developers/applications",
+        Button::Releases => "https://github.com/michelsalib/audio-tray/releases",
+        Button::Cal(Cal::GoogleApi) => "https://console.cloud.google.com/apis/library/calendar-json.googleapis.com",
+        Button::Cal(Cal::GoogleCredentials) => "https://console.cloud.google.com/apis/credentials",
+        Button::Cal(Cal::MicrosoftPortal) => "https://entra.microsoft.com/#view/Microsoft_AAD_RegisteredApps/ApplicationsListBlade/quickStartType~/null/sourceType/Microsoft_AAD_IAM",
+        _ => return None,
+    })
+}
+
 impl Window {
     /// The client area in DIPs.
     fn dips(&self) -> (f32, f32) {
@@ -328,6 +349,27 @@ impl Window {
                 }
             }
         }
+    }
+
+    /// Lay the page out again and draw it.
+    fn refresh(&mut self) {
+        self.relayout();
+        self.invalidate();
+    }
+
+    /// Show `page` from its top, with what the calendar knows read afresh (Home, the Calendar and
+    /// the Notifications pages show it).
+    fn go_to(&mut self, page: Page) {
+        self.model.page = page;
+        self.model.expanded = None;
+        self.model.hint = None;
+        self.stop_capture();
+        if page == Page::Keyboards {
+            self.model.read_keyboards();
+        }
+        self.model.calendar = crate::calendar::status(&self.model.config.calendar.setup());
+        self.scroll = 0.0;
+        self.refresh();
     }
 
     fn invalidate(&self) {
@@ -372,8 +414,7 @@ impl Window {
         self.model.hint = None;
         PENDING.with(|p| *p.borrow_mut() = Some(self.model.config.clone()));
         crate::tray::post(WM_SETTINGS, APPLY, 0);
-        self.relayout();
-        self.invalidate();
+        self.refresh();
     }
 
     /// The display to keep for display `i` with the pill on `edge`: none (automatic) while automatic
@@ -395,8 +436,7 @@ impl Window {
     /// Show `text` in place of `button`'s value, in `tone`.
     fn say(&mut self, button: Button, text: &'static str, tone: model::Tone) {
         self.model.hint = Some((button, text, tone));
-        self.relayout();
-        self.invalidate();
+        self.refresh();
     }
 
     /// Act on a click on `target`; what comes back runs once the state is released.
@@ -406,128 +446,15 @@ impl Window {
             self.save_name();
         }
         match target {
-            Target::Nav(page) => {
-                if self.model.page != page {
-                    self.model.page = page;
-                    self.model.expanded = None;
-                    self.model.hint = None;
-                    self.stop_capture();
-                    if page == Page::Keyboards {
-                        self.model.read_keyboards();
-                    }
-                    if page == Page::Calendar {
-                        self.model.calendar = crate::calendar::status(&self.model.config.calendar.setup());
-                    }
-                    self.scroll = 0.0;
-                    self.relayout();
-                    self.invalidate();
-                }
-                if page == Page::Connectors {
-                    self.model.mpc = crate::integrations::mpc::shares_media();
-                    self.model.edge_sleep = crate::integrations::edge::players_at_risk();
-                    self.relayout();
-                    self.invalidate();
-                    // A redirect added since the last failure: try again now, not at the next call.
-                    return Some(Box::new(|| {
-                        crate::integrations::discord_rpc::retry();
-                        crate::integrations::poke_teams();
-                    }));
-                }
-            }
-            Target::Toggle(Toggle::CalendarShown(i)) => {
-                let key = self.model.calendar.calendars.get(i)?.key.clone();
-                self.change(|c| {
-                    if c.calendar.hidden.contains(&key) {
-                        c.calendar.hidden.retain(|k| *k != key);
-                    } else {
-                        c.calendar.hidden.push(key);
-                    }
-                });
-            }
-            Target::Toggle(Toggle::Site(i)) => {
-                let (key, _, _) = crate::integrations::browser::SITES.get(i)?;
-                self.change(|c| {
-                    if c.browser.sites.iter().any(|s| s == key) {
-                        c.browser.sites.retain(|s| s != key);
-                    } else {
-                        c.browser.sites.push(key.to_string());
-                    }
-                });
-            }
-            Target::Toggle(toggle) => self.change(|c| {
-                let flag = match toggle {
-                    Toggle::Site(_) => return,
-                    Toggle::Strip => &mut c.strip.enabled,
-                    Toggle::StripShortcut => &mut c.strip.shortcut,
-                    Toggle::NextToWifi => &mut c.strip.next_to_wifi,
-                    Toggle::HideVolume => &mut c.strip.hide_windows_volume,
-                    Toggle::HideMic => &mut c.strip.hide_windows_mic,
-                    Toggle::HideLanguage => &mut c.strip.hide_windows_language,
-                    Toggle::Keyboards => &mut c.keyboards.enabled,
-                    Toggle::KeyboardReadout => &mut c.keyboards.show_readout,
-                    Toggle::Music => &mut c.music.enabled,
-                    Toggle::Pill => &mut c.pill.enabled,
-                    Toggle::PillDevices => &mut c.pill.devices,
-                    Toggle::AnnounceTracks => &mut c.pill.announce_tracks,
-                    Toggle::ListeningAlerts => &mut c.pill.listening_alerts,
-                    Toggle::Browser => &mut c.browser.enabled,
-                    Toggle::Mpc => &mut c.mpc.enabled,
-                    Toggle::Discord => &mut c.discord.enabled,
-                    Toggle::Teams => &mut c.teams.enabled,
-                    Toggle::Calendar => &mut c.calendar.enabled,
-                    Toggle::ClockSeconds => &mut c.clock.seconds,
-                    Toggle::ClockWeekday => &mut c.clock.weekday,
-                    Toggle::ClockOneLine => &mut c.clock.one_line,
-                    Toggle::ClockHideDate => &mut c.clock.hide_date,
-                    Toggle::ClockUnread => &mut c.clock.unread,
-                    Toggle::WeekNumbers => &mut c.calendar.week_numbers,
-                    Toggle::WorldClocks => &mut c.calendar.world_clocks,
-                    Toggle::CalendarNotifications => &mut c.calendar.notifications,
-                    Toggle::TakeOver => &mut c.calendar.take_over,
-                    Toggle::CalendarShortcut => &mut c.calendar.shortcut,
-                    Toggle::QuietMeetings => &mut c.calendar.quiet_in_meetings,
-                    Toggle::QuietCalls => &mut c.calendar.quiet_in_calls,
-                    Toggle::CalendarShown(_) => return,
-                    Toggle::Batteries => &mut c.batteries.enabled,
-                    Toggle::BatteryFlyout => &mut c.batteries.flyout,
-                    Toggle::BatteryTooltip => &mut c.batteries.tooltip,
-                    Toggle::BatteryPillCard => &mut c.batteries.pill_card,
-                    Toggle::BatteryPill => &mut c.batteries.pill_alert,
-                    Toggle::BatteryToast => &mut c.batteries.toast,
-                };
-                *flag = !*flag;
-            }),
+            Target::Nav(page) => return self.navigate(page),
+            Target::Toggle(toggle) => self.flip(toggle)?,
             Target::Choice(Choice::KeyboardLayout(k), i) => {
                 let hkl = self.model.layouts.get(i)?.0;
                 self.set_layout(k, hkl);
             }
             Target::Choice(choice, i) => {
                 let monitors: Vec<String> = self.model.monitors.iter().map(|m| m.name.clone()).collect();
-                self.change(|c| match choice {
-                    Choice::Tile => c.music.tile_style = [TileStyle::Off, TileStyle::Cover, TileStyle::Full][i.min(2)],
-                    Choice::MiddleClick => c.strip.middle_click = layout::MIDDLE_CLICKS[i.min(2)],
-                    Choice::BellMiddle => c.calendar.bell_middle_click = layout::BELL_MIDDLE_CLICKS[i.min(2)],
-                    Choice::PillSize => c.pill.size = [PillSize::Hidden, PillSize::Small, PillSize::Big][i.min(2)],
-                    Choice::BrowserTabs => c.browser.every_site = i == 0,
-                    // Automatic, then each display.
-                    Choice::Display => c.pill.monitor = i.checked_sub(1).and_then(|m| monitors.get(m).cloned()),
-                    Choice::LowBattery => {
-                        let levels = crate::config::Batteries::LOW_LEVELS;
-                        c.batteries.low_at = levels[i.min(levels.len() - 1)];
-                    }
-                    Choice::KeyboardLayout(_) => {}
-                    Choice::RingMotion => c.motion.ring = crate::config::MotionStyle::ALL[i.min(2)],
-                    Choice::BarMotion => c.motion.bar = crate::config::MotionStyle::ALL[i.min(2)],
-                    Choice::VolumeMotion => c.motion.volume = crate::config::MotionStyle::ALL[i.min(2)],
-                    Choice::WaveColour => {
-                        c.motion.colour = if i == 1 { crate::config::WaveColour::Cover } else { crate::config::WaveColour::Accent }
-                    }
-                    Choice::CalendarLayout => c.calendar.layout = layout::CALENDAR_LAYOUTS[i.min(2)],
-                    Choice::AgendaRows => c.calendar.rows = layout::AGENDA_ROWS[i.min(2)],
-                    Choice::WeekStart => c.calendar.first_weekday = [None, Some(0), Some(6)][i.min(2)],
-                    Choice::Reminder => c.calendar.remind_minutes = layout::REMINDERS[i.min(3)],
-                    Choice::FocusLength => c.calendar.focus_minutes = layout::FOCUS_LENGTHS[i.min(3)],
-                })
+                self.change(|c| choice.apply(i, c, &monitors));
             }
             Target::Slot(i, edge, align) => {
                 let name = self.pin(i, edge);
@@ -555,13 +482,11 @@ impl Window {
             Target::Connector(connector) => {
                 self.model.open = if self.model.open == Some(connector) { None } else { Some(connector) };
                 self.model.hint = None;
-                self.relayout();
-                self.invalidate();
+                self.refresh();
             }
             Target::Device(i) => {
                 self.model.expanded = if self.model.expanded == Some(i) { None } else { Some(i) };
-                self.relayout();
-                self.invalidate();
+                self.refresh();
             }
             Target::Icon(i, icon) => {
                 let id = self.model.devices.get(i).map(|d| d.id.0.clone())?;
@@ -574,7 +499,60 @@ impl Window {
         None
     }
 
+    /// A click on `page` in the navigation.
+    fn navigate(&mut self, page: Page) -> Option<After> {
+        if self.model.page != page {
+            self.go_to(page);
+        }
+        if page != Page::Connectors {
+            return None;
+        }
+        self.model.mpc = crate::integrations::mpc::shares_media();
+        self.model.edge_sleep = crate::integrations::edge::players_at_risk();
+        self.refresh();
+        // A redirect added since the last failure: try again now, not at the next call.
+        Some(Box::new(|| {
+            crate::integrations::discord_rpc::retry();
+            crate::integrations::poke_teams();
+        }))
+    }
+
+    /// Flip a switch; `None` when it names a calendar or a site no longer there.
+    fn flip(&mut self, toggle: Toggle) -> Option<()> {
+        match toggle {
+            Toggle::CalendarShown(i) => {
+                let key = self.model.calendar.calendars.get(i)?.key.clone();
+                self.change(|c| {
+                    if c.calendar.hidden.contains(&key) {
+                        c.calendar.hidden.retain(|k| *k != key);
+                    } else {
+                        c.calendar.hidden.push(key);
+                    }
+                });
+            }
+            Toggle::Site(i) => {
+                let (key, _, _) = crate::integrations::browser::SITES.get(i)?;
+                self.change(|c| {
+                    if c.browser.sites.iter().any(|s| s == key) {
+                        c.browser.sites.retain(|s| s != key);
+                    } else {
+                        c.browser.sites.push(key.to_string());
+                    }
+                });
+            }
+            _ => self.change(|c| {
+                if let Some(flag) = toggle.flag(c) {
+                    *flag = !*flag;
+                }
+            }),
+        }
+        Some(())
+    }
+
     fn press(&mut self, button: Button) -> Option<After> {
+        if let Some(url) = web_page(button) {
+            return open_page(url);
+        }
         match button {
             Button::Mpc => match crate::integrations::mpc::share_media() {
                 Ok(()) => {
@@ -583,19 +561,10 @@ impl Window {
                 }
                 Err(hint) => self.hint(Button::Mpc, hint),
             },
-            Button::SoundSettings => return Some(Box::new(|| {
-                crate::win::shell_open("ms-settings:sound", None);
-            })),
             // The bell's cross, the panel's moon and this page follow (Windows says it changed).
             Button::Quiet => return Some(Box::new(|| {
                 crate::calendar::focus::toggle();
                 crate::calendar::quiet_changed();
-            })),
-            Button::QuietRules => return Some(Box::new(|| {
-                crate::win::shell_open("ms-settings:notifications", None);
-            })),
-            Button::AllowNotifications => return Some(Box::new(|| {
-                crate::win::shell_open("ms-settings:privacy-notifications", None);
             })),
             // System and performance, where the "Never put these sites to sleep" list is.
             Button::EdgeSleep => return Some(Box::new(|| {
@@ -607,13 +576,8 @@ impl Window {
                 return Some(Box::new(|| {
                     crate::integrations::browser::open_extensions_page();
                     if !crate::integrations::browser::show_extension_dir() {
-                        with_window(|w| w.hint(Button::ExtensionFolder, tr("The extension's folder was not found next to Audio Tray", "Le dossier de l'extension est introuvable à côté d'Audio Tray")));
+                        with_window(|w| w.hint(Button::ExtensionFolder, tr("The extension's folder was not found next to Audio Tray", "Le dossier de l’extension est introuvable à côté d’Audio Tray")));
                     }
-                }));
-            }
-            Button::DiscordPortal => {
-                return Some(Box::new(|| {
-                    crate::win::shell_open("https://discord.com/developers/applications", None);
                 }));
             }
             Button::DiscordRedirect => {
@@ -641,9 +605,32 @@ impl Window {
             Button::Quit => {
                 crate::tray::post(WM_SETTINGS, QUIT, 0);
             }
-            Button::Releases => return Some(Box::new(|| {
-                crate::win::shell_open("https://github.com/michelsalib/audio-tray/releases", None);
-            })),
+            Button::ConfigFolder => {
+                let dir = Config::path().ok().and_then(|p| p.parent().map(|d| d.to_path_buf()));
+                return Some(Box::new(move || {
+                    if let Some(dir) = dir {
+                        let _ = std::fs::create_dir_all(&dir);
+                        crate::win::shell_open(&dir.to_string_lossy(), None);
+                    }
+                }));
+            }
+            Button::AddKeyboard
+            | Button::AddConnection(_)
+            | Button::CancelCapture
+            | Button::RenameKeyboard(_)
+            | Button::SaveName
+            | Button::CancelRename
+            | Button::RemoveKeyboard(_)
+            | Button::RemoveConnection(..) => self.press_keyboard(button)?,
+            // Opened above.
+            Button::SoundSettings | Button::QuietRules | Button::AllowNotifications | Button::DiscordPortal | Button::Releases => {}
+        }
+        None
+    }
+
+    /// The keyboards' buttons; `None` when the keyboard is no longer there.
+    fn press_keyboard(&mut self, button: Button) -> Option<()> {
+        match button {
             Button::AddKeyboard | Button::AddConnection(_) => {
                 crate::keyboards::capture(self.hwnd, WM_KEYBOARD_CAPTURED);
                 self.model.capture = Some(None);
@@ -652,26 +639,22 @@ impl Window {
                     _ => None,
                 };
                 self.model.read_keyboards();
-                self.relayout();
-                self.invalidate();
+                self.refresh();
             }
             Button::CancelCapture => {
                 self.stop_capture();
-                self.relayout();
-                self.invalidate();
+                self.refresh();
             }
             Button::RenameKeyboard(i) => {
                 let name = self.model.config.keyboards.assigned.get(i)?.name.clone();
                 self.model.renaming = Some((i, name));
-                self.relayout();
-                self.invalidate();
+                self.refresh();
             }
-            // Saved above, by any click.
+            // Saved by any click ([`Window::activate`]).
             Button::SaveName => self.save_name(),
             Button::CancelRename => {
                 self.model.renaming = None;
-                self.relayout();
-                self.invalidate();
+                self.refresh();
             }
             Button::RemoveKeyboard(i) => {
                 self.stop_capture();
@@ -686,17 +669,9 @@ impl Window {
                     keyboard.remove_path(j);
                 }
             }),
-            Button::ConfigFolder => {
-                let dir = Config::path().ok().and_then(|p| p.parent().map(|d| d.to_path_buf()));
-                return Some(Box::new(move || {
-                    if let Some(dir) = dir {
-                        let _ = std::fs::create_dir_all(&dir);
-                        crate::win::shell_open(&dir.to_string_lossy(), None);
-                    }
-                }));
-            }
+            _ => {}
         }
-        None
+        Some(())
     }
 
     /// The calendar connector's buttons.
@@ -704,13 +679,7 @@ impl Window {
         use layout::Cal;
         use model::CalendarKey;
         let button = Button::Cal(cal);
-        let open = |url: &'static str| -> Option<After> { Some(Box::new(move || {
-            crate::win::shell_open(url, None);
-        })) };
         match cal {
-            Cal::GoogleApi => return open("https://console.cloud.google.com/apis/library/calendar-json.googleapis.com"),
-            Cal::GoogleCredentials => return open("https://console.cloud.google.com/apis/credentials"),
-            Cal::MicrosoftPortal => return open("https://entra.microsoft.com/#view/Microsoft_AAD_RegisteredApps/ApplicationsListBlade/quickStartType~/null/sourceType/Microsoft_AAD_IAM"),
             Cal::MicrosoftRedirect => match crate::win::set_clipboard_text("http://localhost") {
                 true => self.say(button, tr("Copied: add it under Mobile and desktop applications", "Copié : ajoutez-le sous Applications mobiles et de bureau"), model::Tone::Good),
                 false => self.hint(button, tr("The clipboard is busy: copy again", "Presse-papiers occupé : copiez à nouveau")),
@@ -759,6 +728,8 @@ impl Window {
             Cal::CancelSignIn(provider) => crate::calendar::cancel_sign_in(provider),
             Cal::SignOut(provider) => crate::calendar::sign_out(provider),
             Cal::EditClocks => return Some(Box::new(crate::calendar::zones::edit)),
+            // Opened by [`Window::press`].
+            Cal::GoogleApi | Cal::GoogleCredentials | Cal::MicrosoftPortal => {}
         }
         None
     }
@@ -778,8 +749,7 @@ impl Window {
         };
         let name = name.trim().to_string();
         if name.is_empty() {
-            self.relayout();
-            self.invalidate();
+            self.refresh();
             return;
         }
         self.change(|c| {
@@ -820,8 +790,7 @@ impl Window {
                 }
             }
         }
-        self.relayout();
-        self.invalidate();
+        self.refresh();
         true
     }
 
@@ -836,15 +805,13 @@ impl Window {
         let into = self.model.capture_into;
         if let Some(name) = captured.assigned {
             let mine = into.and_then(|i| self.model.config.keyboards.assigned.get(i)).is_some_and(|k| k.has(&captured.path));
-            let hint = match (mine, crate::lang::french()) {
-                (true, false) => format!("That connection is already part of \"{name}\": connect it another way, then press a key"),
-                (true, true) => format!("Cette connexion fait déjà partie de « {name} » : branchez le clavier autrement, puis appuyez sur une touche"),
-                (false, false) => format!("That one is already here, as \"{name}\": press a key on another keyboard"),
-                (false, true) => format!("Celui-ci est déjà là, sous le nom « {name} » : appuyez sur une touche d'un autre clavier"),
+            let hint = if mine {
+                tf!("That connection is already part of \"{name}\": connect it another way, then press a key", "Cette connexion fait déjà partie de « {name} » : branchez le clavier autrement, puis appuyez sur une touche")
+            } else {
+                tf!("That one is already here, as \"{name}\": press a key on another keyboard", "Celui-ci est déjà là, sous le nom « {name} » : appuyez sur une touche d’un autre clavier")
             };
             self.model.capture = Some(Some(hint));
-            self.relayout();
-            self.invalidate();
+            self.refresh();
             return;
         }
         self.model.capture = None;
@@ -887,8 +854,7 @@ impl Window {
             self.model.calendar = crate::calendar::status(&self.model.config.calendar.setup());
         }
         self.model.update = crate::update::pending_version();
-        self.relayout();
-        self.invalidate();
+        self.refresh();
     }
 }
 
@@ -925,8 +891,7 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESUL
             with_window(|w| {
                 w.size = ((lparam.0 & 0xFFFF) as u32, ((lparam.0 >> 16) & 0xFFFF) as u32);
                 w.gfx.resize(w.size.0, w.size.1);
-                w.relayout();
-                w.invalidate();
+                w.refresh();
             });
             Some(LRESULT(0))
         }
@@ -936,8 +901,7 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESUL
             let r = unsafe { *(lparam.0 as *const RECT) };
             let _ = unsafe { SetWindowPos(hwnd, None, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOZORDER | SWP_NOACTIVATE) };
             with_window(|w| {
-                w.relayout();
-                w.invalidate();
+                w.refresh();
             });
             Some(LRESULT(0))
         }
@@ -1013,8 +977,7 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESUL
         WM_DISPLAYCHANGE => {
             with_window(|w| {
                 w.model.monitors = crate::win::monitors();
-                w.relayout();
-                w.invalidate();
+                w.refresh();
             });
             None
         }
@@ -1026,8 +989,7 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESUL
                 if (&edge_sleep, mpc) != (&w.model.edge_sleep, w.model.mpc) {
                     w.model.edge_sleep = edge_sleep;
                     w.model.mpc = mpc;
-                    w.relayout();
-                    w.invalidate();
+                    w.refresh();
                 }
             });
             None
@@ -1063,15 +1025,9 @@ pub fn preview(config: &Config, page: &str) {
         // Its English or its French title.
         let named = |title: &str| title.to_lowercase().contains(&page.to_lowercase());
         if let Some(page) = Page::ALL.into_iter().find(|p| named(p.titles().0) || named(p.titles().1)) {
-            w.model.page = page;
-            w.relayout();
-            w.invalidate();
+            w.go_to(page);
         }
     });
-    // `calendar`: the Calendar page, with its accounts read.
-    if page.eq_ignore_ascii_case("calendar") {
-        show_page(OPEN_CALENDAR);
-    }
     let mut msg = windows::Win32::UI::WindowsAndMessaging::MSG::default();
     while HWND_OPEN.with(Cell::get) != 0 && crate::wait::get_message(&mut msg) {
         unsafe {

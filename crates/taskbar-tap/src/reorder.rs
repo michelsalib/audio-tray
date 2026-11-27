@@ -25,7 +25,7 @@ use std::sync::Mutex;
 use crate::budget::Budget;
 use crate::log::logf;
 use crate::tree;
-use crate::winrt::{IFrameworkElement, IGridStatics, ISizeChangedEventHandler, ISizeChangedEventHandler_Impl, IUIElement, Thickness, GRID, VISIBILITY_COLLAPSED};
+use crate::winrt::{IFrameworkElement, IGridStatics, ISizeChangedEventHandler, ISizeChangedEventHandler_Impl, IUIElement, Thickness, GRID, STACK_PANEL, VISIBILITY_COLLAPSED};
 use crate::xamlom::{IXamlDiagnostics, InstanceHandle};
 use windows::Win32::Foundation::S_OK;
 use windows_core::Interface;
@@ -34,14 +34,11 @@ use windows_core::Interface;
 /// `StackPanel` from 26300.
 pub(crate) const FRAME_GRID: &str = "SystemTrayFrameGrid";
 
-const STACK_PANEL: &str = "Windows.UI.Xaml.Controls.StackPanel";
-const GRID_TYPE: &str = "Windows.UI.Xaml.Controls.Grid";
-
 const ICONS_TYPE: &str = "SystemTray.NotificationAreaIcons";
-const CONTROL_CENTRE: &str = "ControlCenterButton";
+const CONTROL_CENTRE: &str = crate::part::QUICK_SETTINGS;
 
 fn grid_statics() -> Option<IGridStatics> {
-    crate::decorate::factory(GRID)
+    crate::xaml::factory(GRID)
 }
 
 /// Whether the move must be kept up rather than done once: on a `StackPanel` it is margins
@@ -98,7 +95,7 @@ unsafe fn framework_element(
     diagnostics: &IXamlDiagnostics,
     handle: InstanceHandle,
 ) -> Option<IFrameworkElement> {
-    let object = crate::decorate::object_from_handle(diagnostics, handle)?;
+    let object = crate::xaml::object_from_handle(diagnostics, handle)?;
     match object.cast::<IFrameworkElement>() {
         Ok(element) => Some(element),
         Err(err) => {
@@ -211,14 +208,14 @@ unsafe fn original_margin(diagnostics: &IXamlDiagnostics, handle: InstanceHandle
 
 /// The width a section takes in the panel with the shell's own margins; 0 when collapsed.
 unsafe fn slot_width(diagnostics: &IXamlDiagnostics, handle: InstanceHandle) -> Option<f64> {
-    let visibility = crate::decorate::element::<IUIElement>(diagnostics, handle).and_then(|element| {
+    let visibility = crate::xaml::element::<IUIElement>(diagnostics, handle).and_then(|element| {
         let mut value = 0i32;
         (element.get_Visibility(&mut value) == S_OK).then_some(value)
     })?;
     if visibility == VISIBILITY_COLLAPSED {
         return Some(0.0);
     }
-    let (width, _) = crate::decorate::actual_size(diagnostics, handle)?;
+    let (width, _) = crate::xaml::actual_size(diagnostics, handle)?;
     let margin = original_margin(diagnostics, handle)?;
     Some(width + margin.left + margin.right)
 }
@@ -363,7 +360,7 @@ unsafe fn follow(diagnostics: &IXamlDiagnostics, section: InstanceHandle) {
         }
         followed.push(section);
     }
-    let Some(element) = crate::decorate::element::<IFrameworkElementEvents>(diagnostics, section) else { return };
+    let Some(element) = crate::xaml::element::<IFrameworkElementEvents>(diagnostics, section) else { return };
     let handler: ISizeChangedEventHandler = Resized.into();
     let mut token = 0i64;
     if element.add_SizeChanged(handler.as_raw(), &mut token) != S_OK {
@@ -377,7 +374,7 @@ struct Resized;
 
 impl ISizeChangedEventHandler_Impl for Resized_Impl {
     unsafe fn Invoke(&self, _sender: *mut core::ffi::c_void, _args: *mut core::ffi::c_void) -> windows_core::HRESULT {
-        let replanned = std::panic::catch_unwind(|| {
+        crate::guard("reorder: resize handler", || {
             if !ENABLED.load(Ordering::SeqCst) || !crate::live() || !BUDGET.allowed() || DONE_FOR.load(Ordering::SeqCst) == 0 {
                 return;
             }
@@ -386,9 +383,6 @@ impl ISizeChangedEventHandler_Impl for Resized_Impl {
                 shift_by_margins(&diagnostics, frame);
             }
         });
-        if replanned.is_err() {
-            logf!("reorder: resize handler panicked");
-        }
         windows_core::HRESULT(0)
     }
 }
@@ -448,7 +442,7 @@ unsafe fn move_after_language(diagnostics: &IXamlDiagnostics) -> Outcome {
     };
     match tree::type_of(grid).as_deref() {
         Some(STACK_PANEL) => return shift_by_margins(diagnostics, grid),
-        Some(GRID_TYPE) => {}
+        Some(GRID) => {}
         other => return Outcome::Impossible(format!("{FRAME_GRID} is a {}", other.unwrap_or("?"))),
     }
     let Some(statics) = grid_statics() else {

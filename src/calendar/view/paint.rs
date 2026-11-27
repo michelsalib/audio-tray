@@ -11,11 +11,9 @@ use windows::Win32::Graphics::Direct2D::{
     D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1_ROUNDED_RECT, D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE,
 };
 use windows::Win32::Graphics::DirectWrite::{
-    DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat, IDWriteTextLayout, DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL,
-    DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_WEIGHT_SEMI_BOLD,
-    DWRITE_PARAGRAPH_ALIGNMENT_CENTER, DWRITE_PARAGRAPH_ALIGNMENT_NEAR, DWRITE_TEXT_ALIGNMENT, DWRITE_TEXT_ALIGNMENT_CENTER,
-    DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_TEXT_ALIGNMENT_TRAILING, DWRITE_TRIMMING, DWRITE_TRIMMING_GRANULARITY_CHARACTER,
-    DWRITE_WORD_WRAPPING_NO_WRAP, DWRITE_WORD_WRAPPING_WRAP,
+    DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat, IDWriteTextLayout, DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_WEIGHT_NORMAL,
+    DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT, DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_LEADING,
+    DWRITE_TEXT_ALIGNMENT_TRAILING,
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Imaging::{
@@ -77,7 +75,7 @@ impl Palette {
                 text2: Color::hex(0x000000, 0.606),
                 text3: Color::hex(0x000000, 0.361),
                 hover: Color::hex(0x000000, 0.045),
-                accent: Color::rgb(crate::flyout::theme::accent_shade(4).unwrap_or([0x00, 0x5F, 0xB8])),
+                accent: Color::rgb(crate::theme::accent_shade(4).unwrap_or([0x00, 0x5F, 0xB8])),
                 on_accent: Color::hex(0xFFFFFF, 1.0),
                 tip: Color::hex(0xF9F9F9, 1.0),
                 // A shade darker on the light ground too, the hairline as faint as on the dark.
@@ -85,19 +83,19 @@ impl Palette {
                 divider: Color::hex(0x000000, 0.10),
             }
         } else {
-            let [r, g, b] = crate::flyout::theme::DARK_TINT;
+            let [r, g, b] = crate::theme::DARK_TINT;
             Palette {
-                bg: Color::rgb([r, g, b]).alpha(crate::flyout::theme::DARK_TINT_A),
+                bg: Color::rgb([r, g, b]).alpha(crate::theme::DARK_TINT_A),
                 raised: Color::hex(0xFFFFFF, 0.05),
                 text: Color::hex(0xFFFFFF, 1.0),
                 text2: Color::hex(0xFFFFFF, 0.786),
                 text3: Color::hex(0xFFFFFF, 0.362),
                 hover: Color::hex(0xFFFFFF, 0.061),
-                accent: Color::rgb(crate::flyout::theme::accent_rgb()),
+                accent: Color::rgb(crate::theme::accent_rgb()),
                 on_accent: Color::hex(0x000000, 1.0),
                 tip: Color::hex(0x2C2C2C, 1.0),
-                shade: Color::hex(0x000000, crate::flyout::theme::FOOTER_SHADE_A),
-                divider: Color::hex(0xFFFFFF, crate::flyout::theme::DIVIDER_A),
+                shade: Color::hex(0x000000, crate::theme::FOOTER_SHADE_A),
+                divider: Color::hex(0xFFFFFF, crate::theme::DIVIDER_A),
             }
         }
     }
@@ -122,6 +120,48 @@ pub enum Font {
     Wrap,
     /// [`Font::Title`], wrapping (an event's title in its details).
     TitleWrap,
+}
+
+impl Font {
+    /// Every font, in its own order: [`Gfx`] makes their formats in this order and finds each by
+    /// its value.
+    const ALL: [Font; 12] = [
+        Font::Body,
+        Font::Strong,
+        Font::Caption,
+        Font::CaptionStrong,
+        Font::Icon,
+        Font::IconSmall,
+        Font::Big,
+        Font::Title,
+        Font::Tiny,
+        Font::TinyStrong,
+        Font::Wrap,
+        Font::TitleWrap,
+    ];
+
+    /// Its family, weight and size, and whether it wraps (from the top) or keeps to one line
+    /// (centred).
+    fn spec(self) -> crate::text::Spec {
+        use crate::text::Flow::{Line, Wrap};
+        let text = w!("Segoe UI Variable Text");
+        let icons = w!("Segoe Fluent Icons");
+        let (family, weight, size, flow) = match self {
+            Font::Body => (text, DWRITE_FONT_WEIGHT_NORMAL, 14.0, Line),
+            Font::Strong => (text, DWRITE_FONT_WEIGHT_SEMI_BOLD, 14.0, Line),
+            Font::Caption => (text, DWRITE_FONT_WEIGHT_NORMAL, 12.0, Line),
+            Font::CaptionStrong => (text, DWRITE_FONT_WEIGHT_SEMI_BOLD, 12.0, Line),
+            Font::Icon => (icons, DWRITE_FONT_WEIGHT_NORMAL, 16.0, Line),
+            Font::IconSmall => (icons, DWRITE_FONT_WEIGHT_NORMAL, 10.0, Line),
+            Font::Big => (text, DWRITE_FONT_WEIGHT_SEMI_BOLD, 22.0, Line),
+            Font::Title => (text, DWRITE_FONT_WEIGHT_SEMI_BOLD, 18.0, Line),
+            Font::Tiny => (text, DWRITE_FONT_WEIGHT_NORMAL, 11.0, Line),
+            Font::TinyStrong => (text, DWRITE_FONT_WEIGHT_SEMI_BOLD, 11.0, Line),
+            Font::Wrap => (text, DWRITE_FONT_WEIGHT_NORMAL, 13.0, Wrap),
+            Font::TitleWrap => (text, DWRITE_FONT_WEIGHT_SEMI_BOLD, 18.0, Wrap),
+        };
+        crate::text::Spec { family, weight, size, flow }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -177,41 +217,8 @@ impl Gfx {
             let factory: ID2D1Factory = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None).context("D2D1CreateFactory")?;
             let dwrite: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED).context("DWriteCreateFactory")?;
             let wic: IWICImagingFactory = CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER).context("WIC")?;
-            let mut gfx = Gfx { factory, dwrite, wic, formats: Vec::new(), surface: None, pixels: Vec::new(), images: Default::default(), drawn: (0, 0), layouts: Default::default() };
-            let text = w!("Segoe UI Variable Text");
-            let icons = w!("Segoe Fluent Icons");
-            gfx.formats = vec![
-                gfx.format(text, DWRITE_FONT_WEIGHT_NORMAL, 14.0, false)?,
-                gfx.format(text, DWRITE_FONT_WEIGHT_SEMI_BOLD, 14.0, false)?,
-                gfx.format(text, DWRITE_FONT_WEIGHT_NORMAL, 12.0, false)?,
-                gfx.format(text, DWRITE_FONT_WEIGHT_SEMI_BOLD, 12.0, false)?,
-                gfx.format(icons, DWRITE_FONT_WEIGHT_NORMAL, 16.0, false)?,
-                gfx.format(icons, DWRITE_FONT_WEIGHT_NORMAL, 10.0, false)?,
-                gfx.format(text, DWRITE_FONT_WEIGHT_SEMI_BOLD, 22.0, false)?,
-                gfx.format(text, DWRITE_FONT_WEIGHT_SEMI_BOLD, 18.0, false)?,
-                gfx.format(text, DWRITE_FONT_WEIGHT_NORMAL, 11.0, false)?,
-                gfx.format(text, DWRITE_FONT_WEIGHT_SEMI_BOLD, 11.0, false)?,
-                gfx.format(text, DWRITE_FONT_WEIGHT_NORMAL, 13.0, true)?,
-                gfx.format(text, DWRITE_FONT_WEIGHT_SEMI_BOLD, 18.0, true)?,
-            ];
-            Ok(gfx)
-        }
-    }
-
-    fn format(&self, family: PCWSTR, weight: DWRITE_FONT_WEIGHT, size: f32, wrap: bool) -> Result<IDWriteTextFormat> {
-        unsafe {
-            let format = self.dwrite.CreateTextFormat(family, None, weight, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, size, w!(""))?;
-            if wrap {
-                format.SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP)?;
-                format.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR)?;
-            } else {
-                format.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
-                format.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
-            }
-            let sign = self.dwrite.CreateEllipsisTrimmingSign(&format)?;
-            let trimming = DWRITE_TRIMMING { granularity: DWRITE_TRIMMING_GRANULARITY_CHARACTER, delimiter: 0, delimiterCount: 0 };
-            format.SetTrimming(&trimming, &sign)?;
-            Ok(format)
+            let formats = Font::ALL.iter().map(|font| crate::text::format(&dwrite, font.spec(), w!(""))).collect::<Result<_>>()?;
+            Ok(Gfx { factory, dwrite, wic, formats, surface: None, pixels: Vec::new(), images: Default::default(), drawn: (0, 0), layouts: Default::default() })
         }
     }
 
@@ -357,9 +364,10 @@ fn rect(r: R) -> D2D_RECT_F {
 }
 
 impl Pen<'_> {
-    fn brush(&self, c: Color) -> Option<&ID2D1SolidColorBrush> {
+    /// The frame's brush, in colour c.
+    fn brush(&self, c: Color) -> &ID2D1SolidColorBrush {
         unsafe { self.brush.SetColor(&D2D1_COLOR_F { r: c.0, g: c.1, b: c.2, a: c.3 }) };
-        Some(&self.brush)
+        &self.brush
     }
 
     /// Fill everything with `c`, alpha included (the panel is translucent).
@@ -368,10 +376,8 @@ impl Pen<'_> {
     }
 
     pub fn fill(&self, r: R, radius: f32, c: Color) {
-        if let Some(brush) = self.brush(c) {
-            let rounded = D2D1_ROUNDED_RECT { rect: rect(r), radiusX: radius, radiusY: radius };
-            unsafe { self.target.FillRoundedRectangle(&rounded, brush) };
-        }
+        let rounded = D2D1_ROUNDED_RECT { rect: rect(r), radiusX: radius, radiusY: radius };
+        unsafe { self.target.FillRoundedRectangle(&rounded, self.brush(c)) };
     }
 
     /// A pie in circle `r`, `fraction` of it filled clockwise from the top (the focus timer's).
@@ -386,7 +392,7 @@ impl Pen<'_> {
         if fraction <= 0.001 {
             return;
         }
-        let Some(brush) = self.brush(c) else { return };
+        let brush = self.brush(c);
         let (cx, cy, radius) = (r.x + r.w / 2.0, r.y + r.h / 2.0, r.w / 2.0);
         let angle = fraction * std::f32::consts::TAU;
         let end = Vector2 { X: cx + radius * angle.sin(), Y: cy - radius * angle.cos() };
@@ -415,12 +421,10 @@ impl Pen<'_> {
     }
 
     pub fn stroke(&self, r: R, radius: f32, width: f32, c: Color) {
-        if let Some(brush) = self.brush(c) {
-            let half = width / 2.0;
-            let inner = R::new(r.x + half, r.y + half, r.w - width, r.h - width);
-            let rounded = D2D1_ROUNDED_RECT { rect: rect(inner), radiusX: radius, radiusY: radius };
-            unsafe { self.target.DrawRoundedRectangle(&rounded, brush, width, None) };
-        }
+        let half = width / 2.0;
+        let inner = R::new(r.x + half, r.y + half, r.w - width, r.h - width);
+        let rounded = D2D1_ROUNDED_RECT { rect: rect(inner), radiusX: radius, radiusY: radius };
+        unsafe { self.target.DrawRoundedRectangle(&rounded, self.brush(c), width, None) };
     }
 
     pub fn text(&self, text: &str, font: Font, r: R, c: Color, align: Align) {
@@ -428,10 +432,9 @@ impl Pen<'_> {
             return;
         }
         let Some(layout) = self.layout(text, font, r, align) else { return };
-        let Some(brush) = self.brush(c) else { return };
         // Colour fonts in colour: an emoji (a quick reaction) as the app shows it.
         let options = D2D1_DRAW_TEXT_OPTIONS_CLIP | windows::Win32::Graphics::Direct2D::D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT;
-        unsafe { self.target.DrawTextLayout(Vector2 { X: r.x, Y: r.y }, &layout, brush, options) };
+        unsafe { self.target.DrawTextLayout(Vector2 { X: r.x, Y: r.y }, &layout, self.brush(c), options) };
     }
 
     /// `c` washed in from the left edge of `r`, gone by `reach` (0..1) of its width: an app's
@@ -451,10 +454,8 @@ impl Pen<'_> {
     /// A circle's outline inside `r`, `width` thick.
     pub fn ring(&self, r: R, width: f32, c: Color) {
         use windows::Win32::Graphics::Direct2D::D2D1_ELLIPSE;
-        if let Some(brush) = self.brush(c) {
-            let ellipse = D2D1_ELLIPSE { point: Vector2 { X: r.x + r.w / 2.0, Y: r.y + r.h / 2.0 }, radiusX: (r.w - width) / 2.0, radiusY: (r.h - width) / 2.0 };
-            unsafe { self.target.DrawEllipse(&ellipse, brush, width, None) };
-        }
+        let ellipse = D2D1_ELLIPSE { point: Vector2 { X: r.x + r.w / 2.0, Y: r.y + r.h / 2.0 }, radiusX: (r.w - width) / 2.0, radiusY: (r.h - width) / 2.0 };
+        unsafe { self.target.DrawEllipse(&ellipse, self.brush(c), width, None) };
     }
 
     /// `text` laid out in a box of `r`'s size: made once, then kept while it is drawn.
@@ -480,6 +481,52 @@ impl Pen<'_> {
         };
         layouts.now.insert(key, layout.clone());
         Some(layout)
+    }
+
+    /// A one-line text box's insides in `r`: its text on one line, what is selected on `selection`
+    /// (in `selected` ink), and the caret (in `caret`, when drawn), placed where DirectWrite puts
+    /// them. Scrolled so the caret shows: a long line slides left as it is typed.
+    pub fn field(&self, editor: &super::editor::Editor, font: Font, r: R, [text, selection, selected]: [Color; 3], caret: Option<Color>) {
+        use windows::Win32::Graphics::DirectWrite::{DWRITE_HIT_TEST_METRICS, DWRITE_WORD_WRAPPING_NO_WRAP};
+        // A width no other text has: the layout is this box's alone (its wrapping is changed).
+        const WIDE: f32 = 100_000.0;
+        let Some(layout) = self.layout(editor.text(), font, R::new(0.0, 0.0, WIDE, r.h), Align::Left) else { return };
+        let at = |position: usize| unsafe {
+            let (mut x, mut y) = (0.0f32, 0.0f32);
+            let mut m = DWRITE_HIT_TEST_METRICS::default();
+            let _ = layout.HitTestTextPosition(position as u32, false, &mut x, &mut y, &mut m);
+            (x, m.top, m.height)
+        };
+        unsafe {
+            let _ = layout.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+        }
+        let (cx, top, height) = at(editor.caret16());
+        // Scrolled only as far as the caret needs, a pixel of room after it.
+        let offset = (cx - (r.w - 2.0)).max(0.0);
+        let x0 = r.x - offset;
+        // Whole pixels: a 1-pixel caret stays sharp at any scale.
+        let snap = |v: f32| (v * self.scale).round() / self.scale;
+        self.clip(R::new(r.x - 1.0, r.y, r.w + 2.0, r.h));
+        let band = editor.selection16().map(|(a, b)| {
+            let (ax, bx) = (at(a).0, at(b).0);
+            R::new(snap(x0 + ax), r.y + top, snap(bx - ax), height)
+        });
+        if let Some(band) = band {
+            self.fill(band, 2.0, selection);
+        }
+        let options = D2D1_DRAW_TEXT_OPTIONS_CLIP | windows::Win32::Graphics::Direct2D::D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT;
+        unsafe { self.target.DrawTextLayout(Vector2 { X: x0, Y: r.y }, &layout, self.brush(text), options) };
+        // The selected part again, on its band, in the band's own ink.
+        if let Some(band) = band {
+            self.clip(band);
+            unsafe { self.target.DrawTextLayout(Vector2 { X: x0, Y: r.y }, &layout, self.brush(selected), options) };
+            self.unclip();
+        }
+        if let Some(c) = caret.filter(|_| band.is_none()) {
+            let w = 1.0 / self.scale * self.scale.round().max(1.0);
+            self.fill(R::new(snap(x0 + cx), r.y + top, w, height), 0.0, c);
+        }
+        self.unclip();
     }
 
     pub fn glyph(&self, glyph: char, font: Font, r: R, c: Color) {
@@ -568,5 +615,19 @@ impl Pen<'_> {
 
     pub fn unclip(&self) {
         unsafe { self.target.PopAxisAlignedClip() };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Font;
+
+    /// A font's format is found by its value: [`Font::ALL`] lists every font, each at its value.
+    #[test]
+    fn every_font_is_listed_at_its_own_place() {
+        for (i, font) in Font::ALL.iter().enumerate() {
+            assert_eq!(*font as usize, i, "{font:?}");
+        }
+        assert_eq!(Font::ALL.len(), Font::TitleWrap as usize + 1);
     }
 }

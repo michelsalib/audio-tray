@@ -2,8 +2,6 @@
 //! [`build_view`], panel size, and what a mouse coordinate hits.
 //! No Win32 or pixel buffers here, so it stays unit-testable.
 
-use ab_glyph::FontVec;
-
 use crate::canvas::measure;
 use super::model::{Fit, Model};
 use super::theme::*;
@@ -72,36 +70,11 @@ pub(super) struct LaidElem {
     pub height: i32,
 }
 
-/// The panel width, measured from the rows' content.
-pub(super) fn content_width(model: &Model, scale: f32) -> i32 {
-    let font = ui_font();
-    let font_sb = ui_font_semibold().or(font);
-    let text_px = 14.0 * scale;
-    let hdr_px = 14.0 * scale;
-    let mw = |f: Option<&FontVec>, px: f32, s: &str| f.map(|f| measure(f, px, s)).unwrap_or(0.0);
-
-    let mut max_w = 0.0f32;
-    for g in &model.groups {
-        max_w = max_w.max(HEADER_X * scale + mw(font_sb, hdr_px, g.title) + RIGHT_PAD * scale);
-        if g.default_id.is_some() {
-            max_w = max_w.max((TRACK_X0 + 130.0 + VALUE_W) * scale);
-        }
-        for row in &g.devices {
-            let reserve = if row.battery.is_some() { BATTERY_W } else { RIGHT_PAD };
-            max_w = max_w.max(TEXT_X * scale + mw(font, text_px, &row.label) + reserve * scale);
-        }
-    }
-    for b in &model.batteries {
-        max_w = max_w.max(TEXT_X * scale + mw(font, text_px, &b.name) + BATTERY_W * scale);
-    }
-    // Wide enough for the footer's label and buttons on one line.
-    max_w = max_w.max(footer_min_width(model, scale));
-    // An app's slider needs room after its name.
-    if !model.apps.is_empty() {
-        max_w = max_w.max((APP_TRACK_X0 + 130.0 + VALUE_W) * scale);
-    }
+/// The panel width, in pixels: every panel is [`PANEL_W`] wide (the calendar's and the
+/// notifications' cards too), and a long name is cut with "…".
+pub(super) fn content_width(scale: f32) -> i32 {
     // `ceil`, not `round`, or `fit_label` ellipsises text that was measured to fit.
-    max_w.clamp(MIN_W * scale, MAX_W * scale).ceil() as i32
+    (PANEL_W * scale).ceil() as i32
 }
 
 /// Lay out the panel's elements, returning them and the panel's total height.
@@ -253,7 +226,8 @@ pub(super) fn footer_item_right(scale: f32) -> f32 {
 }
 
 /// The narrowest panel the footer fits in: the left item, a gap, then the icon buttons.
-pub(super) fn footer_min_width(model: &Model, scale: f32) -> f32 {
+#[cfg(test)]
+fn footer_min_width(model: &Model, scale: f32) -> f32 {
     let n = footer_buttons(model).len() as f32;
     let buttons = n * FOOTER_BTN + (n - 1.0) * FOOTER_BTN_GAP;
     footer_item_right(scale) + (FOOTER_GAP + buttons + FOOTER_BTN_RIGHT) * scale
@@ -512,28 +486,14 @@ mod tests {
     }
 
     #[test]
-    fn content_width_always_within_min_max() {
+    fn the_footer_fits_the_panel() {
+        // The labelled item and the icon buttons share one line: too narrow and they would
+        // overlap, a staged update's extra button included.
         for scale in [1.0_f32, 1.5, 2.0] {
-            let m = model(vec![output_group(vec![dev("Speakers", None)])], None);
-            let w = content_width(&m, scale);
-            assert!(w >= (MIN_W * scale).round() as i32, "w={w} below min at scale {scale}");
-            assert!(w <= (MAX_W * scale).round() as i32, "w={w} above max at scale {scale}");
-        }
-    }
-
-    #[test]
-    fn content_width_fits_the_footer_even_with_no_devices() {
-        // With no devices the width comes purely from the footer, whose labelled item and
-        // icon button share one line — too narrow and they would overlap.
-        for scale in [1.0_f32, 1.5, 2.0] {
-            let m = model(vec![], None);
-            let w = content_width(&m, scale);
-            assert!(w >= (MIN_W * scale).round() as i32, "w={w} below the panel floor");
-            assert!(w <= (MAX_W * scale).round() as i32, "w={w} above the cap");
-            assert!(
-                w as f32 >= footer_min_width(&m, scale),
-                "w={w} squeezes the footer at scale {scale}"
-            );
+            for update in [None, Some("9.9.9")] {
+                let m = model(vec![], update);
+                assert!(footer_min_width(&m, scale) <= PANEL_W * scale, "the footer is squeezed at scale {scale}");
+            }
         }
     }
 
@@ -568,7 +528,7 @@ mod tests {
     fn footer_hit_targets_its_actions_and_nothing_between() {
         for scale in [1.0_f32, 1.5, 2.0] {
             let m = model(vec![], None);
-            let width = content_width(&m, scale);
+            let width = content_width(scale);
             let btn = footer_btn_center_x(width, scale, 0).round() as i32;
             assert_eq!(footer_hit(&m, width, scale, btn), Some(ActionKind::Settings));
             let item = ((FOOTER_TEXT_X + 2.0) * scale).round() as i32;
@@ -594,7 +554,7 @@ mod tests {
             vec![ActionKind::Settings, ActionKind::Restart]
         );
 
-        let width = content_width(&staged, scale);
+        let width = content_width(scale);
         let gear = footer_btn_center_x(width, scale, 0);
         let restart = footer_btn_center_x(width, scale, 1);
         assert!(restart < gear - FOOTER_BTN * scale, "buttons overlap: {restart} vs {gear}");

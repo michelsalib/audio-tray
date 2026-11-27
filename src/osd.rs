@@ -24,7 +24,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use crate::audio::Flow;
 use crate::canvas::{measure, Canvas, Rect};
-use crate::flyout::theme::{
+use crate::theme::{
     endpoint_glyph, panel_accent, recording_dot, text, tint, tint_a, ui_font, TRACK_H,
 };
 use crate::icons;
@@ -120,7 +120,7 @@ impl Osd {
     /// screen rect; without one the pointer is used.
     pub(crate) fn show(&mut self, flow: Flow, level: f32, muted: bool, anchor: Option<RECT>) {
         // Windows' light or dark mode, as the panels.
-        crate::flyout::theme::refresh_mode();
+        crate::theme::refresh_mode();
         let at = match anchor {
             Some(slot) => POINT { x: (slot.left + slot.right) / 2, y: (slot.top + slot.bottom) / 2 },
             None => {

@@ -20,6 +20,8 @@ pub const CONTROL_CLASS: &str = "AudioTrayTapControl";
 /// Class of the app's receiver window, found by the TAP with `EnumWindows`.
 pub const RECEIVER_CLASS: &str = "AudioTrayTaskbarIpc";
 
+// ---- Message ids, by value ----
+
 /// TAP → app: a gesture on the strip; `wParam` is an action code below.
 pub const WM_TASKBAR_ACTION: u32 = WM_APP + 20;
 /// App → TAP: put the taskbar back. `wParam`: the requesting owner's pid, 0 = unconditional.
@@ -47,6 +49,27 @@ pub const WM_TASKBAR_STATUS: u32 = WM_APP + 40;
 /// TAP → app: where the pointer is on the clock's button, while the calendar replaces the shell's
 /// (`wParam`, one of `HOVER_*`). The app's mouse hook then takes the button's left clicks.
 pub const WM_TASKBAR_CLOCK_HOVER: u32 = WM_APP + 50;
+/// App → TAP: which of audio-tray's panels is open (`wParam`, one of `OPEN_*`). The TAP keeps the
+/// clock or the bell lit while its card is open, as the shell's buttons are while their flyouts
+/// are, and takes the tooltips of the strip, the clock and the bell off while any panel is open, so
+/// none shows over it.
+pub const WM_TAP_PANEL: u32 = WM_APP + 51;
+/// TAP → app, `wParam` [`PART_FORGET`]: the clock and the bell moved (the bell widened for its
+/// badge), so the rects the app measured for them (UI Automation, [`PART_CLOCK`], [`PART_BELL`],
+/// packed with [`pack_rect`]) are out of date. The hook falls back on those rects when no hover was
+/// told since the pointer last left (Windows' right-click menu takes the pointer and gives no enter
+/// back).
+pub const WM_TASKBAR_CLOCK_RECT: u32 = WM_APP + 52;
+/// App → TAP: a notification went to the bell's list (its banner flew into it): the bell gives a
+/// little ring, its glyph swinging for a moment.
+pub const WM_TAP_BELL_RING: u32 = WM_APP + 53;
+/// TAP → app: the pointer entered ([`BATTERY_HOVER_OVER`]) or left ([`BATTERY_HOVER_LEFT`])
+/// Windows' battery icon, while audio-tray's batteries replace its click (init data `battery=1`).
+/// The app's mouse hook then takes its left clicks ([`ACTION_OPEN_BATTERIES`]); the rest of the
+/// Quick Settings button stays the shell's.
+pub const WM_TASKBAR_BATTERY_HOVER: u32 = WM_APP + 54;
+
+// ---- Message values ----
 
 /// [`WM_TASKBAR_CLOCK_HOVER`]'s values. The button holds the clock and, when Windows shows it, the
 /// bell: the button's own enter and leave say 1 and 0, the bell's 2 and 3, each independently.
@@ -55,15 +78,16 @@ pub const HOVER_OVER: usize = 1;
 pub const HOVER_BELL: usize = 2;
 pub const HOVER_BELL_LEFT: usize = 3;
 
-/// TAP → app, `wParam` [`PART_FORGET`]: the clock and the bell moved (the bell widened for its
-/// badge), so the rects the app measured for them (UI Automation, [`PART_CLOCK`], [`PART_BELL`],
-/// packed with [`pack_rect`]) are out of date. The hook falls back on those rects when no hover was
-/// told since the pointer last left (Windows' right-click menu takes the pointer and gives no enter
-/// back).
-pub const WM_TASKBAR_CLOCK_RECT: u32 = WM_APP + 52;
+/// [`WM_TASKBAR_BATTERY_HOVER`]'s values.
+pub const BATTERY_HOVER_LEFT: usize = 0;
+pub const BATTERY_HOVER_OVER: usize = 1;
+
+/// [`WM_TASKBAR_CLOCK_RECT`]'s parts.
 pub const PART_CLOCK: usize = 0;
 pub const PART_BELL: usize = 1;
 pub const PART_FORGET: usize = 2;
+/// Windows' battery icon (app-internal: the app measures it, as it does the clock and the bell).
+pub const PART_BATTERY: usize = 3;
 
 /// Four signed 16-bit coordinates in one 64-bit `lParam`, and back.
 pub fn pack_rect(left: i32, top: i32, right: i32, bottom: i32) -> isize {
@@ -77,20 +101,14 @@ pub fn unpack_rect(packed: isize) -> (i32, i32, i32, i32) {
     (q(0), q(16), q(32), q(48))
 }
 
-/// App → TAP: which of audio-tray's panels is open (`wParam`, one of `OPEN_*`). The TAP keeps the
-/// clock or the bell lit while its card is open, as the shell's buttons are while their flyouts
-/// are, and takes the tooltips of the strip, the clock and the bell off while any panel is open, so
-/// none shows over it.
-pub const WM_TAP_PANEL: u32 = WM_APP + 51;
+/// [`WM_TAP_PANEL`]'s values: which of audio-tray's panels is open.
 pub const OPEN_NONE: usize = 0;
 pub const OPEN_CALENDAR: usize = 1;
 pub const OPEN_NOTIFICATIONS: usize = 2;
 /// The audio panel (the strip's or the tray icon's).
 pub const OPEN_AUDIO: usize = 3;
-
-/// App → TAP: a notification went to the bell's list (its banner flew into it): the bell gives a
-/// little ring, its glyph swinging for a moment.
-pub const WM_TAP_BELL_RING: u32 = WM_APP + 53;
+/// The battery panel: the battery icon stays lit while it is open.
+pub const OPEN_BATTERIES: usize = 4;
 
 /// Our buttons are not on the taskbar (the notification icon was not found or not decorated).
 pub const STATUS_NO_STRIP: usize = 1 << 0;
@@ -112,6 +130,8 @@ pub const ACTION_OPEN_PANEL: usize = 3;
 pub const ACTION_OPEN_CALENDAR: usize = 4;
 /// A click on the bell beside the clock: audio-tray's notifications.
 pub const ACTION_OPEN_NOTIFICATIONS: usize = 5;
+/// A click on Windows' battery icon: audio-tray's batteries.
+pub const ACTION_OPEN_BATTERIES: usize = 6;
 pub const ACTION_MUSIC_PREVIOUS: usize = 10;
 pub const ACTION_MUSIC_PLAY_PAUSE: usize = 11;
 pub const ACTION_MUSIC_NEXT: usize = 12;
@@ -119,6 +139,8 @@ pub const ACTION_MUSIC_NEXT: usize = 12;
 /// Flow codes in [`WM_TASKBAR_SCROLL`]'s `wParam`.
 pub const FLOW_OUTPUT: usize = 0;
 pub const FLOW_INPUT: usize = 1;
+
+// ---- `WM_COPYDATA` tags ----
 
 /// Handover `WM_COPYDATA` tag ("ATH1") and its results; 0 means a TAP without the handler.
 pub const HANDOVER_MAGIC: usize = 0x4154_4831;
@@ -133,6 +155,80 @@ pub const HANDOVER_DECLINED: isize = 2;
 /// plain; empty: the shell's fill).
 /// `release=1` alone hands the clock back to the shell (the TAP undoes its changes and stops).
 pub const CLOCK_MAGIC: usize = 0x4154_4331;
+/// App → TAP `WM_COPYDATA` tag ("ATB1"): what Windows' battery icon says, as init-data pairs: `tip`
+/// (its tooltip, lines split by `\n`; empty: the shell's own) and `badge_image`, `badge_scale` (an
+/// app-drawn dot at its upper right, as the clock's badge; empty: none). A `badge_width` is
+/// tolerated and unused: the dot is shown at its pixel size.
+pub const BATTERY_MAGIC: usize = 0x4154_4231;
+
+// ---- Init data ----
+
+/// The keys of the init data (`SetSite`'s and a handover's) and of the [`CLOCK_MAGIC`] and
+/// [`BATTERY_MAGIC`] payloads, all [`encode_init`]-encoded.
+pub mod key {
+    // The init data.
+    /// `1`: the TAP logs verbosely.
+    pub const DEBUG: &str = "debug";
+    /// The tooltip (substring) of the tray icon to decorate; empty: the first.
+    pub const TOOLTIP: &str = "tooltip";
+    /// The app name of the taskbar button that hosts the music tile; absent: no tile.
+    pub const TILE: &str = "tile";
+    /// The music tile's content width.
+    pub const STRIP: &str = "strip";
+    /// The app's receiver window.
+    pub const HWND: &str = "hwnd";
+    /// The owner's process id: the TAP reverts when it exits.
+    pub const PID: &str = "pid";
+    /// `0`: the strip's section is not moved next to wifi.
+    pub const REORDER: &str = "reorder";
+    /// `0`: no audio buttons, only the music tile.
+    pub const BUTTONS: &str = "buttons";
+    /// The clock: [`super::CLOCK_CALENDAR`] or [`super::CLOCK_BELL_ONLY`]; absent: the shell's.
+    pub const CLOCK: &str = "clock";
+    /// `1`: Windows' battery icon opens audio-tray's batteries.
+    pub const BATTERY: &str = "battery";
+    /// The app/TAP [`super::PROTOCOL`], for a handover.
+    pub const PROTO: &str = "proto";
+    /// The app's version, for a handover from an app that predates the protocol.
+    pub const VER: &str = "ver";
+    /// The TAP DLL's path the app would inject, for a handover.
+    pub const TAP: &str = "tap";
+    /// The strip: output and input glyphs (hex codepoints), mute and recording flags, accent
+    /// (`RRGGBB`) and its alpha (hex).
+    pub const OUT: &str = "out";
+    pub const IN: &str = "in";
+    pub const OUT_MUTED: &str = "outmuted";
+    pub const IN_MUTED: &str = "inmuted";
+    pub const IN_RECORDING: &str = "inrec";
+    pub const ACCENT: &str = "accent";
+    pub const ALPHA: &str = "alpha";
+    /// `1`: the shell's own volume, microphone and keyboard-layout indicators are hidden.
+    pub const HIDE_VOLUME: &str = "hidevolume";
+    pub const HIDE_MIC: &str = "hidemic";
+    pub const HIDE_LANGUAGE: &str = "hidelanguage";
+
+    // The clock ([`super::CLOCK_MAGIC`]).
+    pub const RELEASE: &str = "release";
+    pub const TIME: &str = "time";
+    pub const DATE: &str = "date";
+    pub const ONE_LINE: &str = "oneline";
+    pub const BADGE: &str = "badge";
+    pub const QUIET: &str = "quiet";
+    pub const WAITING: &str = "waiting";
+
+    // The clock's and the battery's badge pictures.
+    pub const BADGE_IMAGE: &str = "badge_image";
+    pub const BADGE_WIDTH: &str = "badge_width";
+    pub const BADGE_SCALE: &str = "badge_scale";
+
+    // The battery ([`super::BATTERY_MAGIC`]).
+    pub const TIP: &str = "tip";
+}
+
+/// [`key::CLOCK`]'s values: the clock opens audio-tray's calendar (and the bell, when shown, its
+/// notifications), or only the bell is audio-tray's and the clock's taps stay the shell's.
+pub const CLOCK_CALENDAR: &str = "1";
+pub const CLOCK_BELL_ONLY: &str = "2";
 
 /// Plane-15 PUA markers (Segoe Fluent owns the BMP PUA) for earbuds the TAP draws as vectors.
 pub const GLYPH_WIRELESS_EARBUDS: char = '\u{F0001}';
@@ -144,7 +240,7 @@ pub const MUSIC_STATE_FILE: &str = "audio-tray-music.txt";
 /// Version of the app ↔ TAP contract (init-data keys, messages, state file). A loaded TAP adopts a
 /// new app on a handover when this matches and the DLL file is the same, instead of requiring the
 /// identical app version. Bump it on any change an older TAP or app would misread.
-pub const PROTOCOL: u32 = 5;
+pub const PROTOCOL: u32 = 6;
 
 /// Encodes init data: `key=value` pairs joined by `;`. Values escape `%`, `;` and `=` as `%25`,
 /// `%3B` and `%3D`, so a tile name or install path containing them survives; anything else is
@@ -242,7 +338,7 @@ mod tests {
             WM_TASKBAR_ACTION, WM_TAP_REVERT, WM_TASKBAR_RESTARTED, WM_TAP_RESTYLE, WM_TASKBAR_SCROLL,
             WM_MUSIC_PROGRESS, WM_TAP_WIRE_TRANSPORT, WM_TAP_REPIN, WM_TAP_PROGRESS_WINDOW,
             WM_TAP_MUSIC_CHANGED, WM_TASKBAR_STATUS, WM_TASKBAR_CLOCK_HOVER, WM_TAP_PANEL,
-            WM_TASKBAR_CLOCK_RECT, WM_TAP_BELL_RING,
+            WM_TASKBAR_CLOCK_RECT, WM_TAP_BELL_RING, WM_TASKBAR_BATTERY_HOVER,
         ];
         for (i, a) in ids.iter().enumerate() {
             assert!(ids[i + 1..].iter().all(|b| a != b));

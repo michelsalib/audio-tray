@@ -45,7 +45,7 @@ impl Action {
 fn find_receiver() -> Option<HWND> {
     unsafe extern "system" fn visit(hwnd: HWND, lparam: LPARAM) -> BOOL {
         // A panic must not unwind into user32 (and through it, Explorer): treat it as "stop".
-        std::panic::catch_unwind(|| {
+        crate::guard("receiver search", || {
             if unsafe { class_of(hwnd) } == RECEIVER_CLASS_NAME {
                 unsafe { *(lparam.0 as *mut HWND) = hwnd };
                 return BOOL(0); // found — stop enumerating
@@ -172,4 +172,9 @@ pub fn send_bell_hover(over: bool) {
 /// The rects the app measured are out of date (the bell changed width): the app forgets them.
 pub fn forget_part_rects() {
     let _ = post(tap_proto::WM_TASKBAR_CLOCK_RECT, tap_proto::PART_FORGET, 0);
+}
+
+/// The pointer entered (`true`) or left Windows' battery icon.
+pub fn send_battery_hover(over: bool) {
+    let _ = post(tap_proto::WM_TASKBAR_BATTERY_HOVER, if over { tap_proto::BATTERY_HOVER_OVER } else { tap_proto::BATTERY_HOVER_LEFT }, 0);
 }

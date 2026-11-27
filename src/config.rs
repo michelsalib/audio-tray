@@ -1,5 +1,6 @@
-//! Persisted per-device icon choices (plan §6). Keyed by the stable endpoint id string,
-//! never the friendly name. Stored as TOML under `%APPDATA%\AudioTray\config.toml`.
+//! The user's settings, stored as TOML under `%APPDATA%\AudioTray\config.toml` (its secrets in the
+//! Credential Manager, [`crate::secrets`]): each part of the app has its section. A file written by an
+//! older version is brought forward as it is read ([`Config::migrate`]).
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -63,7 +64,7 @@ pub struct Calendar {
     /// Calendar links (ICS), kept in the Credential Manager: an address reads the calendar.
     #[serde(skip_serializing)]
     pub links: Vec<crate::calendar::Link>,
-    /// Minutes before an event the pill reminds of it; 0: no reminders.
+    /// Minutes before an event a notification reminds of it; 0: no reminders.
     pub remind_minutes: u32,
     /// The focus timer's length, in minutes.
     pub focus_minutes: u32,
@@ -83,10 +84,13 @@ pub struct Calendar {
     pub colors: std::collections::BTreeMap<String, String>,
     /// Win+Alt+D opens this calendar, Win+N the notifications.
     pub shortcut: bool,
-    /// The bell beside the clock opens Audio Tray's notifications (Windows' own otherwise), and
-    /// Audio Tray's own notices (batteries, audio devices, reminders) join that list instead of
-    /// the pill.
-    pub notifications: bool,
+    /// The bell beside the clock opens Audio Tray's notifications (Windows' own otherwise), with
+    /// or without the calendar on the clock.
+    pub bell: bool,
+    /// Before [`Calendar::bell`]: the bell was Audio Tray's when this and [`Calendar::enabled`]
+    /// both were. Read from older files only, to bring them forward ([`Config::migrate`]).
+    #[serde(skip_serializing)]
+    notifications: Option<bool>,
     /// Audio Tray shows every notification itself: Windows' banners are turned off (and given back
     /// when this is off or the app quits), and its own show above the bell.
     pub take_over: bool,
@@ -141,7 +145,8 @@ impl Default for Calendar {
             hidden: Vec::new(),
             colors: Default::default(),
             shortcut: true,
-            notifications: true,
+            bell: false,
+            notifications: None,
             take_over: false,
             bell_middle_click: BellMiddleClick::DoNotDisturb,
             world_clocks: true,
@@ -243,12 +248,12 @@ pub enum WaveColour {
     Cover,
 }
 
-static MOTION: std::sync::Mutex<Motion> = std::sync::Mutex::new(Motion {
-    ring: MotionStyle::Google,
-    bar: MotionStyle::Google,
-    volume: MotionStyle::Google,
-    colour: WaveColour::Accent,
-});
+impl Motion {
+    /// [`Motion::default`], as a constant (the motion in use starts as it).
+    pub const DEFAULT: Motion = Motion { ring: MotionStyle::Google, bar: MotionStyle::Google, volume: MotionStyle::Google, colour: WaveColour::Accent };
+}
+
+static MOTION: std::sync::Mutex<Motion> = std::sync::Mutex::new(Motion::DEFAULT);
 
 /// The motion settings in use, for the surfaces that draw bars on their own threads.
 pub fn motion() -> Motion {
@@ -270,19 +275,21 @@ pub struct Batteries {
     pub flyout: bool,
     /// The levels under the tray icon's tooltip.
     pub tooltip: bool,
-    /// The levels on the edge pill's card, under the devices.
-    pub pill_card: bool,
-    /// A warning on the edge pill when one goes low.
-    pub pill_alert: bool,
     /// A Windows notification when one goes low.
     pub toast: bool,
     /// Low is at or under this (%).
     pub low_at: u8,
+    /// The levels live at a battery icon, not in the audio panel nor on the pill: on a PC with a
+    /// battery, Windows' own (its click opens Audio Tray's batteries, its tooltip lists them, a dot
+    /// while one runs low); on a desktop, Audio Tray's own icon, shown while a device reports one.
+    pub taskbar_icon: bool,
+    /// How Audio Tray's own battery icon draws the devices: bars or rings.
+    pub icon_style: BatteryIconStyle,
 }
 
 impl Default for Batteries {
     fn default() -> Self {
-        Self { enabled: true, flyout: true, tooltip: true, pill_card: true, pill_alert: true, toast: true, low_at: 20 }
+        Self { enabled: true, flyout: true, tooltip: true, toast: true, low_at: 20, taskbar_icon: true, icon_style: BatteryIconStyle::Bars }
     }
 }
 
@@ -292,7 +299,7 @@ impl Batteries {
 
     /// The level the hub warns at; 0 when nothing would show a warning.
     pub fn warn_at(&self) -> u8 {
-        if self.enabled && (self.pill_alert || self.toast) {
+        if self.enabled && self.toast {
             self.low_at.min(100)
         } else {
             0
@@ -305,7 +312,7 @@ impl Batteries {
 #[serde(default)]
 pub struct Keyboards {
     pub enabled: bool,
-    /// Confirm each switch on the pill, like a new song.
+    /// Confirm each switch in a small banner over the bell.
     pub show_readout: bool,
     /// One per keyboard; a keyboard not listed switches nothing.
     pub assigned: Vec<AssignedKeyboard>,
@@ -374,10 +381,9 @@ pub struct Pill {
     /// The display, by its device name (`\\.\DISPLAY2`). `None`, or a display no longer
     /// connected, is the one at the chosen edge of the desktop (see [`crate::pill`]).
     pub monitor: Option<String>,
-    /// The red "is listening" alert when an app records outside a known call.
+    /// The red "is listening" banner when an app records outside a known call: one of Audio Tray's
+    /// banners, never the pill's (kept here for old config files).
     pub listening_alerts: bool,
-    /// The output and input devices on the pill, clicked to switch like the taskbar buttons.
-    pub devices: bool,
     /// How much the pill shows at rest; hovering the edge always opens the full card, and warnings
     /// and alerts always show in full.
     pub size: PillSize,
@@ -491,12 +497,27 @@ impl Default for Pill {
             align: PillAlign::Center,
             monitor: None,
             listening_alerts: true,
-            devices: true,
             size: PillSize::Big,
             announce_tracks: false,
             places: Vec::new(),
         }
     }
+}
+
+/// How Audio Tray's own battery icon (a PC without a battery) draws the devices.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BatteryIconStyle {
+    /// A bar per device, stacked.
+    #[default]
+    Bars,
+    /// A ring per device, nested, filled clockwise from the top.
+    Rings,
+}
+
+impl BatteryIconStyle {
+    /// In Settings' order.
+    pub const ALL: [BatteryIconStyle; 2] = [BatteryIconStyle::Bars, BatteryIconStyle::Rings];
 }
 
 /// How the music tile draws into the player's taskbar button.
@@ -594,14 +615,15 @@ pub struct Strip {
     /// Hide Windows' "microphone in use" icon, which the input button's red dot replaces.
     pub hide_windows_mic: bool,
     /// Hide Windows' keyboard-layout indicator ("FRA"). Off by default: unlike the two above it is
-    /// not replaced by anything; Win+Space still switches. Needs the TAP (buttons or music tile).
+    /// not replaced by anything; Win+Space still switches. Needs the TAP (any of [`Config::injects`]' parts).
     pub hide_windows_language: bool,
     /// What a middle click on the output or input button does (a left click opens the panel).
     pub middle_click: MiddleClick,
     /// Win+Ctrl+V (Windows' shortcut for its sound output) opens the audio panel.
     pub shortcut: bool,
     /// Before 0.28: what a left click did (`"switch"`, `"mute"`, `"panel"`) and whether switching
-    /// stopped on a muted last device. Read once into [`Strip::middle_click`], never written back.
+    /// stopped on a muted last device. Read once into [`Strip::middle_click`] ([`Config::migrate`]),
+    /// never written back.
     #[serde(default, skip_serializing)]
     left_click: Option<String>,
     #[serde(default, skip_serializing)]
@@ -621,20 +643,6 @@ impl Default for Strip {
             left_click: None,
             mute_in_cycle: None,
         }
-    }
-}
-
-impl Strip {
-    /// An older file's left-click choice as the middle click's (the left click opens the panel now).
-    fn migrate(&mut self) {
-        if self.left_click.is_none() && self.mute_in_cycle.is_none() {
-            return;
-        }
-        self.middle_click = match (self.left_click.take().as_deref(), self.mute_in_cycle.take()) {
-            (Some("mute"), _) => MiddleClick::Mute,
-            (_, Some(false)) => MiddleClick::Switch,
-            _ => MiddleClick::SwitchMute,
-        };
     }
 }
 
@@ -680,10 +688,30 @@ impl Default for Music {
 }
 
 impl Config {
-    /// Whether anything is drawn into the taskbar (the audio buttons or the music tile), which is
-    /// what injecting into Explorer is for.
+    /// Whether anything is drawn into the taskbar (the audio buttons, the music tile, the calendar on
+    /// the clock, the bell, a clock styled its own way), which is what injecting into Explorer is for.
     pub fn injects(&self) -> bool {
-        self.strip.enabled || self.tile_shown() || self.calendar.enabled || self.clock.styled()
+        self.strip.enabled || self.tile_shown() || self.calendar.enabled || self.calendar.bell || self.clock.styled()
+    }
+
+    /// Windows' battery icon is the batteries' home: asked for, this PC has a battery (and so the
+    /// icon), and Explorer is injected anyway (the battery alone never brings the TAP in).
+    pub fn uses_windows_battery_icon(&self) -> bool {
+        let b = &self.batteries;
+        b.enabled && b.taskbar_icon && crate::batteries::presence() == crate::batteries::Presence::Battery && self.injects()
+    }
+
+    /// Audio Tray's own battery icon is the batteries' home: asked for, on a PC Windows gives no
+    /// battery icon (shown while a device reports one).
+    pub fn uses_own_battery_icon(&self) -> bool {
+        let b = &self.batteries;
+        b.enabled && b.taskbar_icon && crate::batteries::presence() == crate::batteries::Presence::NoBattery
+    }
+
+    /// The levels show in the audio surfaces (the panel's section, the audio icon's tooltip) as each
+    /// is switched: they do while no battery icon is their home.
+    pub fn levels_in_audio(&self) -> bool {
+        self.batteries.enabled && !self.uses_windows_battery_icon() && !self.uses_own_battery_icon()
     }
 
     /// Whether the music tile is drawn.
@@ -707,18 +735,23 @@ impl Config {
                 Self::default()
             }
         };
-        // The secrets live in the Credential Manager; one still in an older file wins until saved.
-        if config.discord.client_secret.is_none() {
-            config.discord.client_secret = crate::secrets::get(crate::secrets::DISCORD_SECRET);
+        config.read_secrets();
+        config
+    }
+
+    /// The secrets, from the Credential Manager. Older files kept the Discord secret and the Teams
+    /// token in plain text: one still there wins until the next [`Config::save`] moves it.
+    fn read_secrets(&mut self) {
+        if self.discord.client_secret.is_none() {
+            self.discord.client_secret = crate::secrets::get(crate::secrets::DISCORD_SECRET);
         }
-        if config.teams.token.is_none() {
-            config.teams.token = crate::secrets::get(crate::secrets::TEAMS_TOKEN);
+        if self.teams.token.is_none() {
+            self.teams.token = crate::secrets::get(crate::secrets::TEAMS_TOKEN);
         }
-        config.calendar.google_client_secret = crate::secrets::get(crate::secrets::CALENDAR_GOOGLE_SECRET);
-        config.calendar.links = crate::secrets::get(crate::secrets::CALENDAR_LINKS)
+        self.calendar.google_client_secret = crate::secrets::get(crate::secrets::CALENDAR_GOOGLE_SECRET);
+        self.calendar.links = crate::secrets::get(crate::secrets::CALENDAR_LINKS)
             .and_then(|text| serde_json::from_str(&text).ok())
             .unwrap_or_default();
-        config
     }
 
     /// A file that does not parse is renamed to `config.toml.bad` (replacing an older one) rather
@@ -747,20 +780,40 @@ impl Config {
 
     /// Parse a config file, bringing one written by an older version forward.
     fn parse(text: &str) -> std::result::Result<Self, toml::de::Error> {
-        let mut config: Self = toml::from_str(text)?;
         let raw: toml::Table = toml::from_str(text)?;
+        let mut config: Self = raw.clone().try_into()?;
+        config.migrate(&raw);
+        Ok(config)
+    }
+
+    /// Bring forward what an older version wrote, as `raw` holds it. Each step reads keys only an
+    /// older file has (or lacks): on a file this version wrote, none does anything.
+    fn migrate(&mut self, raw: &toml::Table) {
         let has = |section: &str, key: &str| raw.get(section).and_then(|s| s.get(key)).is_some();
         // Versions before these switches drew the buttons and the tile whenever they ran, and every
         // version since writes the keys: a file without them is an upgrade, which keeps both.
         if !has("strip", "enabled") {
-            config.strip.enabled = true;
+            self.strip.enabled = true;
         }
-        if !has("music", "tile_style") && !config.music.tile.is_empty() {
-            config.music.tile_style = TileStyle::Full;
+        if !has("music", "tile_style") && !self.music.tile.is_empty() {
+            self.music.tile_style = TileStyle::Full;
         }
-        // The left click's choice became the middle click's (a left click opens the panel).
-        config.strip.migrate();
-        Ok(config)
+        // Before 0.28, the left click's choice: it became the middle click's (a left click opens the
+        // panel now).
+        let strip = &mut self.strip;
+        if strip.left_click.is_some() || strip.mute_in_cycle.is_some() {
+            strip.middle_click = match (strip.left_click.take().as_deref(), strip.mute_in_cycle.take()) {
+                (Some("mute"), _) => MiddleClick::Mute,
+                (_, Some(false)) => MiddleClick::Switch,
+                _ => MiddleClick::SwitchMute,
+            };
+        }
+        // Before the bell had its own switch, it was Audio Tray's only with the calendar on (its
+        // notifications on by default): it stays as it was.
+        let notifications = self.calendar.notifications.take();
+        if !has("calendar", "bell") {
+            self.calendar.bell = self.calendar.enabled && notifications.unwrap_or(true);
+        }
     }
 
     pub fn save(&self) -> Result<()> {
@@ -845,6 +898,20 @@ this is not toml").unwrap();
     }
 
     #[test]
+    fn the_bell_stays_as_it_was_when_it_stands_alone() {
+        let bell = |text: &str| Config::parse(text).unwrap().calendar.bell;
+        // It was Audio Tray's only with the calendar on (its notifications on by default).
+        assert!(bell("[calendar]\nenabled = true\n"));
+        assert!(!bell("[calendar]\nenabled = true\nnotifications = false\n"));
+        assert!(!bell("[calendar]\nenabled = false\nnotifications = true\n"));
+        assert!(!bell(""), "off on a fresh install");
+        // Chosen since, it stays; and the old key is not written back.
+        assert!(bell("[calendar]\nenabled = false\nbell = true\n"));
+        let text = toml::to_string_pretty(&Config::parse("[calendar]\nenabled = true\nnotifications = true\n").unwrap()).unwrap();
+        assert!(text.contains("bell = true") && !text.contains("notifications ="));
+    }
+
+    #[test]
     fn an_upgrade_keeps_the_taskbar_buttons_and_the_tile() {
         let old = "[music]\nenabled = true\ntile = \"YouTube Music\"\n\n[strip]\nnext_to_wifi = true\n";
         let cfg = Config::parse(old).expect("parse");
@@ -900,6 +967,11 @@ this is not toml").unwrap();
         let config = Config { pill, ..Default::default() };
         let back: Config = toml::from_str(&toml::to_string_pretty(&config).unwrap()).unwrap();
         assert_eq!(back.pill.places, config.pill.places, "kept across runs");
+    }
+
+    #[test]
+    fn the_motion_constant_is_the_default() {
+        assert_eq!(Motion::default(), Motion::DEFAULT);
     }
 
     /// Configs from when the strip was opt-in carry a `[taskbar]` section; it must be ignored.

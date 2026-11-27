@@ -19,11 +19,8 @@ use windows::Win32::Graphics::Direct2D::{
     D2D1_PRESENT_OPTIONS_NONE, D2D1_RENDER_TARGET_PROPERTIES, D2D1_ROUNDED_RECT,
 };
 use windows::Win32::Graphics::DirectWrite::{
-    DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat, DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL,
-    DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_WEIGHT_SEMI_BOLD,
-    DWRITE_PARAGRAPH_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT, DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_LEADING,
-    DWRITE_TEXT_ALIGNMENT_TRAILING, DWRITE_TEXT_METRICS, DWRITE_TRIMMING, DWRITE_TRIMMING_GRANULARITY_CHARACTER,
-    DWRITE_WORD_WRAPPING_NO_WRAP,
+    DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat, DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_WEIGHT, DWRITE_FONT_WEIGHT_NORMAL,
+    DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT, DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_TEXT_ALIGNMENT_TRAILING,
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows_numerics::{Matrix3x2, Vector2};
@@ -202,31 +199,14 @@ impl Gfx {
         }
     }
 
+    /// One line, centred top to bottom, cut with "…" ([`crate::text::Flow::Line`]).
     fn format(&self, family: PCWSTR, weight: DWRITE_FONT_WEIGHT, size: f32) -> Result<IDWriteTextFormat> {
-        unsafe {
-            let format = self.dwrite.CreateTextFormat(family, None, weight, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, size, w!("en-us"))?;
-            format.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
-            format.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
-            let sign = self.dwrite.CreateEllipsisTrimmingSign(&format)?;
-            let trimming = DWRITE_TRIMMING { granularity: DWRITE_TRIMMING_GRANULARITY_CHARACTER, delimiter: 0, delimiterCount: 0 };
-            format.SetTrimming(&trimming, &sign)?;
-            Ok(format)
-        }
+        crate::text::format(&self.dwrite, crate::text::Spec { family, weight, size, flow: crate::text::Flow::Line }, w!("en-us"))
     }
 
     /// The width of `text` in `font`, in DIPs.
     pub(super) fn measure(&self, font: Font, text: &str) -> f32 {
-        let wide: Vec<u16> = text.encode_utf16().collect();
-        unsafe {
-            let Ok(layout) = self.dwrite.CreateTextLayout(&wide, &self.formats[font as usize], 4096.0, 100.0) else {
-                return 0.0;
-            };
-            let mut metrics = DWRITE_TEXT_METRICS::default();
-            if layout.GetMetrics(&mut metrics).is_err() {
-                return 0.0;
-            }
-            metrics.widthIncludingTrailingWhitespace
-        }
+        crate::text::width(&self.dwrite, &self.formats[font as usize], text)
     }
 
     /// The client area changed size (pixels).
@@ -652,15 +632,20 @@ fn draw_item(pen: &Pen, s: &Scene, items: &[Item], index: usize, item: &Item) {
             let color = if *selected { p.text } else { p.text2 };
             pen.text(label, Font::Body, R::new(r.x, r.y - 2.0, r.w, r.h), color.alpha(a), Align::Center);
         }
-        Kind::Button { label, accent, glyph, target } => {
-            let (fill, text) = if *accent {
-                (if hover(*target) { p.accent.alpha(0.9) } else { p.accent }, p.on_accent)
+        Kind::Button { label, accent, glyph, dim, target } => {
+            // Dimmed, it is a plain button, faded and still under the pointer: a faded accent reads
+            // as another colour.
+            let a = if *dim { 0.45 } else { 1.0 };
+            let (hover, pressed) = (hover(*target) && !dim, pressed(*target) && !dim);
+            let accent = *accent && !dim;
+            let (fill, text) = if accent {
+                (if hover { p.accent.alpha(0.9) } else { p.accent }, p.on_accent)
             } else {
-                (if hover(*target) { p.control_hover } else { p.control }, if pressed(*target) { p.text2 } else { p.text })
+                (if hover { p.control_hover } else { p.control.alpha(a) }, if pressed { p.text2 } else { p.text.alpha(a) })
             };
             pen.fill(r, 4.0, fill);
             if !accent {
-                pen.stroke(r, 4.0, 1.0, p.control_stroke);
+                pen.stroke(r, 4.0, 1.0, p.control_stroke.alpha(a));
             }
             match glyph {
                 // A menu's chevron trails its label.
@@ -683,7 +668,14 @@ fn draw_item(pen: &Pen, s: &Scene, items: &[Item], index: usize, item: &Item) {
             pen.fill(r, 6.0, if hover(*target) { p.card_hover } else { p.card });
             pen.stroke(r, 6.0, 1.0, p.card_stroke);
             let inner = R::new(r.x + 16.0, r.y + 14.0, r.w - 32.0, r.h - 28.0);
-            status(pen, p, title, *tone, R::new(inner.x, inner.y, inner.w, 18.0), 1.0);
+            // Every tile has its dot, grey while there is nothing to say: their titles line up.
+            let dot = R::new(inner.x, inner.y, inner.w, 18.0);
+            if *tone == Tone::Plain {
+                pen.circle(dot.x + 4.0, dot.y + dot.h / 2.0 + 0.5, 4.0, p.text3);
+                pen.text(title, Font::Caption, R::new(dot.x + 14.0, dot.y, dot.w - 14.0, dot.h), p.text2, Align::Left);
+            } else {
+                status(pen, p, title, *tone, dot, 1.0);
+            }
             pen.text(head, Font::BodyStrong, R::new(inner.x, inner.y + 24.0, inner.w, 22.0), p.text, Align::Left);
             pen.text(line, Font::Caption, R::new(inner.x, inner.y + 48.0, inner.w, 20.0), p.text2, Align::Left);
         }
@@ -709,7 +701,6 @@ fn draw_item(pen: &Pen, s: &Scene, items: &[Item], index: usize, item: &Item) {
             pen.text(title, Font::BodyStrong, R::new(r.x + 36.0, cy - 11.0, r.w - 48.0, 22.0), p.text.alpha(a), Align::Left);
             pen.text(desc, Font::Caption, R::new(r.x + 12.0, r.bottom() - 26.0, r.w - 24.0, 18.0), p.text2.alpha(a), Align::Left);
         }
-        Kind::PillPreview { on } => pill_preview(pen, s, r, *on),
         Kind::Outline => pen.stroke(r, 4.0, 2.0, p.accent),
         Kind::Level { level, low } => {
             // The number, then a bar filled to it: amber when low.
@@ -1224,16 +1215,3 @@ fn player_picture(pen: &Pen, s: &Scene, style: crate::config::TileStyle, r: R, a
     pen.unclip();
 }
 
-/// Home's picture: the pill as it is, its ring moving as its style does, on the left edge.
-fn pill_preview(pen: &Pen, s: &Scene, r: R, on: bool) {
-    let a = if on { 1.0 } else { 0.45 };
-    pen.fill(r, 6.0, SCREEN);
-    pen.clip(r);
-    let cy = r.y + r.h / 2.0;
-    pen.fill(R::new(r.x - 34.0, cy - 64.0, 100.0, 128.0), 33.0, PILL_BG.alpha(a));
-    ring_picture(pen, s, s.model.config.motion.ring, (r.x + 32.0, cy - 26.0), 22.0, a);
-    pen.circle(r.x + 32.0, cy + 30.0, 16.0, DEVICE_DISC.alpha(a));
-    pen.glyph('\u{E767}', Font::IconSmall, R::new(r.x + 24.0, cy + 22.0, 16.0, 16.0), Color::hex(0xFFFFFF, a));
-    pen.unclip();
-    pen.text(tr("Main display", "Écran principal"), Font::Caption, R::new(r.x, r.bottom() - 24.0, r.w - 12.0, 18.0), Color::hex(0xD6D6D6, 1.0), Align::Right);
-}

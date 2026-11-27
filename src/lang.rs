@@ -14,3 +14,12 @@ pub fn french() -> bool {
 pub fn tr(en: &'static str, fr: &'static str) -> &'static str {
     if french() { fr } else { en }
 }
+
+/// `format!` in Windows' language, as [`tr`] for words with values in them: the English pattern,
+/// or the French one (`tf!("{n} apps", "{n} applications")`).
+#[macro_export]
+macro_rules! tf {
+    ($en:literal, $fr:literal $(, $arg:expr)* $(,)?) => {
+        if $crate::lang::french() { format!($fr $(, $arg)*) } else { format!($en $(, $arg)*) }
+    };
+}

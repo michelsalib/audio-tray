@@ -4,7 +4,7 @@
 use core::ffi::c_void;
 use std::sync::{Mutex, MutexGuard};
 
-use windows_core::IInspectable;
+use windows_core::{IInspectable, Interface};
 
 use crate::decorate::{self, Layout};
 use crate::log::logf;
@@ -183,8 +183,6 @@ pub unsafe fn revert_reorder(diagnostics: &IXamlDiagnostics) {
 /// XAML UI thread only (the objects are not agile).
 unsafe fn release(raw: usize) {
     if raw != 0 {
-        drop(core::mem::transmute::<*mut c_void, IInspectable>(
-            raw as *mut c_void,
-        ));
+        drop(IInspectable::from_raw(raw as *mut c_void));
     }
 }

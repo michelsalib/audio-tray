@@ -56,6 +56,88 @@ pub(crate) fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
+/// The device node of PnP instance id `instance_id` (UTF-16, no terminator), when it is there.
+pub(crate) fn devnode(instance_id: &[u16]) -> Option<u32> {
+    use windows::Win32::Devices::DeviceAndDriverInstallation::{CM_Locate_DevNodeW, CM_LOCATE_DEVNODE_NORMAL, CR_SUCCESS};
+    let id: Vec<u16> = instance_id.iter().copied().chain(std::iter::once(0)).collect();
+    let mut node = 0u32;
+    (unsafe { CM_Locate_DevNodeW(&mut node, PCWSTR(id.as_ptr()), CM_LOCATE_DEVNODE_NORMAL) } == CR_SUCCESS).then_some(node)
+}
+
+/// A device node's property: its type and raw bytes, `None` when it has none (or `devinst` is no
+/// node).
+pub(crate) fn devnode_prop(
+    devinst: u32,
+    key: &windows::Win32::Foundation::DEVPROPKEY,
+) -> Option<(windows::Win32::Devices::Properties::DEVPROPTYPE, Vec<u8>)> {
+    use windows::Win32::Devices::DeviceAndDriverInstallation::{CM_Get_DevNode_PropertyW, CR_SUCCESS};
+    use windows::Win32::Devices::Properties::DEVPROPTYPE;
+    let mut ptype = DEVPROPTYPE(0);
+    let mut size = 0u32;
+    // Sized first: CR_BUFFER_SMALL, with the size.
+    let _ = unsafe { CM_Get_DevNode_PropertyW(devinst, key, &mut ptype, None, &mut size, 0) };
+    if size == 0 {
+        return None;
+    }
+    let mut buf = vec![0u8; size as usize];
+    let ret = unsafe { CM_Get_DevNode_PropertyW(devinst, key, &mut ptype, Some(buf.as_mut_ptr()), &mut size, 0) };
+    (ret == CR_SUCCESS).then(|| {
+        buf.truncate(size as usize);
+        (ptype, buf)
+    })
+}
+
+/// A byte property ([`devnode_prop`]).
+pub(crate) fn devnode_byte(devinst: u32, key: &windows::Win32::Foundation::DEVPROPKEY) -> Option<u8> {
+    match devnode_prop(devinst, key)? {
+        (windows::Win32::Devices::Properties::DEVPROP_TYPE_BYTE, bytes) => bytes.first().copied(),
+        _ => None,
+    }
+}
+
+/// A boolean property ([`devnode_prop`]).
+pub(crate) fn devnode_bool(devinst: u32, key: &windows::Win32::Foundation::DEVPROPKEY) -> Option<bool> {
+    match devnode_prop(devinst, key)? {
+        // DEVPROP_BOOLEAN: 0 is false, 0xFF true.
+        (windows::Win32::Devices::Properties::DEVPROP_TYPE_BOOLEAN, bytes) => bytes.first().map(|&b| b != 0),
+        _ => None,
+    }
+}
+
+/// A GUID property ([`devnode_prop`]).
+pub(crate) fn devnode_guid(devinst: u32, key: &windows::Win32::Foundation::DEVPROPKEY) -> Option<windows::core::GUID> {
+    match devnode_prop(devinst, key)? {
+        (windows::Win32::Devices::Properties::DEVPROP_TYPE_GUID, bytes) if bytes.len() >= 16 => {
+            Some(windows::core::GUID::from_u128(u128::from_be_bytes(guid_bytes(&bytes))))
+        }
+        _ => None,
+    }
+}
+
+/// A GUID's in-memory layout (little-endian fields) as the big-endian `u128` `GUID::from_u128` takes.
+pub(crate) fn guid_bytes(raw: &[u8]) -> [u8; 16] {
+    let mut b = [0u8; 16];
+    b[0..4].copy_from_slice(&[raw[3], raw[2], raw[1], raw[0]]);
+    b[4..6].copy_from_slice(&[raw[5], raw[4]]);
+    b[6..8].copy_from_slice(&[raw[7], raw[6]]);
+    b[8..16].copy_from_slice(&raw[8..16]);
+    b
+}
+
+/// A string property, or a string list's first entry (a container's category is a list), trimmed;
+/// `None` when empty ([`devnode_prop`]).
+pub(crate) fn devnode_string(devinst: u32, key: &windows::Win32::Foundation::DEVPROPKEY) -> Option<String> {
+    use windows::Win32::Devices::Properties::{DEVPROP_TYPE_STRING, DEVPROP_TYPE_STRING_LIST};
+    let (ptype, bytes) = devnode_prop(devinst, key)?;
+    if ptype != DEVPROP_TYPE_STRING && ptype != DEVPROP_TYPE_STRING_LIST {
+        return None;
+    }
+    let wide: Vec<u16> = bytes.as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes(*c)).collect();
+    let first = wide.split(|&c| c == 0).next()?;
+    let s = String::from_utf16_lossy(first).trim().to_string();
+    (!s.is_empty()).then_some(s)
+}
+
 /// A `REG_DWORD` under `HKEY_CURRENT_USER`, or `None` if it is absent or another type.
 pub(crate) fn hkcu_dword(subkey: PCWSTR, name: PCWSTR) -> Option<u32> {
     use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};

@@ -96,7 +96,7 @@ pub fn run(args: &[String]) -> Result<()> {
     say!("layouts (GetKeyboardLayoutList):");
     let installed = layouts();
     for layout in &installed {
-        say!("  {:#010x}  klid {:<9} {}", layout.hkl, layout.klid.as_deref().unwrap_or("?"), layout);
+        say!("  {:#010x}  klid {:<9} {}", layout.hkl, super::klid(layout.hkl).as_deref().unwrap_or("?"), layout);
     }
     for rule in &rules {
         if !installed.iter().any(|layout| layout.hkl == rule.hkl) {

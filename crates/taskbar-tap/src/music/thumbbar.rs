@@ -108,7 +108,7 @@ unsafe fn flyout_is_ours(diagnostics: &IXamlDiagnostics, host: &tile::Host) -> b
             {
                 return true;
             }
-            if crate::decorate::text_of(diagnostics, handle)
+            if crate::xaml::text_of(diagnostics, handle)
                 .is_some_and(|text| text.to_lowercase().contains(&wanted))
             {
                 return true;

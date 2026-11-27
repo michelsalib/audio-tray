@@ -43,7 +43,7 @@ pub unsafe fn scroll(diagnostics: &IXamlDiagnostics, strip: &state::Strip) {
         }
         let text = ticker::window(full, width, step as usize);
         for node in crate::tree::find_by_name(name) {
-            crate::decorate::set_text(diagnostics, node, &text);
+            crate::xaml::set_text(diagnostics, node, &text);
         }
     }
 }

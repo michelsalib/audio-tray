@@ -280,7 +280,7 @@ fn clear_progress_bar() {
 
         unsafe extern "system" fn visit(hwnd: HWND, lparam: LPARAM) -> BOOL {
             // A panic must not unwind into user32: treat it as "stop".
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { visit_inner(hwnd, lparam) })).unwrap_or(BOOL(0))
+            crate::guard("music: window search", || unsafe { visit_inner(hwnd, lparam) }).unwrap_or(BOOL(0))
         }
 
         unsafe fn visit_inner(hwnd: HWND, lparam: LPARAM) -> BOOL {

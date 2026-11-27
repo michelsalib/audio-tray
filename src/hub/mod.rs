@@ -5,7 +5,13 @@
 //! Sources run on any thread and call [`emit`]; events queue here and the tray thread is woken
 //! once ([`WM_HUB_EVENTS`]) to fold them all with [`take`]. Nothing here polls.
 
+mod announce;
 pub mod names;
+
+pub(crate) use announce::hand_over;
+/// The banner's test reads a low battery's words back as the tray writes them.
+#[cfg(test)]
+pub(crate) use announce::low_battery;
 
 use std::sync::{Arc, Mutex};
 
@@ -28,6 +34,24 @@ impl VoiceApp {
             VoiceApp::Teams => "Teams",
         }
     }
+}
+
+/// What a surface asks the tray to do (a click on the pill, the flyout's buttons, a banner's): the
+/// tray thread owns the audio and the integrations ([`crate::tray::perform`]).
+#[derive(Clone, PartialEq, Debug)]
+pub enum Action {
+    /// A transport command for the session of this app id.
+    Media(String, crate::music::smtc::Command),
+    /// Toggle the user's mute: in the voice app, or on the default microphone.
+    ToggleMute(Option<VoiceApp>),
+    /// Unmute: in the voice app when it reported the mute, else the default microphone.
+    Unmute(Option<VoiceApp>),
+    /// Leave the call in the voice app.
+    LeaveCall(VoiceApp),
+    /// Bring the app or tab behind a media session (its app id) to the front.
+    Focus(String),
+    /// Screens came or went: the pill goes back where it was placed on this set of them.
+    DisplaysChanged,
 }
 
 /// One media session, from any app.
@@ -62,6 +86,38 @@ impl Media {
     pub fn fraction_now(&self) -> Option<f64> {
         self.timeline?.fraction_at(crate::music::smtc::now_ticks(), self.playing)
     }
+
+    /// Its progress now: a live stream's is full, with no end to fill towards.
+    pub fn progress(&self) -> Progress {
+        match self.length_seconds() {
+            Some(len) => Progress {
+                fraction: self.fraction_now().unwrap_or(0.0) as f32,
+                rate: if self.playing { (1.0 / len) as f32 } else { 0.0 },
+                knob: true,
+            },
+            None => Progress { fraction: 1.0, rate: 0.0, knob: false },
+        }
+    }
+}
+
+/// `new` laid out as `old` was, for a list open under the pointer (the pill's card, the flyout's
+/// Now Playing): a session already shown keeps its place; one that went away stays, paused
+/// (`pause`), rather than slide the next under the pointer; the same track arriving from another
+/// source (Edge's own session giving way to the extension's tab) takes its place over rather than
+/// show twice; new ones go after. `id` and `title` say what a row is.
+pub fn keep_places<T: Clone>(old: &[T], new: Vec<T>, id: impl Fn(&T) -> &str, title: impl Fn(&T) -> &str, pause: impl Fn(&T) -> T) -> Vec<T> {
+    let mut fresh = new;
+    let mut kept: Vec<T> = Vec::with_capacity(old.len() + fresh.len());
+    for o in old {
+        let new_source = |n: &T| !old.iter().any(|o| id(o) == id(n)) && names::same_title(title(n), title(o));
+        let row = match fresh.iter().position(|n| id(n) == id(o)).or_else(|| fresh.iter().position(new_source)) {
+            Some(i) => fresh.remove(i),
+            None => pause(o),
+        };
+        kept.push(row);
+    }
+    kept.extend(fresh);
+    kept
 }
 
 /// One default endpoint, as the surfaces show it.
@@ -127,6 +183,75 @@ pub struct Call {
     pub self_deafened: bool,
     /// The app's icon (PNG), shown where there are no faces to say whose call it is.
     pub icon: Option<std::sync::Arc<Vec<u8>>>,
+}
+
+/// The call the surfaces show (the pill's call pill, the flyout's voice panel): a call an
+/// integration reports, else a meeting app holding the microphone. See [`State::call_summary`].
+#[derive(Clone, PartialEq, Debug)]
+pub struct CallSummary {
+    /// The voice app reporting the call; `None` for a meeting app only seen on the microphone.
+    pub app: Option<VoiceApp>,
+    /// The meeting app holding the microphone, when one does.
+    pub holder: Option<String>,
+    pub channel: Option<String>,
+    /// Who is there; empty when nobody is listed.
+    pub members: Vec<Member>,
+    /// The app's icon (PNG), for a call without faces.
+    pub icon: Option<Arc<Vec<u8>>>,
+    /// The user muted themselves in the voice app.
+    pub self_muted: bool,
+    /// The default microphone is muted.
+    pub mic_muted: bool,
+}
+
+impl CallSummary {
+    /// Whether the user is muted, and where to unmute: in the voice app when it reported the mute,
+    /// else (`None`) on the default microphone.
+    pub fn mute(&self) -> (Option<VoiceApp>, bool) {
+        if self.self_muted { (self.app, true) } else { (None, self.mic_muted) }
+    }
+
+    /// Whether the user is muted, in the voice app or on the default microphone.
+    pub fn muted(&self) -> bool {
+        self.mute().1
+    }
+
+    /// The call's name: "app · channel", the app, or the meeting app holding the microphone.
+    pub fn title(&self) -> String {
+        match (self.app, &self.channel) {
+            (Some(app), Some(channel)) => format!("{} · {channel}", app.label()),
+            (Some(app), None) => app.label().to_string(),
+            (None, _) => self.holder.clone().unwrap_or_else(|| crate::lang::tr("Call", "Appel").to_string()),
+        }
+    }
+
+    /// One line on what goes on in it, in Windows' language: who is talking, else that the user is
+    /// `muted`, else how many are there (or, nobody listed, that the microphone is live).
+    pub fn status_text(&self, muted: bool) -> String {
+        let speaking: Vec<&str> = self.members.iter().filter(|m| m.speaking).map(|m| m.name.as_str()).collect();
+        if !speaking.is_empty() {
+            let names = speaking.join(", ");
+            crate::tf!("{names} talking", "{names} parle")
+        } else if muted {
+            crate::lang::tr("You are muted", "Votre micro est coupé").to_string()
+        } else if self.members.is_empty() {
+            crate::lang::tr("Microphone live", "Micro actif").to_string()
+        } else {
+            let n = self.members.len();
+            crate::tf!("{n} in the call", "{n} dans l'appel")
+        }
+    }
+}
+
+/// A session's progress, as the pill's ring and card bar draw it.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Progress {
+    /// How far through it is now, 0–1; a live stream's is full.
+    pub fraction: f32,
+    /// Fraction per second while playing; 0 when paused or live.
+    pub rate: f32,
+    /// A playhead marks where it is: not on a live stream, which is nowhere in particular.
+    pub knob: bool,
 }
 
 /// What a device with a battery is, for its glyph.
@@ -226,48 +351,33 @@ pub enum Event {
     Notice(Notice),
 }
 
-/// A short-lived notice the pill shows on top of the steady state.
+/// News for the user, told away from the hub and never kept in it: a notification of Audio Tray's
+/// own, or a glance for a song or a layout ([`hand_over`]; the tray announces songs itself).
 #[derive(Clone, PartialEq, Debug)]
 pub enum Notice {
     /// The default output moved because the old one went away.
     AudioMoved { to: String, from: String },
-    /// An app started recording outside a known call; stays until acknowledged.
-    Listening { app: String, user: String },
-    /// A playing session moved on to a new track (the pill shows it when asked to).
+    /// A playing session moved on to a new track (announced when Settings asks for it).
     NewTrack { app_id: String, title: String, artist: String },
     /// The layout is now `layout`, on `keyboard` (empty: no name to give).
     KeyboardSwitched { keyboard: String, layout: String },
     /// A device's battery went low ([`State::low_battery_at`]).
     LowBattery { name: String, kind: BatteryKind, level: u8 },
     /// A calendar event about to start: its title, when and where, the meeting (or the event) to
-    /// open, and how long the reminder stays, in seconds.
-    Meeting { title: String, line: String, url: Option<String>, lasts: u64 },
+    /// open, and when it starts (seconds since the epoch: its banner counts down to it).
+    Meeting { title: String, line: String, url: Option<String>, start: i64 },
     /// The focus timer ran out.
     FocusDone { minutes: u32 },
 }
 
-impl Notice {
-    /// A notification of its own when Audio Tray shows them all: news, not the pill's live state
-    /// (a song playing, an app listening).
-    pub fn is_news(&self) -> bool {
-        !matches!(self, Notice::NewTrack { .. } | Notice::Listening { .. })
-    }
-
-    /// How long it shows; `None` until acknowledged.
-    pub fn lifetime(&self) -> Option<std::time::Duration> {
-        match self {
-            Notice::AudioMoved { .. } => Some(std::time::Duration::from_secs(5)),
-            Notice::Listening { .. } => None,
-            Notice::NewTrack { .. } => Some(std::time::Duration::from_secs(4)),
-            // A glance while typing: short, and replaced by the next switch.
-            Notice::KeyboardSwitched { .. } => Some(std::time::Duration::from_millis(1500)),
-            // Long enough to be seen on coming back to the desk; the flyout keeps the level.
-            Notice::LowBattery { .. } => Some(std::time::Duration::from_secs(12)),
-            // Until the event starts, and a little past.
-            Notice::Meeting { lasts, .. } => Some(std::time::Duration::from_secs(*lasts)),
-            Notice::FocusDone { .. } => Some(std::time::Duration::from_secs(10)),
-        }
-    }
+/// An app recording outside a known call: live state, not news. Its alert (a banner of Audio
+/// Tray's) stays until the app lets go of the microphone or the user acknowledges it.
+#[derive(Clone, PartialEq, Debug)]
+pub struct Listening {
+    /// The app's name, as shown.
+    pub app: String,
+    /// What holds the microphone (an exe path or a package name), as the consent store says.
+    pub user: String,
 }
 
 /// Everything the surfaces render, folded from events.
@@ -290,21 +400,16 @@ pub struct State {
     /// The title last announced as a new song: a player reporting through two sources (YouTube
     /// Music's own session and its browser tab) changes song once, not twice.
     announced: Option<String>,
-    /// Shown newest last; each with when it started.
-    pub notices: Vec<(Notice, std::time::Instant)>,
+    /// The apps listening outside a known call, newest last: the newest one's alert shows.
+    pub listening: Vec<Listening>,
     /// Every connected device that reports a battery.
     pub batteries: Vec<Battery>,
     /// A battery at or under this level (%) is low; 0 warns of none. Set from the config.
     pub low_battery_at: u8,
     /// The devices already warned of, until they charge back past [`RECHARGED`].
     low_warned: Vec<String>,
-    /// Devices that just went low, for the tray to raise a Windows notification about.
-    pub fresh_low: Vec<Battery>,
-    /// Audio Tray's notices merge into the notification list (`calendar::merges_notices`: the bell
-    /// is Audio Tray's): the notices that are news (not the pill's live state) go to
-    /// [`State::outbox`] instead, for the list and its banners.
-    pub merges_notices: bool,
-    /// Notices for the tray to show as notifications, oldest first.
+    /// Notices for the tray to tell ([`hand_over`]), oldest first. The pill is about audio activity
+    /// alone: none of them is its.
     pub outbox: Vec<Notice>,
 }
 
@@ -352,13 +457,10 @@ impl State {
                 let changed = replace(&mut self.mic_users, users);
                 // Released: its alert has nothing left to warn about.
                 let held = self.mic_users.clone();
-                self.notices.retain(|(n, _)| !matches!(n, Notice::Listening { user, .. } if !held.contains(user)));
+                self.listening.retain(|l| held.contains(&l.user));
                 for user in started {
                     if !self.in_known_call(&user) {
-                        self.notices.push((
-                            Notice::Listening { app: names::app_name(&user), user },
-                            std::time::Instant::now(),
-                        ));
+                        self.listening.push(Listening { app: names::app_name(&user), user });
                     }
                 }
                 changed
@@ -366,7 +468,7 @@ impl State {
             Event::Endpoints(endpoints) => {
                 if let (Some(old), Some(new)) = (&self.endpoints.output, &endpoints.output) {
                     if old.id != new.id && !endpoints.outputs.iter().any(|c| c.id == old.id) {
-                        self.push_notice(Notice::AudioMoved { to: new.name.clone(), from: old.name.clone() });
+                        self.outbox.push(Notice::AudioMoved { to: new.name.clone(), from: old.name.clone() });
                     }
                 }
                 replace(&mut self.endpoints, endpoints)
@@ -386,7 +488,7 @@ impl State {
                     }
                     (None, Some(call)) => {
                         // A call explains a recording that started before the integration said so.
-                        self.notices.retain(|(n, _)| !matches!(n, Notice::Listening { app: a, .. } if names::is_voice_app(a, app)));
+                        self.listening.retain(|l| !names::is_voice_app(&l.app, app));
                         self.calls.push((app, call));
                         true
                     }
@@ -423,11 +525,11 @@ impl State {
                 before != problem
             }
             Event::KeyboardSwitched { keyboard, layout } => {
-                self.push_notice(Notice::KeyboardSwitched { keyboard, layout });
+                self.outbox.push(Notice::KeyboardSwitched { keyboard, layout });
                 true
             }
             Event::Notice(notice) => {
-                self.push_notice(notice);
+                self.outbox.push(notice);
                 true
             }
             Event::Batteries(batteries) => {
@@ -445,8 +547,7 @@ impl State {
             if at > 0 && b.level <= at {
                 if !self.low_warned.contains(&b.id) {
                     self.low_warned.push(b.id.clone());
-                    self.push_notice(Notice::LowBattery { name: b.name.clone(), kind: b.kind, level: b.level });
-                    self.fresh_low.push(b.clone());
+                    self.outbox.push(Notice::LowBattery { name: b.name.clone(), kind: b.kind, level: b.level });
                     warned = true;
                 }
             } else if b.level > at.saturating_add(RECHARGED) {
@@ -473,16 +574,7 @@ impl State {
             return;
         }
         self.announced = Some(title.clone());
-        self.push_notice(notice);
-    }
-
-    fn push_notice(&mut self, notice: Notice) {
-        if self.merges_notices && notice.is_news() {
-            self.outbox.push(notice);
-            return;
-        }
-        self.notices.retain(|(n, _)| std::mem::discriminant(n) != std::mem::discriminant(&notice));
-        self.notices.push((notice, std::time::Instant::now()));
+        self.outbox.push(notice);
     }
 
     /// A recording by `user` that a reported call accounts for, or by a known voice/meeting app
@@ -492,27 +584,42 @@ impl State {
         names::is_meeting_app(&app) || self.calls.iter().any(|(voice, _)| names::is_voice_app(&app, *voice))
     }
 
-    /// Drop timed-out notices; returns whether any went, and when the next one is due.
-    pub fn expire(&mut self, now: std::time::Instant) -> (bool, Option<std::time::Duration>) {
-        let before = self.notices.len();
-        self.notices.retain(|(n, at)| n.lifetime().is_none_or(|life| now < *at + life));
-        let next = self
-            .notices
-            .iter()
-            .filter_map(|(n, at)| n.lifetime().map(|life| (*at + life).saturating_duration_since(now)))
-            .min();
-        (self.notices.len() != before, next)
-    }
-
-    /// Acknowledge (dismiss) the notice of the same kind as `notice`.
-    pub fn acknowledge(&mut self, notice: &Notice) {
-        // By kind, as said: an alert dismissed from a banner names no app.
-        self.notices.retain(|(n, _)| std::mem::discriminant(n) != std::mem::discriminant(notice));
+    /// The user acknowledged the listening alert: every app's goes (a banner's close button names
+    /// no app), until another starts listening.
+    pub fn acknowledge_listening(&mut self) {
+        self.listening.clear();
     }
 
     /// The call the pill shows: the first one reported (two voice apps in calls at once is rare).
     pub fn call(&self) -> Option<(VoiceApp, &Call)> {
         self.calls.iter().map(|(app, call)| (*app, call)).next()
+    }
+
+    /// The call the surfaces show: the one an integration reports (for as long as the user is in
+    /// it), else a meeting app holding the microphone.
+    pub fn call_summary(&self) -> Option<CallSummary> {
+        let holder = self.mic_users.iter().map(|user| names::app_name(user)).find(|name| names::is_meeting_app(name));
+        let mic_muted = self.endpoints.input.as_ref().is_some_and(|e| e.muted);
+        match self.call() {
+            Some((app, call)) => Some(CallSummary {
+                app: Some(app),
+                holder,
+                channel: call.channel.clone(),
+                members: call.members.clone(),
+                icon: call.icon.clone(),
+                self_muted: call.self_muted,
+                mic_muted,
+            }),
+            None => holder.map(|holder| CallSummary {
+                app: None,
+                holder: Some(holder),
+                channel: None,
+                members: Vec::new(),
+                icon: None,
+                self_muted: false,
+                mic_muted,
+            }),
+        }
     }
 
     /// The sessions to show: the playing ones, at most `MAX_SHOWN`.
@@ -541,11 +648,6 @@ impl State {
             .filter(|m| !(is_browser_session(m) && self.browser.iter().any(|b| names::same_title(&b.title, &m.title))));
         let tabs = self.browser.iter().filter(|b| !app_has_session(b));
         smtc.chain(tabs).collect()
-    }
-
-    /// Whether the microphone is live for the user: an app holds it.
-    pub fn mic_live(&self) -> bool {
-        !self.mic_users.is_empty()
     }
 }
 
@@ -614,15 +716,15 @@ mod tests {
     }
 
     #[test]
-    fn a_notice_is_acknowledged_by_its_kind() {
-        // A banner's close button names no app: it still dismisses the app's alert, and only that
-        // kind (a battery warning stays).
+    fn the_listening_alert_is_acknowledged_until_another_app_listens() {
+        // A banner's close button names no app: it still dismisses the app's alert.
         let mut state = State::default();
-        let now = std::time::Instant::now();
-        state.notices.push((Notice::Listening { app: "SystemSettings".into(), user: "SystemSettings.exe".into() }, now));
-        state.notices.push((Notice::FocusDone { minutes: 25 }, now));
-        state.acknowledge(&Notice::Listening { app: String::new(), user: String::new() });
-        assert!(matches!(&state.notices[..], [(Notice::FocusDone { .. }, _)]), "{:?}", state.notices.len());
+        state.apply(Event::MicUsers(vec!["SystemSettings.exe".into()]));
+        assert_eq!(state.listening.len(), 1);
+        state.acknowledge_listening();
+        assert!(state.listening.is_empty());
+        state.apply(Event::MicUsers(vec!["SystemSettings.exe".into(), r"C:\Tools\recorder.exe".into()]));
+        assert!(matches!(&state.listening[..], [Listening { app, .. }] if app == "recorder"));
     }
 
     #[test]
@@ -630,12 +732,13 @@ mod tests {
         let mut state = State::default();
         state.apply(endpoints("Headphones", &["Headphones", "Speakers"]));
         state.apply(endpoints("Speakers", &["Headphones", "Speakers"]));
-        assert!(state.notices.is_empty(), "a switch between present devices is not news");
+        assert!(state.outbox.is_empty(), "a switch between present devices is not news");
         state.apply(endpoints("Headphones", &["Headphones", "Speakers"]));
         state.apply(endpoints("Speakers", &["Speakers"]));
+        // News: a notification, never the pill's.
         assert!(matches!(
-            &state.notices[..],
-            [(Notice::AudioMoved { to, from }, _)] if to == "Speakers" && from == "Headphones"
+            &state.outbox[..],
+            [Notice::AudioMoved { to, from }] if to == "Speakers" && from == "Headphones"
         ));
     }
 
@@ -643,9 +746,9 @@ mod tests {
     fn a_recording_outside_a_call_raises_an_alert_until_released() {
         let mut state = State::default();
         state.apply(Event::MicUsers(vec![r"C:\Tools\recorder.exe".into()]));
-        assert!(matches!(&state.notices[..], [(Notice::Listening { app, .. }, _)] if app == "recorder"));
+        assert!(matches!(&state.listening[..], [Listening { app, .. }] if app == "recorder"));
         state.apply(Event::MicUsers(vec![]));
-        assert!(state.notices.is_empty());
+        assert!(state.listening.is_empty());
     }
 
     #[test]
@@ -653,7 +756,7 @@ mod tests {
         let mut state = State::default();
         state.apply(Event::MicUsers(vec![r"C:\Users\me\AppData\Local\Discord\app-1.0\Discord.exe".into()]));
         state.apply(Event::MicUsers(vec![r"C:\Users\me\AppData\Local\Discord\app-1.0\Discord.exe".into(), "MSTeams_8wekyb3d8bbwe".into()]));
-        assert!(state.notices.is_empty(), "{:?}", state.notices);
+        assert!(state.listening.is_empty(), "{:?}", state.listening);
     }
 
     #[test]
@@ -665,6 +768,25 @@ mod tests {
         let (_, call) = state.call().unwrap();
         assert!(call.self_muted && call.members[0].muted);
         assert!(!state.apply(Event::SelfMuted { app: VoiceApp::Teams, muted: true }), "no Teams call to mute");
+    }
+
+    /// The pill's call row and the flyout's voice panel read one summary: its name, and who talks.
+    #[test]
+    fn a_call_is_summed_up_once_for_every_surface() {
+        let mut state = State::default();
+        assert!(state.call_summary().is_none());
+        state.apply(Event::MicUsers(vec!["MSTeams_8wekyb3d8bbwe".into()]));
+        let holder = state.call_summary().unwrap();
+        assert_eq!((holder.app, holder.title(), holder.status_text(false)), (None, "Teams".to_string(), "Microphone live".to_string()));
+        let member = |name: &str, speaking: bool| Member { id: name.into(), name: name.into(), avatar: None, speaking, muted: false, me: false };
+        let call = Call { channel: Some("General".into()), members: vec![member("Ann", true), member("Bo", false)], self_muted: true, ..Default::default() };
+        state.apply(Event::Call { app: VoiceApp::Discord, call: Some(call) });
+        let summary = state.call_summary().unwrap();
+        assert_eq!(summary.title(), "Discord · General");
+        assert_eq!(summary.mute(), (Some(VoiceApp::Discord), true));
+        assert_eq!(summary.status_text(true), "Ann talking");
+        state.apply(Event::Call { app: VoiceApp::Discord, call: Some(Call { members: vec![member("Ann", false), member("Bo", false)], ..Default::default() }) });
+        assert_eq!(state.call_summary().unwrap().status_text(false), "2 in the call");
     }
 
     fn media(app_id: &str, title: &str) -> Media {
@@ -679,6 +801,17 @@ mod tests {
             skip: false,
             video: false,
         }
+    }
+
+    /// An open list (the pill's card, the flyout's Now Playing) keeps its rows: a session gone stays,
+    /// paused; a track moving to the extension's tab keeps its row; a new one goes after.
+    #[test]
+    fn an_open_list_keeps_its_rows_in_place() {
+        let old = vec![media("A", "One"), media("MSEdge", "WORLDS - T1 vs KC")];
+        let new = vec![media("C", "Three"), media("browser:7:2:0", "WORLDS - T1 vs KC")];
+        let kept = keep_places(&old, new, |m| m.app_id.as_str(), |m| m.title.as_str(), |m| Media { playing: false, ..m.clone() });
+        let rows: Vec<(&str, bool)> = kept.iter().map(|m| (m.app_id.as_str(), m.playing)).collect();
+        assert_eq!(rows, [("A", false), ("browser:7:2:0", true), ("C", true)]);
     }
 
     #[test]
@@ -701,18 +834,17 @@ mod tests {
         let song = |title: &str, playing: bool| Media { playing, ..media("ytm", title) };
         let mut state = State::default();
         state.apply(Event::Media(vec![song("One", true)]));
-        assert!(state.notices.is_empty(), "a player opening is not a new song");
+        assert!(state.outbox.is_empty(), "a player opening is not a new song");
         state.apply(Event::Media(vec![song("One", false)]));
         state.apply(Event::Media(vec![song("One", true)]));
-        assert!(state.notices.is_empty(), "a resume is not a new song");
+        assert!(state.outbox.is_empty(), "a resume is not a new song");
         state.apply(Event::Media(vec![song("Two", true)]));
-        assert!(matches!(&state.notices[..], [(Notice::NewTrack { title, .. }, _)] if title == "Two"));
+        // A glance of Audio Tray's, never the pill's.
+        assert!(matches!(&state.outbox[..], [Notice::NewTrack { title, .. }] if title == "Two"));
         // The same song through the player's browser tab is not a second one.
-        let at = state.notices[0].1;
         state.apply(Event::BrowserMedia { host: Some(1), media: vec![Media { playing: true, ..media("browser:1:2:0", "One") }] });
         state.apply(Event::BrowserMedia { host: Some(1), media: vec![Media { playing: true, ..media("browser:1:2:0", "Two") }] });
-        assert_eq!(state.notices.len(), 1);
-        assert_eq!(state.notices[0].1, at, "not raised again");
+        assert_eq!(state.outbox.len(), 1, "not raised again");
     }
 
     #[test]
@@ -747,7 +879,7 @@ mod tests {
     }
 
     fn lows(state: &State) -> Vec<u8> {
-        state.notices.iter().filter_map(|(n, _)| match n {
+        state.outbox.iter().filter_map(|n| match n {
             Notice::LowBattery { level, .. } => Some(*level),
             _ => None,
         }).collect()
@@ -758,16 +890,15 @@ mod tests {
         let mut state = State::default();
         state.set_low_battery_at(20);
         state.apply(Event::Batteries(vec![battery("mouse", 40)]));
-        assert!(state.notices.is_empty());
+        assert!(state.outbox.is_empty());
         assert!(state.apply(Event::Batteries(vec![battery("mouse", 20)])));
         assert_eq!(lows(&state), [20]);
-        assert_eq!(state.fresh_low.len(), 1);
-        state.notices.clear();
+        state.outbox.clear();
         // Wobbling around the threshold, and draining further: no second warning.
         for level in [19, 22, 18, 10] {
             state.apply(Event::Batteries(vec![battery("mouse", level)]));
         }
-        assert!(state.notices.is_empty());
+        assert!(state.outbox.is_empty());
         // Charged past the margin, then low again: warned again.
         state.apply(Event::Batteries(vec![battery("mouse", 20 + RECHARGED + 1)]));
         state.apply(Event::Batteries(vec![battery("mouse", 15)]));
@@ -778,7 +909,7 @@ mod tests {
     fn no_warning_when_off_and_a_lower_threshold_warns_at_once() {
         let mut state = State::default();
         state.apply(Event::Batteries(vec![battery("kb", 5)]));
-        assert!(state.notices.is_empty(), "0 warns of nothing");
+        assert!(state.outbox.is_empty(), "0 warns of nothing");
         assert!(state.set_low_battery_at(10));
         assert_eq!(lows(&state), [5]);
         assert!(!state.set_low_battery_at(10), "unchanged");
@@ -792,20 +923,5 @@ mod tests {
         assert_eq!(BatteryKind::from_category("Input.Gaming"), BatteryKind::Gamepad);
         assert_eq!(BatteryKind::from_category("Audio.Speaker"), BatteryKind::Speaker);
         assert_eq!(BatteryKind::from_category("Other"), BatteryKind::Other);
-    }
-
-    #[test]
-    fn timed_notices_expire_and_report_the_next_deadline() {
-        let mut state = State::default();
-        let t0 = std::time::Instant::now();
-        state.notices.push((Notice::AudioMoved { to: "a".into(), from: "b".into() }, t0));
-        state.notices.push((Notice::Listening { app: "x".into(), user: "x".into() }, t0));
-        let (gone, next) = state.expire(t0 + std::time::Duration::from_secs(1));
-        assert!(!gone);
-        assert_eq!(next, Some(std::time::Duration::from_secs(4)));
-        let (gone, next) = state.expire(t0 + std::time::Duration::from_secs(6));
-        assert!(gone);
-        assert_eq!(next, None, "the alert waits for acknowledgement");
-        assert_eq!(state.notices.len(), 1);
     }
 }

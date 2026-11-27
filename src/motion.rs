@@ -13,7 +13,7 @@
 use crate::canvas::{lerp3, Canvas, Rect};
 use crate::config::MotionStyle;
 
-use crate::flyout::theme::text;
+use crate::theme::text;
 const GREY: [u8; 3] = [0x6A, 0x6A, 0x6A];
 
 /// A damped spring's position and speed.

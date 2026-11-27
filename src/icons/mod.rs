@@ -22,6 +22,45 @@ use crate::audio::FormFactor;
 /// Segoe Fluent Icons, the font Windows renders its own shell/tray glyphs from.
 const FONT_PATH: &str = r"C:\Windows\Fonts\SegoeIcons.ttf";
 
+/// The Segoe Fluent Icons code points every surface draws (the pill, the flyout, the OSD, the
+/// taskbar thumbnail buttons, the banners): one place, so a glyph is the same everywhere.
+pub mod glyph {
+    /// Volume: a speaker with waves.
+    pub const VOLUME: char = '\u{E767}';
+    /// A muted speaker.
+    pub const MUTE: char = '\u{E74F}';
+    pub const MIC: char = '\u{E720}';
+    /// A muted microphone (MicOff).
+    pub const MIC_OFF: char = '\u{EC54}';
+    pub const PREVIOUS: char = '\u{E892}';
+    pub const PLAY: char = '\u{E768}';
+    pub const PAUSE: char = '\u{E769}';
+    pub const NEXT: char = '\u{E893}';
+    /// A session with no cover: music, or a video.
+    pub const MUSIC: char = '\u{EC4F}';
+    pub const VIDEO: char = '\u{E714}';
+    /// Leave a call.
+    pub const HANG_UP: char = '\u{E778}';
+    pub const SETTINGS: char = '\u{E713}';
+    /// Refresh (a circular arrow): restart to update.
+    pub const UPDATE: char = '\u{E72C}';
+    /// Chevrons: a list that opens, a list that folds.
+    pub const DOWN: char = '\u{E70D}';
+    pub const UP: char = '\u{E70E}';
+}
+
+/// A stable hash of a name, the same on every run: what [`name_colour`] picks by, and what tells
+/// one device's notifications from another's.
+pub fn name_hash(name: &str) -> u32 {
+    name.bytes().fold(0u32, |h, b| h.wrapping_mul(31).wrapping_add(b as u32))
+}
+
+/// The colour a face without a picture is drawn on: one of a few, the same for a name each time.
+pub fn name_colour(name: &str) -> [u8; 3] {
+    const PALETTE: [[u8; 3]; 6] = [[0x58, 0x65, 0xF2], [0x2D, 0x7D, 0x9A], [0x8E, 0x44, 0xAD], [0xC0, 0x39, 0x2B], [0x16, 0xA0, 0x85], [0xD3, 0x54, 0x00]];
+    PALETTE[name_hash(name) as usize % PALETTE.len()]
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum IconId {
     WirelessEarbuds,
@@ -51,11 +90,6 @@ impl IconId {
         IconId::Unknown,
     ];
 
-    /// Drawn by hand, not a font's glyph: see [`IconId::render`].
-    pub fn drawn(self) -> bool {
-        matches!(self, IconId::WirelessEarbuds | IconId::RoundEarbuds)
-    }
-
     /// Segoe Fluent code point; the earbud variants are hand-drawn and return headphones here.
     pub fn glyph(self) -> char {
         match self {
@@ -63,9 +97,9 @@ impl IconId {
             IconId::RoundEarbuds => '\u{E7F6}',    // Headphone (no earbuds glyph; see render)
             IconId::Headphones => '\u{E7F6}',      // Headphone
             IconId::HeadsetMic => '\u{E95B}',      // Headset (with mic)
-            IconId::Microphone => '\u{E720}',      // Microphone
+            IconId::Microphone => glyph::MIC,      // Microphone
             IconId::Webcam => '\u{E960}',          // Webcam2 (lens in a body on a stand)
-            IconId::Speakers => '\u{E767}',        // Volume (speaker + waves)
+            IconId::Speakers => glyph::VOLUME,     // Volume (speaker + waves)
             IconId::LaptopSpeakers => '\u{E7F8}',  // DeviceLaptopNoPic
             IconId::Hdmi => '\u{E7F4}',            // TVMonitor
             IconId::Unknown => '\u{E9CE}',         // Unknown (? in a circle)

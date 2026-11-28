@@ -80,8 +80,9 @@ A tiny Windows app for **audio awareness without opening anything** — a pill o
   Batteries card (this PC's charge and state, then every device's level; the rest of Quick
   Settings stays Windows'), its tooltip lists them all, and it wears a red dot while one runs low.
   On a desktop, which Windows gives no battery icon, Audio Tray shows one of its own while a device
-  reports a battery: a bar or a ring per device (the lowest three, Settings > Batteries chooses),
-  green, amber or red by level, with the same tooltip and card; its right click offers the
+  reports a battery, in the style picked from pictures in Settings > Batteries: a bar, a ring or a
+  bubble per device (the lowest three), or the lowest one alone as a battery or its figures with a
+  dot per device, green, amber or red by level, with the same tooltip and card; its right click offers the
   batteries, their settings and Windows' Bluetooth page. The laptop's takeover needs the taskbar
   integration on for something else (the audio buttons, the music tile or the calendar). Windows
   shows a notification when one runs low (20% by default), once until it is charged again. With
@@ -198,7 +199,7 @@ tooltip = true              # the levels under the tray icon's tooltip
 toast = true                # a notification when one runs low
 low_at = 20                 # low is at or under this (%)
 taskbar_icon = true         # they live at the battery icon (Windows' on a laptop, ours on a desktop)
-icon_style = "bars"         # our own icon (a desktop): "bars" or "rings", one per device
+icon_style = "bars"         # our own icon (a desktop): "bars", "rings", "bubbles", "battery" or "number"
 
 [discord]
 enabled = true              # Discord: RPC when client_id/client_secret are set, and the Vencord pipe

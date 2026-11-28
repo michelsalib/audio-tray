@@ -1,7 +1,8 @@
 //! Audio Tray's own battery icon (a PC without a battery): one picture for every device, drawn at
-//! the tray's exact pixel size so each edge lands on the pixel grid. Each device (up to three, the
-//! lowest first) is a bar or a ring filled to its level in its tone's colour, over a faint track:
-//! it reads as "the devices", not as this PC's battery.
+//! the tray's exact pixel size so each edge lands on the pixel grid. Either each device (up to
+//! three, the lowest first) is a bar, a ring or a bubble filled to its level in its tone's colour
+//! over a faint track, or the lowest one alone is a battery or its figures, with a dot per device
+//! under it.
 
 use crate::batteries::Tone;
 
@@ -20,6 +21,14 @@ pub fn render(style: Style, levels: &[(u8, Tone)], size: u32, light: bool) -> Ve
     match style {
         Style::Bars => bars(&mut canvas, shown, ink, light),
         Style::Rings => rings(&mut canvas, shown, ink, light),
+        Style::Bubbles => bubbles(&mut canvas, shown, ink, light),
+        Style::Battery => battery(&mut canvas, shown, ink, light),
+        Style::Number => {
+            if !number(&mut canvas, shown, light) {
+                // No font to write it with: the battery says the same.
+                battery(&mut canvas, shown, ink, light);
+            }
+        }
     }
     canvas.pixels
 }
@@ -72,6 +81,115 @@ fn rings(c: &mut Canvas, levels: &[(u8, Tone)], ink: [u8; 3], light: bool) {
     }
 }
 
+/// One circle per device, filled from the bottom to its level like a glass: one large, two side by
+/// side, three in a cluster.
+fn bubbles(c: &mut Canvas, levels: &[(u8, Tone)], ink: [u8; 3], light: bool) {
+    let u = c.size as f32 / 24.0;
+    // Centre and radius, on the 24-unit grid.
+    let places: &[(f32, f32, f32)] = match levels.len() {
+        0 | 1 => &[(12.0, 12.0, 9.5)],
+        2 => &[(6.0, 12.0, 5.0), (18.0, 12.0, 5.0)],
+        _ => &[(12.0, 6.25, 5.25), (6.25, 16.75, 5.25), (17.75, 16.75, 5.25)],
+    };
+    let rim = (1.25 * u).round().max(1.0);
+    for (&(level, tone), &(x, y, r)) in levels.iter().zip(places) {
+        let (cx, cy, r) = (x * u, y * u, r * u);
+        let inner = r - rim;
+        c.disc(cx, cy, inner, (ink, TRACK * 0.5));
+        let top = cy + inner - 2.0 * inner * fraction(level);
+        let rgb = tone.rgb(light);
+        c.fill(rgb, 1.0, |px, py| {
+            let disc = ((px - cx).powi(2) + (py - cy).powi(2)).sqrt() - inner;
+            disc.max(top - py)
+        });
+        c.fill(ink, 0.6, |px, py| (((px - cx).powi(2) + (py - cy).powi(2)).sqrt() - (r - rim / 2.0)).abs() - rim / 2.0);
+    }
+}
+
+/// The dots' diameter and the gap between them, in whole pixels.
+fn dot_size(u: f32) -> (f32, f32) {
+    ((3.5 * u).round().max(2.0), (1.5 * u).round().max(1.0))
+}
+
+/// How tall the dots' row is with the space above it (nothing for one device: no dots).
+fn dots_room(levels: &[(u8, Tone)], u: f32) -> f32 {
+    if levels.len() < 2 {
+        return 0.0;
+    }
+    dot_size(u).0 + (2.0 * u).round().max(1.0)
+}
+
+/// A dot per device in its tone, a centred row whose top is `top`; none for one device.
+fn dots(c: &mut Canvas, levels: &[(u8, Tone)], top: f32, light: bool) {
+    if levels.len() < 2 {
+        return;
+    }
+    let u = c.size as f32 / 24.0;
+    let (d, gap) = dot_size(u);
+    let n = levels.len() as f32;
+    let x0 = ((c.size as f32 - (n * d + (n - 1.0) * gap)) / 2.0).round();
+    for (i, &(_, tone)) in levels.iter().enumerate() {
+        c.disc(x0 + i as f32 * (d + gap) + d / 2.0, top + d / 2.0, d / 2.0, (tone.rgb(light), 1.0));
+    }
+}
+
+/// One battery, outlined in the taskbar's ink and filled to the lowest level in its tone, the dots
+/// under it. Every edge on whole pixels.
+fn battery(c: &mut Canvas, levels: &[(u8, Tone)], ink: [u8; 3], light: bool) {
+    let Some(&(level, tone)) = levels.first() else { return };
+    let s = c.size as f32;
+    let u = s / 24.0;
+    let line = (1.25 * u).round().max(1.0);
+    let nub = (2.0 * u).round().max(1.0);
+    let (x, h) = ((2.0 * u).round(), (10.0 * u).round());
+    let w = s - (1.0 * u).round() - nub - x;
+    let below = dots_room(levels, u);
+    let y = ((s - h - below) / 2.0).round();
+    c.ring_rect([x, y, w, h], 2.5 * u, line, (ink, 1.0));
+    let inset = (h * 0.3).round();
+    c.round_rect(x + w - 1.0, y + inset, nub + 1.0, h - 2.0 * inset, 0.75 * u, (ink, 1.0));
+    let pad = line + (1.0 * u).round().max(1.0);
+    let (fw, fh) = (w - 2.0 * pad, h - 2.0 * pad);
+    c.round_rect(x + pad, y + pad, fw * fraction(level), fh, (0.75 * u).min(fh / 2.0), (tone.rgb(light), 1.0));
+    dots(c, levels, y + h + below - dot_size(u).0, light);
+}
+
+/// The lowest level in figures, in its tone, the dots under it; false when no font could write it.
+fn number(c: &mut Canvas, levels: &[(u8, Tone)], light: bool) -> bool {
+    let Some(&(level, tone)) = levels.first() else { return true };
+    let s = c.size as f32;
+    let u = s / 24.0;
+    let text = level.min(100).to_string();
+    let below = dots_room(levels, u);
+    // As large as fits, a pixel clear of each side.
+    let (room_w, room_h) = (s - 2.0, s - 2.0 - below);
+    let mut em = s * if below > 0.0 { 0.7 } else { 0.85 };
+    let fit = loop {
+        if em < 5.0 {
+            return false;
+        }
+        match crate::icons::text_coverage(&text, em) {
+            Some((cov, w, h)) if w as f32 <= room_w && h as f32 <= room_h => break (cov, w, h),
+            Some(_) => em -= 1.0,
+            None => return false,
+        }
+    };
+    let (cov, w, h) = fit;
+    let x0 = ((s - w as f32) / 2.0).round() as u32;
+    let y0 = ((s - h as f32 - below) / 2.0).round() as u32;
+    let rgb = tone.rgb(light);
+    for y in 0..h {
+        for x in 0..w {
+            let a = cov[(y * w + x) as usize];
+            if a > 0 && x0 + x < c.size && y0 + y < c.size {
+                c.blend(x0 + x, y0 + y, rgb, 1.0, a as f32 / 255.0);
+            }
+        }
+    }
+    dots(c, levels, y0 as f32 + h as f32 + below - dot_size(u).0, light);
+    true
+}
+
 /// A square RGBA picture, drawn into with coverage (anti-aliased) and blended over.
 struct Canvas {
     size: u32,
@@ -116,15 +234,24 @@ impl Canvas {
         if w <= 0.0 || h <= 0.0 {
             return;
         }
-        let r = r.min(w / 2.0).min(h / 2.0);
-        let (cx, cy) = (x + w / 2.0, y + h / 2.0);
-        let (hw, hh) = (w / 2.0 - r, h / 2.0 - r);
+        self.fill(rgb, opacity, |px, py| rect_distance(px, py, x, y, w, h, r));
+    }
+
+    /// A rounded rectangle's outline (`[x, y, w, h]`), `line` wide inside its edge.
+    fn ring_rect(&mut self, [x, y, w, h]: [f32; 4], r: f32, line: f32, (rgb, opacity): Paint) {
+        if w <= 2.0 * line || h <= 2.0 * line {
+            return;
+        }
+        let inner = (r - line).max(0.0);
         self.fill(rgb, opacity, |px, py| {
-            let qx = (px - cx).abs() - hw;
-            let qy = (py - cy).abs() - hh;
-            let outside = (qx.max(0.0).powi(2) + qy.max(0.0).powi(2)).sqrt();
-            outside + qx.max(qy).min(0.0) - r
+            let outside = rect_distance(px, py, x, y, w, h, r);
+            let hole = rect_distance(px, py, x + line, y + line, w - 2.0 * line, h - 2.0 * line, inner);
+            outside.max(-hole)
         });
+    }
+
+    fn disc(&mut self, cx: f32, cy: f32, r: f32, (rgb, opacity): Paint) {
+        self.fill(rgb, opacity, |px, py| ((px - cx).powi(2) + (py - cy).powi(2)).sqrt() - r);
     }
 
     /// A ring of `radius` (its stroke's middle), `stroke` wide, drawn clockwise from the top for
@@ -157,6 +284,15 @@ impl Canvas {
             to_start.min(to_end)
         });
     }
+}
+
+/// `(px, py)`'s signed distance to a rectangle with corners of radius `r` (negative inside).
+fn rect_distance(px: f32, py: f32, x: f32, y: f32, w: f32, h: f32, r: f32) -> f32 {
+    let r = r.min(w / 2.0).min(h / 2.0);
+    let qx = (px - x - w / 2.0).abs() - (w / 2.0 - r);
+    let qy = (py - y - h / 2.0).abs() - (h / 2.0 - r);
+    let outside = (qx.max(0.0).powi(2) + qy.max(0.0).powi(2)).sqrt();
+    outside + qx.max(qy).min(0.0) - r
 }
 
 #[cfg(test)]
@@ -202,5 +338,51 @@ mod tests {
         assert_eq!(right, Tone::Fair.rgb(false));
         assert!(alpha(&p, 24, 2, 12) < 160, "left {}", alpha(&p, 24, 2, 12));
         assert_eq!(alpha(&p, 24, 12, 12), 0);
+    }
+
+    const THREE: [(u8, Tone); 3] = [(10, Tone::Low), (35, Tone::Fair), (80, Tone::Good)];
+
+    /// The pixels of exactly `rgb`, fully opaque, in rows `ys`.
+    fn count(p: &[u8], size: u32, ys: std::ops::Range<u32>, rgb: [u8; 3]) -> usize {
+        ys.flat_map(|y| (0..size).map(move |x| (x, y))).filter(|&(x, y)| alpha(p, size, x, y) == 255 && self::rgb(p, size, x, y) == rgb).count()
+    }
+
+    /// The battery is the lowest device's, in its tone; under it, a dot per device in each one's.
+    #[test]
+    fn the_battery_shows_the_lowest_and_a_dot_each() {
+        let p = render(Style::Battery, &THREE, 24, false);
+        // The body (rows 4 to 13) holds only the lowest's colour.
+        assert!(count(&p, 24, 4..14, Tone::Low.rgb(false)) > 0);
+        assert_eq!(count(&p, 24, 4..14, Tone::Good.rgb(false)), 0);
+        // The dots' row holds all three.
+        for tone in [Tone::Low, Tone::Fair, Tone::Good] {
+            assert!(count(&p, 24, 14..24, tone.rgb(false)) > 0, "{tone:?}");
+        }
+        // One device: no dots.
+        let one = render(Style::Battery, &[(80, Tone::Good)], 24, false);
+        assert_eq!(count(&one, 24, 18..24, Tone::Good.rgb(false)), 0);
+    }
+
+    /// The figures are written in the lowest's tone, at every tray size.
+    #[test]
+    fn the_number_is_written_in_its_tone() {
+        // Written, not the battery it falls back to.
+        assert!(crate::icons::text_coverage("10", 16.0).is_some());
+        for size in [16, 20, 24, 32] {
+            let p = render(Style::Number, &THREE, size, true);
+            let ink = (0..size * size).filter(|i| p[(*i * 4 + 3) as usize] > 128 && p[(*i * 4) as usize..(*i * 4 + 3) as usize] == Tone::Low.rgb(true)).count();
+            assert!(ink > 6, "size {size}: {ink} pixels");
+        }
+    }
+
+    /// Bubbles: one per device, each filled from the bottom (the low one barely, the full one high).
+    #[test]
+    fn a_bubble_per_device_fills_from_the_bottom() {
+        let p = render(Style::Bubbles, &[(30, Tone::Low), (35, Tone::Fair), (80, Tone::Good)], 24, false);
+        // The top bubble (centre 12, 6.25) is the lowest: its bottom is coloured, its top is not.
+        assert_eq!(rgb(&p, 24, 12, 9), Tone::Low.rgb(false));
+        assert_ne!(rgb(&p, 24, 12, 5), Tone::Low.rgb(false));
+        // The right one (80%) is coloured high up.
+        assert_eq!(rgb(&p, 24, 17, 15), Tone::Good.rgb(false));
     }
 }

@@ -236,7 +236,8 @@ pub fn run(args: &[String], backend: &WasapiBackend) -> Result<bool> {
             use crate::tray::battery::render::Style;
             let dir = std::path::PathBuf::from(args.get(1).map_or(".", String::as_str));
             let cases: [&[u8]; 3] = [&[78], &[35, 78], &[12, 35, 78]];
-            for (style, label) in [(Style::Bars, "bars"), (Style::Rings, "rings")] {
+            let styles = [(Style::Bars, "bars"), (Style::Rings, "rings"), (Style::Bubbles, "bubbles"), (Style::Battery, "battery"), (Style::Number, "number")];
+            for (style, label) in styles {
                 for levels in cases {
                     let (rgba, size) = crate::tray::battery::icon_pixels(style, levels, 20);
                     let name = format!("battery-{label}-{}-{size}.rgba", levels.len());

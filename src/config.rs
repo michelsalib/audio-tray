@@ -513,11 +513,17 @@ pub enum BatteryIconStyle {
     Bars,
     /// A ring per device, nested, filled clockwise from the top.
     Rings,
+    /// A bubble per device, filled from the bottom like a glass.
+    Bubbles,
+    /// One battery filled to the lowest level, a dot per device under it.
+    Battery,
+    /// The lowest level in figures, a dot per device under it.
+    Number,
 }
 
 impl BatteryIconStyle {
-    /// In Settings' order.
-    pub const ALL: [BatteryIconStyle; 2] = [BatteryIconStyle::Bars, BatteryIconStyle::Rings];
+    /// In Settings' order: a mark per device, then the lowest one.
+    pub const ALL: [BatteryIconStyle; 5] = [BatteryIconStyle::Bars, BatteryIconStyle::Rings, BatteryIconStyle::Bubbles, BatteryIconStyle::Battery, BatteryIconStyle::Number];
 }
 
 /// How the music tile draws into the player's taskbar button.

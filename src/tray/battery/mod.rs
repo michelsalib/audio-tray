@@ -214,6 +214,16 @@ pub(super) fn menu() {
     }
 }
 
+/// Audio Tray's own icon in `style`, `px` square, for three sample devices (one low, one fair and
+/// one good at `low_at`), in the taskbar's theme: Settings' pictures of the styles. With whether
+/// the taskbar is light, for what they are drawn on.
+pub(crate) fn preview(style: render::Style, low_at: u8, px: u32) -> (Vec<u8>, bool) {
+    let light = super::icon::taskbar_is_light();
+    let levels = [low_at.saturating_sub(5).max(3), low_at.saturating_mul(3) / 2, 80];
+    let toned: Vec<_> = levels.iter().map(|l| (*l, Tone::of(*l, low_at))).collect();
+    (render::render(style, &toned, px, light), light)
+}
+
 /// Dev: Audio Tray's own icon in `style` for `levels` (of `low_at`), as raw RGBA, for previews.
 #[cfg(feature = "dev")]
 pub(crate) fn icon_pixels(style: render::Style, levels: &[u8], low_at: u8) -> (Vec<u8>, u32) {

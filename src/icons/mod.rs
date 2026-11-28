@@ -8,10 +8,11 @@ use std::sync::OnceLock;
 use ab_glyph::{Font, FontVec};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use windows::core::PCWSTR;
+use windows::core::{w, BOOL, PCWSTR};
 use windows::Win32::Graphics::DirectWrite::{
-    DWriteCreateFactory, IDWriteFactory2, IDWriteFontFace, DWRITE_FACTORY_TYPE_SHARED,
-    DWRITE_FONT_FACE_TYPE_TRUETYPE, DWRITE_FONT_SIMULATIONS_NONE, DWRITE_GLYPH_OFFSET,
+    DWriteCreateFactory, IDWriteFactory2, IDWriteFontCollection, IDWriteFontFace, DWRITE_FACTORY_TYPE_SHARED,
+    DWRITE_FONT_FACE_TYPE_TRUETYPE, DWRITE_FONT_METRICS, DWRITE_FONT_SIMULATIONS_NONE, DWRITE_FONT_STRETCH_NORMAL,
+    DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT_BOLD, DWRITE_GLYPH_METRICS, DWRITE_GLYPH_OFFSET,
     DWRITE_GLYPH_RUN, DWRITE_GRID_FIT_MODE_ENABLED, DWRITE_MEASURING_MODE_GDI_NATURAL,
     DWRITE_RENDERING_MODE_GDI_NATURAL, DWRITE_TEXTURE_ALIASED_1x1,
     DWRITE_TEXT_ANTIALIAS_MODE_GRAYSCALE,
@@ -316,6 +317,92 @@ impl Dwrite {
             }
         }
         Ok((buf, size, size))
+    }
+}
+
+/// `text` in Segoe UI Bold at `em` pixels, grid-fitted like [`render_glyph`]: its coverage, one
+/// byte a pixel, tight to the ink, and that box's width and height. `None` without DirectWrite or
+/// the font.
+pub fn text_coverage(text: &str, em: f32) -> Option<(Vec<u8>, u32, u32)> {
+    BOLD.with(|cell| cell.get_or_init(Bold::new).as_ref()?.coverage(text, em))
+}
+
+/// A DirectWrite factory and Segoe UI Bold's face, cached per thread.
+struct Bold {
+    factory: IDWriteFactory2,
+    face: IDWriteFontFace,
+}
+
+thread_local! {
+    static BOLD: OnceCell<Option<Bold>> = const { OnceCell::new() };
+}
+
+impl Bold {
+    fn new() -> Option<Bold> {
+        unsafe {
+            let factory: IDWriteFactory2 = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED).ok()?;
+            let mut fonts: Option<IDWriteFontCollection> = None;
+            factory.GetSystemFontCollection(&mut fonts, false).ok()?;
+            let fonts = fonts?;
+            let (mut index, mut exists) = (0u32, BOOL(0));
+            fonts.FindFamilyName(w!("Segoe UI"), &mut index, &mut exists).ok()?;
+            if !exists.as_bool() {
+                return None;
+            }
+            let font = fonts.GetFontFamily(index).ok()?.GetFirstMatchingFont(DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL).ok()?;
+            Some(Bold { factory, face: font.CreateFontFace().ok()? })
+        }
+    }
+
+    fn coverage(&self, text: &str, em: f32) -> Option<(Vec<u8>, u32, u32)> {
+        let points: Vec<u32> = text.chars().map(u32::from).collect();
+        let n = points.len();
+        if n == 0 {
+            return None;
+        }
+        unsafe {
+            let mut indices = vec![0u16; n];
+            self.face.GetGlyphIndices(points.as_ptr(), n as u32, indices.as_mut_ptr()).ok()?;
+            let mut font = DWRITE_FONT_METRICS::default();
+            self.face.GetMetrics(&mut font);
+            let mut glyphs = vec![DWRITE_GLYPH_METRICS::default(); n];
+            self.face.GetDesignGlyphMetrics(indices.as_ptr(), n as u32, glyphs.as_mut_ptr(), false).ok()?;
+            // Whole-pixel advances: each figure starts on the grid, as crisp as the first.
+            let advances: Vec<f32> = glyphs.iter().map(|g| (g.advanceWidth as f32 * em / font.designUnitsPerEm as f32).round()).collect();
+            let offsets = vec![DWRITE_GLYPH_OFFSET { advanceOffset: 0.0, ascenderOffset: 0.0 }; n];
+            let run = DWRITE_GLYPH_RUN {
+                // Borrowed without touching its refcount, as in `Dwrite::render`.
+                fontFace: ManuallyDrop::new(Some(std::mem::transmute_copy(&self.face))),
+                fontEmSize: em,
+                glyphCount: n as u32,
+                glyphIndices: indices.as_ptr(),
+                glyphAdvances: advances.as_ptr(),
+                glyphOffsets: offsets.as_ptr(),
+                isSideways: false.into(),
+                bidiLevel: 0,
+            };
+            let analysis = self
+                .factory
+                .CreateGlyphRunAnalysis(
+                    &run,
+                    None,
+                    DWRITE_RENDERING_MODE_GDI_NATURAL,
+                    DWRITE_MEASURING_MODE_GDI_NATURAL,
+                    DWRITE_GRID_FIT_MODE_ENABLED,
+                    DWRITE_TEXT_ANTIALIAS_MODE_GRAYSCALE,
+                    0.0,
+                    em.round(),
+                )
+                .ok()?;
+            let bounds = analysis.GetAlphaTextureBounds(DWRITE_TEXTURE_ALIASED_1x1).ok()?;
+            let (bw, bh) = ((bounds.right - bounds.left).max(0) as u32, (bounds.bottom - bounds.top).max(0) as u32);
+            if bw == 0 || bh == 0 {
+                return None;
+            }
+            let mut coverage = vec![0u8; (bw * bh) as usize];
+            analysis.CreateAlphaTexture(DWRITE_TEXTURE_ALIASED_1x1, &bounds, &mut coverage).ok()?;
+            Some((coverage, bw, bh))
+        }
     }
 }
 

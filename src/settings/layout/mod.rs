@@ -401,6 +401,8 @@ pub(super) enum Picture {
     Bell(crate::config::BellMiddleClick),
     /// What the music player's taskbar button shows.
     PlayerButton(TileStyle),
+    /// How Audio Tray's own battery icon draws the devices.
+    BatteryIcon(crate::config::BatteryIconStyle),
 }
 
 #[derive(Clone, PartialEq, Debug)]

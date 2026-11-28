@@ -21,11 +21,14 @@ A tiny Windows app for **audio awareness without opening anything** — a pill o
     it to mute;
   - amber when you talk while muted in a call.
 
-  It is about audio activity alone. An app that starts listening outside a known call raises a
-  red banner of Audio Tray's (click to mute, right-click to dismiss), whatever the bell; everything
-  else Audio Tray tells you (a device that disconnected, a battery running low, a keyboard layout,
-  a meeting) is a notification: Audio Tray's own under the bell when it shows them, Windows'
-  otherwise.
+  It is about audio activity alone. What Audio Tray tells you is a glance over the bell, a small
+  pill gone in a few seconds and never listed: an app that starts listening outside a known call
+  (red, click to mute, right-click to dismiss, whatever the bell), where the sound went when a
+  device disconnected (accent), a battery running low (amber, red when very low), a focus session
+  done (green), a keyboard layout and, if you like, each new song. While glances keep quiet (Do
+  not disturb, a full-screen app, the open panel), the sound, battery and focus ones are sent as
+  notifications instead, so none is lost. A meeting is always a notification, counting down with
+  its Join button: Audio Tray's own under the bell when it shows them, Windows' otherwise.
 
   It never takes focus, lets clicks through while quiet, hides behind fullscreen apps, and costs
   nothing while still: it is drawn with DirectComposition and the progress ring
@@ -84,8 +87,9 @@ A tiny Windows app for **audio awareness without opening anything** — a pill o
   bubble per device (the lowest three), or the lowest one alone as a battery or its figures with a
   dot per device, green, amber or red by level, with the same tooltip and card; its right click offers the
   batteries, their settings and Windows' Bluetooth page. The laptop's takeover needs the taskbar
-  integration on for something else (the audio buttons, the music tile or the calendar). Windows
-  shows a notification when one runs low (20% by default), once until it is charged again. With
+  integration on for something else (the audio buttons, the music tile or the calendar). One
+  running low (20% by default) says so once until it is charged again, in an amber glance over the
+  bell (a notification while glances keep quiet). With
   the battery icon turned off, they show in the audio panel and under the audio icon's tooltip
   instead. Windows
   says when a Bluetooth level changes or a device connects; a receiver's devices are asked every

@@ -48,6 +48,13 @@ pub mod glyph {
     /// Chevrons: a list that opens, a list that folds.
     pub const DOWN: char = '\u{E70D}';
     pub const UP: char = '\u{E70E}';
+
+    /// A battery filled to `percent`, to the nearest tenth: Battery0 (E850, empty) … Battery9
+    /// (E859); full is Battery10, apart at E83F (E85A is BatteryCharging0).
+    pub fn battery(percent: u8) -> char {
+        let tenth = ((percent.min(100) as f32 / 10.0).round() as u32).min(10);
+        if tenth == 10 { '\u{E83F}' } else { char::from_u32(0xE850 + tenth).unwrap_or('\u{E850}') }
+    }
 }
 
 /// A stable hash of a name, the same on every run: what [`name_colour`] picks by, and what tells

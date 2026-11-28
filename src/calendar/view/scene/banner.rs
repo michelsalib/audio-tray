@@ -155,10 +155,14 @@ pub fn glance(g: &Glance) -> Scene {
     let main = R::new(0.0, 0.0, w, GLANCE_H);
     let mut ink = Layout::new(hover, None, None, false);
     let round = GLANCE_H / 2.0;
-    // The accent, or a colour of its own (an alert's red), its words then in white.
+    // The accent, or a colour of its own (an alert's red, a battery's amber, focus's green), its
+    // words then in white, or near black on a light one (white on amber cannot be read).
     let lit = hover == Some(Hit::Toast(0));
     let (fill, ink_main, ink_soft) = match tint {
-        Some(rgb) => (Fill::Rgba(rgb, if lit { 225 } else { 255 }), Ink::Rgba([0xFF; 3], 255), Ink::Rgba([0xFF; 3], 205)),
+        Some(rgb) => {
+            let words = if light(rgb) { [0x1B; 3] } else { [0xFF; 3] };
+            (Fill::Rgba(rgb, if lit { 225 } else { 255 }), Ink::Rgba(words, 255), Ink::Rgba(words, 205))
+        }
         None => (if lit { Fill::AccentHover } else { Fill::Accent }, Ink::OnAccent, Ink::OnAccent2),
     };
     ink.draw(main, Draw::Rect { fill, radius: round });
@@ -193,6 +197,17 @@ pub fn glance(g: &Glance) -> Scene {
         ink.draw(R::new(round, GLANCE_H - 5.0, run * left.clamp(0.0, 1.0), 2.0), Draw::Rect { fill: Fill::OnAccentWash, radius: 1.0 });
     }
     ink.into_scene(main)
+}
+
+/// A colour light enough to take near-black words: its relative luminance (sRGB, WCAG's) well
+/// past the point where both contrast alike (0.18), so the alert's red keeps its white words
+/// while a battery's amber and focus's green get dark ones.
+fn light([r, g, b]: [u8; 3]) -> bool {
+    let linear = |c: u8| {
+        let c = c as f32 / 255.0;
+        if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
+    };
+    0.2126 * linear(r) + 0.7152 * linear(g) + 0.0722 * linear(b) > 0.3
 }
 
 /// A banner's picture in its photo's place.
@@ -236,5 +251,28 @@ pub(super) fn art(ink: &mut Layout, spot: R, art: &Art) {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The alert's red keeps white words; a battery's amber and focus's green take dark ones.
+    #[test]
+    fn light_tints_take_dark_words() {
+        assert!(!light(RED));
+        assert!(light(AMBER));
+        assert!(light(GREEN));
+    }
+
+    /// A battery's glyph: empty, the tenths, full apart.
+    #[test]
+    fn a_battery_glyph_follows_its_level() {
+        use crate::icons::glyph::battery;
+        assert_eq!(battery(0), '\u{E850}');
+        assert_eq!(battery(12), '\u{E851}');
+        assert_eq!(battery(96), '\u{E83F}');
+        assert_eq!(battery(100), '\u{E83F}');
     }
 }

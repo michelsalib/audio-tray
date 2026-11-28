@@ -613,10 +613,7 @@ fn draw_battery(cv: &mut Canvas, scale: f32, right: f32, cy: f32, pct: u8, font:
     if let Some(f) = font {
         cv.draw_text(f, px, (right - tw, cy + px * 0.34), text(), DIM, &label);
     }
-    // Segoe Fluent battery levels: Battery0 (E850, empty) … Battery9 (E859); full is Battery10,
-    // apart at E83F (E85A is BatteryCharging0).
-    let level = ((pct as f32 / 10.0).round() as u32).min(10);
-    let glyph = if level == 10 { '\u{E83F}' } else { char::from_u32(0xE850 + level).unwrap_or('\u{E850}') };
+    let glyph = crate::icons::glyph::battery(pct);
     let size = (20.0 * scale).round() as u32;
     let gap = 5.0 * scale;
     blit_glyph(cv, glyph, size, text(), DIM, |gw, gh| ((right - tw - gap - gw as f32).round() as i32, (cy - gh as f32 / 2.0).round() as i32));

@@ -25,7 +25,7 @@ pub use view::words::{words, Words};
 pub use view::words::english;
 
 pub use view::{battery_dot, power_changed, set_batteries, Badge, Panel};
-pub use view::banner::{display_changed, glance, listening, now_playing};
+pub use view::banner::{display_changed, glance, listening, notice, now_playing, Note};
 pub mod zones;
 
 use std::sync::atomic::{AtomicBool, Ordering};

@@ -25,6 +25,7 @@
 //!   --banners [count] [secs]       banners of what is listed
 //!   --banner-sim                   the banners' simulation, failing when a check does
 //!   --listening-preview            the "an app is listening" banner, for a few seconds
+//!   --glance-preview               the notices told by a glance (sound moved, battery low, focus)
 //!   --digest [secs]                the digest's banner over everything listed now
 //!   --vol <up|down|get>            nudge or read the default output volume by one scroll notch
 //!   --osd [out|in] [level%]        preview the scroll readout beside the cursor until it fades
@@ -275,6 +276,15 @@ pub fn run(args: &[String], backend: &WasapiBackend) -> Result<bool> {
         Some("--listening-preview") => {
             crate::calendar::listening(Some(("SystemSettings".into(), "SystemSettings.exe".into())));
             crate::win::pump_for(std::time::Duration::from_secs(6));
+        }
+        Some("--glance-preview") => {
+            // The notices told by a glance, stacked: the sound moved, two batteries low, focus done.
+            use crate::calendar::{notice, Note};
+            notice("Sound now on Speakers (Realtek)", "WH-1000XM5 disconnected.", Note::Audio);
+            notice("MX Keys battery low", "18% left. Time to charge it.", Note::Battery(18));
+            notice("G705 Mouse battery low", "9% left. Time to charge it.", Note::Battery(9));
+            notice("Focus done", "25 minutes of focus. Take a break.", Note::Focus);
+            crate::win::pump_for(std::time::Duration::from_secs(8));
         }
         Some("--digest") => crate::calendar::preview_digest(args.get(1).and_then(|s| s.parse().ok()).unwrap_or(8)),
         Some("--keyboards") => crate::keyboards::spike::run(&args[1..])?,

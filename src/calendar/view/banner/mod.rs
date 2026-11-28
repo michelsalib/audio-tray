@@ -127,6 +127,31 @@ enum Is {
     /// A new song: a glance with its cover, never listed (the next replaces it); a click brings the
     /// player to the front, its × or a right click dismisses it.
     Song,
+    /// A notice of Audio Tray's (the sound moved, a battery low, focus done): a glance in its own
+    /// colour for the banners' time, never listed; a click or its × dismisses it.
+    Notice(Note),
+}
+
+/// What an Audio Tray notice told by a glance is about: its glyph and its colour.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Note {
+    /// The sound moved to another device: the speaker, in the accent.
+    Audio,
+    /// A device's battery low, at this level: its battery, amber, red once very low.
+    Battery(u8),
+    /// A focus session ended: the check, in green.
+    Focus,
+}
+
+impl Note {
+    /// Its glyph and its colour (`None`: the accent).
+    fn look(self) -> (char, Option<[u8; 3]>) {
+        match self {
+            Note::Audio => (crate::icons::glyph::VOLUME, None),
+            Note::Battery(level) => (crate::icons::glyph::battery(level), Some(if level <= LOW_LEVEL { RED } else { AMBER })),
+            Note::Focus => (GLYPH_FOCUS, Some(GREEN)),
+        }
+    }
 }
 
 struct Shown {
@@ -481,6 +506,19 @@ pub fn now_playing(title: &str, body: &str, cover: Option<(String, std::sync::Ar
     );
 }
 
+/// A notice of Audio Tray's as a glance in its colour (`note`), never listed, each its own (two
+/// batteries low are two). `false` when glances keep quiet now (Do not disturb, a full-screen app,
+/// the open panel) or the banners are busy: the caller then sends it as a notification, which the
+/// list keeps and a quiet time's digest sums up, so none is lost.
+pub fn notice(title: &str, body: &str, note: Note) -> bool {
+    if quiet_now() {
+        return false;
+    }
+    let Some(toast) = own_toast(title.to_string(), body.to_string(), crate::toast::AUMID.into(), Default::default()) else { return false };
+    show(toast, Is::Notice(note), Some(lifetime()), None);
+    true
+}
+
 /// The banner of kind `is` showing (a glance, a song, an app listening: one of each at most) takes
 /// what `update` gives it and is drawn again in place; with none showing, `show_new` shows one.
 fn replace_or_show(is: Is, update: impl FnOnce(&mut Shown), show_new: impl FnOnce()) {
@@ -614,7 +652,7 @@ fn show(toast: Toast, is: Is, life: Option<Duration>, chime_at: Option<Instant>)
         }
     };
     // A notification's card over Windows' acrylic; a glance draws its own pill, solid.
-    if !matches!(is, Is::Glance | Is::Listening | Is::Song) {
+    if !matches!(is, Is::Glance | Is::Listening | Is::Song | Is::Notice(_)) {
         unsafe { crate::layered::style_panel(hwnd, crate::layered::CORNER_ROUND) };
     }
     // Over the oldest's room, a fourth sends it to the list: the oldest that would go anyway, never
@@ -640,7 +678,7 @@ fn show(toast: Toast, is: Is, life: Option<Duration>, chime_at: Option<Instant>)
             }
         };
         let tint = match is {
-            Is::Glance | Is::Listening | Is::Song => None,
+            Is::Glance | Is::Listening | Is::Song | Is::Notice(_) => None,
             Is::Digest => Some(accent()),
             Is::Listed => b.tint_of(&toast),
         };

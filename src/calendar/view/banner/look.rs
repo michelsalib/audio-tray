@@ -165,6 +165,10 @@ pub(super) fn scene_at(s: &Shown, left: Option<f32>) -> Scene {
         Is::Listening => Some((GLYPH_MIC, Some(RED), true)),
         Is::Glance => Some((GLYPH_KEYBOARD, None, false)),
         Is::Song => Some((GLYPH_SONG, None, true)),
+        Is::Notice(note) => {
+            let (glyph, tint) = note.look();
+            Some((glyph, tint, true))
+        }
         Is::Listed | Is::Digest => None,
     };
     if let Some((glyph, tint, closable)) = glance {
@@ -306,7 +310,7 @@ pub(super) const SPEAKER_AT_REST: [f32; 4] = [0.5, 0.9, 0.65, 0.4];
 pub(super) fn lively(s: &Shown) -> bool {
     let now = Instant::now();
     // Glances (the layout's, an app listening): pills, drawn whole (their line is not a card's).
-    matches!(s.is, Is::Glance | Is::Listening | Is::Song)
+    matches!(s.is, Is::Glance | Is::Listening | Is::Song | Is::Notice(_))
         || (animated()
             && (s.toast.rich.call
                 || (Own::of(&s.toast) != Own::No && now.duration_since(s.born) < ART_FOR)

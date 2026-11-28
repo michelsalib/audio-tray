@@ -167,7 +167,12 @@ pub(super) struct Gfx {
     icons: RefCell<Vec<(IconKey, ID2D1Bitmap)>>,
     /// The app's logo, by its pixel size, drawn for this target.
     logo: RefCell<Option<(u32, ID2D1Bitmap)>>,
+    /// The battery icon styles' pictures drawn for this target, and whether the taskbar was light.
+    batteries: RefCell<Vec<(BatteryKey, ID2D1Bitmap, bool)>>,
 }
+
+/// A battery icon style's picture: the style, its pixel size and the low level it is toned for.
+type BatteryKey = (crate::config::BatteryIconStyle, u32, u8);
 
 /// What the pointer is doing, for hover and press states.
 #[derive(Clone, Copy, Default)]
@@ -181,7 +186,7 @@ impl Gfx {
         unsafe {
             let factory: ID2D1Factory = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None).context("D2D1CreateFactory")?;
             let dwrite: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED).context("DWriteCreateFactory")?;
-            let mut gfx = Gfx { factory, dwrite, formats: Vec::new(), target: None, icons: RefCell::default(), logo: RefCell::default() };
+            let mut gfx = Gfx { factory, dwrite, formats: Vec::new(), target: None, icons: RefCell::default(), logo: RefCell::default(), batteries: RefCell::default() };
             let text = w!("Segoe UI Variable Text");
             let display = w!("Segoe UI Variable Display");
             let icons = w!("Segoe Fluent Icons");
@@ -233,6 +238,7 @@ impl Gfx {
                 self.target = Some(self.factory.CreateHwndRenderTarget(&props, &hwnd_props).context("CreateHwndRenderTarget")?);
                 self.icons.borrow_mut().clear();
                 *self.logo.borrow_mut() = None;
+                self.batteries.borrow_mut().clear();
             }
             let target = self.target.clone().expect("just built");
             target.SetDpi(96.0 * scale, 96.0 * scale);
@@ -910,6 +916,7 @@ fn picture_of(pen: &Pen, s: &Scene, picture: layout::Picture, r: R, a: f32) {
         Picture::Click(click) => click_picture(pen, s, click, r, a),
         Picture::Bell(click) => bell_picture(pen, s, click, r, a),
         Picture::PlayerButton(style) => player_picture(pen, s, style, r, a),
+        Picture::BatteryIcon(style) => battery_icon_picture(pen, s, style, r, a),
         Picture::Ring(style) => {
             let radius = (r.w.min(r.h) / 2.0 - 10.0).max(10.0);
             ring_picture(pen, s, style, (r.x + r.w / 2.0, r.y + r.h / 2.0), radius, a);
@@ -928,6 +935,29 @@ fn picture_of(pen: &Pen, s: &Scene, picture: layout::Picture, r: R, a: f32) {
             }
         }
     }
+}
+
+/// The tray's own battery icon in `style`, drawn by the icon's own code for three devices and
+/// magnified, on a piece of taskbar in the taskbar's theme.
+fn battery_icon_picture(pen: &Pen, s: &Scene, style: crate::config::BatteryIconStyle, r: R, a: f32) {
+    const ICON: f32 = 44.0;
+    let px = (ICON * pen.scale).round() as u32;
+    let key = (style, px, s.model.config.batteries.low_at);
+    let cached = pen.gfx.batteries.borrow().iter().find(|(k, ..)| *k == key).map(|(_, b, light)| (b.clone(), *light));
+    let (bitmap, light) = match cached {
+        Some(found) => found,
+        None => {
+            let (rgba, light) = crate::tray::battery::preview(style, key.2, px);
+            let Some(b) = pen.rgba_bitmap(&rgba, px, px) else { return };
+            pen.gfx.batteries.borrow_mut().push((key, b.clone(), light));
+            (b, light)
+        }
+    };
+    let plate = R::new(r.x + (r.w - (r.w - 8.0).min(132.0)) / 2.0, r.y + (r.h - 64.0) / 2.0, (r.w - 8.0).min(132.0), 64.0);
+    pen.fill(plate, 8.0, Color::hex(if light { 0xEEEEEE } else { 0x1C1C1C }, a));
+    pen.stroke(plate, 8.0, 1.0, Color::hex(if light { 0x000000 } else { 0xFFFFFF }, 0.08 * a));
+    let at = R::new(plate.x + (plate.w - ICON) / 2.0, plate.y + (plate.h - ICON) / 2.0, ICON, ICON);
+    unsafe { pen.target.DrawBitmap(&bitmap, Some(&rect(at)), a, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, None) };
 }
 
 /// A cover with its ring around it, in `style`, filled to two thirds.

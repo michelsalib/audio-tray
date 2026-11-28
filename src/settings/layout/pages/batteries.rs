@@ -3,8 +3,8 @@
 
 use crate::lang::tr;
 
-use super::super::column::{Column, Gate, Switch};
-use super::super::{plain, Choice, Kind, Model, Page, Toggle, Tone, CARD_H, CARD_PAD, R};
+use super::super::column::{choice_tiles, Column, Gate, Switch};
+use super::super::{plain, Choice, Kind, Model, Page, Picture, Toggle, Tone, CARD_H, CARD_PAD, R};
 use super::{needs_tap, note};
 
 /// A battery level's bar and number.
@@ -77,8 +77,28 @@ pub(in crate::settings::layout) fn batteries(col: &mut Column, model: &Model) {
     if laptop {
         return;
     }
-    let styles = [tr("Bars", "Barres").to_string(), tr("Rings", "Anneaux").to_string()];
-    let style = crate::config::BatteryIconStyle::ALL.iter().position(|s| *s == b.icon_style).unwrap_or(0);
-    let gate = Gate::needs(off || !b.taskbar_icon, tr("Needs the battery icon, above", "Nécessite l’icône de batterie, ci-dessus"), None);
-    col.segments(tr("Battery icon style", "Style de l’icône de batterie"), plain(tr("A bar or a ring per device", "Une barre ou un anneau par appareil")), &styles, style, gate, Choice::BatteryIconStyle);
+    // Each style as the icon itself draws it, on a piece of taskbar: a mark per device on the first
+    // row, the lowest one alone on the second.
+    col.section(tr("How the battery icon looks", "Apparence de l’icône de batterie"));
+    let moot = off || !b.taskbar_icon;
+    if moot {
+        note(col, tr("Needs the battery icon, above", "Nécessite l’icône de batterie, ci-dessus"));
+    }
+    use crate::config::BatteryIconStyle as S;
+    let per_device = [
+        (S::Bars, tr("Bars", "Barres"), tr("A bar per device", "Une barre par appareil")),
+        (S::Rings, tr("Rings", "Anneaux"), tr("A ring per device", "Un anneau par appareil")),
+        (S::Bubbles, tr("Bubbles", "Bulles"), tr("A bubble per device", "Une bulle par appareil")),
+    ];
+    let lowest = [
+        (S::Battery, tr("Battery", "Batterie"), tr("The lowest, a dot each", "La plus faible, un point chacun")),
+        (S::Number, tr("Number", "Nombre"), tr("The lowest level in figures", "Le niveau le plus faible en chiffres")),
+    ];
+    for row in [&per_device[..], &lowest[..]] {
+        let tiles = choice_tiles(row, &S::ALL, b.icon_style, Picture::BatteryIcon, Choice::BatteryIconStyle);
+        col.tiles(None, &tiles, moot, STYLE_TILE_H);
+    }
 }
+
+/// A battery icon style's picture tile.
+const STYLE_TILE_H: f32 = 150.0;
